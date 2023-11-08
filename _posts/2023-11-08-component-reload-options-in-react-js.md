@@ -3,10 +3,8 @@ layout: post
 title: Component Reload Options in React.js
 date: '2023-11-08 00:22:43 +0530'
 categories: [React, JavaScript]
-tags: [react components, reloading, useeffect, conditional rendering]
+tags: [React Components, Reloading, useEffect, Conditional Rendering]
 ---
-
-# Component Reload Options in React.js
 
 When developing React.js applications, you may come across scenarios where you need to refresh or reload components under certain conditions. This can be essential for maintaining data consistency, fetching new data, or handling user interactions. In this post, we'll explore different methods to achieve component reloads in React.
 
