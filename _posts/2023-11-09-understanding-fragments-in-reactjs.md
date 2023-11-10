@@ -4,8 +4,6 @@ title: Understanding Fragments in ReactJS
 date: '2023-11-09 23:00:06 +0530'
 tags: [ReactJS, Fragments, Web Development, JavaScript]
 categories: [React, Frontend Development, JavaScript]
-is_series: true
-series_title: "ReactJS"
 ---
 
 ## Introduction

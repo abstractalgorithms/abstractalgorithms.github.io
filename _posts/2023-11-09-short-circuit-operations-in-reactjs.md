@@ -4,8 +4,6 @@ title: Short Circuit Operations in ReactJS
 date: '2023-11-09 15:07:19 +0530'
 categories: [ReactJS, JavaScript, Front-end Development]
 tags: [Short Circuit Operations, Conditional Rendering, State Management, React Components, React Hooks]
-is_series: true
-series_title: "ReactJS"
 ---
 
 In ReactJS, short circuit operations are a powerful tool for writing concise and expressive code. They allow you to handle conditional rendering and state management in a more elegant way. In this blog post, we'll explore what short circuit operations are, how to use them effectively, and provide examples of their usage.
