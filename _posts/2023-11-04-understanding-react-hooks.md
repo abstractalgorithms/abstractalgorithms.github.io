@@ -71,6 +71,151 @@ In this example, we use `useEffect` to create a timer that updates the `seconds`
 
 React offers several other hooks for various purposes, such as `useContext`, `useReducer`, and `useRef`. You can combine and use these hooks to manage state, side effects, and more in your functional components.
 
+## Context Hook: `useContext`
+
+Context in React allows you to pass data through the component tree without having to pass props down manually at every level. The `useContext` hook simplifies the process of consuming this context in functional components.
+
+Let's consider an example where we have a theme context:
+
+```jsx
+// ThemeContext.js
+import { createContext } from 'react';
+
+const ThemeContext = createContext();
+
+export default ThemeContext;
+```
+
+Now, in a component, we can use `useContext` to access the current theme:
+
+```jsx
+// ThemedComponent.js
+import React, { useContext } from 'react';
+import ThemeContext from './ThemeContext';
+
+const ThemedComponent = () => {
+  const theme = useContext(ThemeContext);
+
+  return (
+    <div style={{ color: theme.text, background: theme.background }}>
+      Themed Content
+    </div>
+  );
+};
+
+export default ThemedComponent;
+```
+
+## Reducer Hook: `useReducer`
+
+`useReducer` is a powerful hook for managing complex state logic in a more organized way. It takes a reducer function and an initial state, returning the current state and a dispatch function.
+
+Consider a simple counter example:
+
+```jsx
+import React, { useReducer } from 'react';
+
+const initialState = { count: 0 };
+
+const reducer = (state, action) => {
+  switch (action.type) {
+    case 'increment':
+      return { count: state.count + 1 };
+    case 'decrement':
+      return { count: state.count - 1 };
+    default:
+      return state;
+  }
+};
+
+const Counter = () => {
+  const [state, dispatch] = useReducer(reducer, initialState);
+
+  return (
+    <div>
+      Count: {state.count}
+      <button onClick={() => dispatch({ type: 'increment' })}>Increment</button>
+      <button onClick={() => dispatch({ type: 'decrement' })}>Decrement</button>
+    </div>
+  );
+};
+
+export default Counter;
+```
+
+Using `useReducer` makes it easier to manage state transitions and actions in a more predictable way.
+
+## Ref Hook `useRef`
+
+`useRef` is a handy hook for accessing and interacting with the DOM directly. It returns a mutable object (`{ current: ... }`) that persists across renders without causing re-renders when its value changes.
+
+Here's a simple example:
+
+```jsx
+import React, { useRef, useEffect } from 'react';
+
+const FocusInput = () => {
+  const inputRef = useRef(null);
+
+  useEffect(() => {
+    inputRef.current.focus();
+  }, []);
+
+  return <input ref={inputRef} />;
+};
+
+export default FocusInput;
+```
+
+In this example, the input field is focused as soon as the component mounts, thanks to the `useRef` hook.
+
+## Memo Hook `useMemo`
+
+`useMemo` is a hook that memoizes the result of a computation. It is particularly useful when dealing with expensive calculations or complex operations within a component. By memoizing the result, React ensures that the computation only occurs when necessary, preventing unnecessary re-renders and improving performance.
+
+Consider a scenario where a component renders a list of items, and the total count of items needs to be displayed. Without memoization, calculating the total count on every render can be inefficient.
+
+```jsx
+import React, { useMemo } from 'react';
+
+const ItemList = ({ items }) => {
+  const totalCount = useMemo(() => {
+    console.log('Calculating total count...');
+    return items.reduce((acc, item) => acc + item.quantity, 0);
+  }, [items]);
+
+  return (
+    <div>
+      <p>Total Count: {totalCount}</p>
+      {/* Render the list of items */}
+    </div>
+  );
+};
+```
+
+## Callback Hook `useCallback
+
+While `useMemo` is designed for memoizing values, `useCallback` is tailored for memoizing functions. It memoizes the provided function instance so that it's not recreated on every render unless its dependencies change. This can be crucial in optimizing the performance of components that rely on callback functions.`
+
+In a scenario where a child component receives a callback function as a prop, using useCallback can prevent unnecessary re-creation of the function.
+
+```jsx
+import React, { useCallback } from 'react';
+
+const ChildComponent = ({ onClick }) => {
+  return <button onClick={onClick}>Click me</button>;
+};
+
+const ParentComponent = () => {
+  const handleClick = useCallback(() => {
+    console.log('Button clicked!');
+    // Handle click logic
+  }, []);
+
+  return <ChildComponent onClick={handleClick} />;
+};
+```
+
 ## Custom Hooks
 
 React allows you to create custom Hooks to encapsulate and reuse stateful logic. Here's an example of a custom Hook for handling form input:
