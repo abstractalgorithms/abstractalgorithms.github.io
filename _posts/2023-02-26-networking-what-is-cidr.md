@@ -8,11 +8,9 @@ tags: [networking, cidr, subnetting]
 
 ## What is CIDR
 
-CIDR (Classless Inter-Domain Routing) is a way of assigning unique addresses to devices on a computer network.
+CIDR (Classless Inter-Domain Routing) is a method for assigning unique addresses to devices on a computer network. CIDR employs a prefix notation to represent IP addresses as well as their associated subnet masks. The prefix indicates the number of bits used in the subnet mask to identify the network portion of the address. For instance, a prefix of /24 indicates that the first 24 bits of the IP address identify the network and the remaining 8 bits identify individual devices on the network.
 
-CIDR uses a prefix notation to represent IP addresses and their associated subnet masks. The prefix indicates the number of bits in the subnet mask that are used to identify the network portion of the address. For example, a prefix of /24 indicates that the first 24 bits of the IP address are used to identify the network, while the remaining 8 bits are used to identify individual devices on the network. 
-
-This allows for more efficient use of IP addresses and more flexibility in designing networks. For example, with CIDR, a network administrator can divide a large network into smaller subnets and assign unique IP addresses to each device on those subnets
+CIDR enables network administrators to use IP addresses more efficiently and design networks more flexibly. For instance, they can divide a large network into smaller subnets and assign unique IP addresses to each device on those subnets.
 
 ### Example
 
@@ -22,9 +20,9 @@ This allows for more efficient use of IP addresses and more flexibility in desig
 
 #### Available IPs
 
-The formula to calculate the number of assignable IP address to CIDR networks is "**Subtract the number of network bits from 32. Raise 2 to that power and subtract 2 for the network and broadcast addresses**". For example, a /24 network has 2^(32 - 24) - 2 addresses available for host assignment.
+The formula to calculate the number of assignable IP addresses to CIDR networks is "**Subtract the number of network bits from 32. Raise 2 to that power and subtract 2 for the network and broadcast addresses**". For example, a /24 network has 2^(32 - 24) - 2 addresses available for host assignment.
 
-Some example ranges as per above formula:
+Some example ranges as per the above formula:
 
 | CIDR Notation | Available Bits | Host Formula | Available Hosts |
 | ------------- | -------------- | ------------ | --------------- |
