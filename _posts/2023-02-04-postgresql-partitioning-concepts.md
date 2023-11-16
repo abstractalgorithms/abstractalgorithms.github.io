@@ -47,42 +47,42 @@ CREATE TABLE sales_range (
   price numeric
 );
 
--- Create the first child table for sales data from 2020-01-01 to 2020-06-30
-CREATE TABLE sales_range_2020_1
+-- Create the first child table for sales data from 2023-01-01 to 2023-06-30
+CREATE TABLE sales_range_2023_1
 INHERITS (sales_range)
 PARTITION BY RANGE (date);
 
-CREATE TABLE sales_range_2020_2
+CREATE TABLE sales_range_2023_2
 INHERITS (sales_range)
 PARTITION BY RANGE (date);
 
-CREATE TABLE sales_range_2020_3
+CREATE TABLE sales_range_2023_3
 INHERITS (sales_range)
 PARTITION BY RANGE (date);
 
 -- Add check constraints to specify the range of dates for each partition
-ALTER TABLE sales_range_2020_1
-  ADD CONSTRAINT sales_range_2020_1_check
-  CHECK (date >= '2020-01-01' AND date <= '2020-06-30');
+ALTER TABLE sales_range_2023_1
+  ADD CONSTRAINT sales_range_2023_1_check
+  CHECK (date >= '2023-01-01' AND date <= '2023-06-30');
 
-ALTER TABLE sales_range_2020_2
-  ADD CONSTRAINT sales_range_2020_2_check
-  CHECK (date >= '2020-07-01' AND date <= '2020-12-31');
+ALTER TABLE sales_range_2023_2
+  ADD CONSTRAINT sales_range_2023_2_check
+  CHECK (date >= '2023-07-01' AND date <= '2023-12-31');
 
-ALTER TABLE sales_range_2020_3
-  ADD CONSTRAINT sales_range_2020_3_check
+ALTER TABLE sales_range_2023_3
+  ADD CONSTRAINT sales_range_2023_3_check
   CHECK (date >= '2021-01-01' AND date <= '2021-06-30');
 
 -- Create a trigger function to automatically redirect inserts to the appropriate partition
 CREATE OR REPLACE FUNCTION insert_sales_range()
 RETURNS TRIGGER AS $$
 BEGIN
-  IF (NEW.date >= '2020-01-01' AND NEW.date <= '2020-06-30') THEN
-    INSERT INTO sales_range_2020_1 VALUES (NEW.*);
-  ELSIF (NEW.date >= '2020-07-01' AND NEW.date <= '2020-12-31') THEN
-    INSERT INTO sales_range_2020_2 VALUES (NEW.*);
+  IF (NEW.date >= '2023-01-01' AND NEW.date <= '2023-06-30') THEN
+    INSERT INTO sales_range_2023_1 VALUES (NEW.*);
+  ELSIF (NEW.date >= '2023-07-01' AND NEW.date <= '2023-12-31') THEN
+    INSERT INTO sales_range_2023_2 VALUES (NEW.*);
   ELSE
-    INSERT INTO sales_range_2020_3 VALUES (NEW.*);
+    INSERT INTO sales_range_2023_3 VALUES (NEW.*);
   END IF;
   RETURN NULL;
 END;
@@ -106,11 +106,11 @@ CREATE TABLE sales_range (
   price numeric
 ) PARTITION BY RANGE (date);
 
--- Create the first partition table for sales data from 2020-01-01 to 2020-06-30
-CREATE TABLE sales_range_2020_1 PARTITION OF sales_range FOR VALUES FROM ('2020-01-01') TO ('2020-06-30');
+-- Create the first partition table for sales data from 2023-01-01 to 2023-06-30
+CREATE TABLE sales_range_2023_1 PARTITION OF sales_range FOR VALUES FROM ('2023-01-01') TO ('2023-06-30');
 
--- Create the second partition table for sales data from 2020-07-01 to 2020-12-31
-CREATE TABLE sales_range_2020_2 PARTITION OF sales_range FOR VALUES FROM ('2020-07-01') TO ('2020-12-31');
+-- Create the second partition table for sales data from 2023-07-01 to 2023-12-31
+CREATE TABLE sales_range_2023_2 PARTITION OF sales_range FOR VALUES FROM ('2023-07-01') TO ('2023-12-31');
 
 -- Create the third partition table for sales data from 2021-01-01 to 2021-06-30
 CREATE TABLE sales_range_2021_1 PARTITION OF sales_range FOR VALUES FROM ('2021-01-01') TO ('2021-06-30');
@@ -123,7 +123,7 @@ With this setup, any insert into the "sales_range" table will be automatically r
 ```sql
 INSERT INTO public.sales_range
 ("date", item_id, quantity, price)
-VALUES('2020-01-01', 1, 10, 10.00);
+VALUES('2023-01-01', 1, 10, 10.00);
 
 INSERT INTO public.sales_range
 ("date", item_id, quantity, price)
@@ -380,16 +380,16 @@ CREATE TABLE orders (
 ) PARTITION BY RANGE (order_date);
 
 -- Create first partition based on order date
-CREATE TABLE orders_2022 PARTITION OF orders FOR VALUES FROM ('2022-01-01') TO ('2023-01-01') PARTITION BY LIST (product_id);
+CREATE TABLE orders_2023 PARTITION OF orders FOR VALUES FROM ('2023-01-01') TO ('2023-01-01') PARTITION BY LIST (product_id);
 
 -- Create second partition based on order date
 CREATE TABLE orders_2023 PARTITION OF orders FOR VALUES FROM ('2023-01-01') TO ('2024-01-01') PARTITION BY LIST (product_id);
 
 -- Create sub partition A1 based on product ID on first partition based on order date
-CREATE TABLE orders_2022_A1 PARTITION OF orders_2022 FOR values IN (1);
+CREATE TABLE orders_2023_A1 PARTITION OF orders_2023 FOR values IN (1);
 
 -- Create sub partition A2 based on product ID on first partition based on order date
-CREATE TABLE orders_2022_A2 PARTITION OF orders_2022 FOR values IN (2);
+CREATE TABLE orders_2023_A2 PARTITION OF orders_2023 FOR values IN (2);
 ```
 
 
@@ -399,30 +399,30 @@ CREATE TABLE orders_2022_A2 PARTITION OF orders_2022 FOR values IN (2);
 ```sql
 INSERT INTO public.orders
 (order_id, order_date, customer_id, product_id, quantity, amount)
-VALUES(1, '2022-02-01', 1, 1, 10, 10);
+VALUES(1, '2023-02-01', 1, 1, 10, 10);
 
 INSERT INTO public.orders
 (order_id, order_date, customer_id, product_id, quantity, amount)
-VALUES(2, '2022-02-01', 2, 2, 10, 10);
+VALUES(2, '2023-02-01', 2, 2, 10, 10);
 
 INSERT INTO public.orders
 (order_id, order_date, customer_id, product_id, quantity, amount)
-VALUES(3, '2022-02-01', 3, 1, 10, 10);
+VALUES(3, '2023-02-01', 3, 1, 10, 10);
 
-select * from public.orders_2022
+select * from public.orders_2023
 
-1	2022-02-01	1	1	10	10.0
-3	2022-02-01	3	1	10	10.0
-2	2022-02-01	2	2	10	10.0
+1	2023-02-01	1	1	10	10.0
+3	2023-02-01	3	1	10	10.0
+2	2023-02-01	2	2	10	10.0
 
-select * from public.orders_2022_A1
+select * from public.orders_2023_A1
 
-1	2022-02-01	1	1	10	10.0
-3	2022-02-01	3	1	10	10.0
+1	2023-02-01	1	1	10	10.0
+3	2023-02-01	3	1	10	10.0
 
-select * from public.orders_2022_A2 
+select * from public.orders_2023_A2 
 
-2	2022-02-01	2	2	10	10.0
+2	2023-02-01	2	2	10	10.0
 ```
 
 ![Sub Partitions View](/assets/img/postgresql-sub-partition.png){: .normal }

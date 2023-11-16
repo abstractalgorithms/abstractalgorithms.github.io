@@ -6,8 +6,6 @@ tags: [Databases, SQL, NoSQL, BASE, CAP, ACID, Examples]
 categories: [Technology]
 ---
 
-In this blog post, we will explore the concept of databases and discuss their two main types: SQL (Relational) databases and NoSQL (Non-Relational) databases. Let's dive in!
-
 ## Types of Databases
 
 | Database Type | Description | Example |
@@ -57,7 +55,3 @@ ACID properties ensure that database transactions are reliable and follow specif
 | Consistency | Transactions bring the database from one valid state to another. | All database rules are followed after a transaction. |
 | Isolation | Transactions are executed in isolation from each other, preventing interference. | Multiple transactions on the same data don't affect each other. |
 | Durability | Once a transaction is committed, its changes are permanent and survive any failures. | Committed data remains even after a system crash. |
-
-## Conclusion
-
-Databases play a crucial role in modern application development, and understanding the differences between SQL and NoSQL databases is essential for making informed architectural decisions. The BASE and CAP principles offer alternatives to traditional ACID properties, catering to the needs of distributed systems.
