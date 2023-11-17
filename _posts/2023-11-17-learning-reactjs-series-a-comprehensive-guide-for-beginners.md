@@ -8,7 +8,8 @@ tags: [ReactJS, Frontend, Learning, Beginner's Guide]
 
 Are you new to frontend development and eager to dive into the world of ReactJS? Look no further! This comprehensive guide is the perfect starting point for beginners who want to learn ReactJS and build dynamic and interactive user interfaces.
 
-> I am no expert in ReactJS, the blog series will only outline what I am learning and then sharing for others to learn. {: .prompt-warning }
+> I am no expert in ReactJS, the blog series will only outline what I am learning and then sharing for others to learn. 
+{: .prompt-warning }
 
 ## Why ReactJS?
 
@@ -22,25 +23,50 @@ Our Learning ReactJS series is structured to take you from the basics to more ad
 
 In the first installment, we'll cover the fundamentals of ReactJS, including setting up your development environment, understanding JSX, and creating your first React component.
 
+- Installation and IDE Setup
+- What is JSX
+- Create first react application
+
 ### Part 2: Components and Props
 
 Learn about the core building blocks of React applications: components. We'll explore the concept of props (properties) and how they facilitate communication between components.
+
+- What is a React component
+- Different ways to create a React Component
+- How props is used to communicating data between React components
 
 ### Part 3: State and Lifecycle
 
 Understand the importance of state in React applications and discover how to manage component lifecycles. This part will delve into class components and functional components with hooks.
 
+- What is a React State and how it is managed in a react application
+- Lifecycle of a React components
+- Class component vs Function component
+- What are the React hooks and why it is used
+
 ### Part 4: Handling Forms and Events
 
 Explore how React handles user input through forms and events. Learn about controlled components and gain insights into handling various user interactions.
+
+- React forms and event handling
+- Controlled Component and un Controlled Component
+- Handling user interactions in React
 
 ### Part 5: Routing in React
 
 Dive into React Router to enable navigation in your single-page applications. Understand how to set up routes, navigate between pages, and pass parameters.
 
+- What is React Router 
+- Enabling navigations in a single page application using React
+- Setting up routes, navigation paths and parameter passing
+
 ### Part 6: State Management with Redux
 
 Delve into state management using Redux, a predictable state container for JavaScript applications. Learn how to manage the state of your entire application in a centralized store.
+
+- State management approaches using React
+- Local Storage, Session Storage
+- What is Redux and how to use it to manage state in React applications
 
 ## How to Use This Series
 

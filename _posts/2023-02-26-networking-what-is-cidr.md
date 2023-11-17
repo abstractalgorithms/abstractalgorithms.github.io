@@ -33,3 +33,6 @@ Some example ranges as per the above formula:
 | /28           | 32 - 28 = 4    | 2^4 - 2      | 14              |
 | /30           | 32 - 30 = 2    | 2^2 - 2      | 2               |
 
+## Conclusion
+
+In conclusion, CIDR (Classless Inter-Domain Routing) is a powerful method in computer networking for efficiently assigning unique addresses to devices. By utilizing a prefix notation that signifies the number of bits used in the subnet mask, CIDR allows for precise identification of network portions in IP addresses. This flexibility empowers network administrators to design and manage networks more efficiently, breaking down large networks into smaller, manageable subnets with unique IP assignments.
