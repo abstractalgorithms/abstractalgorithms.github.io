@@ -21,9 +21,6 @@ Welcome to the "Mastering Terraform" series, a comprehensive guide designed to h
     - [Remote Backends](#remote-backends)
     - [Terraform Cloud](#terraform-cloud)
 7. [Conclusion](#conclusion)
-<!-- 7. [Best Practices](#best-practices)
-8. [Troubleshooting and Debugging](#troubleshooting)
-9. [Real-world Use Cases](#real-world-use-cases) -->
 
 ## Getting Started with Terraform <a id="getting-started"></a>
 
@@ -480,10 +477,6 @@ terraform {
 ```
 
 By configuring Terraform to use Terraform Cloud as a remote backend, you can take advantage of its collaborative features and easily manage your infrastructure as a team.
-
-<!-- ## Best Practices <a id="best-practices"></a>
-
-## Real-world Use Cases <a id="real-world-use-cases"></a> -->
 
 ## Conclusion <a id="conclusion"></a>
 
