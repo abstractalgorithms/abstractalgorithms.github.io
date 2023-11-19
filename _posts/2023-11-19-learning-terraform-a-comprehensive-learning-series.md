@@ -17,11 +17,13 @@ Welcome to the "Mastering Terraform" series, a comprehensive guide designed to h
 4. [Creating Reusable Modules](#modules)
 5. [Working with Variables](#variables)
 6. [Advanced Terraform Features](#advanced-features)
-    - [Provisioners and Remote Backends](#provisioners-remote-backends)
+    - [Provisioners](#provisioners)
+    - [Remote Backends](#remote-backends)
     - [Terraform Cloud](#terraform-cloud)
-7. [Best Practices](#best-practices)
+7. [Conclusion](#conclusion)
+<!-- 7. [Best Practices](#best-practices)
 8. [Troubleshooting and Debugging](#troubleshooting)
-9. [Real-world Use Cases](#real-world-use-cases)
+9. [Real-world Use Cases](#real-world-use-cases) -->
 
 ## Getting Started with Terraform <a id="getting-started"></a>
 
@@ -399,7 +401,7 @@ Let's dive deeper into how variables work in Terraform.
 
 ## Advanced Terraform Features <a id="advanced-features"></a>
 
-### Provisioners
+### Provisioners <a id="provisioners"></a>
 
 Provisioners in Terraform enable you to execute scripts or commands on local or remote machines as part of resource creation or destruction. While they can be powerful, it's crucial to use them judiciously, as they introduce dependencies and may impact the idempotence of your infrastructure.
 
@@ -438,7 +440,7 @@ This example demonstrates a remote-exec provisioner, which executes commands on 
 
 Provisioners should be used cautiously, and alternative approaches such as cloud-init scripts or configuration management tools may be preferred for more complex scenarios.
 
-### Remote Backends
+### Remote Backends <a id="remote-backends"></a>
 
 Terraform Remote Backends store the state file remotely, allowing for collaboration, locking, and versioning. This is crucial in team environments to prevent conflicts when multiple users are making changes concurrently.
 
@@ -460,7 +462,7 @@ In this example, the state file is stored in an S3 bucket, and DynamoDB is used 
 
 Remote Backends also support other providers like Azure Storage, Google Cloud Storage, and more.
 
-### Terraform Cloud
+### Terraform Cloud <a id="terraform-cloud"></a>
 
 [Terraform Cloud](https://www.terraform.io/cloud) is a fully managed service by HashiCorp that provides collaboration, versioning, and additional features for Terraform. It acts as a remote backend, storing state files securely and offering features like run history, variable management, and policy enforcement.
 
@@ -483,6 +485,6 @@ By configuring Terraform to use Terraform Cloud as a remote backend, you can tak
 
 ## Real-world Use Cases <a id="real-world-use-cases"></a> -->
 
-## Conclusion
+## Conclusion <a id="conclusion"></a>
 
 Thank you for joining us on this Terraform learning journey. We hope this series empowers you to harness the full potential of Terraform for your infrastructure needs. If you have any questions or topics you'd like us to cover in future posts, feel free to reach out.
