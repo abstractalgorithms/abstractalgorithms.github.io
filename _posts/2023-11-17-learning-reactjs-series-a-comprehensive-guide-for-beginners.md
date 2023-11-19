@@ -11,75 +11,84 @@ Are you new to frontend development and eager to dive into the world of ReactJS?
 > I am no expert in ReactJS, the blog series will only outline what I am learning and then sharing for others to learn. 
 {: .prompt-warning }
 
-## Why ReactJS?
+# Table of Contents
 
-ReactJS, developed by Facebook, has become one of the most popular JavaScript libraries for building user interfaces. Its component-based architecture, virtual DOM, and reactive nature make it a powerful tool for creating modern web applications.
+1. [Why ReactJS?](#why-reactjs)
+2. [Series Outline](#series-outline)
+   - [Part 1: Getting Started with ReactJS](#part-1-getting-started-with-reactjs)
+   - [Part 2: Components and Props](#part-2-components-and-props)
+   - [Part 3: State and Lifecycle](#part-3-state-and-lifecycle)
+   - [Part 4: Handling Forms and Events](#part-4-handling-forms-and-events)
+   - [Part 5: Routing in React](#part-5-routing-in-react)
+   - [Part 6: State Management with Redux](#part-6-state-management-with-redux)
+3. [How to Use This Series](#how-to-use-this-series)
+4. [Conclusion](#conclusion)
 
-## Series Outline
+## Why ReactJS? <a name="why-reactjs"></a>
 
-Our Learning ReactJS series is structured to take you from the basics to more advanced concepts, ensuring a smooth learning curve. Here's a sneak peek at what each part of the series will cover:
+Explore the reasons behind the popularity of ReactJS and how its component-based architecture and virtual DOM contribute to building powerful user interfaces.
 
-### Part 1: Getting Started with ReactJS
+## Series Outline <a name="series-outline"></a>
 
-In the first installment, we'll cover the fundamentals of ReactJS, including setting up your development environment, understanding JSX, and creating your first React component.
+Get an overview of the entire Learning ReactJS series, with a breakdown of what each part will cover.
+
+### Part 1: Getting Started with ReactJS <a name="part-1-getting-started-with-reactjs"></a>
+
+Learn the basics of ReactJS, including setting up your development environment, understanding JSX, and creating your first React component.
 
 - Installation and IDE Setup
 - What is JSX
 - Create first react application
 
-### Part 2: Components and Props
+### Part 2: Components and Props <a name="part-2-components-and-props"></a>
 
-Learn about the core building blocks of React applications: components. We'll explore the concept of props (properties) and how they facilitate communication between components.
+Dive into the core building blocks of React applications: components. Understand the concept of props (properties) and how they facilitate communication between components.
 
 - What is a React component
 - Different ways to create a React Component
-- How props is used to communicating data between React components
+- How props are used to communicate data between React components
 
-### Part 3: State and Lifecycle
+### Part 3: State and Lifecycle <a name="part-3-state-and-lifecycle"></a>
 
-Understand the importance of state in React applications and discover how to manage component lifecycles. This part will delve into class components and functional components with hooks.
+Explore the importance of state in React applications and learn how to manage component lifecycles. Understand class components, functional components with hooks, and the overall lifecycle of React components.
 
-- What is a React State and how it is managed in a react application
-- Lifecycle of a React components
+- What is React State and how it is managed in a React application
+- Lifecycle of React components
 - Class component vs Function component
-- What are the React hooks and why it is used
+- Introduction to React hooks and their usage
 
-### Part 4: Handling Forms and Events
+### Part 4: Handling Forms and Events <a name="part-4-handling-forms-and-events"></a>
 
-Explore how React handles user input through forms and events. Learn about controlled components and gain insights into handling various user interactions.
+Discover how React handles user input through forms and events. Learn about controlled components, uncontrolled components, and gain insights into handling various user interactions.
 
 - React forms and event handling
-- Controlled Component and un Controlled Component
+- Controlled Component vs Uncontrolled Component
 - Handling user interactions in React
 
-### Part 5: Routing in React
+### Part 5: Routing in React <a name="part-5-routing-in-react"></a>
 
-Dive into React Router to enable navigation in your single-page applications. Understand how to set up routes, navigate between pages, and pass parameters.
+Delve into React Router to enable navigation in your single-page applications. Understand how to set up routes, navigate between pages, and pass parameters.
 
-- What is React Router 
-- Enabling navigations in a single page application using React
-- Setting up routes, navigation paths and parameter passing
+- What is React Router
+- Enabling navigation in a single-page application using React
+- Setting up routes, navigation paths, and parameter passing
 
-### Part 6: State Management with Redux
+### Part 6: State Management with Redux <a name="part-6-state-management-with-redux"></a>
 
-Delve into state management using Redux, a predictable state container for JavaScript applications. Learn how to manage the state of your entire application in a centralized store.
+Explore state management approaches using React. Understand local storage, session storage, and delve into Redux, a predictable state container for JavaScript applications.
 
 - State management approaches using React
 - Local Storage, Session Storage
 - What is Redux and how to use it to manage state in React applications
 
-## How to Use This Series
+## How to Use This Series <a name="how-to-use-this-series"></a>
+
+Guidelines on how to effectively use this Learning ReactJS series to enhance your understanding.
 
 - Follow the series sequentially, starting with Part 1.
-- Complete the exercises and examples provided in each part to reinforce your understanding.
-- Don't hesitate to experiment with the concepts learned by building your mini-projects.
+- Complete exercises and examples provided in each part for practical reinforcement.
+- Experiment with the learned concepts by building your mini-projects.
 
-## Conclusion
+## Conclusion <a name="conclusion"></a>
 
 By the end of this Learning ReactJS series, you'll have a solid foundation to build upon as you continue your journey in frontend development. ReactJS is a versatile library that empowers developers to create modern, responsive, and interactive user interfaces.
-
-Stay tuned for the first part of our series, where we'll guide you through setting up your development environment and creating your first React component. Happy coding!
-
-Remember, learning ReactJS is an exciting journey, and we're here to help you every step of the way. If you have any questions or feedback, feel free to reach out in the comments below.
-
-Happy coding!
