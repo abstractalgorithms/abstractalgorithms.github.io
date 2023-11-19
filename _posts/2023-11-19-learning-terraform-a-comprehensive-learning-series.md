@@ -397,7 +397,7 @@ Let's dive deeper into how variables work in Terraform.
 
    Terraform will prompt you for values if it doesn't find them in the configuration or specified via flags.
 
-## Advanced Terraform Features <a id="#advanced-features"></a>
+## Advanced Terraform Features <a id="advanced-features"></a>
 
 ### Provisioners
 
