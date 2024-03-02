@@ -18,13 +18,14 @@ Welcome to the "Mastering Terraform" series, a comprehensive guide designed to h
 5. [Working with Variables](#variables)
 6. [Working with Console](#console)
 7. [Various Functions in Terraform](#functions)
-7. [Advanced Terraform Features](#advanced-features)
+8. [Understanding Data Sources](#data-sources)
+9. [Advanced Terraform Features](#advanced-features)
     - [Resource Management](#resource-management)
     - [Provisioners](#provisioners)
     - [Remote Backends](#remote-backends)
     - [Terraform Cloud](#terraform-cloud)
-8. [Lifecycle Methods](#lifecycle-methods)
-9. [Conclusion](#conclusion)
+10. [Lifecycle Methods](#lifecycle-methods)
+11. [Conclusion](#conclusion)
 
 ## Getting Started with Terraform <a id="getting-started"></a>
 
@@ -329,7 +330,7 @@ Finally:
 
 3. **Testing:** If possible, include automated tests for your modules to ensure they work as expected.
 
-## Working with Variables <a id="variables"></a>
+## **Working with Variables** <a id="variables"></a>
 
 Let's dive deeper into how variables work in Terraform.
 
@@ -622,7 +623,7 @@ Example:
 
 Output: `true`
 
-## Real-world Applications
+### Real-world Applications
 
 Let's incorporate these functions into practical scenarios:
 
@@ -639,6 +640,132 @@ output "uppercase_fruits" {
 ```
 
 In this example, we use the `upper` function to convert each element in the list to uppercase.
+
+## Data Sources in Terraform <a id="data-sources"></a>
+
+In Terraform, data sources allow you to fetch information from existing infrastructure components or external systems and use that information in your configurations. Unlike resources, which create and manage infrastructure, data sources are read-only and provide a way to incorporate external data into your Terraform configurations.
+
+### Configuration Syntax
+
+Data sources are defined using the `data` block, followed by the data source type and configuration settings. Here's a basic example fetching information about an AWS VPC:
+
+```hcl
+data "aws_vpcs" "example" {
+  default = true
+}
+```
+
+In this example, we're using the `aws_vpcs` data source to retrieve information about all VPCs in the AWS account. The `default` attribute is set to `true` to use the default configuration.
+
+### Use Cases for Data Sources
+
+1. **Fetching Existing Resources:**
+   ```hcl
+   data "aws_instance" "existing_instance" {
+     instance_id = "i-0123456789abcdef0"
+   }
+   ```
+
+   Use data sources to fetch information about an existing AWS EC2 instance based on its instance ID.
+
+2. **Getting AMI Information:**
+   ```hcl
+   data "aws_ami" "latest_amazon_linux" {
+     most_recent = true
+     owners      = ["amazon"]
+
+     filter {
+       name   = "name"
+       values = ["amzn2-ami-hvm-*-x86_64-gp2"]
+     }
+   }
+   ```
+
+   Retrieve information about the latest Amazon Linux AMI using the `aws_ami` data source.
+
+3. **Accessing Remote State:**
+   ```hcl
+   data "terraform_remote_state" "network" {
+     backend = "s3"
+     config = {
+       bucket         = "network-state"
+       key            = "terraform.tfstate"
+       region         = "us-west-2"
+     }
+   }
+   ```
+
+   Use data sources to access remote state stored in an S3 bucket.
+
+### Advanced Configurations
+
+Data sources often support advanced configurations, including filtering, querying, and transforming data. Explore documentation and experiment to leverage the full capabilities of data sources.
+
+### Using Data Sources
+Using data from data sources in Terraform involves referencing the data source outputs in your configuration. The data source outputs become variables that you can use elsewhere in your Terraform code. Here's a step-by-step guide on how to use data from data sources:
+
+#### 1. Define a Data Source
+
+First, define the data source in your Terraform configuration. This is where you specify the criteria for fetching the data. For example, fetching information about an AWS VPC:
+
+```hcl
+data "aws_vpcs" "example" {
+  default = true
+}
+```
+
+#### 2. Reference the Data Source Output
+
+After defining the data source, you can reference its output in other parts of your configuration. The output is defined by the name you give to the data source block (`aws_vpcs` in this case) and the alias you give to the output (`example` in this case).
+
+For example, to reference the VPC IDs fetched by the data source, you might use:
+
+```hcl
+resource "aws_subnet" "example_subnet" {
+  vpc_id     = data.aws_vpcs.example.ids[0]  # Using the first VPC ID from the data source
+  cidr_block = "10.0.1.0/24"
+  # Other subnet configurations...
+}
+```
+
+In this example, `data.aws_vpcs.example.ids` refers to the list of VPC IDs fetched by the data source. The `[0]` index is used to access the first VPC ID in the list. You can adjust this based on your specific needs.
+
+#### 3. Leverage Data Source Outputs
+
+You can use data source outputs in various Terraform configurations, such as in resource blocks, variable assignments, or even in outputs.
+
+```hcl
+output "first_vpc_id" {
+  value = data.aws_vpcs.example.ids[0]
+}
+```
+
+This output would expose the first VPC ID fetched by the data source, making it available for reference or display.
+
+#### Example: Using Data Source Outputs in a Complete Configuration
+
+Putting it all together, here's an example configuration that uses data from the AWS VPC data source to create a subnet:
+
+```hcl
+# Define AWS VPC data source
+data "aws_vpcs" "example" {
+  default = true
+}
+
+# Create an AWS subnet using the first VPC ID from the data source
+resource "aws_subnet" "example_subnet" {
+  vpc_id     = data.aws_vpcs.example.ids[0]
+  cidr_block = "10.0.1.0/24"
+  # Other subnet configurations...
+}
+
+# Output the first VPC ID for reference
+output "first_vpc_id" {
+  value = data.aws_vpcs.example.ids[0]
+}
+```
+
+In this example, the VPC ID fetched by the data source is used in the `aws_subnet` resource and exposed as an output.
 
 ## Advanced Terraform Features <a id="advanced-features"></a>
 
@@ -783,6 +910,68 @@ By configuring Terraform to use Terraform Cloud as a remote backend, you can tak
 
 
 ## Lifecycle Methods <a id="lifecycle-methods"></a>
+
+In Terraform, lifecycle blocks are used to configure certain aspects of resource management, such as when to create, update, or delete resources. These blocks allow you to control the behavior of Terraform during different lifecycle stages of a resource.
+
+Here's an explanation of the available lifecycle methods in Terraform along with examples:
+
+1. **Create Before Destroy (`create_before_destroy`)**:
+   - By default, Terraform destroys the existing resource and then creates a new one when changes are detected. However, in some cases, you may want to create the new resource before destroying the existing one to avoid downtime.
+   - Example:
+     ```hcl
+     resource "aws_instance" "example" {
+       # Other configuration options...
+     
+       lifecycle {
+         create_before_destroy = true
+       }
+     }
+     ```
+   - This will instruct Terraform to create a new instance before destroying the existing one when updates are detected.
+
+2. **Prevent Destroy (`prevent_destroy`)**:
+   - This method prevents Terraform from destroying a resource, which can be useful for critical resources that should not be accidentally deleted.
+   - Example:
+     ```hcl
+     resource "aws_instance" "example" {
+       # Other configuration options...
+     
+       lifecycle {
+         prevent_destroy = true
+       }
+     }
+     ```
+   - This will prevent Terraform from destroying the instance, and any attempt to destroy it will result in an error.
+
+3. **Ignore Changes (`ignore_changes`)**:
+   - This method specifies attributes that Terraform should ignore when detecting changes to a resource. It can be used to prevent certain attributes from triggering updates.
+   - Example:
+     ```hcl
+     resource "aws_instance" "example" {
+       # Other configuration options...
+     
+       lifecycle {
+         ignore_changes = ["tags"]
+       }
+     }
+     ```
+   - This will ignore changes to the "tags" attribute of the instance and prevent them from triggering updates.
+
+4. **Create Timeout (`create_before_destroy`)**:
+   - This method specifies the maximum time Terraform should wait for a resource to be created. If the resource creation exceeds this timeout, Terraform will fail.
+   - Example:
+     ```hcl
+     resource "aws_instance" "example" {
+       # Other configuration options...
+     
+       lifecycle {
+         create_before_destroy {
+           timeout = "10m"
+         }
+       }
+     }
+     ```
+   - This will set a timeout of 10 minutes for creating the new instance before destroying the existing one.
 
 ## Conclusion <a id="conclusion"></a>
 
