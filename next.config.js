@@ -11,8 +11,8 @@ const nextConfig = {
     unoptimized: true
   },
   // Add basePath and assetPrefix for GitHub Pages (only in production)
-  basePath: process.env.NODE_ENV === 'production' ? '/abstractalgorithms.github.io' : '',
-  assetPrefix: process.env.NODE_ENV === 'production' ? '/abstractalgorithms.github.io/' : '',
+  basePath: '',
+  assetPrefix: '',
   pageExtensions: ['js', 'jsx', 'mdx', 'ts', 'tsx'],
   webpack: (config) => {
     config.resolve.fallback = {
