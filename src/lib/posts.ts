@@ -54,7 +54,11 @@ export async function getPosts(): Promise<Post[]> {
           author: data.author || 'Anonymous',
           tags: data.tags || [],
           readingTime: readingTime(content).text,
-          coverImage: data.coverImage,
+          coverImage: data.coverImage ? 
+            data.coverImage.startsWith('./') ? 
+              `/posts/${dir}/${data.coverImage.slice(2)}` : 
+              data.coverImage : 
+            undefined,
           fixedUrl: data.fixedUrl, // Add fixedUrl from frontmatter if present
         }
         
@@ -96,7 +100,11 @@ export async function getPostBySlug(slug: string): Promise<Post | null> {
       author: data.author || 'Anonymous',
       tags: data.tags || [],
       readingTime: readingTime(content).text,
-      coverImage: data.coverImage,
+      coverImage: data.coverImage ? 
+        data.coverImage.startsWith('./') ? 
+          `/posts/${slug}/${data.coverImage.slice(2)}` : 
+          data.coverImage : 
+        undefined,
       fixedUrl: data.fixedUrl, // Add fixedUrl from frontmatter if present
     }
   } catch (error) {
