@@ -18,6 +18,7 @@ export interface Post {
   tags: string[]
   readingTime: string
   coverImage?: string
+  fixedUrl?: string // Optional fixed URL for the post
 }
 
 export async function getPosts(): Promise<Post[]> {
@@ -54,6 +55,7 @@ export async function getPosts(): Promise<Post[]> {
           tags: data.tags || [],
           readingTime: readingTime(content).text,
           coverImage: data.coverImage,
+          fixedUrl: data.fixedUrl, // Add fixedUrl from frontmatter if present
         }
         
         posts.push(post)
@@ -95,6 +97,7 @@ export async function getPostBySlug(slug: string): Promise<Post | null> {
       tags: data.tags || [],
       readingTime: readingTime(content).text,
       coverImage: data.coverImage,
+      fixedUrl: data.fixedUrl, // Add fixedUrl from frontmatter if present
     }
   } catch (error) {
     console.error('Error reading post:', error)

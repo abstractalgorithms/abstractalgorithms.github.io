@@ -3,6 +3,7 @@ import { getPosts, getPostBySlug } from '../../../lib/posts'
 import PostHeader from '../../../components/PostHeader'
 import PostContent from '../../../components/PostContent'
 import RelatedPosts from '../../../components/RelatedPosts'
+import GiscusComments from '../../../components/GiscusComments'
 
 interface PostPageProps {
   params: {
@@ -33,7 +34,9 @@ export async function generateMetadata({ params }: PostPageProps) {
       type: 'article',
       publishedTime: post.date,
       authors: [post.author],
+      url: post.fixedUrl || undefined, // Use fixedUrl if specified
     },
+    alternates: post.fixedUrl ? { canonical: post.fixedUrl } : undefined,
   }
 }
 
@@ -56,6 +59,7 @@ export default async function PostPage({ params }: PostPageProps) {
       <div className="medium-container py-8">
         <div className="max-w-3xl mx-auto">
           <PostContent content={post.content} />
+          <GiscusComments />
         </div>
       </div>
       
