@@ -7,9 +7,10 @@ import type { Post } from '../lib/posts'
 interface PostCardProps {
   post: Post
   featured?: boolean
+  compact?: boolean
 }
 
-export default function PostCard({ post, featured = false }: PostCardProps) {
+export default function PostCard({ post, featured = false, compact = false }: PostCardProps) {
   const formattedDate = formatDistanceToNow(new Date(post.date), { addSuffix: true })
 
   if (featured) {
@@ -82,10 +83,16 @@ export default function PostCard({ post, featured = false }: PostCardProps) {
   }
 
   return (
-    <article className="post-card p-8 hover:shadow-xl transition-all duration-300">
-      <div className={`grid gap-8 ${post.coverImage ? 'lg:grid-cols-3' : 'grid-cols-1'}`}>
+    <article className={`post-card hover:shadow-xl transition-all duration-300 ${
+      compact ? 'p-6 h-full flex flex-col' : 'p-8'
+    }`}>
+      <div className={compact ? 'space-y-6 flex-1 flex flex-col' : `grid gap-8 ${post.coverImage ? 'lg:grid-cols-3' : 'grid-cols-1'}`}>
         {post.coverImage && (
-          <div className="relative aspect-[4/3] lg:aspect-square rounded-xl overflow-hidden">
+          <div className={`relative overflow-hidden rounded-xl ${
+            compact 
+              ? 'aspect-[16/10] mb-4 flex-shrink-0' 
+              : 'aspect-[4/3] lg:aspect-square'
+          }`}>
             <Image
               src={post.coverImage}
               alt={post.title}
@@ -95,8 +102,8 @@ export default function PostCard({ post, featured = false }: PostCardProps) {
           </div>
         )}
         
-        <div className={post.coverImage ? 'lg:col-span-2 space-y-6' : 'col-span-1 space-y-6'}>
-          <h3 className="text-xl lg:text-2xl font-bold text-gray-900 leading-tight">
+        <div className={compact ? 'space-y-4 flex-1 flex flex-col' : (post.coverImage ? 'lg:col-span-2 space-y-6' : 'col-span-1 space-y-6')}>
+          <h3 className={`font-bold text-gray-900 leading-tight ${compact ? 'text-xl lg:text-2xl' : 'text-xl lg:text-2xl'}`}>
             <Link 
               href={`/posts/${post.slug}`}
               className="hover:text-green-600 transition-colors"
@@ -105,11 +112,11 @@ export default function PostCard({ post, featured = false }: PostCardProps) {
             </Link>
           </h3>
           
-          <p className="text-gray-700 text-base leading-relaxed">
+          <p className={`text-gray-700 leading-relaxed ${compact ? 'text-base line-clamp-3 flex-1' : 'text-base'}`}>
             {post.excerpt}
           </p>
           
-          <div className="flex items-center justify-between pt-4">
+          <div className="flex items-center justify-between pt-4 mt-auto">
             <div className="post-meta text-sm">
               <User className="w-4 h-4" />
               <span className="font-medium">{post.author}</span>
@@ -121,7 +128,7 @@ export default function PostCard({ post, featured = false }: PostCardProps) {
             
             <Link 
               href={`/posts/${post.slug}`}
-              className="inline-flex items-center text-green-600 hover:text-green-700 font-semibold group"
+              className="inline-flex items-center text-green-600 hover:text-green-700 font-semibold group flex-shrink-0"
             >
               Read Article
               <ArrowRight className="ml-2 w-4 h-4 group-hover:translate-x-1 transition-transform" />
@@ -130,14 +137,14 @@ export default function PostCard({ post, featured = false }: PostCardProps) {
           
           {post.tags.length > 0 && (
             <div className="flex flex-wrap gap-3 pt-4">
-              {post.tags.slice(0, 4).map((tag) => (
+              {post.tags.slice(0, compact ? 3 : 4).map((tag) => (
                 <span key={tag} className="tag">
                   {tag}
                 </span>
               ))}
-              {post.tags.length > 4 && (
+              {post.tags.length > (compact ? 3 : 4) && (
                 <span className="text-sm text-gray-500 px-3 py-2">
-                  +{post.tags.length - 4} more
+                  +{post.tags.length - (compact ? 3 : 4)} more
                 </span>
               )}
             </div>

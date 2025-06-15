@@ -4,21 +4,22 @@ import { useState, useEffect } from 'react'
 import { useSearchParams } from 'next/navigation'
 import PostCard from '../../components/PostCard'
 import Link from 'next/link'
-import { ArrowLeft, Calendar, Hash, Filter } from 'lucide-react'
+import { ArrowLeft, Calendar, Hash, Filter, ChevronLeft, ChevronRight } from 'lucide-react'
 import type { Post } from '../../lib/posts'
 
 interface PostsPageClientProps {
   posts: Post[]
 }
 
-export default function PostsPageClient({ posts: allPosts }: PostsPageClientProps) {
-  const searchParams = useSearchParams()
+export default function PostsPageClient({ posts: allPosts }: PostsPageClientProps) {  const searchParams = useSearchParams()
   const [selectedTag, setSelectedTag] = useState<string | null>(null)
   const [filteredPosts, setFilteredPosts] = useState(allPosts)
-
+  const [currentPage, setCurrentPage] = useState(1)
+  const postsPerPage = 8 // 8 posts per page (2 columns x 4 rows)
   useEffect(() => {
     const tag = searchParams.get('tag')
     setSelectedTag(tag)
+    setCurrentPage(1) // Reset to first page when filtering
     
     if (tag) {
       setFilteredPosts(allPosts.filter(post => post.tags.includes(tag)))
@@ -26,7 +27,6 @@ export default function PostsPageClient({ posts: allPosts }: PostsPageClientProp
       setFilteredPosts(allPosts)
     }
   }, [searchParams, allPosts])
-
   const pageTitle = selectedTag 
     ? `${selectedTag.replace(/-/g, ' ').replace(/\b\w/g, l => l.toUpperCase())} Articles`
     : 'All Articles'
@@ -34,6 +34,21 @@ export default function PostsPageClient({ posts: allPosts }: PostsPageClientProp
   const pageDescription = selectedTag
     ? `Articles tagged with "${selectedTag}"`
     : 'Browse all articles about algorithms, data structures, and software engineering concepts.'
+
+  // Pagination calculations
+  const totalPages = Math.ceil(filteredPosts.length / postsPerPage)
+  const startIndex = (currentPage - 1) * postsPerPage
+  const endIndex = startIndex + postsPerPage
+  const currentPosts = filteredPosts.slice(startIndex, endIndex)
+
+  const handlePageChange = (page: number) => {
+    setCurrentPage(page)
+    // Scroll to top of posts section
+    const postsSection = document.getElementById('posts-section')
+    if (postsSection) {
+      postsSection.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    }
+  }
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -55,10 +70,15 @@ export default function PostsPageClient({ posts: allPosts }: PostsPageClientProp
                   <Filter className="w-4 h-4 mr-2" />
                   Filtered by: {selectedTag}
                 </div>
-              )}
-              <div className="flex items-center text-sm text-gray-500">
+              )}              <div className="flex items-center text-sm text-gray-500">
                 <Calendar className="w-4 h-4 mr-2" />
                 {filteredPosts.length} articles {selectedTag ? 'found' : 'available'}
+                {totalPages > 1 && (
+                  <>
+                    <span className="mx-2">•</span>
+                    <span>Page {currentPage} of {totalPages}</span>
+                  </>
+                )}
               </div>
             </div>
           </div>
@@ -80,19 +100,80 @@ export default function PostsPageClient({ posts: allPosts }: PostsPageClientProp
             )}
           </div>
         </div>
-      </div>
-
-      {/* Posts Section */}
-      <div className="wide-container py-16">
+      </div>      {/* Posts Section */}
+      <div id="posts-section" className="wide-container py-16">
         {filteredPosts.length > 0 ? (
           <div className="space-y-12">
-            {filteredPosts.map((post, index) => (
-              <PostCard 
-                key={post.slug} 
-                post={post} 
-                featured={false} // No featured posts on this page
-              />
-            ))}
+            {/* Posts Grid */}
+            <div className="posts-grid">
+              {currentPosts.map((post, index) => (
+                <PostCard 
+                  key={post.slug} 
+                  post={post} 
+                  featured={false}
+                  compact={true} // Use compact layout for grid
+                />
+              ))}
+              {/* Add an empty div if odd number of posts on large screens for better visual balance */}
+              {currentPosts.length % 2 === 1 && (
+                <div className="hidden lg:block"></div>
+              )}
+            </div>            {/* Pagination */}
+            {totalPages > 1 && (
+              <div className="pagination-section">
+                <div className="flex items-center justify-center space-x-4">
+                  <button
+                    onClick={() => handlePageChange(currentPage - 1)}
+                    disabled={currentPage === 1}
+                    className="inline-flex items-center px-4 py-2 text-sm font-medium text-gray-500 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 hover:text-gray-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                  >
+                    <ChevronLeft className="w-4 h-4 mr-1" />
+                    Previous
+                  </button>
+
+                  <div className="flex items-center space-x-2">
+                    {Array.from({ length: totalPages }, (_, i) => i + 1).map((page) => {
+                      // Show first page, last page, current page, and pages around current page
+                      const shouldShow = 
+                        page === 1 || 
+                        page === totalPages || 
+                        (page >= currentPage - 1 && page <= currentPage + 1)
+                      
+                      if (!shouldShow) {
+                        // Show ellipsis if there's a gap
+                        if (page === currentPage - 2 || page === currentPage + 2) {
+                          return <span key={page} className="px-2 text-gray-400">...</span>
+                        }
+                        return null
+                      }
+
+                      return (
+                        <button
+                          key={page}
+                          onClick={() => handlePageChange(page)}
+                          className={`px-3 py-2 text-sm font-medium rounded-lg transition-colors ${
+                            page === currentPage
+                              ? 'bg-green-600 text-white'
+                              : 'text-gray-500 bg-white border border-gray-300 hover:bg-gray-50 hover:text-gray-700'
+                          }`}
+                        >
+                          {page}
+                        </button>
+                      )
+                    })}
+                  </div>
+
+                  <button
+                    onClick={() => handlePageChange(currentPage + 1)}
+                    disabled={currentPage === totalPages}
+                    className="inline-flex items-center px-4 py-2 text-sm font-medium text-gray-500 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 hover:text-gray-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                  >
+                    Next
+                    <ChevronRight className="w-4 h-4 ml-1" />
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         ) : (
           <div className="text-center py-20">
