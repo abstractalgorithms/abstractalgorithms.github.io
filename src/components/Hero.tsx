@@ -1,67 +1,82 @@
 import Link from 'next/link'
 import { ArrowRight, Code, Database, Layers } from 'lucide-react'
+import RotatingText from './RotatingText'
 
 export default function Hero() {
+  const rotatingTexts = [
+    'Algorithms',
+    'Development',
+    'Concepts',
+    'Data Structures',
+    'System Design',
+    'Programming',
+    'Engineering',
+    'Innovation'
+  ]
+
   return (
-    <section className="bg-gradient-to-br from-gray-50 to-white py-20">
-      <div className="medium-container">
-        <div className="text-center max-w-4xl mx-auto">
-          <h1 className="text-5xl md:text-6xl font-bold text-gray-900 mb-6 leading-tight">
-            Master the Art of{' '}
-            <span className="text-transparent bg-clip-text bg-gradient-to-r from-green-600 to-emerald-600">
-              Algorithms
-            </span>
+    <section className="bg-gradient-to-br from-gray-50 via-white to-green-50/30 py-20 lg:py-32">
+      <div className="wide-container">
+        <div className="text-center max-w-5xl mx-auto">
+          <h1 className="text-4xl md:text-5xl lg:text-6xl font-bold text-gray-900 mb-8 leading-tight">
+            Master the Art of
+            <br />
+            <RotatingText 
+              texts={rotatingTexts}
+              interval={2500}
+              className="text-transparent bg-clip-text bg-gradient-to-r from-green-600 to-emerald-600"
+            />
           </h1>
           
-          <p className="text-xl text-gray-600 mb-8 leading-relaxed max-w-2xl mx-auto">
+          <p className="text-lg md:text-xl lg:text-2xl text-gray-600 mb-12 leading-relaxed max-w-4xl mx-auto font-light">
             Dive deep into algorithms, data structures, and system design with clear explanations, 
-            visual examples, and practical implementations.
+            visual examples, and practical implementations that make complex concepts accessible.
           </p>
           
-          <div className="flex flex-col sm:flex-row items-center justify-center gap-4 mb-12">
+          <div className="flex flex-col sm:flex-row items-center justify-center gap-6 mb-24">
             <Link 
-              href="#latest" 
-              className="inline-flex items-center px-8 py-3 bg-green-600 text-white font-semibold rounded-lg hover:bg-green-700 transition-colors group"
+              href="/discover" 
+              className="inline-flex items-center px-8 py-3 bg-green-600 text-white font-semibold rounded-xl hover:bg-green-700 transition-all duration-200 shadow-lg hover:shadow-xl text-base group"
             >
               Start Reading
               <ArrowRight className="ml-2 w-5 h-5 group-hover:translate-x-1 transition-transform" />
             </Link>
             <Link 
               href="/about" 
-              className="inline-flex items-center px-8 py-3 border border-gray-300 text-gray-700 font-semibold rounded-lg hover:bg-gray-50 transition-colors"
+              className="inline-flex items-center px-8 py-3 border-2 border-gray-300 text-gray-700 font-semibold rounded-xl hover:bg-gray-50 transition-all duration-200 text-base"
             >
               Learn More
             </Link>
           </div>
           
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-8 max-w-3xl mx-auto">
-            <div className="text-center">
-              <div className="w-12 h-12 bg-green-100 text-green-600 rounded-lg flex items-center justify-center mx-auto mb-4">
-                <Code className="w-6 h-6" />
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-12 max-w-4xl mx-auto">
+            <div className="text-center group">
+              <div className="w-16 h-16 bg-green-100 text-green-600 rounded-2xl flex items-center justify-center mx-auto mb-6 group-hover:scale-110 transition-transform duration-200">
+                <Code className="w-8 h-8" />
               </div>
-              <h3 className="font-semibold text-gray-900 mb-2">Algorithms</h3>
-              <p className="text-gray-600 text-sm">
-                From sorting to graph traversal, master the fundamental algorithms
+              <h3 className="text-lg font-bold text-gray-900 mb-4">Algorithms</h3>
+              <p className="text-gray-600 text-base leading-relaxed">
+                From sorting to graph traversal, master the fundamental algorithms that power modern software
               </p>
             </div>
             
-            <div className="text-center">
-              <div className="w-12 h-12 bg-blue-100 text-blue-600 rounded-lg flex items-center justify-center mx-auto mb-4">
-                <Database className="w-6 h-6" />
+            <div className="text-center group">
+              <div className="w-16 h-16 bg-blue-100 text-blue-600 rounded-2xl flex items-center justify-center mx-auto mb-6 group-hover:scale-110 transition-transform duration-200">
+                <Database className="w-8 h-8" />
               </div>
-              <h3 className="font-semibold text-gray-900 mb-2">Data Structures</h3>
-              <p className="text-gray-600 text-sm">
-                Learn about trees, graphs, hashmaps and advanced data structures
+              <h3 className="text-lg font-bold text-gray-900 mb-4">Data Structures</h3>
+              <p className="text-gray-600 text-base leading-relaxed">
+                Learn about trees, graphs, hash tables and advanced data structures that organize information efficiently
               </p>
             </div>
             
-            <div className="text-center">
-              <div className="w-12 h-12 bg-purple-100 text-purple-600 rounded-lg flex items-center justify-center mx-auto mb-4">
-                <Layers className="w-6 h-6" />
+            <div className="text-center group">
+              <div className="w-16 h-16 bg-purple-100 text-purple-600 rounded-2xl flex items-center justify-center mx-auto mb-6 group-hover:scale-110 transition-transform duration-200">
+                <Layers className="w-8 h-8" />
               </div>
-              <h3 className="font-semibold text-gray-900 mb-2">System Design</h3>
-              <p className="text-gray-600 text-sm">
-                Understand how to design scalable and robust systems
+              <h3 className="text-lg font-bold text-gray-900 mb-4">System Design</h3>
+              <p className="text-gray-600 text-base leading-relaxed">
+                Understand how to design scalable, robust systems that handle millions of users
               </p>
             </div>
           </div>

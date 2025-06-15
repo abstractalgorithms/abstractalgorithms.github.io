@@ -50,7 +50,7 @@ export default async function PostPage({ params }: PostPageProps) {
   const allPosts = await getPosts()
   const relatedPosts = allPosts
     .filter(p => p.slug !== post.slug)
-    .slice(0, 3)
+    .slice(0, 6) // Show more posts for a better carousel experience
 
   return (
     <article className="min-h-screen bg-white">
