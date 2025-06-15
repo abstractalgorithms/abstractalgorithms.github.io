@@ -24,7 +24,7 @@ export default function Footer() {
                 <Github className="w-5 h-5" />
               </a>
               <a 
-                href="https://twitter.com/abstractalgs" 
+                href="https://x.com/abstractalgs" 
                 target="_blank" 
                 rel="noopener noreferrer"
                 className="text-gray-400 hover:text-gray-600 transition-colors"
@@ -93,7 +93,7 @@ export default function Footer() {
         
         <div className="mt-8 pt-8 border-t border-gray-200 text-center">
           <p className="text-gray-600 text-sm">
-            © {currentYear} Abstract Algorithms. Built with Next.js and hosted on GitHub Pages.
+            © {currentYear} Abstract Algorithms. All rights reserved.
           </p>
         </div>
       </div>
