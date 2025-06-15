@@ -34,7 +34,9 @@ export async function generateMetadata({ params }: PostPageProps) {
       type: 'article',
       publishedTime: post.date,
       authors: [post.author],
+      url: post.fixedUrl || undefined, // Use fixedUrl if specified
     },
+    alternates: post.fixedUrl ? { canonical: post.fixedUrl } : undefined,
   }
 }
 
