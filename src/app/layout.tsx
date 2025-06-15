@@ -18,6 +18,20 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en">
+      <head>
+        {/* Google Site Verification */}
+        <meta name="google-site-verification" content="D5v1M3nD8oO9DNaZKujCwBLNNqf35CTJo114uv8yMNU" />
+        {/* Google Analytics */}
+        <script async src="https://www.googletagmanager.com/gtag/js?id=G-VZR168MHE2"></script>
+        <script dangerouslySetInnerHTML={{
+          __html: `
+            window.dataLayer = window.dataLayer || [];
+            function gtag(){dataLayer.push(arguments);}
+            gtag('js', new Date());
+            gtag('config', 'G-VZR168MHE2');
+          `,
+        }} />
+      </head>
       <body className={inter.className}>
         <div className="min-h-screen flex flex-col">
           <Header />
