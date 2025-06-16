@@ -6,7 +6,7 @@ import remarkGfm from 'remark-gfm'
 import remarkHtml from 'remark-html'
 import readingTime from 'reading-time'
 
-const postsDirectory = path.join(process.cwd(), 'public/posts')
+const postsDirectory = path.join(process.cwd(), 'src/posts')
 
 export interface Post {
   slug: string
@@ -40,11 +40,45 @@ export async function getPosts(): Promise<Post[]> {
 
     for (const dir of postDirs) {
       const postPath = path.join(postsDirectory, dir)
-      const indexPath = path.join(postPath, 'index.mdx')
+      const metadataPath = path.join(postPath, 'metadata.ts')
+      const contentPath = path.join(postPath, 'content.mdx')
       
-      if (fs.statSync(postPath).isDirectory() && fs.existsSync(indexPath)) {
-        const fileContents = fs.readFileSync(indexPath, 'utf8')
-        const { data, content } = matter(fileContents)
+      if (fs.statSync(postPath).isDirectory()) {
+        let data: any = {}
+        let content = ''
+        
+        // Check for separate metadata and content files
+        if (fs.existsSync(metadataPath) && fs.existsSync(contentPath)) {
+          try {
+            // Read the metadata file as text and parse it
+            const metadataContent = fs.readFileSync(metadataPath, 'utf8')
+            // Extract the metadata object (simple regex parsing)
+            const metadataMatch = metadataContent.match(/export const metadata = \{([\s\S]*)\}/)
+            if (metadataMatch) {
+              // Parse simple key-value pairs
+              const lines = metadataMatch[1].split('\n')
+              lines.forEach(line => {
+                const match = line.match(/^\s*(\w+):\s*"([^"]*)"/)
+                if (match) {
+                  data[match[1]] = match[2]
+                } else {
+                  const arrayMatch = line.match(/^\s*(\w+):\s*\[(.*)\]/)
+                  if (arrayMatch) {
+                    data[arrayMatch[1]] = arrayMatch[2].split(',').map(s => s.trim().replace(/"/g, ''))
+                  }
+                }
+              })
+            }
+          } catch (error) {
+            console.warn(`Error reading metadata file for ${dir}:`, error)
+          }
+          
+          // Read content from separate file
+          content = fs.readFileSync(contentPath, 'utf8')
+        } else {
+          console.warn(`Missing required files for post: ${dir}`)
+          continue // Skip if no valid content found
+        }
         
         // Process markdown content
         const processedContent = await remark()
@@ -90,15 +124,45 @@ export async function getPosts(): Promise<Post[]> {
 
 export async function getPostBySlug(slug: string): Promise<Post | null> {
   try {
-    const postPath = path.join(postsDirectory, slug, 'index.mdx')
+    const postPath = path.join(postsDirectory, slug)
+    const metadataPath = path.join(postPath, 'metadata.ts')
+    const contentPath = path.join(postPath, 'content.mdx')
     
     if (!fs.existsSync(postPath)) {
       return null
     }
 
-    const fileContents = fs.readFileSync(postPath, 'utf8')
-    const { data, content } = matter(fileContents)
+    let data: any = {}
+    let content = ''
     
+    // Check for separate metadata file first
+    if (fs.existsSync(metadataPath)) {
+      try {
+        const metadataContent = fs.readFileSync(metadataPath, 'utf8')
+        const metadataMatch = metadataContent.match(/export const metadata = \{([\s\S]*)\}/)
+        if (metadataMatch) {
+          const lines = metadataMatch[1].split('\n')
+          lines.forEach(line => {
+            const match = line.match(/^\s*(\w+):\s*"([^"]*)"/)
+            if (match) {
+              data[match[1]] = match[2]
+            } else {
+              const arrayMatch = line.match(/^\s*(\w+):\s*\[(.*)\]/)
+              if (arrayMatch) {
+                data[arrayMatch[1]] = arrayMatch[2].split(',').map(s => s.trim().replace(/"/g, ''))
+              }
+            }
+          })
+        }
+      } catch (error) {
+        console.warn(`Error reading metadata file for ${slug}:`, error)
+      }
+      
+      content = fs.readFileSync(contentPath, 'utf8')
+    } else {
+      return null
+    }
+
     // Process markdown content
     const processedContent = await remark()
       .use(remarkGfm)

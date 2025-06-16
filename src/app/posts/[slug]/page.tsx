@@ -1,9 +1,9 @@
 import { notFound } from 'next/navigation'
 import { getPosts, getPostBySlug } from '../../../lib/posts'
 import PostHeader from '../../../components/PostHeader'
-import PostContent from '../../../components/PostContent'
 import RelatedPosts from '../../../components/RelatedPosts'
 import GiscusComments from '../../../components/GiscusComments'
+import PostContentWrapper from '../../../components/PostContentWrapper'
 import dynamic from 'next/dynamic'
 
 const SeriesNav = dynamic(() => import('../../../components/SeriesNav'), { ssr: false })
@@ -23,11 +23,7 @@ export async function generateStaticParams() {
 
 export async function generateMetadata({ params }: PostPageProps) {
   const post = await getPostBySlug(params.slug)
-  
-  if (!post) {
-    return {}
-  }
-
+  if (!post) return {}
   return {
     title: post.title,
     description: post.excerpt,
@@ -37,7 +33,7 @@ export async function generateMetadata({ params }: PostPageProps) {
       type: 'article',
       publishedTime: post.date,
       authors: [post.author],
-      url: post.fixedUrl || undefined, // Use fixedUrl if specified
+      url: post.fixedUrl || undefined,
     },
     alternates: post.fixedUrl ? { canonical: post.fixedUrl } : undefined,
   }
@@ -45,15 +41,9 @@ export async function generateMetadata({ params }: PostPageProps) {
 
 export default async function PostPage({ params }: PostPageProps) {
   const post = await getPostBySlug(params.slug)
-  
-  if (!post) {
-    notFound()
-  }
-
+  if (!post) notFound()
   const allPosts = await getPosts()
-  const relatedPosts = allPosts
-    .filter(p => p.slug !== post.slug)
-    .slice(0, 6) // Show more posts for a better carousel experience
+  const relatedPosts = allPosts.filter(p => p.slug !== post.slug).slice(0, 6)
 
   return (
     <article className="min-h-screen bg-white">
@@ -69,7 +59,7 @@ export default async function PostPage({ params }: PostPageProps) {
       )}
       <div className="medium-container py-8">
         <div className="max-w-3xl mx-auto">
-          <PostContent content={post.content} />
+          <PostContentWrapper slug={params.slug} />
           <GiscusComments />
         </div>
       </div>
