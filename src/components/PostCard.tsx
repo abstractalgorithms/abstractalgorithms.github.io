@@ -1,8 +1,8 @@
 import Link from 'next/link'
-import Image from 'next/image'
 import { Calendar, Clock, User, ArrowRight } from 'lucide-react'
 import { formatDistanceToNow } from 'date-fns'
 import type { Post } from '../lib/posts'
+import OptimizedImage from './OptimizedImage'
 
 interface PostCardProps {
   post: Post
@@ -22,6 +22,21 @@ export default function PostCard({ post, featured = false, compact = false }: Po
               <span className="bg-gradient-to-r from-green-500 to-emerald-600 text-white text-sm font-semibold px-4 py-2 rounded-full shadow-sm">
                 ⭐ Featured Article
               </span>
+              <div className="ml-4 flex items-center gap-4 text-sm text-gray-600">
+                <div className="flex items-center gap-1">
+                  <Clock className="w-4 h-4" />
+                  <span className="font-medium">{post.readingTime}</span>
+                </div>
+                {post.tags.length > 0 && (
+                  <div className="flex gap-2">
+                    {post.tags.slice(0, 2).map((tag) => (
+                      <span key={tag} className="bg-green-50 text-green-700 px-3 py-1 rounded-full text-xs font-medium border border-green-200">
+                        {tag}
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
             </div>
             
             <h2 className="text-3xl lg:text-4xl font-bold text-gray-900 leading-tight">
@@ -69,11 +84,13 @@ export default function PostCard({ post, featured = false, compact = false }: Po
           
           {post.coverImage && (
             <div className="relative aspect-[4/3] rounded-2xl overflow-hidden shadow-lg">
-              <Image
+              <OptimizedImage
                 src={post.coverImage}
                 alt={post.title}
+                style="featured"
                 fill
-                className="object-cover hover:scale-105 transition-transform duration-300"
+                priority
+                className="hover:scale-105 transition-transform duration-300"
               />
             </div>
           )}
@@ -93,16 +110,39 @@ export default function PostCard({ post, featured = false, compact = false }: Po
               ? 'aspect-[16/10] mb-4 flex-shrink-0' 
               : 'aspect-[4/3] lg:aspect-square'
           }`}>
-            <Image
+            <OptimizedImage
               src={post.coverImage}
               alt={post.title}
+              style={compact ? "thumbnail" : "post"}
               fill
-              className="object-cover hover:scale-105 transition-transform duration-300"
+              className="hover:scale-105 transition-transform duration-300"
             />
           </div>
         )}
         
         <div className={compact ? 'space-y-4 flex-1 flex flex-col' : (post.coverImage ? 'lg:col-span-2 space-y-6' : 'col-span-1 space-y-6')}>
+          {/* Tags and reading time at the top for better visibility */}
+          <div className="flex items-center justify-between">
+            {post.tags.length > 0 && (
+              <div className="flex flex-wrap gap-2">
+                {post.tags.slice(0, compact ? 2 : 3).map((tag) => (
+                  <span key={tag} className="bg-blue-50 text-blue-700 px-3 py-1 rounded-full text-xs font-medium border border-blue-200">
+                    {tag}
+                  </span>
+                ))}
+                {post.tags.length > (compact ? 2 : 3) && (
+                  <span className="text-xs text-gray-500 px-3 py-1">
+                    +{post.tags.length - (compact ? 2 : 3)}
+                  </span>
+                )}
+              </div>
+            )}
+            <div className="flex items-center gap-1 text-sm text-gray-600 flex-shrink-0">
+              <Clock className="w-4 h-4" />
+              <span className="font-medium">{post.readingTime}</span>
+            </div>
+          </div>
+          
           <h3 className={`font-bold text-gray-900 leading-tight ${compact ? 'text-xl lg:text-2xl' : 'text-xl lg:text-2xl'}`}>
             <Link 
               href={`/posts/${post.slug}`}
@@ -122,8 +162,6 @@ export default function PostCard({ post, featured = false, compact = false }: Po
               <span className="font-medium">{post.author}</span>
               <Calendar className="w-4 h-4" />
               <span>{formattedDate}</span>
-              <Clock className="w-4 h-4" />
-              <span>{post.readingTime}</span>
             </div>
             
             <Link 
@@ -134,21 +172,6 @@ export default function PostCard({ post, featured = false, compact = false }: Po
               <ArrowRight className="ml-2 w-4 h-4 group-hover:translate-x-1 transition-transform" />
             </Link>
           </div>
-          
-          {post.tags.length > 0 && (
-            <div className="flex flex-wrap gap-3 pt-4">
-              {post.tags.slice(0, compact ? 3 : 4).map((tag) => (
-                <span key={tag} className="tag">
-                  {tag}
-                </span>
-              ))}
-              {post.tags.length > (compact ? 3 : 4) && (
-                <span className="text-sm text-gray-500 px-3 py-2">
-                  +{post.tags.length - (compact ? 3 : 4)} more
-                </span>
-              )}
-            </div>
-          )}
         </div>
       </div>
     </article>

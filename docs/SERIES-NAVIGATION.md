@@ -2,7 +2,7 @@
 
 ## Available Series Navigation Components
 
-The blog supports multiple types of series navigation components to create cohesive learning paths for readers.
+The blog supports multiple types of series navigation components to create cohesive learning series for readers.
 
 ### 1. InlineSeriesNav (Recommended)
 
@@ -10,10 +10,10 @@ The blog supports multiple types of series navigation components to create cohes
 
 ```jsx
 <InlineSeriesNav 
-  seriesName="Learning Path: Databases" 
+  seriesName="Learning Series: Databases" 
   currentOrder={1} 
   total={3} 
-  prev={null} 
+  prev={null}
   next="/posts/next-post"
   seriesItems={[
     { title: "Post Title 1", slug: "/posts/post-1", order: 1 },
@@ -39,9 +39,9 @@ The blog supports multiple types of series navigation components to create cohes
 
 ```jsx
 <FloatingSeriesNav 
-  seriesName="Learning Path: Databases" 
+  seriesName="Learning Series: Databases" 
   currentOrder={1} 
-  total={3} 
+  total={3}
   prev={null} 
   next="/posts/next-post"
   seriesItems={[...]}
@@ -59,7 +59,7 @@ The blog supports multiple types of series navigation components to create cohes
 
 ```jsx
 <SeriesNav 
-  seriesName="Learning Path: Databases" 
+  seriesName="Learning Series: Databases" 
   currentOrder={1} 
   total={3} 
   prev={null} 
@@ -121,7 +121,7 @@ interface SeriesItem {
 # Your Post Title
 
 <InlineSeriesNav 
-  seriesName="Learning Path: Databases" 
+  seriesName="Learning Series: Databases" 
   currentOrder={1} 
   total={3} 
   prev={null} 
@@ -138,7 +138,7 @@ interface SeriesItem {
 ...article content...
 
 <InlineSeriesNav 
-  seriesName="Learning Path: Databases" 
+  seriesName="Learning Series: Databases" 
   currentOrder={1} 
   total={3} 
   prev={null} 

@@ -28,6 +28,82 @@ export interface Post {
   }
 }
 
+export interface LearningPath {
+  name: string
+  description: string
+  posts: Post[]
+  totalPosts: number
+  estimatedTime: string
+  tags: string[]
+  latestUpdate: string
+}
+
+// Helper function to segregate posts into independent posts and series
+export function segregatePosts(posts: Post[]): {
+  independentPosts: Post[]
+  seriesPosts: Post[]
+  learningPaths: LearningPath[]
+} {
+  const independentPosts: Post[] = []
+  const seriesPosts: Post[] = []
+  const seriesMap = new Map<string, Post[]>()
+
+  posts.forEach(post => {
+    if (post.series) {
+      seriesPosts.push(post)
+      const seriesName = post.series.name
+      if (!seriesMap.has(seriesName)) {
+        seriesMap.set(seriesName, [])
+      }
+      seriesMap.get(seriesName)!.push(post)
+    } else {
+      independentPosts.push(post)
+    }
+  })
+
+  // Create learning series from series
+  const learningPaths: LearningPath[] = Array.from(seriesMap.entries()).map(([seriesName, seriesPosts]) => {
+    // Sort posts by order
+    const sortedPosts = seriesPosts.sort((a, b) => (a.series?.order || 0) - (b.series?.order || 0))
+    
+    // Calculate total estimated reading time
+    const totalMinutes = sortedPosts.reduce((total, post) => {
+      const minutes = parseInt(post.readingTime.split(' ')[0]) || 0
+      return total + minutes
+    }, 0)
+    
+    const estimatedTime = totalMinutes > 60 
+      ? `${Math.round(totalMinutes / 60)} hours` 
+      : `${totalMinutes} minutes`
+
+    // Get all unique tags from series posts
+    const allTags = new Set<string>()
+    sortedPosts.forEach(post => post.tags.forEach(tag => allTags.add(tag)))
+
+    // Get latest update date
+    const latestUpdate = sortedPosts
+      .map(post => new Date(post.date))
+      .sort((a, b) => b.getTime() - a.getTime())[0]
+      .toISOString()
+
+    return {
+      name: seriesName,
+      description: sortedPosts[0]?.excerpt || '',
+      posts: sortedPosts,
+      totalPosts: sortedPosts.length,
+      estimatedTime,
+      tags: Array.from(allTags),
+      latestUpdate
+    }
+  })
+
+  return {
+    independentPosts: independentPosts.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()),
+    seriesPosts,
+    learningPaths: learningPaths.sort((a, b) => new Date(b.latestUpdate).getTime() - new Date(a.latestUpdate).getTime())
+  }
+}
+
 export async function getPosts(): Promise<Post[]> {
   try {
     if (!fs.existsSync(postsDirectory)) {
@@ -55,19 +131,28 @@ export async function getPosts(): Promise<Post[]> {
             // Extract the metadata object (simple regex parsing)
             const metadataMatch = metadataContent.match(/export const metadata = \{([\s\S]*)\}/)
             if (metadataMatch) {
-              // Parse simple key-value pairs
-              const lines = metadataMatch[1].split('\n')
-              lines.forEach(line => {
-                const match = line.match(/^\s*(\w+):\s*"([^"]*)"/)
-                if (match) {
-                  data[match[1]] = match[2]
-                } else {
-                  const arrayMatch = line.match(/^\s*(\w+):\s*\[(.*)\]/)
-                  if (arrayMatch) {
-                    data[arrayMatch[1]] = arrayMatch[2].split(',').map(s => s.trim().replace(/"/g, ''))
+              // Use a more sophisticated parsing approach
+              try {
+                // Create a safe Function constructor to parse the metadata
+                const metadataString = `return {${metadataMatch[1]}}`
+                const parseFunction = new Function(metadataString)
+                data = parseFunction()
+              } catch (funcError) {
+                console.warn(`Error parsing metadata for ${dir}, falling back to regex parsing:`, funcError)
+                // Fallback to simple regex parsing
+                const lines = metadataMatch[1].split('\n')
+                lines.forEach(line => {
+                  const match = line.match(/^\s*(\w+):\s*"([^"]*)"/)
+                  if (match) {
+                    data[match[1]] = match[2]
+                  } else {
+                    const arrayMatch = line.match(/^\s*(\w+):\s*\[(.*)\]/)
+                    if (arrayMatch) {
+                      data[arrayMatch[1]] = arrayMatch[2].split(',').map(s => s.trim().replace(/"/g, ''))
+                    }
                   }
-                }
-              })
+                })
+              }
             }
           } catch (error) {
             console.warn(`Error reading metadata file for ${dir}:`, error)

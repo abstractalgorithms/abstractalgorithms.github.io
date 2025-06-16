@@ -4,6 +4,7 @@ import { useDeploymentStatus } from './DeploymentBanner'
 import DeploymentBanner from './DeploymentBanner'
 import Header from './Header'
 import Footer from './Footer'
+import StickyFooterCTA from './StickyFooterCTA'
 
 interface LayoutWrapperProps {
   children: React.ReactNode
@@ -22,6 +23,7 @@ export default function LayoutWrapper({ children }: LayoutWrapperProps) {
         </main>
         <Footer />
       </div>
+      <StickyFooterCTA />
     </div>
   )
 }

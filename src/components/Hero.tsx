@@ -1,5 +1,5 @@
 import Link from 'next/link'
-import { ArrowRight, Code, Database, Layers } from 'lucide-react'
+import { ArrowRight, Code, Database, Layers, BookOpen, FileText } from 'lucide-react'
 import RotatingText from './RotatingText'
 
 export default function Hero() {
@@ -16,9 +16,9 @@ export default function Hero() {
 
   return (
     <section className="bg-gradient-to-br from-gray-50 via-white to-green-50/30 py-20 lg:py-32">
-      <div className="wide-container">
-        <div className="text-center max-w-5xl mx-auto">
-          <h1 className="text-4xl md:text-5xl lg:text-6xl font-bold text-gray-900 mb-8 leading-tight">
+      <div className="hero-container">
+        <div className="text-center max-w-5xl mx-auto content-mobile-safe">
+          <h1 className="text-4xl md:text-5xl lg:text-6xl font-bold text-gray-900 mb-6 leading-tight">
             Master the Art of
             <br />
             <RotatingText 
@@ -28,25 +28,64 @@ export default function Hero() {
             />
           </h1>
           
-          <p className="text-lg md:text-xl lg:text-2xl text-gray-600 mb-12 leading-relaxed max-w-4xl mx-auto font-light">
+          {/* Clear tagline */}
+          <div className="text-xl md:text-2xl font-medium text-green-700 mb-8 tracking-wide">
+            Deep dives into software design, architecture, and performance
+          </div>
+          
+          <p className="text-lg md:text-xl text-gray-600 mb-12 leading-relaxed max-w-4xl mx-auto font-light">
             Dive deep into algorithms, data structures, and system design with clear explanations, 
             visual examples, and practical implementations that make complex concepts accessible.
           </p>
           
-          <div className="flex flex-col sm:flex-row items-center justify-center gap-6 mb-24">
+          <div className="flex flex-col sm:flex-row items-center justify-center gap-6 mb-16">
             <Link 
-              href="/discover" 
-              className="inline-flex items-center px-8 py-3 bg-green-600 text-white font-semibold rounded-xl hover:bg-green-700 transition-all duration-200 shadow-lg hover:shadow-xl text-base group"
+              href="/posts?view=series" 
+              className="inline-flex items-center px-8 py-3 bg-blue-600 text-white font-semibold rounded-xl hover:bg-blue-700 transition-all duration-200 shadow-lg hover:shadow-xl text-base group"
             >
-              Start Reading
+              <BookOpen className="mr-2 w-5 h-5" />
+              Learning Series
               <ArrowRight className="ml-2 w-5 h-5 group-hover:translate-x-1 transition-transform" />
             </Link>
             <Link 
-              href="/about" 
+              href="/posts?view=independent" 
+              className="inline-flex items-center px-8 py-3 bg-green-600 text-white font-semibold rounded-xl hover:bg-green-700 transition-all duration-200 shadow-lg hover:shadow-xl text-base group"
+            >
+              <FileText className="mr-2 w-5 h-5" />
+              Quick Reads
+              <ArrowRight className="ml-2 w-5 h-5 group-hover:translate-x-1 transition-transform" />
+            </Link>
+            <Link 
+              href="/discover" 
               className="inline-flex items-center px-8 py-3 border-2 border-gray-300 text-gray-700 font-semibold rounded-xl hover:bg-gray-50 transition-all duration-200 text-base"
             >
-              Learn More
+              Discover Topics
             </Link>
+          </div>
+
+          {/* Content Type Explanation */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-8 max-w-4xl mx-auto mb-16 text-left">
+            <div className="bg-blue-50 border border-blue-200 rounded-xl p-6">
+              <div className="flex items-center mb-4">
+                <BookOpen className="w-6 h-6 text-blue-600 mr-3" />
+                <h3 className="text-lg font-bold text-blue-900">Learning Series</h3>
+              </div>
+              <p className="text-blue-800 text-sm leading-relaxed">
+                Structured, multi-part series that take you through complex topics step-by-step. 
+                Perfect for comprehensive understanding of frameworks, architectures, or advanced concepts.
+              </p>
+            </div>
+            
+            <div className="bg-green-50 border border-green-200 rounded-xl p-6">
+              <div className="flex items-center mb-4">
+                <FileText className="w-6 h-6 text-green-600 mr-3" />
+                <h3 className="text-lg font-bold text-green-900">Quick Reads</h3>
+              </div>
+              <p className="text-green-800 text-sm leading-relaxed">
+                Standalone articles covering specific algorithms, data structures, or concepts. 
+                Great for targeted learning, quick reference, or exploring individual topics.
+              </p>
+            </div>
           </div>
           
           <div className="grid grid-cols-1 md:grid-cols-3 gap-12 max-w-4xl mx-auto">
