@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import { useSearchParams, useRouter } from 'next/navigation'
 import PostCard from '../../components/PostCard'
 import LearningPathCard from '../../components/LearningPathCard'
@@ -24,14 +24,12 @@ export default function PostsPageClient({ posts: allPosts }: PostsPageClientProp
   const [currentPage, setCurrentPage] = useState(1)
   const postsPerPage = 8 // 8 posts per page (2 columns x 4 rows)
   
-  // Segregate posts
-  const { independentPosts, learningPaths } = segregatePosts(allPosts)
+  // Segregate posts - memoized to prevent recalculation on every render
+  const { independentPosts, learningPaths } = useMemo(() => segregatePosts(allPosts), [allPosts])
   const handleViewModeChange = (mode: ViewMode) => {
-    // Update state immediately for responsive UI
-    setViewMode(mode)
-    setCurrentPage(1)
+    console.log('View mode changing to:', mode)
     
-    // Update URL
+    // Update URL - let the useEffect handle state updates
     const params = new URLSearchParams(searchParams.toString())
     if (mode === 'all') {
       params.delete('view')
@@ -41,9 +39,11 @@ export default function PostsPageClient({ posts: allPosts }: PostsPageClientProp
     const queryString = params.toString()
     const url = queryString ? `/posts?${queryString}` : '/posts'
     
-    // Use replace instead of push to avoid navigation issues
+    console.log('Navigating to URL:', url)
+      // Use replace instead of push to avoid navigation issues
     router.replace(url)
   }
+
   useEffect(() => {
     const tag = searchParams.get('tag')
     const urlMode = searchParams.get('view') as ViewMode || 'all'
@@ -55,9 +55,8 @@ export default function PostsPageClient({ posts: allPosts }: PostsPageClientProp
     setSelectedTag(tag)
     setCurrentPage(1) // Reset to first page when filtering
     
-    console.log('Effect triggered - view mode:', viewMode, 'URL mode:', urlMode, 'tag:', tag, 'learningPaths count:', learningPaths.length)
-  }, [searchParams, learningPaths.length])
-
+    console.log('Effect triggered - view mode:', viewMode, 'URL mode:', urlMode, 'tag:', tag)
+  }, [searchParams, viewMode])
   // Separate effect for filtering posts based on current state
   useEffect(() => {
     let postsToFilter = allPosts
@@ -121,24 +120,25 @@ export default function PostsPageClient({ posts: allPosts }: PostsPageClientProp
     // Scroll to top of posts section
     const postsSection = document.getElementById('posts-section')
     if (postsSection) {
-      postsSection.scrollIntoView({ behavior: 'smooth', block: 'start' })
-    }
+      postsSection.scrollIntoView({ behavior: 'smooth', block: 'start' })    }
   }
 
   return (
     <div className="min-h-screen bg-gray-50">
-      {/* Header Section */}      <div className="bg-white border-b border-gray-200">
+      {/* Header Section */}
+      <div className="bg-white border-b border-gray-200 relative z-10">
         <div className="wide-container py-12">
-          <div className="flex items-center justify-between mb-8">
-            <Link 
+          <div className="flex items-center justify-between mb-8">            <Link 
               href={selectedTag ? "/discover" : "/"}
               className="inline-flex items-center text-green-600 hover:text-green-700 font-medium transition-colors group"
+              onClick={() => console.log('Navigation link clicked:', selectedTag ? "/discover" : "/")}
             >
               <ArrowLeft className="w-5 h-5 mr-2 group-hover:-translate-x-1 transition-transform" />
               {selectedTag ? 'Back to Discover' : 'Back to Home'}
             </Link>
 
-            {/* View Mode Toggle */}            <div className="flex items-center gap-4">
+            {/* View Mode Toggle */}
+            <div className="flex items-center gap-4">
               <div className="flex items-center bg-gray-100 rounded-lg p-1">
                 <button
                   onClick={() => handleViewModeChange('all')}
@@ -170,16 +170,16 @@ export default function PostsPageClient({ posts: allPosts }: PostsPageClientProp
                       : 'text-gray-600 hover:text-gray-900'
                   }`}
                 >
-                  <BookOpen className="w-4 h-4" />
-                  Learning Series
-                </button>              </div>
+                  <BookOpen className="w-4 h-4" />                  Learning Series
+                </button>
+              </div>
             </div>
             
             <div className="flex items-center gap-6">
               {selectedTag && (
                 <div className="flex items-center text-sm text-green-600 bg-green-50 px-3 py-1 rounded-full">
-                  <Filter className="w-4 h-4 mr-2" />
-                  Filtered by: {selectedTag}                </div>
+                  <Filter className="w-4 h-4 mr-2" />                  Filtered by: {selectedTag}
+                </div>
               )}
               <div className="flex items-center text-sm text-gray-500">
                 <Calendar className="w-4 h-4 mr-2" />
@@ -189,9 +189,9 @@ export default function PostsPageClient({ posts: allPosts }: PostsPageClientProp
                     <span className="mx-2">•</span>
                     <span>Page {currentPage} of {totalPages}</span>
                   </>
-                )}
-              </div>
-            </div>          </div>
+                )}              </div>
+            </div>
+          </div>
           
           <div className="text-center max-w-3xl mx-auto">
             <h1 className="text-5xl lg:text-6xl font-bold text-gray-900 mb-6 leading-tight">
