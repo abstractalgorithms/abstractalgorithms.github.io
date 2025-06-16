@@ -4,6 +4,9 @@ import PostHeader from '../../../components/PostHeader'
 import PostContent from '../../../components/PostContent'
 import RelatedPosts from '../../../components/RelatedPosts'
 import GiscusComments from '../../../components/GiscusComments'
+import dynamic from 'next/dynamic'
+
+const SeriesNav = dynamic(() => import('../../../components/SeriesNav'), { ssr: false })
 
 interface PostPageProps {
   params: {
@@ -55,14 +58,21 @@ export default async function PostPage({ params }: PostPageProps) {
   return (
     <article className="min-h-screen bg-white">
       <PostHeader post={post} />
-      
+      {post.series && (
+        <SeriesNav
+          seriesName={post.series.name}
+          currentOrder={post.series.order}
+          total={post.series.total}
+          prev={post.series.prev}
+          next={post.series.next}
+        />
+      )}
       <div className="medium-container py-8">
         <div className="max-w-3xl mx-auto">
           <PostContent content={post.content} />
           <GiscusComments />
         </div>
       </div>
-      
       {relatedPosts.length > 0 && (
         <RelatedPosts posts={relatedPosts} />
       )}

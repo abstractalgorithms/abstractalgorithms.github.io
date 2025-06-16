@@ -19,6 +19,13 @@ export interface Post {
   readingTime: string
   coverImage?: string
   fixedUrl?: string // Optional fixed URL for the post
+  series?: {
+    name: string
+    order: number
+    total: number
+    prev: string | null
+    next: string | null
+  }
 }
 
 export async function getPosts(): Promise<Post[]> {
@@ -60,6 +67,13 @@ export async function getPosts(): Promise<Post[]> {
               data.coverImage : 
             undefined,
           fixedUrl: data.fixedUrl, // Add fixedUrl from frontmatter if present
+          series: data.series ? {
+            name: data.series.name,
+            order: data.series.order,
+            total: data.series.total,
+            prev: data.series.prev ?? null,
+            next: data.series.next ?? null,
+          } : undefined,
         }
         
         posts.push(post)
@@ -106,6 +120,13 @@ export async function getPostBySlug(slug: string): Promise<Post | null> {
           data.coverImage : 
         undefined,
       fixedUrl: data.fixedUrl, // Add fixedUrl from frontmatter if present
+      series: data.series ? {
+        name: data.series.name,
+        order: data.series.order,
+        total: data.series.total,
+        prev: data.series.prev ?? null,
+        next: data.series.next ?? null,
+      } : undefined,
     }
   } catch (error) {
     console.error('Error reading post:', error)
