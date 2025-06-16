@@ -22,10 +22,8 @@ export default function PostsPageClient({ posts: allPosts }: PostsPageClientProp
   const [viewMode, setViewMode] = useState<ViewMode>('all')
   const [filteredPosts, setFilteredPosts] = useState(allPosts)
   const [currentPage, setCurrentPage] = useState(1)
-  const postsPerPage = 8 // 8 posts per page (2 columns x 4 rows)
-  
-  // Segregate posts - memoized to prevent recalculation on every render
-  const { independentPosts, learningPaths } = useMemo(() => segregatePosts(allPosts), [allPosts])
+  const postsPerPage = 8 // 8 posts per page (2 columns x 4 rows)  // Segregate posts - memoized to prevent recalculation on every render
+  const { independentPosts, seriesPosts, learningPaths } = useMemo(() => segregatePosts(allPosts), [allPosts])
   const handleViewModeChange = (mode: ViewMode) => {
     console.log('View mode changing to:', mode)
     
@@ -60,8 +58,7 @@ export default function PostsPageClient({ posts: allPosts }: PostsPageClientProp
   // Separate effect for filtering posts based on current state
   useEffect(() => {
     let postsToFilter = allPosts
-    
-    // Filter by view mode first
+      // Filter by view mode first
     switch (viewMode) {
       case 'independent':
         postsToFilter = independentPosts
@@ -70,7 +67,8 @@ export default function PostsPageClient({ posts: allPosts }: PostsPageClientProp
         postsToFilter = learningPaths.flatMap(path => path.posts)
         break
       default:
-        postsToFilter = allPosts
+        // For "all" view, show independent posts + first part of each series
+        postsToFilter = [...independentPosts, ...seriesPosts].sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
     }
     
     // Then filter by tag if selected
@@ -79,7 +77,7 @@ export default function PostsPageClient({ posts: allPosts }: PostsPageClientProp
     } else {
       setFilteredPosts(postsToFilter)
     }
-  }, [viewMode, selectedTag, allPosts, independentPosts, learningPaths])
+  }, [viewMode, selectedTag, allPosts, independentPosts, seriesPosts, learningPaths])
 
   const getPageTitle = () => {
     if (selectedTag) {

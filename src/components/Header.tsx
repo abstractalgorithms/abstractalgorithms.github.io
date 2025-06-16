@@ -40,6 +40,12 @@ export default function Header() {
              Posts
             </Link>
             <Link 
+              href="/badges" 
+              className="text-gray-600 hover:text-gray-900 font-medium transition-colors text-lg"
+            >
+              Badges
+            </Link>
+            <Link 
               href="/about" 
               className="text-gray-600 hover:text-gray-900 font-medium transition-colors text-lg"
             >
@@ -100,6 +106,13 @@ export default function Header() {
                 onClick={() => setIsMobileMenuOpen(false)}
               >
                 Posts
+              </Link>
+              <Link 
+                href="/badges" 
+                className="text-gray-600 hover:text-gray-900 font-medium transition-colors text-lg py-2"
+                onClick={() => setIsMobileMenuOpen(false)}
+              >
+                Badges
               </Link>
               <Link 
                 href="/about" 
