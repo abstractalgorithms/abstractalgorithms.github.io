@@ -1,6 +1,10 @@
 # Abstract Algorithms Blog
 
-A modern, Medium-style blogging platform built with Next.js 14, featuring static site generation and GitHub Pages deployment.
+[![Deploy Website](https://github.com/abstractalgorithms/abstractalgorithms.github.io/actions/workflows/deploy.yml/badge.svg)](https://github.com/abstractalgorithms/abstractalgorithms.github.io/actions/workflows/deploy.yml)
+[![Build Android APK](https://github.com/abstractalgorithms/abstractalgorithms.github.io/actions/workflows/build-android-simple.yml/badge.svg)](https://github.com/abstractalgorithms/abstractalgorithms.github.io/actions/workflows/build-android-simple.yml)
+[![Latest Release](https://img.shields.io/github/v/release/abstractalgorithms/abstractalgorithms.github.io)](https://github.com/abstractalgorithms/abstractalgorithms.github.io/releases/latest)
+
+A modern, Medium-style blogging platform built with Next.js 14, featuring static site generation, automated deployments, and GitHub Pages hosting.
 
 ## Features
 
@@ -12,6 +16,34 @@ A modern, Medium-style blogging platform built with Next.js 14, featuring static
 - 🔍 **SEO Optimized**: Built-in meta tags, Open Graph, and structured data
 - 📊 **Reading Time**: Automatic reading time estimation for posts
 - 🎯 **GitHub Pages**: Easy deployment with GitHub Actions
+- 🔄 **Automated Releases**: Automatic GitHub releases for every deployment
+- 📱 **Android App**: Native Android WebView app with automated APK builds
+- 🔙 **Rollback Support**: One-click rollback to previous deployments
+
+## 🚀 Deployment & Releases
+
+This project features a fully automated CI/CD pipeline:
+
+### Automatic Website Deployment
+- **Trigger**: Every push to `main` branch (excluding Android-only changes)
+- **Process**: Build → Deploy to GitHub Pages → Create Release
+- **URL**: [https://abstractalgorithms.github.io](https://abstractalgorithms.github.io)
+
+### Automatic GitHub Releases
+- **Created**: After every successful deployment
+- **Format**: `v{YYYY.MM.DD}-{run_number}` (e.g., `v2024.12.19-42`)
+- **Content**: Changelog, deployment details, contributor list, and quick links
+- **Cleanup**: Automatically removes releases older than the latest 10
+
+### Android APK Builds
+- **Trigger**: Changes to `android/` directory or manual dispatch
+- **Output**: Debug and release APKs available as artifacts
+- **Independent**: Android build failures don't affect web deployment
+
+### Rollback Capability
+- **Manual Trigger**: Via GitHub Actions workflow
+- **Target**: Last successful deployment or specific commit
+- **Safe**: Preserves deployment history and creates rollback releases
 
 ## Getting Started
 
