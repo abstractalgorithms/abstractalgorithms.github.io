@@ -4,6 +4,7 @@ import PostHeader from '../../../components/PostHeader'
 import RelatedPosts from '../../../components/RelatedPosts'
 import GiscusComments from '../../../components/GiscusComments'
 import PostContentWrapper from '../../../components/PostContentWrapper'
+import BlogPostStructuredData from '../../../components/BlogPostStructuredData'
 import dynamic from 'next/dynamic'
 
 const SeriesNav = dynamic(() => import('../../../components/SeriesNav'), { ssr: false })
@@ -66,6 +67,20 @@ export default async function PostPage({ params }: PostPageProps) {
       {relatedPosts.length > 0 && (
         <RelatedPosts posts={relatedPosts} />
       )}
+      <BlogPostStructuredData 
+        title={post.title}
+        description={post.excerpt}
+        datePublished={post.date}
+        author={post.author}
+        url={`${process.env.NODE_ENV === 'production' 
+          ? 'https://abstractalgorithms.github.io' 
+          : 'http://localhost:3000'}/posts/${post.slug}`}
+        image={post.coverImage ? 
+          `${process.env.NODE_ENV === 'production' 
+            ? 'https://abstractalgorithms.github.io' 
+            : 'http://localhost:3000'}${post.coverImage}` 
+          : undefined}
+      />
     </article>
   )
 }
