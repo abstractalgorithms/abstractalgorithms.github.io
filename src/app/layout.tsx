@@ -29,6 +29,15 @@ export const metadata = {
   authors: [{ name: 'Abstract Algorithms' }],
   creator: 'Abstract Algorithms',
   publisher: 'Abstract Algorithms',
+  icons: {
+    icon: [
+      { url: '/favicon.svg', type: 'image/svg+xml' },
+      { url: '/icon.svg', type: 'image/svg+xml', sizes: '32x32' }
+    ],
+    apple: [
+      { url: '/apple-icon.svg', type: 'image/svg+xml', sizes: '180x180' }
+    ]
+  },
   openGraph: {
     type: 'website',
     locale: 'en_US',
@@ -63,6 +72,8 @@ export default function RootLayout({
     <html lang="en">
       <head>
         <StructuredData />
+        <link rel="manifest" href="/manifest.json" />
+        <meta name="theme-color" content="#00D885" />
         {/* Google Site Verification */}
         <meta name="google-site-verification" content="D5v1M3nD8oO9DNaZKujCwBLNNqf35CTJo114uv8yMNU" />
         {/* Google Analytics */}

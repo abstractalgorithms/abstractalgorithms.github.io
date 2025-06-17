@@ -2,10 +2,25 @@
 
 import Link from 'next/link'
 import { Search, BookOpen, Github, Menu, X } from 'lucide-react'
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
+import SearchModal from './SearchModal'
 
 export default function Header() {
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false)
+  const [isSearchOpen, setIsSearchOpen] = useState(false)
+
+  // Global keyboard shortcut for search (Cmd+K or Ctrl+K)
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+        e.preventDefault()
+        setIsSearchOpen(true)
+      }
+    }
+
+    document.addEventListener('keydown', handleKeyDown)
+    return () => document.removeEventListener('keydown', handleKeyDown)
+  }, [])
 
   return (
     <header className="bg-white border-b border-gray-200 sticky top-0 z-50 backdrop-blur-sm bg-white/95">
@@ -45,22 +60,29 @@ export default function Header() {
             >
               Badges
             </Link>
-            <Link 
-              href="/about" 
-              className="text-gray-600 hover:text-gray-900 font-medium transition-colors text-lg"
-            >
-              About
-            </Link>
-            <Link 
-              href="/contact" 
-              className="text-gray-600 hover:text-gray-900 font-medium transition-colors text-lg"
-            >
-              Contact
-            </Link>
           </nav>
           
           <div className="flex items-center space-x-6">
-            <button className="p-3 text-gray-600 hover:text-gray-900 rounded-xl hover:bg-gray-100 transition-colors">
+            {/* Search Button with Keyboard Shortcut */}
+            <button 
+              onClick={() => setIsSearchOpen(true)}
+              className="hidden md:flex items-center gap-3 px-4 py-2 text-gray-600 hover:text-gray-900 bg-gray-100 hover:bg-gray-200 rounded-xl transition-colors"
+              title="Search posts (⌘K)"
+            >
+              <Search className="w-5 h-5" />
+              <span className="text-sm">Search</span>
+              <div className="flex items-center gap-1">
+                <kbd className="px-1.5 py-0.5 text-xs bg-white border border-gray-300 rounded text-gray-500">⌘</kbd>
+                <kbd className="px-1.5 py-0.5 text-xs bg-white border border-gray-300 rounded text-gray-500">K</kbd>
+              </div>
+            </button>
+            
+            {/* Mobile Search Button */}
+            <button 
+              onClick={() => setIsSearchOpen(true)}
+              className="md:hidden p-3 text-gray-600 hover:text-gray-900 rounded-xl hover:bg-gray-100 transition-colors"
+              title="Search posts"
+            >
               <Search className="w-6 h-6" />
             </button>
             <a 
@@ -114,24 +136,16 @@ export default function Header() {
               >
                 Badges
               </Link>
-              <Link 
-                href="/about" 
-                className="text-gray-600 hover:text-gray-900 font-medium transition-colors text-lg py-2"
-                onClick={() => setIsMobileMenuOpen(false)}
-              >
-                About
-              </Link>
-              <Link 
-                href="/contact" 
-                className="text-gray-600 hover:text-gray-900 font-medium transition-colors text-lg py-2"
-                onClick={() => setIsMobileMenuOpen(false)}
-              >
-                Contact
-              </Link>
             </nav>
           </div>
         )}
       </div>
+      
+      {/* Search Modal */}
+      <SearchModal 
+        isOpen={isSearchOpen} 
+        onClose={() => setIsSearchOpen(false)} 
+      />
     </header>
   )
 }

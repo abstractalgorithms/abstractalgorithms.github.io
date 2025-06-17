@@ -7,8 +7,8 @@ export default function Footer() {
   return (
     <footer className="bg-gray-50 border-t border-gray-200">
       <div className="medium-container py-12">
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-8">
-          <div className="md:col-span-2">
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-8">
+          <div className="lg:col-span-2">
             <h3 className="text-lg font-semibold text-gray-900 mb-4">Abstract Algorithms</h3>
             <p className="text-gray-600 mb-4 max-w-md">
               Exploring the fascinating world of algorithms, data structures, and software engineering 
@@ -57,12 +57,38 @@ export default function Footer() {
                 </Link>
               </li>
               <li>
-                <Link href="/about" className="text-gray-600 hover:text-gray-900 transition-colors">
-                  About
+                <Link href="/discover" className="text-gray-600 hover:text-gray-900 transition-colors">
+                  Discover
                 </Link>
               </li>
               <li>
-                <Link href="/contact" className="text-gray-600 hover:text-gray-900 transition-colors">
+                <Link href="/posts" className="text-gray-600 hover:text-gray-900 transition-colors">
+                  Posts
+                </Link>
+              </li>
+              <li>
+                <Link href="/badges" className="text-gray-600 hover:text-gray-900 transition-colors">
+                  Badges
+                </Link>
+              </li>
+              <li>
+                <Link href="/search" className="text-gray-600 hover:text-gray-900 transition-colors">
+                  Search
+                </Link>
+              </li>
+            </ul>
+          </div>
+          
+          <div>
+            <h4 className="text-sm font-semibold text-gray-900 mb-4">About</h4>
+            <ul className="space-y-2">
+              <li>
+                <Link href="/about" className="text-gray-600 hover:text-gray-900 transition-colors font-medium">
+                  About Us
+                </Link>
+              </li>
+              <li>
+                <Link href="/contact" className="text-gray-600 hover:text-gray-900 transition-colors font-medium">
                   Contact
                 </Link>
               </li>

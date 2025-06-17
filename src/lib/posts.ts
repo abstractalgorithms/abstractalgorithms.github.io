@@ -5,6 +5,7 @@ import { remark } from 'remark'
 import remarkGfm from 'remark-gfm'
 import remarkHtml from 'remark-html'
 import readingTime from 'reading-time'
+import { postsCache } from './cache'
 
 const postsDirectory = path.join(process.cwd(), 'src/posts')
 
@@ -111,6 +112,15 @@ export function segregatePosts(posts: Post[]): {
 }
 
 export async function getPosts(): Promise<Post[]> {
+  // Try to get from cache first
+  const cachedData = postsCache.getCachedData()
+  if (cachedData) {
+    console.log('📦 Using cached posts data')
+    return cachedData.posts
+  }
+
+  console.log('🔄 Building posts cache...')
+  
   try {
     if (!fs.existsSync(postsDirectory)) {
       console.warn('Posts directory does not exist:', postsDirectory)
@@ -208,7 +218,25 @@ export async function getPosts(): Promise<Post[]> {
     }
 
     // Sort posts by date (newest first)
-    return posts.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
+    const sortedPosts = posts.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
+    
+    // Build search index for caching
+    const searchIndex = sortedPosts.map(post => ({
+      slug: post.slug,
+      title: post.title,
+      content: post.content.replace(/<[^>]*>/g, ''), // Strip HTML
+      tags: post.tags,
+      readingTime: post.readingTime,
+      excerpt: post.excerpt
+    }))
+    
+    // Get learning paths
+    const { learningPaths } = segregatePosts(sortedPosts)
+    
+    // Update cache
+    postsCache.updateCache(sortedPosts, learningPaths, searchIndex)
+    
+    return sortedPosts
   } catch (error) {
     console.error('Error reading posts:', error)
     return []
