@@ -60,6 +60,15 @@ export default function Header() {
             >
               Badges
             </Link>
+            {process.env.NODE_ENV === 'development' && (
+              <Link 
+                href="/content-creator" 
+                className="text-blue-600 hover:text-blue-700 font-medium transition-colors text-lg bg-blue-50 px-3 py-1 rounded-lg"
+                title="Content Creator (Dev Only)"
+              >
+                Create
+              </Link>
+            )}
           </nav>
           
           <div className="flex items-center space-x-6">
@@ -136,6 +145,15 @@ export default function Header() {
               >
                 Badges
               </Link>
+              {process.env.NODE_ENV === 'development' && (
+                <Link 
+                  href="/content-creator" 
+                  className="text-blue-600 hover:text-blue-700 font-medium transition-colors text-lg py-2 bg-blue-50 px-3 rounded-lg"
+                  onClick={() => setIsMobileMenuOpen(false)}
+                >
+                  Create Content
+                </Link>
+              )}
             </nav>
           </div>
         )}

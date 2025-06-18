@@ -1,6 +1,7 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
+import dynamic from 'next/dynamic'
 import { Post } from '../lib/posts'
 import SeriesQuiz from './SeriesQuiz'
 import { BadgeDisplay } from './BadgeSystem'
@@ -15,6 +16,34 @@ import {
   videoStreamingQuizQuestions,
   distributedCacheQuizQuestions
 } from '../data/systemDesignQuiz'
+
+// Create dynamic components that properly process MDX with all plugins
+const createMDXComponent = (slug: string) => {
+  return dynamic(
+    () => import(`../posts/${slug}/content.mdx`),
+    { 
+      ssr: false,
+      loading: () => <div className="animate-pulse h-64 bg-gray-100 rounded"></div>
+    }
+  )
+}
+
+// Component to dynamically load and render MDX content
+function DynamicMDXContent({ slug }: { slug: string }) {
+  const PostContent = useMemo(() => {
+    return createMDXComponent(slug)
+  }, [slug])
+
+  if (!PostContent) {
+    return (
+      <div className="text-center py-12">
+        <p className="text-gray-600">Content not found for slug: {slug}</p>
+      </div>
+    )
+  }
+
+  return <PostContent />
+}
 
 interface DynamicSeriesContentProps {
   initialPost: Post
@@ -308,8 +337,7 @@ export default function DynamicSeriesContent({ initialPost, allSeriesParts }: Dy
                 <div className="lg:hidden mb-6">
                   <TableOfContents />
                 </div>
-                
-                <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden">
+                  <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden">
                   <div className="p-8 lg:p-12">                    <div 
                       className="prose prose-lg prose-gray max-w-none
                                  prose-headings:text-gray-900 prose-headings:font-semibold
@@ -318,18 +346,17 @@ export default function DynamicSeriesContent({ initialPost, allSeriesParts }: Dy
                                  prose-h3:text-xl prose-h3:mt-10 prose-h3:mb-5 prose-h3:leading-tight
                                  prose-p:text-gray-700 prose-p:leading-relaxed prose-p:mb-6 prose-p:text-base
                                  prose-a:text-blue-600 prose-a:no-underline hover:prose-a:underline prose-a:font-medium
-                                 prose-strong:text-gray-900 prose-strong:font-semibold
-                                 prose-code:text-white prose-code:bg-transparent prose-code:px-0 prose-code:py-0 prose-code:rounded-none prose-code:text-sm prose-code:font-medium
-                                 prose-pre:bg-gray-900 prose-pre:border prose-pre:border-gray-200 prose-pre:rounded-lg prose-pre:shadow-sm prose-pre:text-white
+                                 prose-strong:text-gray-900 prose-strong:font-semibold                                 prose-code:text-blue-700 prose-code:bg-blue-50 prose-code:px-2 prose-code:py-1 prose-code:rounded prose-code:text-sm prose-code:font-medium
+                                 prose-pre:bg-gray-900 prose-pre:border prose-pre:border-gray-200 prose-pre:rounded-lg prose-pre:shadow-sm
                                  prose-blockquote:border-l-blue-500 prose-blockquote:bg-blue-50 prose-blockquote:py-4 prose-blockquote:px-6 prose-blockquote:rounded-r-lg prose-blockquote:my-6
                                  prose-ul:my-6 prose-ol:my-6 prose-ul:space-y-2 prose-ol:space-y-2
                                  prose-li:my-1 prose-li:leading-relaxed
                                  prose-table:text-sm prose-table:shadow-sm prose-table:border prose-table:border-gray-200 prose-table:rounded-lg prose-table:overflow-hidden
                                  prose-th:bg-gray-50 prose-th:font-semibold prose-th:text-gray-800 prose-th:px-4 prose-th:py-3
                                  prose-td:px-4 prose-td:py-3 prose-td:border-t prose-td:border-gray-200
-                                 prose-img:rounded-lg prose-img:shadow-md prose-img:my-8"
-                      dangerouslySetInnerHTML={{ __html: currentPost.content }}
-                    />
+                                 prose-img:rounded-lg prose-img:shadow-md prose-img:my-8">
+                      <DynamicMDXContent slug={currentPost.slug} />
+                    </div>
                   </div>
                 </div>
                   {/* Bottom Navigation Buttons - Inside Content Area */}
