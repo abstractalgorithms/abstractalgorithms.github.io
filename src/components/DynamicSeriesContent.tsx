@@ -1,4 +1,4 @@
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        'use client'
+'use client'
 
 import { useState, useEffect } from 'react'
 import { Post } from '../lib/posts'
@@ -6,6 +6,7 @@ import SeriesQuiz from './SeriesQuiz'
 import { BadgeDisplay } from './BadgeSystem'
 import TableOfContents from './TableOfContents'
 import { terraformQuizQuestions } from '../data/terraformQuiz'
+import { databaseIndexesQuizQuestions } from '../data/databaseIndexesQuiz'
 import { 
   systemDesignIntroQuizQuestions,
   urlShortenerQuizQuestions,
@@ -25,7 +26,6 @@ export default function DynamicSeriesContent({ initialPost, allSeriesParts }: Dy
   const [isLoading, setIsLoading] = useState(false)
   const [showQuiz, setShowQuiz] = useState(false)
   const [quizCompleted, setQuizCompleted] = useState(false)
-
   const currentOrder = currentPost.series?.order || 1
   const total = currentPost.series?.total || 1
   const seriesName = currentPost.series?.name || ''
@@ -39,7 +39,6 @@ export default function DynamicSeriesContent({ initialPost, allSeriesParts }: Dy
     const badgeId = `${seriesName.toLowerCase().replace(/\s+/g, '-')}-completion`
     setQuizCompleted(badges.includes(badgeId))
   }, [seriesName])
-  
   const handlePartChange = async (targetOrder: number) => {
     if (targetOrder === currentOrder && !showQuiz) return
     
@@ -92,13 +91,17 @@ export default function DynamicSeriesContent({ initialPost, allSeriesParts }: Dy
         earnedDate: new Date().toLocaleDateString(),
         score: Math.round(score * 100)
       }
-      localStorage.setItem('badgeDetails', JSON.stringify(badgeDetails))
-    }
+      localStorage.setItem('badgeDetails', JSON.stringify(badgeDetails))    }
   }
+  
   const getQuizQuestions = () => {
     // Return questions based on series name
     if (seriesName.toLowerCase().includes('terraform')) {
       return terraformQuizQuestions
+    }
+    
+    if (seriesName.toLowerCase().includes('database indexes')) {
+      return databaseIndexesQuizQuestions
     }
     
     if (seriesName.toLowerCase().includes('system design')) {
@@ -171,18 +174,16 @@ export default function DynamicSeriesContent({ initialPost, allSeriesParts }: Dy
               </div>
             </div>
           </div>
-        </nav>      </div>
-
-      {/* Timeline Navigation */}
+        </nav>      </div>      {/* Timeline Navigation */}
       <div className="bg-white border-b border-gray-200 shadow-sm">
-        <div className="max-w-6xl mx-auto px-6 py-6">
-          <div className="text-center mb-6">
-            <span className="text-lg font-semibold text-gray-800">Series Timeline</span>
-            <p className="text-sm text-gray-600 mt-1">Navigate through the learning series</p>
+        <div className="max-w-6xl mx-auto px-6 py-4">
+          <div className="text-center mb-4">
+            <span className="text-base font-semibold text-gray-800">Series Timeline</span>
+            <p className="text-xs text-gray-600 mt-1">Navigate through the learning series</p>
           </div>
           
           {/* Timeline Container */}
-          <div className="relative overflow-x-auto pb-4">
+          <div className="relative overflow-x-auto pb-2">
             <div className="flex items-center justify-between min-w-max px-4">
               {/* Timeline Line */}
               <div className="absolute top-8 left-0 right-0 h-0.5 bg-gray-200 z-0"></div>
@@ -190,23 +191,25 @@ export default function DynamicSeriesContent({ initialPost, allSeriesParts }: Dy
                 className="absolute top-8 left-0 h-0.5 bg-gradient-to-r from-green-500 to-blue-500 z-10 transition-all duration-700"
                 style={{ width: `${((currentOrder - 1) / Math.max(total - 1, 1)) * 100}%` }}
               ></div>
-              
-              {/* Timeline Items */}
+                {/* Timeline Items */}
               {Array.from({ length: total }, (_, i) => i + 1).map((partNum) => {
                 const partPost = allSeriesParts.find(p => p.series?.order === partNum)
                 const partTitle = partPost?.title || `Part ${partNum}`
-                const shortTitle = partTitle.replace(/^(Part \d+:\s*|Design a\s*)/i, '')
+                // Extract meaningful title parts - remove common prefixes and get core topic
+                const shortTitle = partTitle
+                  .replace(/^(Part \d+:\s*|Design a\s*|Database Indexes?\s*)/i, '')
+                  .replace(/:\s*[A-Z].*$/, '') // Remove subtitle after colon
+                  .trim()
                 const isActive = partNum === currentOrder && !showQuiz
                 const isCompleted = partNum < currentOrder || (partNum <= currentOrder && quizCompleted)
                 const isAccessible = partNum <= currentOrder || isCompleted
-                
-                return (
-                  <div key={partNum} className="flex flex-col items-center z-20 bg-white px-2">
+                  return (
+                  <div key={partNum} className="flex flex-col items-center z-20 bg-white px-1">
                     {/* Timeline Node */}
                     <button
                       onClick={() => handlePartChange(partNum)}
                       disabled={isLoading || !isAccessible}
-                      className={`w-16 h-16 rounded-full text-sm font-bold transition-all duration-300 shadow-md border-4 relative ${
+                      className={`w-12 h-12 rounded-full text-xs font-bold transition-all duration-300 shadow-md border-2 relative ${
                         isActive
                           ? 'bg-gradient-to-br from-blue-500 to-blue-600 text-white border-blue-300 shadow-xl scale-110 ring-2 ring-blue-200'
                           : isCompleted
@@ -218,7 +221,7 @@ export default function DynamicSeriesContent({ initialPost, allSeriesParts }: Dy
                       title={partTitle}
                     >
                       {isCompleted && !isActive ? (
-                        <svg className="w-6 h-6 mx-auto" fill="currentColor" viewBox="0 0 20 20">
+                        <svg className="w-4 h-4 mx-auto" fill="currentColor" viewBox="0 0 20 20">
                           <path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" />
                         </svg>
                       ) : (
@@ -227,12 +230,12 @@ export default function DynamicSeriesContent({ initialPost, allSeriesParts }: Dy
                     </button>
                     
                     {/* Title */}
-                    <div className="mt-3 text-center max-w-24">
+                    <div className="mt-2 text-center max-w-24">
                       <div className="text-xs font-medium text-gray-700 leading-tight">
                         Part {partNum}
                       </div>
-                      <div className="text-xs text-gray-500 mt-1 leading-tight">
-                        {shortTitle.length > 20 ? shortTitle.substring(0, 20) + '...' : shortTitle}
+                      <div className="text-xs text-gray-500 leading-tight">
+                        {shortTitle.length > 18 ? shortTitle.substring(0, 18) + '...' : shortTitle}
                       </div>
                     </div>
                   </div>
@@ -271,41 +274,8 @@ export default function DynamicSeriesContent({ initialPost, allSeriesParts }: Dy
                     Test Knowledge
                   </div>
                 </div>
-              </div>
-            </div>
+              </div>            </div>
           </div>
-          
-          {/* Top Navigation Buttons */}
-          {!showQuiz && (
-            <div className="mt-6 flex justify-center">
-              <div className="flex gap-3 sm:gap-6">
-                <button
-                  onClick={goToPrev}
-                  disabled={!hasPrev || isLoading}
-                  className={`px-6 sm:px-8 py-2 sm:py-3 rounded-lg text-sm sm:text-base font-semibold transition-all duration-300 ${
-                    hasPrev && !isLoading
-                      ? 'bg-gray-700 hover:bg-gray-800 text-white shadow-lg hover:shadow-xl transform hover:-translate-y-1 hover:scale-105'
-                      : 'text-gray-400 bg-gray-100 cursor-not-allowed'
-                  }`}
-                >
-                  ← Previous
-                </button>
-                <button
-                  onClick={goToNext}
-                  disabled={isLoading}
-                  className={`px-6 sm:px-8 py-2 sm:py-3 rounded-lg text-sm sm:text-base font-semibold transition-all duration-300 ${
-                    !isLoading
-                      ? currentOrder === total
-                        ? 'bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-700 hover:to-purple-700 text-white shadow-lg hover:shadow-xl transform hover:-translate-y-1 hover:scale-105'
-                        : 'bg-gradient-to-r from-green-600 to-blue-600 hover:from-green-700 hover:to-blue-700 text-white shadow-lg hover:shadow-xl transform hover:-translate-y-1 hover:scale-105'
-                      : 'text-gray-400 bg-gray-100 cursor-not-allowed'
-                  }`}
-                >
-                  {currentOrder === total ? 'Take Final Quiz →' : 'Next Part →'}
-                </button>
-              </div>
-            </div>
-          )}
         </div>
       </div>
 
@@ -333,10 +303,8 @@ export default function DynamicSeriesContent({ initialPost, allSeriesParts }: Dy
                   <TableOfContents className="max-w-full" />
                 </div>
               </div>
-              
-              {/* Main Content */}
-              <div className="lg:col-span-4 order-1 lg:order-2">
-                {/* Table of Contents - Mobile */}
+                {/* Main Content */}
+              <div className="lg:col-span-4 order-1 lg:order-2">                {/* Table of Contents - Mobile */}
                 <div className="lg:hidden mb-6">
                   <TableOfContents />
                 </div>
@@ -359,57 +327,46 @@ export default function DynamicSeriesContent({ initialPost, allSeriesParts }: Dy
                                  prose-table:text-sm prose-table:shadow-sm prose-table:border prose-table:border-gray-200 prose-table:rounded-lg prose-table:overflow-hidden
                                  prose-th:bg-gray-50 prose-th:font-semibold prose-th:text-gray-800 prose-th:px-4 prose-th:py-3
                                  prose-td:px-4 prose-td:py-3 prose-td:border-t prose-td:border-gray-200
-                                 prose-img:rounded-lg prose-img:shadow-md prose-img:my-8"dangerouslySetInnerHTML={{ __html: currentPost.content }}
+                                 prose-img:rounded-lg prose-img:shadow-md prose-img:my-8"
+                      dangerouslySetInnerHTML={{ __html: currentPost.content }}
                     />
                   </div>
                 </div>
+                  {/* Bottom Navigation Buttons - Inside Content Area */}
+                {!showQuiz && (
+                  <div className="mt-8 flex justify-center">
+                    <div className="flex gap-3 sm:gap-6">
+                      <button
+                        onClick={goToPrev}
+                        disabled={!hasPrev || isLoading}
+                        className={`px-6 sm:px-10 py-3 sm:py-4 rounded-lg sm:rounded-xl text-sm sm:text-base font-semibold transition-all duration-300 ${
+                          hasPrev && !isLoading
+                            ? 'bg-gray-700 hover:bg-gray-800 text-white shadow-lg hover:shadow-xl transform hover:-translate-y-1 hover:scale-105'
+                            : 'text-gray-400 bg-gray-100 cursor-not-allowed'
+                        }`}
+                      >
+                        ← Previous
+                      </button>
+                      <button
+                        onClick={goToNext}
+                        disabled={isLoading}
+                        className={`px-6 sm:px-10 py-3 sm:py-4 rounded-lg sm:rounded-xl text-sm sm:text-base font-semibold transition-all duration-300 ${
+                          !isLoading
+                            ? currentOrder === total
+                              ? 'bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-700 hover:to-purple-700 text-white shadow-lg hover:shadow-xl transform hover:-translate-y-1 hover:scale-105'
+                              : 'bg-gradient-to-r from-green-600 to-blue-600 hover:from-green-700 hover:to-blue-700 text-white shadow-lg hover:shadow-xl transform hover:-translate-y-1 hover:scale-105'
+                            : 'text-gray-400 bg-gray-100 cursor-not-allowed'
+                        }`}
+                      >
+                        {currentOrder === total ? 'Take Final Quiz →' : 'Next Part →'}
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
-          )}
-        </div>
+          )}        </div>
       </div>
-      
-      {/* Bottom Navigation */}      {!showQuiz && (
-        <div className="border-t border-gray-200 bg-gradient-to-br from-gray-50 to-white">
-          <div className="max-w-6xl mx-auto px-6 py-10">
-            <div className="bg-white rounded-2xl shadow-lg border border-gray-200 p-8">
-              <div className="flex flex-col items-center space-y-8">
-                <div className="text-center">
-                  <h3 className="text-2xl font-bold text-gray-900 mb-3">{seriesName}</h3>
-                  <p className="text-gray-600 max-w-lg">Navigate through the learning series and track your progress</p>
-                </div>
-                
-                {/* Navigation Buttons */}                <div className="flex gap-3 sm:gap-6">
-                  <button
-                    onClick={goToPrev}
-                    disabled={!hasPrev || isLoading}
-                    className={`px-6 sm:px-10 py-3 sm:py-4 rounded-lg sm:rounded-xl text-sm sm:text-base font-semibold transition-all duration-300 ${
-                      hasPrev && !isLoading
-                        ? 'bg-gray-700 hover:bg-gray-800 text-white shadow-lg hover:shadow-xl transform hover:-translate-y-1 hover:scale-105'
-                        : 'text-gray-400 bg-gray-100 cursor-not-allowed'
-                    }`}
-                  >
-                    ← Previous
-                  </button>
-                    <button
-                    onClick={goToNext}
-                    disabled={isLoading}
-                    className={`px-6 sm:px-10 py-3 sm:py-4 rounded-lg sm:rounded-xl text-sm sm:text-base font-semibold transition-all duration-300 ${
-                      !isLoading
-                        ? currentOrder === total
-                          ? 'bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-700 hover:to-purple-700 text-white shadow-lg hover:shadow-xl transform hover:-translate-y-1 hover:scale-105'
-                          : 'bg-gradient-to-r from-green-600 to-blue-600 hover:from-green-700 hover:to-blue-700 text-white shadow-lg hover:shadow-xl transform hover:-translate-y-1 hover:scale-105'
-                        : 'text-gray-400 bg-gray-100 cursor-not-allowed'
-                    }`}
-                  >
-                    {currentOrder === total ? 'Take Final Quiz →' : 'Next Part →'}
-                  </button>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   )
 }
