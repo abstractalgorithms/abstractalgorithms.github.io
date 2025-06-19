@@ -46,9 +46,7 @@ const nextConfig = {
     esmExternals: true,
     // Optimize package imports
     optimizePackageImports: ['lucide-react', 'date-fns'],
-    // Use SWC for faster builds
-    swcFileReading: true,
-    swcMinifyDebugger: false,
+    // Note: swcFileReading and swcMinifyDebugger are no longer valid in Next.js 14
   },
   
   // Page extensions

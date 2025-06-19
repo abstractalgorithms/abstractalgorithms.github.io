@@ -1,8 +1,8 @@
 'use client';
 
 import { useState } from 'react';
-import { usePosts } from '../../hooks/usePosts';
-import { useAuth } from '../../hooks/useAuth';
+import { usePosts } from '../hooks/usePosts';
+import { useAuth } from '../hooks/useAuth';
 import { PlusCircle, Edit, Trash2, Eye, Clock, User, Calendar } from 'lucide-react';
 
 export default function PostsManager() {
