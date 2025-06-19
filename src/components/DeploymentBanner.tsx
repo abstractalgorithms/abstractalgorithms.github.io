@@ -55,8 +55,8 @@ export default function DeploymentBanner({
 // Hook to detect deployment/upgrade status
 export function useDeploymentStatus() {
   const [isDeploying, setIsDeploying] = useState(false)
-
   useEffect(() => {
+    // Temporarily disabled to stop 404 errors
     // Check for deployment status via various methods
     const checkDeploymentStatus = async () => {
       try {
@@ -67,30 +67,29 @@ export function useDeploymentStatus() {
           return
         }
 
-        // Method 2: Check via a status endpoint (if you have one)
-        const response = await fetch('/api/deployment-status', { 
-          method: 'GET',
-          cache: 'no-cache'
-        })
+        // Method 2: Disabled - Check via a status endpoint
+        // const response = await fetch('/api/deployment-status', { 
+        //   method: 'GET',
+        //   cache: 'no-cache'
+        // })
         
-        if (response.ok) {
-          const data = await response.json()
-          setIsDeploying(data.isDeploying || false)
-        }
+        // if (response.ok) {
+        //   const data = await response.json()
+        //   setIsDeploying(data.isDeploying || false)
+        // }
       } catch (error) {
         // Method 3: Check via build timestamp or version mismatch
         // This could detect when a new version is available
         console.log('Deployment status check failed:', error)
       }
-    }
-
-    // Initial check
+    }    // Initial check
     checkDeploymentStatus()
 
+    // Disabled polling to stop 404 errors
     // Poll every 30 seconds during deployment
-    const interval = setInterval(checkDeploymentStatus, 30000)
+    // const interval = setInterval(checkDeploymentStatus, 30000)
 
-    return () => clearInterval(interval)
+    // return () => clearInterval(interval)
   }, [])
 
   // Manual methods to control deployment banner

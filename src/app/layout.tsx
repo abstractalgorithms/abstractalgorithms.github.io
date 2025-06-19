@@ -2,6 +2,7 @@ import './globals.css'
 import { Inter } from 'next/font/google'
 import LayoutWrapper from '../components/LayoutWrapper'
 import StructuredData from '../components/StructuredData'
+import { AuthProvider } from '../hooks/useAuth'
 
 const inter = Inter({ subsets: ['latin'] })
 
@@ -88,9 +89,11 @@ export default function RootLayout({
         }} />
       </head>
       <body className={inter.className}>
-        <LayoutWrapper>
-          {children}
-        </LayoutWrapper>
+        <AuthProvider>
+          <LayoutWrapper>
+            {children}
+          </LayoutWrapper>
+        </AuthProvider>
       </body>
     </html>
   )

@@ -2,6 +2,9 @@
 
 import React, { useState, useCallback, useRef } from 'react'
 import MDXPreview from '../../components/MDXPreview'
+import AuthModal from '../../components/AuthModal'
+import UserMenu, { AuthStatus } from '../../components/UserMenu'
+import { useAuth } from '../../hooks/useAuth'
 import { 
   BookOpen, 
   FileText, 
@@ -25,8 +28,15 @@ import {
   Tag,
   User,
   Lightbulb,
-  List
+  List,
+  Shield,
+  Lock
 } from 'lucide-react'
+
+// API Configuration
+const API_BASE_URL = process.env.NODE_ENV === 'production' 
+  ? 'https://abstractalgorithms-server.netlify.app/api'
+  : (process.env.NEXT_PUBLIC_SERVER_URL || '/api')
 
 // Types
 interface PostMetadata {
@@ -145,6 +155,10 @@ const PREDEFINED_TAGS = [
 ]
 
 export default function ContentCreatorClient() {
+  // Authentication
+  const { user, userProfile, loading: authLoading, hasPermission } = useAuth()
+  const [showAuthModal, setShowAuthModal] = useState(false)
+  
   // State management
   const [contentType, setContentType] = useState<ContentType | null>(null)
   const [currentStep, setCurrentStep] = useState(0)
@@ -168,8 +182,7 @@ export default function ContentCreatorClient() {
     order: 1,
     parts: [{ order: 1, title: '', slug: '' }]
   })
-  
-  const [content, setContent] = useState('')
+    const [content, setContent] = useState('')
   const [images, setImages] = useState<UploadedImage[]>([])
   const [isPreviewMode, setIsPreviewMode] = useState(false)
   const [generatedFiles, setGeneratedFiles] = useState<Array<{
@@ -177,9 +190,96 @@ export default function ContentCreatorClient() {
     content: string
     type: 'typescript' | 'mdx' | 'folder'
   }>>([])
-  
-  // Refs
+  const [uploadingImages, setUploadingImages] = useState<Set<string>>(new Set())
+  const [uploadErrors, setUploadErrors] = useState<string[]>([])
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const [isDragOver, setIsDragOver] = useState(false)
+  
+  // Drag and drop handlers
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault()
+    setIsDragOver(true)
+  }, [])
+  
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
+    e.preventDefault()
+    setIsDragOver(false)
+  }, [])
+    const handleDrop = useCallback(async (e: React.DragEvent) => {
+    e.preventDefault()
+    setIsDragOver(false)
+    
+    const files = Array.from(e.dataTransfer.files).filter(file => 
+      file.type.startsWith('image/')
+    )
+    
+    if (files.length === 0) return
+    
+    // Generate a temporary slug for the upload
+    const tempSlug = basicInfo.title ? generateSlug(basicInfo.title) : `temp-${Date.now()}`
+      // Clear any previous errors
+    setUploadErrors([])
+    
+    for (const file of files) {
+      const fileId = `${file.name}-${Date.now()}`
+      
+      try {
+        // Add to uploading state
+        setUploadingImages(prev => {
+          const newSet = new Set(prev)
+          newSet.add(fileId)
+          return newSet
+        })
+        
+        // Create form data for upload
+        const formData = new FormData()
+        formData.append('image', file)
+        formData.append('postSlug', tempSlug)
+        formData.append('altText', '')
+        
+        // Upload to server
+        const response = await fetch(`${API_BASE_URL}/upload-image`, {
+          method: 'POST',
+          body: formData
+        })
+        
+        const result = await response.json()
+        
+        if (result.success) {
+          // Add to images state with server path
+          const image: UploadedImage = {
+            file,
+            name: result.filename,
+            url: result.path, // Use server path instead of blob URL
+            altText: ''
+          }
+          setImages(prev => [...prev, image])
+        } else {
+          throw new Error(result.error || 'Upload failed')
+        }
+      } catch (error) {
+        console.error('Error uploading image:', error)
+        setUploadErrors(prev => [...prev, `Failed to upload ${file.name}: ${error instanceof Error ? error.message : 'Unknown error'}`])
+        
+        // Fallback to local blob URL for preview
+        const url = URL.createObjectURL(file)
+        const image: UploadedImage = {
+          file,
+          name: file.name,
+          url,
+          altText: ''
+        }
+        setImages(prev => [...prev, image])
+      } finally {
+        // Remove from uploading state
+        setUploadingImages(prev => {
+          const newSet = new Set(prev)
+          newSet.delete(fileId)
+          return newSet
+        })
+      }
+    }
+  }, [basicInfo.title])
   
   // Helper functions
   const generateSlug = (title: string) => {
@@ -216,30 +316,89 @@ export default function ContentCreatorClient() {
   const markStepCompleted = (stepIndex: number) => {
     // This would be used to update step completion status
   }
-  
   // Image handling
-  const handleImageUpload = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
+  const handleImageUpload = useCallback(async (event: React.ChangeEvent<HTMLInputElement>) => {
     const files = event.target.files
     if (!files) return
     
-    Array.from(files).forEach(file => {
+    // Generate a temporary slug for the upload
+    const tempSlug = basicInfo.title ? generateSlug(basicInfo.title) : `temp-${Date.now()}`
+    
+    // Clear any previous errors
+    setUploadErrors([])
+    
+    for (const file of Array.from(files)) {
       if (file.type.startsWith('image/')) {
-        const url = URL.createObjectURL(file)
-        const image: UploadedImage = {
-          file,
-          name: file.name,
-          url,
-          altText: ''
+        const fileId = `${file.name}-${Date.now()}`
+          try {
+          // Add to uploading state
+          setUploadingImages(prev => {
+            const newSet = new Set(prev)
+            newSet.add(fileId)
+            return newSet
+          })
+          
+          // Create form data for upload
+          const formData = new FormData()
+          formData.append('image', file)
+          formData.append('postSlug', tempSlug)
+          formData.append('altText', '')
+            // Upload to server
+          const response = await fetch(`${API_BASE_URL}/upload-image`, {
+            method: 'POST',
+            body: formData
+          })
+          
+          const result = await response.json()
+          
+          if (result.success) {
+            // Add to images state with server path
+            const image: UploadedImage = {
+              file,
+              name: result.filename,
+              url: result.path, // Use server path instead of blob URL
+              altText: ''
+            }
+            setImages(prev => [...prev, image])
+          } else {
+            throw new Error(result.error || 'Upload failed')
+          }
+        } catch (error) {
+          console.error('Error uploading image:', error)
+          setUploadErrors(prev => [...prev, `Failed to upload ${file.name}: ${error instanceof Error ? error.message : 'Unknown error'}`])
+          
+          // Fallback to local blob URL for preview
+          const url = URL.createObjectURL(file)
+          const image: UploadedImage = {
+            file,
+            name: file.name,
+            url,
+            altText: ''
+          }
+          setImages(prev => [...prev, image])
+        } finally {
+          // Remove from uploading state
+          setUploadingImages(prev => {
+            const newSet = new Set(prev)
+            newSet.delete(fileId)
+            return newSet
+          })
         }
-        setImages(prev => [...prev, image])
       }
-    })
-  }, [])
-  
-  const removeImage = useCallback((index: number) => {
+    }
+    
+    // Clear the input
+    if (event.target) {
+      event.target.value = ''
+    }
+  }, [basicInfo.title])
+    const removeImage = useCallback(async (index: number) => {
     setImages(prev => {
       const image = prev[index]
-      URL.revokeObjectURL(image.url)
+      // Only revoke blob URLs, not server URLs
+      if (image.url.startsWith('blob:')) {
+        URL.revokeObjectURL(image.url)
+      }
       return prev.filter((_, i) => i !== index)
     })
   }, [])
@@ -297,9 +456,8 @@ export default function ContentCreatorClient() {
     
     try {
       const slug = generateSlug(basicInfo.title)
-      
-      // Option 1: Create files locally in the project (recommended for development)
-      const response = await fetch('/api/create-post', {
+        // Option 1: Create files locally in the project (recommended for development)
+      const response = await fetch(`${API_BASE_URL}/create-post`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -639,14 +797,108 @@ Note: Automatic file creation failed, but you can download and set up manually.`
           </div>
         </div>
       </div>
+    )  }
+
+  // Authentication loading state
+  if (authLoading) {
+    return (
+      <div className="min-h-screen bg-gray-50 flex items-center justify-center">
+        <div className="text-center">
+          <Loader2 className="w-8 h-8 animate-spin mx-auto mb-4 text-blue-600" />
+          <p className="text-gray-600">Loading authentication...</p>
+        </div>
+      </div>
     )
   }
 
+  // Authentication required
+  if (!user) {
+    return (
+      <>
+        <div className="min-h-screen bg-gray-50 flex items-center justify-center">
+          <div className="max-w-md w-full mx-4">
+            <div className="bg-white rounded-lg shadow-lg p-8 text-center">
+              <div className="w-16 h-16 bg-blue-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                <Lock className="w-8 h-8 text-blue-600" />
+              </div>
+              <h2 className="text-2xl font-bold text-gray-900 mb-2">Authentication Required</h2>
+              <p className="text-gray-600 mb-6">
+                You need to sign in to access the content creator. Create an account or sign in to start creating amazing content.
+              </p>
+              <button
+                onClick={() => setShowAuthModal(true)}
+                className="w-full bg-blue-600 text-white py-3 px-4 rounded-lg hover:bg-blue-700 transition-colors flex items-center justify-center gap-2"
+              >
+                <User className="w-5 h-5" />
+                Sign In to Continue
+              </button>
+              <div className="mt-4 p-3 bg-blue-50 rounded-md text-left">
+                <h4 className="font-medium text-blue-900 text-sm mb-1">What you can do:</h4>
+                <ul className="text-xs text-blue-800 space-y-1">
+                  <li>• Create and edit blog posts</li>
+                  <li>• Upload and manage images</li>
+                  <li>• Build learning series</li>
+                  <li>• Preview content in real-time</li>
+                </ul>
+              </div>
+            </div>
+          </div>
+        </div>
+        <AuthModal 
+          isOpen={showAuthModal} 
+          onClose={() => setShowAuthModal(false)} 
+        />
+      </>
+    )
+  }
+
+  // Permission check
+  if (!hasPermission('create')) {
+    return (
+      <div className="min-h-screen bg-gray-50 flex items-center justify-center">
+        <div className="max-w-md w-full mx-4">
+          <div className="bg-white rounded-lg shadow-lg p-8 text-center">
+            <div className="w-16 h-16 bg-orange-100 rounded-full flex items-center justify-center mx-auto mb-4">
+              <Shield className="w-8 h-8 text-orange-600" />
+            </div>
+            <h2 className="text-2xl font-bold text-gray-900 mb-2">Insufficient Permissions</h2>
+            <p className="text-gray-600 mb-4">
+              Your account doesn't have permission to create content. You're currently logged in as:
+            </p>
+            <div className="bg-gray-50 rounded-lg p-4 mb-6">
+              <div className="flex items-center justify-center gap-2 mb-2">
+                <div className="w-8 h-8 bg-blue-600 rounded-full flex items-center justify-center text-white font-medium text-sm">
+                  {userProfile?.displayName?.[0] || user.email?.[0]}
+                </div>
+                <div>
+                  <div className="font-medium text-gray-900">{userProfile?.displayName || 'User'}</div>
+                  <div className="text-sm text-gray-500">{user.email}</div>
+                </div>
+              </div>
+              <div className="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-gray-100 text-gray-800 border border-gray-200">
+                Role: {userProfile?.role || 'reader'}
+              </div>
+            </div>
+            <p className="text-sm text-gray-500 mb-4">
+              Contact an administrator to upgrade your role to Contributor, Editor, or Admin to access the content creator.
+            </p>
+            <button
+              onClick={() => window.location.href = '/'}
+              className="bg-gray-600 text-white py-2 px-4 rounded-lg hover:bg-gray-700 transition-colors"
+            >
+              Back to Home
+            </button>
+          </div>
+        </div>
+      </div>
+    )
+  }
   // Main creator interface
   return (
-    <div className="min-h-screen bg-gray-50">
-      {/* Header */}
-      <div className="bg-white shadow-sm border-b border-gray-200">
+    <>
+      <div className="min-h-screen bg-gray-50">
+        {/* Header */}
+        <div className="bg-white shadow-sm border-b border-gray-200">
         <div className="container mx-auto px-6">
           <div className="flex items-center justify-between py-4">
             <div className="flex items-center space-x-4">
@@ -660,18 +912,22 @@ Note: Automatic file creation failed, but you can download and set up manually.`
               <div className="h-6 w-px bg-gray-300" />
               <h1 className="text-2xl font-bold text-gray-900">
                 {contentType === CONTENT_TYPES.SERIES ? 'Learning Series' : 'Independent Article'}
-              </h1>
-            </div>
+              </h1>            </div>
             
-            {generationComplete && (
-              <button
-                onClick={downloadAllFiles}
-                className="flex items-center px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
-              >
-                <Download className="w-4 h-4 mr-2" />
-                Download All Files
-              </button>
-            )}
+            <div className="flex items-center gap-4">
+              {generationComplete && (
+                <button
+                  onClick={downloadAllFiles}
+                  className="flex items-center px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
+                >
+                  <Download className="w-4 h-4 mr-2" />
+                  Download All Files
+                </button>
+              )}
+              
+              {/* User Menu */}
+              <UserMenu />
+            </div>
           </div>
         </div>
       </div>
@@ -1004,15 +1260,45 @@ Remember to upload images in the next step if you want to include them!"
                           <div className="flex items-center justify-between mb-4">
                             <label className="block text-sm font-medium text-gray-700">
                               Upload Images
-                            </label>
-                            <button
+                            </label>                            <button
                               onClick={() => fileInputRef.current?.click()}
-                              className="flex items-center px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
+                              disabled={uploadingImages.size > 0}
+                              className="flex items-center px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                             >
-                              <Upload className="w-4 h-4 mr-2" />
-                              Upload Images
+                              {uploadingImages.size > 0 ? (
+                                <>
+                                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                                  Uploading...
+                                </>
+                              ) : (
+                                <>
+                                  <Upload className="w-4 h-4 mr-2" />
+                                  Upload Images
+                                </>
+                              )}
                             </button>
                           </div>
+                          
+                          {/* Error Messages */}
+                          {uploadErrors.length > 0 && (
+                            <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg">
+                              <div className="flex items-center mb-2">
+                                <AlertCircle className="w-4 h-4 text-red-600 mr-2" />
+                                <span className="text-sm font-medium text-red-800">Upload Errors:</span>
+                              </div>
+                              <ul className="text-sm text-red-700 space-y-1">
+                                {uploadErrors.map((error, index) => (
+                                  <li key={index}>• {error}</li>
+                                ))}
+                              </ul>
+                              <button
+                                onClick={() => setUploadErrors([])}
+                                className="mt-2 text-sm text-red-600 hover:text-red-800 underline"
+                              >
+                                Clear errors
+                              </button>
+                            </div>
+                          )}
                           
                           <input
                             ref={fileInputRef}
@@ -1022,15 +1308,37 @@ Remember to upload images in the next step if you want to include them!"
                             onChange={handleImageUpload}
                             className="hidden"
                           />
-                          
-                          <div className="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center">
-                            <ImageIcon className="w-12 h-12 text-gray-400 mx-auto mb-4" />
-                            <p className="text-gray-600 mb-2">
-                              Drag and drop images here, or click the upload button
-                            </p>
-                            <p className="text-sm text-gray-500">
+                            <div 
+                            className={`border-2 border-dashed rounded-lg p-8 text-center transition-colors ${
+                              isDragOver 
+                                ? 'border-blue-400 bg-blue-50' 
+                                : 'border-gray-300 hover:border-gray-400'
+                            }`}
+                            onDragOver={handleDragOver}
+                            onDragLeave={handleDragLeave}
+                            onDrop={handleDrop}
+                          >
+                            <ImageIcon className={`w-12 h-12 mx-auto mb-4 ${
+                              isDragOver ? 'text-blue-500' : 'text-gray-400'
+                            }`} />
+                            <p className={`mb-2 ${
+                              isDragOver ? 'text-blue-700' : 'text-gray-600'
+                            }`}>
+                              {isDragOver 
+                                ? 'Drop images here' 
+                                : 'Drag and drop images here, or click the upload button'
+                              }
+                            </p>                            <p className="text-sm text-gray-500">
                               Supports: JPG, PNG, GIF, WebP
                             </p>
+                            {uploadingImages.size > 0 && (
+                              <div className="mt-4 flex items-center justify-center">
+                                <Loader2 className="w-5 h-5 animate-spin text-blue-600 mr-2" />
+                                <span className="text-sm text-blue-600">
+                                  Uploading {uploadingImages.size} image{uploadingImages.size > 1 ? 's' : ''}...
+                                </span>
+                              </div>
+                            )}
                           </div>
                         </div>
                         
@@ -1244,13 +1552,20 @@ Remember to upload images in the next step if you want to include them!"
                       {currentStep === steps.length - 1 ? 'Complete' : 'Next'}
                       <ChevronRight className="w-4 h-4 ml-1" />
                     </button>
-                  </div>
-                )}
-              </div>
+                  </div>                )}              </div>
             </div>
           </div>
         </div>
       </div>
-    </div>
+      
+      {/* Close main min-h-screen div */}
+      </div>
+
+      {/* Auth Modal */}
+      <AuthModal 
+        isOpen={showAuthModal} 
+        onClose={() => setShowAuthModal(false)} 
+      />
+    </>
   )
 }

@@ -1,13 +1,16 @@
 'use client'
 
 import Link from 'next/link'
-import { Search, BookOpen, Github, Menu, X } from 'lucide-react'
+import { Search, BookOpen, Menu, X } from 'lucide-react'
 import { useState, useEffect } from 'react'
 import SearchModal from './SearchModal'
+import UserMenu from './UserMenu'
+import AuthModal from './AuthModal'
 
 export default function Header() {
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false)
   const [isSearchOpen, setIsSearchOpen] = useState(false)
+  const [showAuthModal, setShowAuthModal] = useState(false)
 
   // Global keyboard shortcut for search (Cmd+K or Ctrl+K)
   useEffect(() => {
@@ -18,8 +21,17 @@ export default function Header() {
       }
     }
 
+    const handleOpenAuthModal = () => {
+      setShowAuthModal(true)
+    }
+
     document.addEventListener('keydown', handleKeyDown)
-    return () => document.removeEventListener('keydown', handleKeyDown)
+    window.addEventListener('openAuthModal', handleOpenAuthModal)
+    
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown)
+      window.removeEventListener('openAuthModal', handleOpenAuthModal)
+    }
   }, [])
 
   return (
@@ -54,21 +66,6 @@ export default function Header() {
             >
              Posts
             </Link>
-            <Link 
-              href="/badges" 
-              className="text-gray-600 hover:text-gray-900 font-medium transition-colors text-lg"
-            >
-              Badges
-            </Link>
-            {process.env.NODE_ENV === 'development' && (
-              <Link 
-                href="/content-creator" 
-                className="text-blue-600 hover:text-blue-700 font-medium transition-colors text-lg bg-blue-50 px-3 py-1 rounded-lg"
-                title="Content Creator (Dev Only)"
-              >
-                Create
-              </Link>
-            )}
           </nav>
           
           <div className="flex items-center space-x-6">
@@ -94,14 +91,11 @@ export default function Header() {
             >
               <Search className="w-6 h-6" />
             </button>
-            <a 
-              href="https://github.com/abstractalgorithms" 
-              target="_blank" 
-              rel="noopener noreferrer"
-              className="p-3 text-gray-600 hover:text-gray-900 rounded-xl hover:bg-gray-100 transition-colors"
-            >
-              <Github className="w-6 h-6" />
-            </a>
+            
+            {/* User Menu / Authentication - Fixed container to prevent layout shifts */}
+            <div className="flex items-center min-w-[120px]">
+              <UserMenu />
+            </div>
             
             {/* Mobile menu button */}
             <button 
@@ -138,13 +132,6 @@ export default function Header() {
               >
                 Posts
               </Link>
-              <Link 
-                href="/badges" 
-                className="text-gray-600 hover:text-gray-900 font-medium transition-colors text-lg py-2"
-                onClick={() => setIsMobileMenuOpen(false)}
-              >
-                Badges
-              </Link>
               {process.env.NODE_ENV === 'development' && (
                 <Link 
                   href="/content-creator" 
@@ -163,6 +150,10 @@ export default function Header() {
       <SearchModal 
         isOpen={isSearchOpen} 
         onClose={() => setIsSearchOpen(false)} 
+      />
+      <AuthModal 
+        isOpen={showAuthModal} 
+        onClose={() => setShowAuthModal(false)} 
       />
     </header>
   )
