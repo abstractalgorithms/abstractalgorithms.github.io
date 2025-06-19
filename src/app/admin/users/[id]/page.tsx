@@ -9,9 +9,6 @@ export async function generateStaticParams() {
   ];
 }
 
-// This ensures the page is treated as dynamic in client-side navigation
-export const dynamic = 'force-dynamic';
-
 export default function AdminUserProfilePage() {
   return <AdminUserView />;
 }
