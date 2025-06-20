@@ -19,8 +19,25 @@ import {
 
 // Create dynamic components that properly process MDX with all plugins
 const createMDXComponent = (slug: string) => {
+  // Handle series parts - if slug contains a slash, it's likely a series part
+  const mdxPath = slug.includes('/') 
+    ? slug  // For parts like "system-design-interview/part-2"
+    : `${slug}/content`; // For main posts like "system-design-interview"
+    
   return dynamic(
-    () => import(`../posts/${slug}/content.mdx`),
+    () => import(`../posts/${mdxPath}.mdx`).catch((err) => {
+      console.error(`Failed to load MDX file: ../posts/${mdxPath}.mdx`, err);
+      // Return a fallback component
+      return {
+        default: () => (
+          <div className="text-center py-12 bg-yellow-50 border border-yellow-200 rounded-lg">
+            <h3 className="text-lg font-semibold text-yellow-800 mb-2">Content Unavailable</h3>
+            <p className="text-yellow-700">Unable to load content for: {slug}</p>
+            <p className="text-sm text-yellow-600 mt-2">File path: ../posts/{mdxPath}.mdx</p>
+          </div>
+        )
+      };
+    }),
     { 
       ssr: false,
       loading: () => <div className="animate-pulse h-64 bg-gray-100 rounded"></div>
@@ -30,19 +47,40 @@ const createMDXComponent = (slug: string) => {
 
 // Component to dynamically load and render MDX content
 function DynamicMDXContent({ slug }: { slug: string }) {
+  const [error, setError] = useState<string | null>(null);
+  
   const PostContent = useMemo(() => {
-    return createMDXComponent(slug)
-  }, [slug])
+    try {
+      return createMDXComponent(slug);
+    } catch (err) {
+      setError(`Failed to load content for: ${slug}`);
+      return null;
+    }
+  }, [slug]);
+
+  if (error) {
+    return (
+      <div className="text-center py-12 bg-red-50 border border-red-200 rounded-lg">
+        <p className="text-red-600 font-medium">{error}</p>
+        <p className="text-sm text-red-500 mt-2">Please check if the content file exists.</p>
+      </div>
+    );
+  }
 
   if (!PostContent) {
     return (
       <div className="text-center py-12">
-        <p className="text-gray-600">Content not found for slug: {slug}</p>
+        <div className="animate-pulse h-64 bg-gray-100 rounded mb-4"></div>
+        <p className="text-gray-600">Loading content...</p>
       </div>
-    )
+    );
   }
 
-  return <PostContent />
+  return (
+    <div className="relative">
+      <PostContent />
+    </div>
+  );
 }
 
 interface DynamicSeriesContentProps {
@@ -68,7 +106,7 @@ export default function DynamicSeriesContent({ initialPost, allSeriesParts }: Dy
     const badgeId = `${seriesName.toLowerCase().replace(/\s+/g, '-')}-completion`
     setQuizCompleted(badges.includes(badgeId))
   }, [seriesName])
-  const handlePartChange = async (targetOrder: number) => {
+    const handlePartChange = async (targetOrder: number) => {
     if (targetOrder === currentOrder && !showQuiz) return
     
     setIsLoading(true)
@@ -79,9 +117,6 @@ export default function DynamicSeriesContent({ initialPost, allSeriesParts }: Dy
     
     if (targetPost) {
       setCurrentPost(targetPost)
-      // Don't change URL to avoid static generation issues
-      // The UI state change is sufficient for navigation within the series
-      
       // Scroll to top of page
       window.scrollTo({ top: 0, behavior: 'smooth' })
     }

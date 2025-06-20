@@ -12,8 +12,10 @@ async function generateSitemap() {
 
   // Extract metadata from each post
   for (const dir of postDirs) {
-    const metadataPath = path.join(postsDirectory, dir, 'metadata.ts')
+    const dirPath = path.join(postsDirectory, dir)
     
+    // Check for series landing page (metadata.ts)
+    const metadataPath = path.join(dirPath, 'metadata.ts')
     if (fs.existsSync(metadataPath)) {
       try {
         const metadataContent = fs.readFileSync(metadataPath, 'utf8')
@@ -24,11 +26,45 @@ async function generateSitemap() {
           posts.push({
             title: titleMatch[1],
             date: dateMatch[1],
-            slug: dir
+            slug: dir,
+            type: 'series'
           })
         }
       } catch (error) {
         console.warn(`Error reading metadata for ${dir}:`, error)
+      }
+    }
+    
+    // Check for individual MDX files (series parts)
+    const files = fs.readdirSync(dirPath, { withFileTypes: true })
+      .filter(dirent => dirent.isFile() && dirent.name.endsWith('.mdx'))
+      .map(dirent => dirent.name)
+    
+    for (const file of files) {
+      if (file === 'content.mdx') continue // Skip main content file, use metadata.ts instead
+      
+      const filePath = path.join(dirPath, file)
+      try {
+        const content = fs.readFileSync(filePath, 'utf8')
+        const metadataMatch = content.match(/export const metadata = \{([\s\S]*?)\}/)
+        
+        if (metadataMatch) {
+          const metadataContent = metadataMatch[1]
+          const titleMatch = metadataContent.match(/title:\s*"([^"]*)"/)
+          const dateMatch = metadataContent.match(/date:\s*"([^"]*)"/)
+          
+          if (titleMatch && dateMatch) {
+            const fileName = file.replace('.mdx', '')
+            posts.push({
+              title: titleMatch[1],
+              date: dateMatch[1],
+              slug: `${dir}/${fileName}`,
+              type: 'part'
+            })
+          }
+        }
+      } catch (error) {
+        console.warn(`Error reading ${file} in ${dir}:`, error)
       }
     }
   }
@@ -73,12 +109,16 @@ async function generateSitemap() {
 
   sitemapXml += `
 </urlset>`
-
   // Write sitemap to public directory
   const sitemapPath = path.join(process.cwd(), 'public/sitemap.xml')
   fs.writeFileSync(sitemapPath, sitemapXml)
 
-  console.log(`✅ Sitemap generated with ${posts.length} posts`)
+  const seriesPosts = posts.filter(p => p.type === 'series')
+  const partPosts = posts.filter(p => p.type === 'part')
+
+  console.log(`✅ Sitemap generated with ${posts.length} total entries`)
+  console.log(`   - ${seriesPosts.length} series landing pages`)
+  console.log(`   - ${partPosts.length} individual parts`)
   console.log(`📁 Written to: ${sitemapPath}`)
 }
 

@@ -54,8 +54,7 @@ export default function PostsPageClient({ posts: allPosts }: PostsPageClientProp
     setCurrentPage(1) // Reset to first page when filtering
     
     console.log('Effect triggered - view mode:', viewMode, 'URL mode:', urlMode, 'tag:', tag)
-  }, [searchParams, viewMode])
-  // Separate effect for filtering posts based on current state
+  }, [searchParams, viewMode])  // Separate effect for filtering posts based on current state
   useEffect(() => {
     let postsToFilter = allPosts
       // Filter by view mode first
@@ -67,7 +66,8 @@ export default function PostsPageClient({ posts: allPosts }: PostsPageClientProp
         postsToFilter = learningPaths.flatMap(path => path.posts)
         break
       default:
-        // For "all" view, show independent posts + first part of each series
+        // For "all" view, show independent posts + first part of each series only
+        // This excludes individual series parts (part-2, part-3, etc.) which should only be accessible via series navigation
         postsToFilter = [...independentPosts, ...seriesPosts].sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
     }
     

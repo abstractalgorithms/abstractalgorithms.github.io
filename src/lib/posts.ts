@@ -51,9 +51,9 @@ export function segregatePosts(posts: Post[]): {
 
   posts.forEach(post => {
     if (post.series) {
-      // Only include the first part of a series in the main series listing
-      // Series parts (order > 1) should only be accessible through navigation
-      if (post.series.order === 1) {
+      // Series landing pages (without order) or first parts (order === 1) appear in main listing
+      // All other series parts (order > 1) should only be accessible through navigation
+      if (!post.series.order || post.series.order === 1) {
         seriesPosts.push(post)
       }
       
@@ -308,12 +308,12 @@ async function processPost(dir: string, metadataPath: string, contentPath: strin
 }
 
 // Helper function to get part title from metadata
-function getPartTitle(partIndex: number, parts?: Array<{order: number, title: string}>): string {
+function getPartTitle(partNumber: number, parts?: Array<{order: number, title: string}>): string {
   if (parts) {
-    const part = parts.find(p => p.order === partIndex + 1)
+    const part = parts.find(p => p.order === partNumber)
     if (part) return part.title
   }
-  return `Part ${partIndex + 1}`
+  return `Part ${partNumber}`
 }
 
 export async function getPostBySlug(slug: string): Promise<Post | null> {
@@ -362,9 +362,9 @@ export async function getPostBySlug(slug: string): Promise<Post | null> {
           title: getPartTitle(partNumber, seriesMetadata.series?.parts),
           series: seriesMetadata.series ? {
             ...seriesMetadata.series,
-            order: partNumber + 1,
-            prev: partNumber === 1 ? `/posts/${seriesSlug}` : `/posts/${seriesSlug}/part-${partNumber}`,
-            next: partNumber < (seriesMetadata.series?.total - 1) ? `/posts/${seriesSlug}/part-${partNumber + 1}` : null
+            order: partNumber, // partNumber is already 1-indexed from filename
+            prev: partNumber === 2 ? `/posts/${seriesSlug}` : partNumber > 2 ? `/posts/${seriesSlug}/part-${partNumber - 1}` : null,
+            next: partNumber < seriesMetadata.series?.total ? `/posts/${seriesSlug}/part-${partNumber + 1}` : null
           } : undefined
         }
         
