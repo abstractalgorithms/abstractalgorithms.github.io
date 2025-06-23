@@ -1,0 +1,11 @@
+export const metadata = {
+  "postId": "2c3d4e5f-6a7b-8c9d-0e1f-2a3b4c5d6e7f",
+  "title": "Microservices: Using Quarkus",
+  "date": "2022-11-21 23:10:59 +0530",
+  "excerpt": "Learn about Microservices: Using Quarkus.",
+  "author": "Abstract Algorithms",
+  "tags": [
+    "general"
+  ],
+  "coverImage": "./assets/overview.png"
+};
