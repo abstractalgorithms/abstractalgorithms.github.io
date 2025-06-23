@@ -1,5 +1,5 @@
 export const metadata = {
-  "postId": "bc94b244-8977-404b-8693-778e9dcc4a35",
+  "postId": "c3c4d114-bbdd-4a82-a8b9-6238e6dee79b",
   "title": "LLM Engineering Mastery - Complete Series",
   "date": "2024-01-27",
   "excerpt": "Complete LLM Engineering Mastery series with 3 parts covering Part 1 of the LLM Engineering Mastery series: Master foundation models from an engineering perspective - understanding capabilities, limitations, and practical integration strategies.",
