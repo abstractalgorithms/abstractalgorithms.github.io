@@ -1,0 +1,581 @@
+{
+  "id": "problem-read-your-own-writes-consistency-patterns",
+  "slug": "read-your-own-writes-consistency-patterns",
+  "title": "Solving Read-Your-Own-Writes Replica Lag",
+  "problemType": "architecture",
+  "difficulty": "medium",
+  "prompt": "Your Identity & User Settings service runs on MySQL 8.0 (1 primary writer + 4 asynchronous GTID read replicas) serving 8,500 RPS. When users update their MFA phone number, billing address, or RBAC permissions via `PATCH /v1/users/{id}`, the frontend immediately reloads `GET /v1/users/{id}`. During analytics exports or schema maintenance, `Seconds_Behind_Source` fluctuates between 400 ms and 3.2 s, causing users to see their old MFA number and resubmit the form multiple times—or worse, experience stale RBAC permissions. Design a Read-Your-Own-Writes (RYOW) architecture that eliminates stale self-reads across all user settings.",
+  "spark": {
+    "summary": "MySQL 8.0 InnoDB GTID replica lag (400 ms–3.2 s) causes users updating MFA numbers or RBAC roles to see stale pre-update state on immediate refresh.",
+    "keyTakeaway": "Combine a short Redis sticky-primary window (`ryow:user:{id}`) with GTID-verified reads (`WAIT_FOR_EXECUTED_GTID_SET`) and write-through cache invalidation.",
+    "byteSummary": "**Core Mechanics:** A MySQL 8.0 topology with 1 primary writer and 4 asynchronous GTID read replicas serves 8,500 RPS cleanly—until analytics exports or DDL push `Seconds_Behind_Source` to `400 ms–3.2 s`.\n\n**Visual & Structural Flow:** Depicts PATCH Primary -> Immediate GET Hits Lagging Replica (FastAPI Client -> MySQL Primary -> Read Replica); Sticky-Primary Window & Bounded GTID Wait (FastAPI + SQLAlchemy Router -> Redis Sticky Window (5s TTL) -> MySQL Primary (Writer) -> 4x Read Replicas (>=80% load)).\n\n**Trade-Offs & Production:** Two naive workarounds break under load: **Routing all reads to Primary**: Destroys the `>= 80%` read offload across the 4 replicas, overloading the single writer. Causal session consistency is essential in read-heavy, single-writer relational architectures: **Identity, MFA & RBAC Services**: Guarantees revoked tokens/roles take effect immediately.\n\n**Failure Modes & Application:** Causal session consistency is essential in read-heavy, single-writer relational architectures: **Identity, MFA & RBAC Services**: Guarantees revoked tokens/roles take effect immediately."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why async replica lag breaks Read-Your-Own-Writes",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": "A MySQL 8.0 topology with 1 primary writer and 4 asynchronous GTID read replicas serves 8,500 RPS cleanly—until analytics exports or DDL push `Seconds_Behind_Source` to `400 ms–3.2 s`. When a user updates their MFA phone number or RBAC permissions via `PATCH /v1/users/{id}` and immediately reloads `GET /v1/users/{id}`, routing the read to a lagging replica returns stale pre-update state.",
+      "purpose": "The mechanism: understand how Why async replica lag breaks Read-Your-Own-Writes works from first principles."
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "Duplicate submissions and stale RBAC authorization checks",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "Breaking Read-Your-Own-Writes (RYOW) on identity and security paths causes immediate incidents:\n\n1. **Security Vulnerability**: Revoked RBAC permissions (`GET /v1/users/{id}/permissions`) continue to authorize requests for up to 3.2 seconds.\n2. **UX Confusion & Retries**: Users see their old MFA phone number after saving and resubmit the form repeatedly.",
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Async Replica Lag Race",
+        "title": "PATCH Primary -> Immediate GET Hits Lagging Replica",
+        "actors": [
+          {
+            "id": "app",
+            "label": "FastAPI Client"
+          },
+          {
+            "id": "pri",
+            "label": "MySQL Primary"
+          },
+          {
+            "id": "rep",
+            "label": "Read Replica"
+          }
+        ],
+        "events": [
+          {
+            "from": "app",
+            "to": "pri",
+            "label": "PATCH /users/42 (revoke admin)",
+            "status": "ok"
+          },
+          {
+            "from": "pri",
+            "to": "app",
+            "label": "200 OK (GTID uuid:901)",
+            "status": "ok"
+          },
+          {
+            "from": "pri",
+            "to": "rep",
+            "label": "Async binlog lag (1.2s)",
+            "status": "warn"
+          },
+          {
+            "from": "app",
+            "to": "rep",
+            "label": "GET /users/42/permissions",
+            "status": "warn"
+          },
+          {
+            "from": "rep",
+            "to": "app",
+            "label": "Returns stale admin=true!",
+            "status": "fail"
+          }
+        ],
+        "summary": "Routing an immediate post-write GET to an asynchronous replica exposes revoked permissions during the replication lag window."
+      },
+      "purpose": "The problem: see what breaks without Duplicate submissions and stale RBAC authorization checks under real concurrency or scale."
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Why Seconds_Behind_Source=0 and routing all reads to primary fail",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "Two naive workarounds break under load:\n\n- **Routing all reads to Primary**: Destroys the `>= 80%` read offload across the 4 replicas, overloading the single writer.\n- **Trusting `Seconds_Behind_Source = 0`**: In MySQL, `0` only means the SQL thread caught up to the I/O thread's *currently fetched* relay log—if the I/O thread is stalled, the replica still serves stale data.",
+      "purpose": "The problem: see what breaks without Why Seconds_Behind_Source=0 and routing all reads to primary fail under real concurrency or scale."
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise solution: Redis Sticky-Primary Window + GTID Causal Tokens",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": "Preserve `>= 80%` replica offload while guaranteeing RYOW and `< 50 ms` read bounds:\n\n- **Sticky-Primary Redis Window (`ryow:user:{id}`)**: On `PATCH`, set a short Redis key (`TTL = 5 s`) after the DB commits. While present, `GET` routes directly to the Primary (zero replica lag).\n- **GTID Causal Verification**: Return `gtid_executed` from the Primary commit (`source_uuid:tx_id`). Replicas run `SELECT WAIT_FOR_EXECUTED_GTID_SET(gtid, 0.05)` (50 ms max); if it times out (`!= 0`), fail over that single read to Primary.\n- **Write-Through Cache Invalidation**: Delete/update Redis *after* DB commit (never before) so concurrent reads never repopulate Redis from a stale replica.",
+      "sectionDiagram": {
+        "kind": "wal-mvcc",
+        "eyebrow": "RYOW Routing Architecture",
+        "title": "Sticky-Primary Window & Bounded GTID Wait",
+        "nodes": [
+          {
+            "label": "FastAPI + SQLAlchemy Router",
+            "role": "Checks ryow:user:{id} + GTID"
+          },
+          {
+            "label": "Redis Sticky Window (5s TTL)",
+            "role": "Routes recent writers to Primary"
+          },
+          {
+            "label": "MySQL Primary (Writer)",
+            "role": "Emits gtid_executed token"
+          },
+          {
+            "label": "4x Read Replicas (>=80% load)",
+            "role": "WAIT_FOR_EXECUTED_GTID_SET(50ms)"
+          }
+        ],
+        "cards": [
+          {
+            "label": "5s Sticky Window",
+            "detail": "Recent mutators read from Primary for 5s, eliminating replica lag on immediate page reloads."
+          },
+          {
+            "label": "50ms GTID Gate",
+            "detail": "If a replica has not applied the caller's GTID within 50ms, fall back to Primary immediately."
+          },
+          {
+            "label": "Security-Critical Paths",
+            "detail": "RBAC permission checks bypass stale replicas or read from Primary/consistent cache."
+          }
+        ],
+        "summary": "Combining a 5s Redis sticky-primary flag with a 50ms GTID wait guarantees RYOW without sacrificing 80%+ replica offload."
+      },
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where Read-Your-Own-Writes patterns are used in production",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": "Causal session consistency is essential in read-heavy, single-writer relational architectures:\n\n- **Identity, MFA & RBAC Services**: Guarantees revoked tokens/roles take effect immediately.\n- **E-Commerce Cart & Profile Updates**: Ensures users see their newly added address or payment method.\n- **Multi-Region Read Replicas**: Uses LSN/GTID watermarks in Postgres/MySQL to avoid global cross-region locks.",
+      "supportingConcepts": [
+        {
+          "slug": "consistency-replication",
+          "title": "Concept: Consistency & Replication",
+          "kind": "concept"
+        },
+        {
+          "slug": "mysql-replication-topologies",
+          "title": "Concept: MySQL Replication Topologies",
+          "kind": "concept"
+        },
+        {
+          "slug": "cap-theorem-consistency-models",
+          "title": "Concept: CAP & Consistency Models",
+          "kind": "concept"
+        },
+        {
+          "slug": "design-distributed-key-value-store",
+          "title": "System Design: Distributed Key-Value Store",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why is `Seconds_Behind_Source = 0` insufficient to guarantee Read-Your-Own-Writes on a MySQL 8.0 read replica?",
+      "options": [
+        {
+          "id": "a",
+          "text": "It only measures the lag between the SQL thread and the I/O thread's currently fetched relay log, not actual primary commit time",
+          "correct": true,
+          "feedback": "Correct: GTID-based checks (`WAIT_FOR_EXECUTED_GTID_SET`) or a sticky-primary window are required for causal RYOW."
+        },
+        {
+          "id": "b",
+          "text": "MySQL 8.0 disables GTIDs whenever read replicas are attached",
+          "correct": false,
+          "feedback": "GTIDs are specifically designed to track committed transactions across MySQL 8.0 topologies."
+        },
+        {
+          "id": "c",
+          "text": "Redis TTLs cannot be set below 60 seconds",
+          "correct": false,
+          "feedback": "Redis supports second and millisecond TTLs (e.g., 5s sticky-primary window)."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why is `Seconds_Behind_Source = 0` insufficient to guarantee Read-Your-Own-Writes on a MySQL 8.0 read replica?",
+        "options": [
+          {
+            "id": "a",
+            "text": "It only measures the lag between the SQL thread and the I/O thread's currently fetched relay log, not actual primary commit time",
+            "correct": true,
+            "feedback": "Correct: GTID-based checks (`WAIT_FOR_EXECUTED_GTID_SET`) or a sticky-primary window are required for causal RYOW."
+          },
+          {
+            "id": "b",
+            "text": "MySQL 8.0 disables GTIDs whenever read replicas are attached",
+            "correct": false,
+            "feedback": "GTIDs are specifically designed to track committed transactions across MySQL 8.0 topologies."
+          },
+          {
+            "id": "c",
+            "text": "Redis TTLs cannot be set below 60 seconds",
+            "correct": false,
+            "feedback": "Redis supports second and millisecond TTLs (e.g., 5s sticky-primary window)."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why async replica lag breaks Read-Your-Own-Writes', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "b",
+            "text": "A MySQL 8.0 topology with 1 primary writer and 4 asynchronous GTID read replicas serves 8,500 RPS cleanly—until analytics exports or DDL push Seconds_Behind_Source to 400…",
+            "correct": true,
+            "feedback": "Correct: A MySQL 8.0 topology with 1 primary writer and 4 asynchronous GTID read replicas serves 8,500 RPS cleanly—until analytics exports or DDL push Seconds_Behind_Source to 400…"
+          },
+          {
+            "id": "c",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Duplicate submissions and stale RBAC authorization checks', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "b",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "c",
+            "text": "Breaking Read-Your-Own-Writes (RYOW) on identity and security paths causes immediate incidents: 1.",
+            "correct": true,
+            "feedback": "Correct: Breaking Read-Your-Own-Writes (RYOW) on identity and security paths causes immediate incidents: 1."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** A MySQL 8.0 topology with 1 primary writer and 4 asynchronous GTID read replicas serves 8,500 RPS cleanly—until analytics exports or DDL push `Seconds_Behind_Source` to `400 ms–3.2 s`.\n\n**How It Flows:** Think of Solving Read-Your-Own-Writes Replica Lag as a clear step-by-step chain: FastAPI Client -> MySQL Primary -> Read Replica -> FastAPI + SQLAlchemy Router -> Redis Sticky Window (5s TTL).\n\n**Why Beginners Should Care:** Combine a short Redis sticky-primary window (`ryow:user:{id}`) with GTID-verified reads (`WAIT_FOR_EXECUTED_GTID_SET`) and write-through cache invalidation.",
+      "spark": {
+        "summary": "A MySQL 8.0 topology with 1 primary writer and 4 asynchronous GTID read replicas serves 8,500 RPS cleanly—until analytics exports or DDL push `Seconds_Behind_Source` to `400 ms–3.2 s`.",
+        "keyTakeaway": "Combine a short Redis sticky-primary window (`ryow:user:{id}`) with GTID-verified reads (`WAIT_FOR_EXECUTED_GTID_SET`) and write-through cache invalidation."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why async replica lag breaks Read-Your-Own-Writes",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why async replica lag breaks Read-Your-Own-Writes works from first principles.",
+          "explanation": "A MySQL 8.0 topology with 1 primary writer and 4 asynchronous GTID read replicas serves 8,500 RPS cleanly—until analytics exports or DDL push `Seconds_Behind_Source` to `400 ms–3.2 s`. When a user updates their MFA phone number or RBAC permissions via `PATCH /v1/users/{id}` and immediately reloads `GET /v1/users/{id}`, routing the read to a lagging replica returns stale pre-update state.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Duplicate submissions and stale RBAC authorization checks",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without Duplicate submissions and stale RBAC authorization checks under real concurrency or scale.",
+          "explanation": "Breaking Read-Your-Own-Writes (RYOW) on identity and security paths causes immediate incidents: 1. **Security Vulnerability**: Revoked RBAC permissions (`GET /v1/users/{id}/permissions`) continue to authorize requests for up to 3.2 seconds. 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Async Replica Lag Race",
+            "title": "PATCH Primary -> Immediate GET Hits Lagging Replica",
+            "actors": [
+              {
+                "id": "app",
+                "label": "FastAPI Client"
+              },
+              {
+                "id": "pri",
+                "label": "MySQL Primary"
+              },
+              {
+                "id": "rep",
+                "label": "Read Replica"
+              }
+            ],
+            "events": [
+              {
+                "from": "app",
+                "to": "pri",
+                "label": "PATCH /users/42 (revoke admin)",
+                "status": "ok"
+              },
+              {
+                "from": "pri",
+                "to": "app",
+                "label": "200 OK (GTID uuid:901)",
+                "status": "ok"
+              },
+              {
+                "from": "pri",
+                "to": "rep",
+                "label": "Async binlog lag (1.2s)",
+                "status": "warn"
+              },
+              {
+                "from": "app",
+                "to": "rep",
+                "label": "GET /users/42/permissions",
+                "status": "warn"
+              },
+              {
+                "from": "rep",
+                "to": "app",
+                "label": "Returns stale admin=true!",
+                "status": "fail"
+              }
+            ],
+            "summary": "Routing an immediate post-write GET to an asynchronous replica exposes revoked permissions during the replication lag window."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Why Seconds_Behind_Source=0 and routing all reads to primary fail",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "The problem: see what breaks without Why Seconds_Behind_Source=0 and routing all reads to primary fail under real concurrency or scale.",
+          "explanation": "Two naive workarounds break under load: **Routing all reads to Primary**: Destroys the `>= 80%` read offload across the 4 replicas, overloading the single writer. **Trusting `Seconds_Behind_Source = 0`**: In MySQL, `0` only means the SQL thread caught up to the I/O thread's *currently fetched* relay log—if the I/O thread is stalled, the replica still serves stale data.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Redis Sticky-Primary Window + GTID Causal Tokens",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Preserve `>= 80%` replica offload while guaranteeing RYOW and `< 50 ms` read bounds: **Sticky-Primary Redis Window (`ryow:user:{id}`)**: On `PATCH`, set a short Redis key (`TTL = 5 s`) after the DB commits. While present, `GET` routes directly to the Primary (zero replica lag). **GTID Causal Verification**: Return `gtid_executed` from the Primary commit (`source_uuid:tx_id`).",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "wal-mvcc",
+            "eyebrow": "RYOW Routing Architecture",
+            "title": "Sticky-Primary Window & Bounded GTID Wait",
+            "nodes": [
+              {
+                "label": "FastAPI + SQLAlchemy Router",
+                "role": "Checks ryow:user:{id} + GTID"
+              },
+              {
+                "label": "Redis Sticky Window (5s TTL)",
+                "role": "Routes recent writers to Primary"
+              },
+              {
+                "label": "MySQL Primary (Writer)",
+                "role": "Emits gtid_executed token"
+              },
+              {
+                "label": "4x Read Replicas (>=80% load)",
+                "role": "WAIT_FOR_EXECUTED_GTID_SET(50ms)"
+              }
+            ],
+            "cards": [
+              {
+                "label": "5s Sticky Window",
+                "detail": "Recent mutators read from Primary for 5s, eliminating replica lag on immediate page reloads."
+              },
+              {
+                "label": "50ms GTID Gate",
+                "detail": "If a replica has not applied the caller's GTID within 50ms, fall back to Primary immediately."
+              },
+              {
+                "label": "Security-Critical Paths",
+                "detail": "RBAC permission checks bypass stale replicas or read from Primary/consistent cache."
+              }
+            ],
+            "summary": "Combining a 5s Redis sticky-primary flag with a 50ms GTID wait guarantees RYOW without sacrificing 80%+ replica offload."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Combine a short Redis sticky-primary window (`ryow:user:{id}`) with GTID-verified reads (`WAIT_FOR_EXECUTED_GTID_SET`) and write-through cache invalidation."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** A MySQL 8.0 topology with 1 primary writer and 4 asynchronous GTID read replicas serves 8,500 RPS cleanly—until analytics exports or DDL push `Seconds_Behind_Source` to `400 ms–3.2 s`.\n\n**Visual & Structural Flow:** Depicts PATCH Primary -> Immediate GET Hits Lagging Replica (FastAPI Client -> MySQL Primary -> Read Replica); Sticky-Primary Window & Bounded GTID Wait (FastAPI + SQLAlchemy Router -> Redis Sticky Window (5s TTL) -> MySQL Primary (Writer) -> 4x Read Replicas (>=80% load)).\n\n**Trade-Offs & Production:** Two naive workarounds break under load: **Routing all reads to Primary**: Destroys the `>= 80%` read offload across the 4 replicas, overloading the single writer. Causal session consistency is essential in read-heavy, single-writer relational architectures: **Identity, MFA & RBAC Services**: Guarantees revoked tokens/roles take effect immediately.\n\n**Failure Modes & Application:** Causal session consistency is essential in read-heavy, single-writer relational architectures: **Identity, MFA & RBAC Services**: Guarantees revoked tokens/roles take effect immediately.",
+      "spark": {
+        "summary": "MySQL 8.0 InnoDB GTID replica lag (400 ms–3.2 s) causes users updating MFA numbers or RBAC roles to see stale pre-update state on immediate refresh.",
+        "keyTakeaway": "Combine a short Redis sticky-primary window (`ryow:user:{id}`) with GTID-verified reads (`WAIT_FOR_EXECUTED_GTID_SET`) and write-through cache invalidation."
+      }
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** MySQL 8.0 InnoDB GTID replica lag (400 ms–3.2 s) causes users updating MFA numbers or RBAC roles to see stale pre-update state on immediate refresh.\n\n**Production Trade-Offs:** Two naive workarounds break under load: **Routing all reads to Primary**: Destroys the `>= 80%` read offload across the 4 replicas, overloading the single writer.\n\n**Failure Modes & Edge Cases:** Causal session consistency is essential in read-heavy, single-writer relational architectures: **Identity, MFA & RBAC Services**: Guarantees revoked tokens/roles take effect immediately.\n\n**Principal Takeaway:** Combine a short Redis sticky-primary window (`ryow:user:{id}`) with GTID-verified reads (`WAIT_FOR_EXECUTED_GTID_SET`) and write-through cache invalidation.",
+      "spark": {
+        "summary": "MySQL 8.0 InnoDB GTID replica lag (400 ms–3.2 s) causes users updating MFA numbers or RBAC roles to see stale pre-update state on immediate refresh.",
+        "keyTakeaway": "Combine a short Redis sticky-primary window (`ryow:user:{id}`) with GTID-verified reads (`WAIT_FOR_EXECUTED_GTID_SET`) and write-through cache invalidation."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why async replica lag breaks Read-Your-Own-Writes",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why async replica lag breaks Read-Your-Own-Writes works from first principles.",
+          "explanation": "A MySQL 8.0 topology with 1 primary writer and 4 asynchronous GTID read replicas serves 8,500 RPS cleanly—until analytics exports or DDL push `Seconds_Behind_Source` to `400 ms–3.2 s`. When a user updates their MFA phone number or RBAC permissions via `PATCH /v1/users/{id}` and immediately reloads `GET /v1/users/{id}`, routing the read to a lagging replica returns stale pre-update state.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Duplicate submissions and stale RBAC authorization checks",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without Duplicate submissions and stale RBAC authorization checks under real concurrency or scale.",
+          "explanation": "Breaking Read-Your-Own-Writes (RYOW) on identity and security paths causes immediate incidents:\n\n1. **Security Vulnerability**: Revoked RBAC permissions (`GET /v1/users/{id}/permissions`) continue to authorize requests for up to 3.2 seconds.\n2. **UX Confusion & Retries**: Users see their old MFA phone number after saving and resubmit the form repeatedly.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Async Replica Lag Race",
+            "title": "PATCH Primary -> Immediate GET Hits Lagging Replica",
+            "actors": [
+              {
+                "id": "app",
+                "label": "FastAPI Client"
+              },
+              {
+                "id": "pri",
+                "label": "MySQL Primary"
+              },
+              {
+                "id": "rep",
+                "label": "Read Replica"
+              }
+            ],
+            "events": [
+              {
+                "from": "app",
+                "to": "pri",
+                "label": "PATCH /users/42 (revoke admin)",
+                "status": "ok"
+              },
+              {
+                "from": "pri",
+                "to": "app",
+                "label": "200 OK (GTID uuid:901)",
+                "status": "ok"
+              },
+              {
+                "from": "pri",
+                "to": "rep",
+                "label": "Async binlog lag (1.2s)",
+                "status": "warn"
+              },
+              {
+                "from": "app",
+                "to": "rep",
+                "label": "GET /users/42/permissions",
+                "status": "warn"
+              },
+              {
+                "from": "rep",
+                "to": "app",
+                "label": "Returns stale admin=true!",
+                "status": "fail"
+              }
+            ],
+            "summary": "Routing an immediate post-write GET to an asynchronous replica exposes revoked permissions during the replication lag window."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Why Seconds_Behind_Source=0 and routing all reads to primary fail",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "The problem: see what breaks without Why Seconds_Behind_Source=0 and routing all reads to primary fail under real concurrency or scale.",
+          "explanation": "Two naive workarounds break under load:\n\n- **Routing all reads to Primary**: Destroys the `>= 80%` read offload across the 4 replicas, overloading the single writer.\n- **Trusting `Seconds_Behind_Source = 0`**: In MySQL, `0` only means the SQL thread caught up to the I/O thread's *currently fetched* relay log—if the I/O thread is stalled, the replica still serves stale data.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Redis Sticky-Primary Window + GTID Causal Tokens",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Preserve `>= 80%` replica offload while guaranteeing RYOW and `< 50 ms` read bounds:\n\n- **Sticky-Primary Redis Window (`ryow:user:{id}`)**: On `PATCH`, set a short Redis key (`TTL = 5 s`) after the DB commits. While present, `GET` routes directly to the Primary (zero replica lag).\n- **GTID Causal Verification**: Return `gtid_executed` from the Primary commit (`source_uuid:tx_id`). Replicas run `SELECT WAIT_FOR_EXECUTED_GTID_SET(gtid, 0.05)` (50 ms max); if it times out (`!= 0`), fail over that single read to Primary.\n- **Write-Through Cache Invalidation**: Delete/update Redis *after* DB commit (never before) so concurrent reads never repopulate Redis from a stale replica.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "wal-mvcc",
+            "eyebrow": "RYOW Routing Architecture",
+            "title": "Sticky-Primary Window & Bounded GTID Wait",
+            "nodes": [
+              {
+                "label": "FastAPI + SQLAlchemy Router",
+                "role": "Checks ryow:user:{id} + GTID"
+              },
+              {
+                "label": "Redis Sticky Window (5s TTL)",
+                "role": "Routes recent writers to Primary"
+              },
+              {
+                "label": "MySQL Primary (Writer)",
+                "role": "Emits gtid_executed token"
+              },
+              {
+                "label": "4x Read Replicas (>=80% load)",
+                "role": "WAIT_FOR_EXECUTED_GTID_SET(50ms)"
+              }
+            ],
+            "cards": [
+              {
+                "label": "5s Sticky Window",
+                "detail": "Recent mutators read from Primary for 5s, eliminating replica lag on immediate page reloads."
+              },
+              {
+                "label": "50ms GTID Gate",
+                "detail": "If a replica has not applied the caller's GTID within 50ms, fall back to Primary immediately."
+              },
+              {
+                "label": "Security-Critical Paths",
+                "detail": "RBAC permission checks bypass stale replicas or read from Primary/consistent cache."
+              }
+            ],
+            "summary": "Combining a 5s Redis sticky-primary flag with a 50ms GTID wait guarantees RYOW without sacrificing 80%+ replica offload."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where Read-Your-Own-Writes patterns are used in production",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Causal session consistency is essential in read-heavy, single-writer relational architectures:\n\n- **Identity, MFA & RBAC Services**: Guarantees revoked tokens/roles take effect immediately.\n- **E-Commerce Cart & Profile Updates**: Ensures users see their newly added address or payment method.\n- **Multi-Region Read Replicas**: Uses LSN/GTID watermarks in Postgres/MySQL to avoid global cross-region locks.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Combine a short Redis sticky-primary window (`ryow:user:{id}`) with GTID-verified reads (`WAIT_FOR_EXECUTED_GTID_SET`) and write-through cache invalidation."
+    }
+  }
+}

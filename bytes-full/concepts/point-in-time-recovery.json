@@ -1,0 +1,740 @@
+{
+  "id": "concept-point-in-time-recovery",
+  "slug": "point-in-time-recovery",
+  "name": "Point-in-Time Recovery",
+  "domain": "Databases & Storage Engines",
+  "tagline": "Combining physical base backups with continuous WAL/binlog archiving to rewind a database to the exact instant before logical corruption.",
+  "purpose": "Build a progressive mental model of Point-in-Time Recovery (PITR)—from why snapshots and replicas fail against `DROP TABLE` to targeting exact LSNs and timelines safely.",
+  "spark": {
+    "summary": "Point-in-time recovery (PITR) pairs periodic physical base backups with continuous transaction log archiving (such as PostgreSQL WAL or MySQL binlogs) so you can rewind a database to any exact second, transaction ID, or log sequence number before a destructive event.",
+    "keyTakeaway": "Snapshots alone lose everything written since the last backup; PITR bounds data loss to your log-shipping interval by replaying committed changes up to the exact instant before corruption.",
+    "byteSummary": "**Core Mechanics:** Every ACID database writes state changes to an append-only transaction log (Write-Ahead Log in PostgreSQL, Redo/Binlog in MySQL) before dirty pages hit data files.\n\n**Visual & Structural Flow:** Depicts PITR Restoration Architecture (Base Snapshot + WAL Stream) (Base Backup (02:00) -> S3 WAL Archive -> Target Stop (11:14:07) -> Timeline 00000002); Non-Destructive PITR Replay & Verification Sequence (SRE / Operator -> S3 (pgBackRest) -> Recovery Cluster -> Live Primary).\n\n**Trade-Offs & Production:** Balance RPO, RTO on multi-terabyte databases, and operational complexity. A 400 GB Postgres 16 cluster takes a `pgBackRest` full backup at 02:00 UTC and ships WALs to S3.\n\n**Failure Modes & Application:** Explore WAL internals, PostgreSQL maintenance, and multi-region disaster recovery."
+  },
+  "learningJourney": [
+    {
+      "id": "01-what-it-is",
+      "eyebrow": "STAGE 01 · WHAT IT IS",
+      "title": "What is Point-in-Time Recovery (PITR)",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": "Every ACID database writes state changes to an append-only transaction log (Write-Ahead Log in PostgreSQL, Redo/Binlog in MySQL) before dirty pages hit data files. **PITR** turns that log into an out-of-band time machine using two artifacts: a consistent **physical base backup** (`pg_basebackup` / `pgBackRest`) and an **unbroken chain of archived 16 MB WAL segments** starting from the backup's start LSN.\n\nDuring recovery, you restore the base backup into a fresh cluster and replay WAL up to `recovery_target_time`, `recovery_target_xid`, `recovery_target_lsn`, or a named `pg_create_restore_point(...)`.",
+      "sectionDiagram": {
+        "kind": "wal-mvcc",
+        "eyebrow": "Base Backup + WAL Replay",
+        "title": "PITR Restoration Architecture (Base Snapshot + WAL Stream)",
+        "nodes": [
+          {
+            "id": "base",
+            "label": "Base Backup (02:00)",
+            "role": "Start LSN 42/80000028"
+          },
+          {
+            "id": "wal",
+            "label": "S3 WAL Archive",
+            "role": "Continuous 16MB segs"
+          },
+          {
+            "id": "target",
+            "label": "Target Stop (11:14:07)",
+            "role": "action = 'pause'"
+          },
+          {
+            "id": "new",
+            "label": "Timeline 00000002",
+            "role": "Verified & Promoted"
+          }
+        ],
+        "edges": [
+          {
+            "label": "restore + replay WAL"
+          },
+          {
+            "label": "stop before bad XID"
+          }
+        ],
+        "cards": [
+          {
+            "label": "1. Unbroken Chain",
+            "detail": "Every 16 MB WAL segment between the base backup LSN and target time must exist in object storage."
+          },
+          {
+            "label": "2. Pause & Verify",
+            "detail": "Set recovery_target_action = 'pause' to run read-only SELECT checks before promoting."
+          },
+          {
+            "label": "3. Timeline Isolation",
+            "detail": "Promotion increments the timeline ID (00000002) so new writes never overwrite Timeline 1 WAL."
+          }
+        ],
+        "summary": "Base backups bound RTO, while continuous WAL archiving bounds RPO to seconds or minutes."
+      },
+      "purpose": "The mechanism: understand how Point-in-Time Recovery (PITR) works from first principles."
+    },
+    {
+      "id": "02-why-we-need-it",
+      "eyebrow": "STAGE 02 · WHY WE NEED IT",
+      "title": "Why we need PITR (and why Replicas do not save you)",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": "Daily `pg_dump` or storage snapshots leave up to 24 hours of unrecoverable data loss. Worse, **streaming replication and Multi-AZ standbys do not protect against human or application errors**: an accidental `TRUNCATE TABLE`, `DELETE` without `WHERE`, or ransomware wipe replicates to every standby in milliseconds. Only PITR lets you rewind to the exact transaction before destruction.",
+      "ideas": [
+        {
+          "title": "An Untested Archive Is a Broken Archive",
+          "description": "A single missing 16 MB WAL segment halts replay at that LSN. Monitor `pg_stat_archiver.failed_count` and run monthly automated restore drills."
+        },
+        {
+          "title": "Named Restore Points Before Risky DDL",
+          "description": "Run `SELECT pg_create_restore_point('pre_migration')` immediately before backfills or migrations so you have an exact, clock-skew-free stop target."
+        }
+      ],
+      "purpose": "The problem: see what breaks without PITR under real concurrency or scale."
+    },
+    {
+      "id": "03-where-it-is-used",
+      "eyebrow": "STAGE 03 · WHERE IT IS USED",
+      "title": "Where PITR is mandatory (and where logical/rebuild suffices)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "Use physical PITR on all authoritative OLTP databases; skip it for ephemeral caches or derived search indexes that rebuild faster from primary sources.",
+      "comparison": [
+        {
+          "choice": "Good Candidate: Production OLTP Clusters (RPO < 5 min)",
+          "benefits": [
+            "Bounds data loss to `archive_timeout` (e.g., 60–300s) and spins up isolated forensic clones at historical timestamps."
+          ],
+          "costs": [
+            "High-write clusters (4,000 TPS -> ~14 GB/hr WAL) require parallel WAL prefetch and object-storage lifecycle tuning."
+          ]
+        },
+        {
+          "choice": "Avoid: Ephemeral Redis Caches & Derived Search Indexes",
+          "benefits": [
+            "Rebuild from the primary OLTP database or Kafka log rather than archiving WALs."
+          ],
+          "costs": [
+            "Archiving volatile cache mutations wastes S3 IOPS and storage."
+          ]
+        },
+        {
+          "choice": "Avoid: Single-Row Oops on a 20 TB Cluster",
+          "benefits": [
+            "If soft-deletes or logical table backups exist, surgical restore avoids replaying terabytes for one row."
+          ],
+          "costs": [
+            "Physical PITR restores the entire cluster separately before you `pg_dump` the recovered table back."
+          ]
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    },
+    {
+      "id": "04-how-it-is-managed",
+      "eyebrow": "STAGE 04 · HOW IT IS MANAGED",
+      "title": "How PITR Archiving & Safe Target Recovery are configured",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "Enable `wal_level = replica`, `archive_mode = on`, and `archive_timeout = 300s` (with `pgBackRest` or `WAL-G` for parallel LZ4/Zstd compression and checksums). During recovery, **always** set `recovery_target_action = 'pause'` first so you never overshoot and promote past the destructive transaction.",
+      "markdownContent": "```ini\n# PostgreSQL postgresql.auto.conf for safe PITR verification\nrestore_command = 'pgbackrest --stanza=prod-pg archive-get %f \"%p\"'\nrecovery_target_time = '2026-11-18 11:14:07.000 UTC'\nrecovery_target_inclusive = false\nrecovery_target_action = 'pause'\nrecovery_target_timeline = 'latest'\n```\n\n```sql\n-- Verify recovered state while paused, then promote explicitly:\nSELECT count(*) FROM users;\nSELECT pg_wal_replay_resume(); -- or pg_promote()\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-alternatives",
+      "eyebrow": "STAGE 05 · ALTERNATIVES",
+      "title": "Alternatives: Physical PITR vs. `pg_dump` vs. Copy-on-Write Snapshots",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": "Balance RPO, RTO on multi-terabyte databases, and operational complexity.",
+      "comparison": [
+        {
+          "choice": "Physical PITR (pgBackRest / WAL-G)",
+          "benefits": [
+            "Sub-second target precision, seconds-to-minutes RPO, and no table-locking SQL parse overhead."
+          ],
+          "costs": [
+            "RTO scales with WAL volume since last base backup unless mitigated with daily incremental backups and parallel prefetch."
+          ]
+        },
+        {
+          "choice": "Logical Backups (`pg_dump`)",
+          "benefits": [
+            "Allows restoring a single dropped table directly into a live database."
+          ],
+          "costs": [
+            "24-hour RPO gap and slow single/parallel SQL restore on >500 GB databases."
+          ]
+        },
+        {
+          "choice": "Cloud CoW Storage Snapshots (RDS/Aurora/ZFS)",
+          "benefits": [
+            "Near-instantaneous volume restore (low RTO) paired with managed WAL shipping."
+          ],
+          "costs": [
+            "Cloud vendor lock-in and higher storage snapshot costs on high-churn volumes."
+          ]
+        }
+      ],
+      "purpose": "The trade-off: compare competing approaches across latency, consistency, and operational cost."
+    },
+    {
+      "id": "06-production-architecture",
+      "eyebrow": "STAGE 06 · PRODUCTION ARCHITECTURE",
+      "title": "Production example: Rewinding Past a 11:14:07 `TRUNCATE`",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": "A 400 GB Postgres 16 cluster takes a `pgBackRest` full backup at 02:00 UTC and ships WALs to S3. At 11:14:07.412 UTC an operator runs `TRUNCATE TABLE users`. Engineers provision an isolated recovery cluster, replay WAL up to `11:14:07.000 UTC` with `action='pause'`, verify `users` rows, promote to Timeline 2, and export the table.",
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Forensic Restore Drill",
+        "title": "Non-Destructive PITR Replay & Verification Sequence",
+        "actors": [
+          {
+            "id": "ops",
+            "label": "SRE / Operator"
+          },
+          {
+            "id": "s3",
+            "label": "S3 (pgBackRest)"
+          },
+          {
+            "id": "clone",
+            "label": "Recovery Cluster"
+          },
+          {
+            "id": "prod",
+            "label": "Live Primary"
+          }
+        ],
+        "events": [
+          {
+            "from": "s3",
+            "to": "clone",
+            "label": "Restore 02:00 base backup",
+            "status": "ok"
+          },
+          {
+            "from": "s3",
+            "to": "clone",
+            "label": "Parallel WAL fetch -> 11:14:07",
+            "status": "ok"
+          },
+          {
+            "from": "clone",
+            "to": "ops",
+            "label": "Pause before TRUNCATE (verify rows)",
+            "status": "warn"
+          },
+          {
+            "from": "clone",
+            "to": "prod",
+            "label": "Promote TL2 + export recovered table",
+            "status": "ok"
+          }
+        ],
+        "summary": "Restoring into an isolated clone with `action='pause'` keeps production's Timeline 1 history intact."
+      },
+      "purpose": "Production architecture: see how the components compose end to end under real load."
+    },
+    {
+      "id": "07-problems-and-further-reading",
+      "eyebrow": "STAGE 07 · PROBLEMS SOLVED & FURTHER DEEP DIVE",
+      "title": "Problems solved by PITR & Related Storage Concepts",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": "Explore WAL internals, PostgreSQL maintenance, and multi-region disaster recovery.",
+      "supportingConcepts": [
+        {
+          "slug": "postgresql-vacuum-and-table-bloat",
+          "title": "Problem: PostgreSQL Vacuum & Table Bloat",
+          "kind": "problem"
+        },
+        {
+          "slug": "postgresql-xid-wraparound-prevention",
+          "title": "Problem: PostgreSQL XID Wraparound Prevention",
+          "kind": "problem"
+        },
+        {
+          "slug": "acid-transaction-fundamentals",
+          "title": "Concept: ACID Transaction Fundamentals",
+          "kind": "concept"
+        },
+        {
+          "slug": "multi-region-disaster-recovery",
+          "title": "Concept: Multi-Region Disaster Recovery",
+          "kind": "concept"
+        }
+      ],
+      "purpose": "Applied problems: connect these internals to concrete system design and debugging scenarios."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "When configuring a PostgreSQL PITR restore to recover from an accidental `DROP TABLE`, why should you set `recovery_target_action = 'pause'` instead of `'promote'`?",
+      "options": [
+        {
+          "id": "a",
+          "text": "It lets you run read-only `SELECT` queries to verify you stopped *before* the `DROP TABLE` without advancing to a new timeline prematurely",
+          "correct": true,
+          "feedback": "Correct: if you overshoot the target with `'promote'`, you must wipe and re-restore from the base backup."
+        },
+        {
+          "id": "b",
+          "text": "Because `'promote'` deletes all archived WAL files from S3",
+          "correct": false,
+          "feedback": "Promotion creates a new timeline, it doesn't delete S3 WALs, but overshooting forces a full re-restore."
+        },
+        {
+          "id": "c",
+          "text": "Because `'pause'` automatically merges recovered rows back into the live primary",
+          "correct": false,
+          "feedback": "You must still verify and export/cut over manually after promotion."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "When configuring a PostgreSQL PITR restore to recover from an accidental `DROP TABLE`, why should you set `recovery_target_action = 'pause'` instead of `'promote'`?",
+        "options": [
+          {
+            "id": "a",
+            "text": "It lets you run read-only `SELECT` queries to verify you stopped *before* the `DROP TABLE` without advancing to a new timeline prematurely",
+            "correct": true,
+            "feedback": "Correct: if you overshoot the target with `'promote'`, you must wipe and re-restore from the base backup."
+          },
+          {
+            "id": "b",
+            "text": "Because `'promote'` deletes all archived WAL files from S3",
+            "correct": false,
+            "feedback": "Promotion creates a new timeline, it doesn't delete S3 WALs, but overshooting forces a full re-restore."
+          },
+          {
+            "id": "c",
+            "text": "Because `'pause'` automatically merges recovered rows back into the live primary",
+            "correct": false,
+            "feedback": "You must still verify and export/cut over manually after promotion."
+          }
+        ]
+      },
+      {
+        "question": "What is the main benefit—and corresponding operational trade-off—of using Good Candidate: Production OLTP Clusters (RPO < 5 min) in Point-in-Time Recovery?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Advantage: Rebuild from the primary OLTP database or Kafka log rather than archiving WALs. It has zero operational or latency overhead compared to Avoid: Ephemeral Redis Caches & Derived Search Indexes.",
+            "correct": false,
+            "feedback": "Not quite: that describes Avoid: Ephemeral Redis Caches & Derived Search Indexes, whereas Good Candidate: Production OLTP Clusters (RPO < 5 min) specifically trades off: High-write clusters (4,000 TPS -> ~14 GB/hr WAL) require parallel WAL prefetch and object-storage lifecycle tuning."
+          },
+          {
+            "id": "b",
+            "text": "Relying solely on Single-Row Oops on a 20 TB Cluster avoids all operational and latency trade-offs",
+            "correct": false,
+            "feedback": "Incorrect: every production option in Point-in-Time Recovery carries concrete latency, consistency, or operational costs."
+          },
+          {
+            "id": "c",
+            "text": "Advantage: Bounds data loss to archive_timeout (e.g., 60–300s) and spins up isolated forensic clones at historical timestamps. Cost: High-write clusters (4,000 TPS -> ~14 GB/hr WAL) require parallel WAL prefetch and object-storage lifecycle tuning.",
+            "correct": true,
+            "feedback": "Correct: Good Candidate: Production OLTP Clusters (RPO < 5 min) delivers bounds data loss to archive_timeout (e.g., 60–300s) and spins up isolated forensic clones at historical timestamps. while requiring you to manage high-write clusters (4,000 TPS -> ~14 GB/hr WAL) require parallel WAL prefetch and object-storage lifecycle tuning."
+          }
+        ]
+      },
+      {
+        "question": "Why is Named Restore Points Before Risky DDL critical when operating Point-in-Time Recovery in production?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Run SELECT pg_create_restore_point('pre_migration') immediately before backfills or migrations so you have an exact, clock-skew-free stop target.",
+            "correct": true,
+            "feedback": "Correct: Run SELECT pg_create_restore_point('pre_migration') immediately before backfills or migrations so you have an exact, clock-skew-free stop target."
+          },
+          {
+            "id": "b",
+            "text": "It only applies during local unit testing and can be disabled in production to save memory.",
+            "correct": false,
+            "feedback": "Incorrect: 'Named Restore Points Before Risky DDL' directly governs production reliability and correctness under real traffic."
+          },
+          {
+            "id": "c",
+            "text": "It replaces the need for observability, timeouts, or capacity planning across Point-in-Time Recovery.",
+            "correct": false,
+            "feedback": "Incorrect: 'Named Restore Points Before Risky DDL' works alongside proper bounds, monitoring, and failure isolation."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** Every ACID database writes state changes to an append-only transaction log (Write-Ahead Log in PostgreSQL, Redo/Binlog in MySQL) before dirty pages hit data files.\n\n**How It Flows:** Think of Point-in-Time Recovery as a clear step-by-step chain: Base Backup (02:00) -> S3 WAL Archive -> Target Stop (11:14:07) -> Timeline 00000002 -> SRE / Operator.\n\n**Why Beginners Should Care:** Snapshots alone lose everything written since the last backup; PITR bounds data loss to your log-shipping interval by replaying committed changes up to the exact instant before corruption.",
+      "spark": {
+        "summary": "Every ACID database writes state changes to an append-only transaction log (Write-Ahead Log in PostgreSQL, Redo/Binlog in MySQL) before dirty pages hit data files.",
+        "keyTakeaway": "Snapshots alone lose everything written since the last backup; PITR bounds data loss to your log-shipping interval by replaying committed changes up to the exact instant before corruption."
+      },
+      "learningJourney": [
+        {
+          "id": "01-what-it-is",
+          "title": "What is Point-in-Time Recovery (PITR)",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Point-in-Time Recovery (PITR) works from first principles.",
+          "explanation": "Every ACID database writes state changes to an append-only transaction log (Write-Ahead Log in PostgreSQL, Redo/Binlog in MySQL) before dirty pages hit data files. **PITR** turns that log into an out-of-band time machine using two artifacts: a consistent **physical base backup** (`pg_basebackup` / `pgBackRest`) and an **unbroken chain of archived 16 MB WAL segments** starting from the backup's start LSN.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "wal-mvcc",
+            "eyebrow": "Base Backup + WAL Replay",
+            "title": "PITR Restoration Architecture (Base Snapshot + WAL Stream)",
+            "nodes": [
+              {
+                "id": "base",
+                "label": "Base Backup (02:00)",
+                "role": "Start LSN 42/80000028"
+              },
+              {
+                "id": "wal",
+                "label": "S3 WAL Archive",
+                "role": "Continuous 16MB segs"
+              },
+              {
+                "id": "target",
+                "label": "Target Stop (11:14:07)",
+                "role": "action = 'pause'"
+              },
+              {
+                "id": "new",
+                "label": "Timeline 00000002",
+                "role": "Verified & Promoted"
+              }
+            ],
+            "edges": [
+              {
+                "label": "restore + replay WAL"
+              },
+              {
+                "label": "stop before bad XID"
+              }
+            ],
+            "cards": [
+              {
+                "label": "1. Unbroken Chain",
+                "detail": "Every 16 MB WAL segment between the base backup LSN and target time must exist in object storage."
+              },
+              {
+                "label": "2. Pause & Verify",
+                "detail": "Set recovery_target_action = 'pause' to run read-only SELECT checks before promoting."
+              },
+              {
+                "label": "3. Timeline Isolation",
+                "detail": "Promotion increments the timeline ID (00000002) so new writes never overwrite Timeline 1 WAL."
+              }
+            ],
+            "summary": "Base backups bound RTO, while continuous WAL archiving bounds RPO to seconds or minutes."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-why-we-need-it",
+          "title": "Why we need PITR (and why Replicas do not save you)",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without PITR under real concurrency or scale.",
+          "explanation": "Daily `pg_dump` or storage snapshots leave up to 24 hours of unrecoverable data loss. Worse, **streaming replication and Multi-AZ standbys do not protect against human or application errors**: an accidental `TRUNCATE TABLE`, `DELETE` without `WHERE`, or ransomware wipe replicates to every standby in milliseconds. Only PITR lets you rewind to the exact transaction before destruction.",
+          "ideas": [
+            {
+              "title": "An Untested Archive Is a Broken Archive",
+              "description": "A single missing 16 MB WAL segment halts replay at that LSN. Monitor `pg_stat_archiver.failed_count` and run monthly automated restore drills."
+            },
+            {
+              "title": "Named Restore Points Before Risky DDL",
+              "description": "Run `SELECT pg_create_restore_point('pre_migration')` immediately before backfills or migrations so you have an exact, clock-skew-free stop target."
+            }
+          ],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-where-it-is-used",
+          "title": "Where PITR is mandatory (and where logical/rebuild suffices)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Use physical PITR on all authoritative OLTP databases; skip it for ephemeral caches or derived search indexes that rebuild faster from primary sources.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "06-production-architecture",
+          "title": "Production example: Rewinding Past a 11:14:07 `TRUNCATE`",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Production architecture: see how the components compose end to end under real load.",
+          "explanation": "A 400 GB Postgres 16 cluster takes a `pgBackRest` full backup at 02:00 UTC and ships WALs to S3. At 11:14:07.412 UTC an operator runs `TRUNCATE TABLE users`. Engineers provision an isolated recovery cluster, replay WAL up to `11:14:07.000 UTC` with `action='pause'`, verify `users` rows, promote to Timeline 2, and export the table.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Forensic Restore Drill",
+            "title": "Non-Destructive PITR Replay & Verification Sequence",
+            "actors": [
+              {
+                "id": "ops",
+                "label": "SRE / Operator"
+              },
+              {
+                "id": "s3",
+                "label": "S3 (pgBackRest)"
+              },
+              {
+                "id": "clone",
+                "label": "Recovery Cluster"
+              },
+              {
+                "id": "prod",
+                "label": "Live Primary"
+              }
+            ],
+            "events": [
+              {
+                "from": "s3",
+                "to": "clone",
+                "label": "Restore 02:00 base backup",
+                "status": "ok"
+              },
+              {
+                "from": "s3",
+                "to": "clone",
+                "label": "Parallel WAL fetch -> 11:14:07",
+                "status": "ok"
+              },
+              {
+                "from": "clone",
+                "to": "ops",
+                "label": "Pause before TRUNCATE (verify rows)",
+                "status": "warn"
+              },
+              {
+                "from": "clone",
+                "to": "prod",
+                "label": "Promote TL2 + export recovered table",
+                "status": "ok"
+              }
+            ],
+            "summary": "Restoring into an isolated clone with `action='pause'` keeps production's Timeline 1 history intact."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Snapshots alone lose everything written since the last backup; PITR bounds data loss to your log-shipping interval by replaying committed changes up to the exact instant before corruption."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** Every ACID database writes state changes to an append-only transaction log (Write-Ahead Log in PostgreSQL, Redo/Binlog in MySQL) before dirty pages hit data files.\n\n**Visual & Structural Flow:** Depicts PITR Restoration Architecture (Base Snapshot + WAL Stream) (Base Backup (02:00) -> S3 WAL Archive -> Target Stop (11:14:07) -> Timeline 00000002); Non-Destructive PITR Replay & Verification Sequence (SRE / Operator -> S3 (pgBackRest) -> Recovery Cluster -> Live Primary).\n\n**Trade-Offs & Production:** Balance RPO, RTO on multi-terabyte databases, and operational complexity. A 400 GB Postgres 16 cluster takes a `pgBackRest` full backup at 02:00 UTC and ships WALs to S3.\n\n**Failure Modes & Application:** Explore WAL internals, PostgreSQL maintenance, and multi-region disaster recovery.",
+      "spark": {
+        "summary": "Point-in-time recovery (PITR) pairs periodic physical base backups with continuous transaction log archiving (such as PostgreSQL WAL or MySQL binlogs) so you can rewind a database to any exact second, transaction ID, or log sequence number before a destructive event.",
+        "keyTakeaway": "Snapshots alone lose everything written since the last backup; PITR bounds data loss to your log-shipping interval by replaying committed changes up to the exact instant before corruption."
+      }
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** Point-in-time recovery (PITR) pairs periodic physical base backups with continuous transaction log archiving (such as PostgreSQL WAL or MySQL binlogs) so you can rewind a database to any exact second, transaction ID, or log sequence number before a destructive event.\n\n**Production Trade-Offs:** Enable `wal_level = replica`, `archive_mode = on`, and `archive_timeout = 300s` (with `pgBackRest` or `WAL-G` for parallel LZ4/Zstd compression and checksums).\n\n**Failure Modes & Edge Cases:** Explore WAL internals, PostgreSQL maintenance, and multi-region disaster recovery.\n\n**Principal Takeaway:** Snapshots alone lose everything written since the last backup; PITR bounds data loss to your log-shipping interval by replaying committed changes up to the exact instant before corruption.",
+      "spark": {
+        "summary": "Point-in-time recovery (PITR) pairs periodic physical base backups with continuous transaction log archiving (such as PostgreSQL WAL or MySQL binlogs) so you can rewind a database to any exact second, transaction ID, or log sequence number before a destructive event.",
+        "keyTakeaway": "Snapshots alone lose everything written since the last backup; PITR bounds data loss to your log-shipping interval by replaying committed changes up to the exact instant before corruption."
+      },
+      "learningJourney": [
+        {
+          "id": "01-what-it-is",
+          "title": "What is Point-in-Time Recovery (PITR)",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Point-in-Time Recovery (PITR) works from first principles.",
+          "explanation": "Every ACID database writes state changes to an append-only transaction log (Write-Ahead Log in PostgreSQL, Redo/Binlog in MySQL) before dirty pages hit data files. **PITR** turns that log into an out-of-band time machine using two artifacts: a consistent **physical base backup** (`pg_basebackup` / `pgBackRest`) and an **unbroken chain of archived 16 MB WAL segments** starting from the backup's start LSN.\n\nDuring recovery, you restore the base backup into a fresh cluster and replay WAL up to `recovery_target_time`, `recovery_target_xid`, `recovery_target_lsn`, or a named `pg_create_restore_point(...)`.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "wal-mvcc",
+            "eyebrow": "Base Backup + WAL Replay",
+            "title": "PITR Restoration Architecture (Base Snapshot + WAL Stream)",
+            "nodes": [
+              {
+                "id": "base",
+                "label": "Base Backup (02:00)",
+                "role": "Start LSN 42/80000028"
+              },
+              {
+                "id": "wal",
+                "label": "S3 WAL Archive",
+                "role": "Continuous 16MB segs"
+              },
+              {
+                "id": "target",
+                "label": "Target Stop (11:14:07)",
+                "role": "action = 'pause'"
+              },
+              {
+                "id": "new",
+                "label": "Timeline 00000002",
+                "role": "Verified & Promoted"
+              }
+            ],
+            "edges": [
+              {
+                "label": "restore + replay WAL"
+              },
+              {
+                "label": "stop before bad XID"
+              }
+            ],
+            "cards": [
+              {
+                "label": "1. Unbroken Chain",
+                "detail": "Every 16 MB WAL segment between the base backup LSN and target time must exist in object storage."
+              },
+              {
+                "label": "2. Pause & Verify",
+                "detail": "Set recovery_target_action = 'pause' to run read-only SELECT checks before promoting."
+              },
+              {
+                "label": "3. Timeline Isolation",
+                "detail": "Promotion increments the timeline ID (00000002) so new writes never overwrite Timeline 1 WAL."
+              }
+            ],
+            "summary": "Base backups bound RTO, while continuous WAL archiving bounds RPO to seconds or minutes."
+          },
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-why-we-need-it",
+          "title": "Why we need PITR (and why Replicas do not save you)",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without PITR under real concurrency or scale.",
+          "explanation": "Daily `pg_dump` or storage snapshots leave up to 24 hours of unrecoverable data loss. Worse, **streaming replication and Multi-AZ standbys do not protect against human or application errors**: an accidental `TRUNCATE TABLE`, `DELETE` without `WHERE`, or ransomware wipe replicates to every standby in milliseconds. Only PITR lets you rewind to the exact transaction before destruction.",
+          "caveats": null,
+          "ideas": [
+            {
+              "title": "An Untested Archive Is a Broken Archive",
+              "description": "A single missing 16 MB WAL segment halts replay at that LSN. Monitor `pg_stat_archiver.failed_count` and run monthly automated restore drills."
+            },
+            {
+              "title": "Named Restore Points Before Risky DDL",
+              "description": "Run `SELECT pg_create_restore_point('pre_migration')` immediately before backfills or migrations so you have an exact, clock-skew-free stop target."
+            }
+          ],
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "03-where-it-is-used",
+          "title": "Where PITR is mandatory (and where logical/rebuild suffices)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Use physical PITR on all authoritative OLTP databases; skip it for ephemeral caches or derived search indexes that rebuild faster from primary sources.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-how-it-is-managed",
+          "title": "How PITR Archiving & Safe Target Recovery are configured",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Enable `wal_level = replica`, `archive_mode = on`, and `archive_timeout = 300s` (with `pgBackRest` or `WAL-G` for parallel LZ4/Zstd compression and checksums). During recovery, **always** set `recovery_target_action = 'pause'` first so you never overshoot and promote past the destructive transaction.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "05-alternatives",
+          "title": "Alternatives: Physical PITR vs. `pg_dump` vs. Copy-on-Write Snapshots",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "The trade-off: compare competing approaches across latency, consistency, and operational cost.",
+          "explanation": "Balance RPO, RTO on multi-terabyte databases, and operational complexity.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "06-production-architecture",
+          "title": "Production example: Rewinding Past a 11:14:07 `TRUNCATE`",
+          "eyebrow": "Advanced Path · Stage 06",
+          "purpose": "Production architecture: see how the components compose end to end under real load.",
+          "explanation": "A 400 GB Postgres 16 cluster takes a `pgBackRest` full backup at 02:00 UTC and ships WALs to S3. At 11:14:07.412 UTC an operator runs `TRUNCATE TABLE users`. Engineers provision an isolated recovery cluster, replay WAL up to `11:14:07.000 UTC` with `action='pause'`, verify `users` rows, promote to Timeline 2, and export the table.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Forensic Restore Drill",
+            "title": "Non-Destructive PITR Replay & Verification Sequence",
+            "actors": [
+              {
+                "id": "ops",
+                "label": "SRE / Operator"
+              },
+              {
+                "id": "s3",
+                "label": "S3 (pgBackRest)"
+              },
+              {
+                "id": "clone",
+                "label": "Recovery Cluster"
+              },
+              {
+                "id": "prod",
+                "label": "Live Primary"
+              }
+            ],
+            "events": [
+              {
+                "from": "s3",
+                "to": "clone",
+                "label": "Restore 02:00 base backup",
+                "status": "ok"
+              },
+              {
+                "from": "s3",
+                "to": "clone",
+                "label": "Parallel WAL fetch -> 11:14:07",
+                "status": "ok"
+              },
+              {
+                "from": "clone",
+                "to": "ops",
+                "label": "Pause before TRUNCATE (verify rows)",
+                "status": "warn"
+              },
+              {
+                "from": "clone",
+                "to": "prod",
+                "label": "Promote TL2 + export recovered table",
+                "status": "ok"
+              }
+            ],
+            "summary": "Restoring into an isolated clone with `action='pause'` keeps production's Timeline 1 history intact."
+          },
+          "level": "L7 · STAFF / PRINCIPAL"
+        },
+        {
+          "id": "07-problems-and-further-reading",
+          "title": "Problems solved by PITR & Related Storage Concepts",
+          "eyebrow": "Advanced Path · Stage 07",
+          "purpose": "Applied problems: connect these internals to concrete system design and debugging scenarios.",
+          "explanation": "Explore WAL internals, PostgreSQL maintenance, and multi-region disaster recovery.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Snapshots alone lose everything written since the last backup; PITR bounds data loss to your log-shipping interval by replaying committed changes up to the exact instant before corruption."
+    }
+  }
+}

@@ -1,0 +1,905 @@
+{
+  "id": "concept-distributed-locking",
+  "slug": "distributed-locking",
+  "name": "Distributed Locking & Redlock Algorithm",
+  "domain": "Distributed Systems",
+  "tagline": "Coordinating mutually exclusive access across independent processes using time-bounded leases and monotonic fencing tokens.",
+  "purpose": "Build a progressive mental model of distributed locking—from why single-node mutexes fail over a network to how production systems combine leases, watchdogs, and fencing tokens.",
+  "spark": {
+    "summary": "Distributed locking coordinates mutually exclusive access to a shared resource across independent processes that share no memory, using a network-accessible lease store such as Redis, etcd, or ZooKeeper.",
+    "keyTakeaway": "A distributed lock is only a time-bounded lease—without monotonic fencing tokens verified by the downstream storage engine, GC pauses or network partitions will still cause split-brain corruption.",
+    "byteSummary": "**Core Mechanics:** On a single machine, a `pthread_mutex` or Java `synchronized` block works because all threads share one kernel, one memory space, and one hardware clock. Across multiple servers, there is no shared memory.\n\n**Visual & Structural Flow:** Depicts Distributed Lock State Machine (UNLOCKED -> LEASED -> EXPIRED / STALE); How GC Pauses Break Leases — And How Fencing Tokens Stop Stale Writes (Worker A -> etcd / Lock -> Worker B -> Fenced DB); 3-Node etcd Raft Lock Cluster + Fenced PostgreSQL Store (etcd Leader -> etcd Follower 1 -> etcd Follower 2 -> Fenced Postgres).\n\n**Trade-Offs & Production:** Choosing a locking mechanism means choosing your failure model. In production payment and inventory pipelines, teams pair an **etcd Lease** (or ZooKeeper ephemeral sequential znode) with **storage-enforced fencing**.\n\n**Failure Modes & Application:** Distributed locking is rarely an end in itself—it is a building block inside high-concurrency system designs."
+  },
+  "learningJourney": [
+    {
+      "id": "01-what-is-distributed-locking",
+      "eyebrow": "STAGE 01 · WHAT IT IS",
+      "title": "What is Distributed Locking",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": "On a single machine, a `pthread_mutex` or Java `synchronized` block works because all threads share one kernel, one memory space, and one hardware clock. Across multiple servers, there is no shared memory. A **distributed lock** is a **time-bounded lease** stored in an external coordination service (such as Redis, etcd, or ZooKeeper) that grants one caller temporary exclusive permission to act on a resource key.\n\nEvery safe distributed lock has four fields: a **resource key** (`lock:invoice:77`), a **globally unique owner token** (`uuid-a`, so only the holder can release it), a **TTL / lease duration** (`PX 30000`, so a crashed holder does not deadlock the cluster forever), and—for correctness-critical writes—a **monotonic fencing token** (`revision = 412`).",
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "Lease Lifecycle",
+        "title": "Distributed Lock State Machine",
+        "states": [
+          {
+            "id": "free",
+            "label": "UNLOCKED",
+            "sublabel": "Key absent in store",
+            "tone": "blue"
+          },
+          {
+            "id": "leased",
+            "label": "LEASED",
+            "sublabel": "Owner UUID + TTL active",
+            "tone": "green"
+          },
+          {
+            "id": "expired",
+            "label": "EXPIRED / STALE",
+            "sublabel": "TTL elapsed; new token",
+            "tone": "amber"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "free",
+            "to": "leased",
+            "label": "SET key uuid NX PX"
+          },
+          {
+            "from": "leased",
+            "to": "free",
+            "label": "Lua: GET==uuid -> DEL"
+          },
+          {
+            "from": "leased",
+            "to": "expired",
+            "label": "GC pause > TTL"
+          },
+          {
+            "from": "expired",
+            "to": "leased",
+            "label": "Next client (token+1)"
+          }
+        ],
+        "summary": "A lock never stays held forever: either the owner atomically releases it with its UUID, or the TTL expires and a new monotonic token is issued."
+      },
+      "purpose": "The mechanism: understand how Distributed Locking works from first principles."
+    },
+    {
+      "id": "02-why-we-need-it",
+      "eyebrow": "STAGE 02 · WHY WE NEED IT",
+      "title": "Why we need Distributed Locking (and why naive locks fail)",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": "When multiple stateless workers process queues, cron jobs, or checkout requests concurrently, two workers can read the same state (`stock = 1` or `invoice = UNPAID`) and both execute an irreversible side effect—double-charging a credit card or overselling the last item. Even if you add a lock, **asynchronous networks and stop-the-world GC pauses** break naive mutual exclusion: Worker A can freeze after acquiring a 10 s lock, wake up at 15 s believing it still holds the lock, and overwrite Worker B's work.",
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Split-Brain Prevention",
+        "title": "How GC Pauses Break Leases — And How Fencing Tokens Stop Stale Writes",
+        "actors": [
+          {
+            "id": "wa",
+            "label": "Worker A"
+          },
+          {
+            "id": "coord",
+            "label": "etcd / Lock"
+          },
+          {
+            "id": "wb",
+            "label": "Worker B"
+          },
+          {
+            "id": "db",
+            "label": "Fenced DB"
+          }
+        ],
+        "events": [
+          {
+            "from": "wa",
+            "to": "coord",
+            "label": "Acquire lease -> token 412",
+            "status": "ok"
+          },
+          {
+            "from": "wa",
+            "to": "wa",
+            "label": "15s JVM GC Pause (TTL=10s)",
+            "status": "warn"
+          },
+          {
+            "from": "wb",
+            "to": "coord",
+            "label": "Acquire expired -> token 413",
+            "status": "ok"
+          },
+          {
+            "from": "wb",
+            "to": "db",
+            "label": "Write + token 413 (committed)",
+            "status": "ok"
+          },
+          {
+            "from": "wa",
+            "to": "db",
+            "label": "Stale write + token 412 (412 < 413!)",
+            "status": "fail"
+          }
+        ],
+        "summary": "Mutual exclusion over an unreliable network is only safe when the storage layer rejects writes carrying a fencing token older than the highest token seen."
+      },
+      "ideas": [
+        {
+          "title": "Efficiency Locks vs. Correctness Locks",
+          "description": "Use an efficiency lock (like single-node Redis or Redlock) when an occasional duplicate execution only wastes CPU or money. Use a correctness lock with monotonic fencing tokens (etcd/ZooKeeper + storage check) when duplicate writes corrupt financial or inventory state."
+        },
+        {
+          "title": "The Slow-vs-Dead Ambiguity",
+          "description": "A lock service cannot tell whether a silent client crashed or is merely paused in GC. That is why every lock must be a finite lease rather than an indefinite hold."
+        }
+      ],
+      "purpose": "The problem: see what breaks without Distributed Locking under real concurrency or scale."
+    },
+    {
+      "id": "03-where-it-is-used",
+      "eyebrow": "STAGE 03 · WHERE IT IS USED",
+      "title": "Where Distributed Locking is used (and where to avoid it)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "Distributed locks belong at **coarse-grained coordination boundaries**, not on every database row. They shine when coordinating external side effects that lack native compare-and-swap primitives, or when electing a single active controller.",
+      "comparison": [
+        {
+          "choice": "Good Candidate: Payment / Provisioning Side Effects",
+          "benefits": [
+            "Prevents duplicate external API calls (Stripe charge, Terraform apply) when paired with idempotency keys."
+          ],
+          "costs": [
+            "Adds 1–20 ms coordination RTT before the external call."
+          ]
+        },
+        {
+          "choice": "Good Candidate: Single-Leader Cron / Compaction",
+          "benefits": [
+            "Ensures only one scheduler or shard rebalancer runs per cluster epoch."
+          ],
+          "costs": [
+            "Requires heartbeat lease renewal while the leader is healthy."
+          ]
+        },
+        {
+          "choice": "Avoid: High-Throughput Row Updates (>10k QPS)",
+          "benefits": [
+            "Use database ACID transactions (`SELECT ... FOR UPDATE`) or optimistic version columns instead."
+          ],
+          "costs": [
+            "External lock contention serializes traffic and destroys tail latency."
+          ]
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    },
+    {
+      "id": "04-how-it-is-managed",
+      "eyebrow": "STAGE 04 · HOW IT IS MANAGED",
+      "title": "How Distributed Locks are acquired, renewed, and released",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "Safe lock management requires atomic primitives at every step of the lifecycle:\n\n1. **Atomic Acquisition**: Never run `SETNX` followed by `EXPIRE`—a crash between the two creates an eternal lock. Always use `SET lock:sku:4829 <uuid> NX PX 30000`.\n2. **Watchdog / Lease Renewal**: If work can outlive the initial TTL, run a background daemon (e.g., Redisson's watchdog) that extends the TTL at `TTL / 3` intervals—and **aborts local work** if renewal fails.\n3. **Atomic Compare-and-Delete Release**: Never issue a blind `DEL lock:sku:4829`. If your lease expired during a pause, `DEL` will delete another worker's active lock. Execute a server-side Lua script that checks `GET == owner_uuid` before deleting.\n4. **Bounded Retries with Jitter**: Contending callers must back off exponentially with full jitter instead of spinning in a tight `while (!acquire())` loop.",
+      "markdownContent": "```lua\n-- Atomic release in Redis: delete ONLY if the caller still owns the token\nif redis.call(\"get\", KEYS[1]) == ARGV[1] then\n  return redis.call(\"del\", KEYS[1])\nelse\n  return 0\nend\n```\n\n```sql\n-- Storage-side fencing token validation (PostgreSQL)\nUPDATE ledger_accounts\nSET balance_cents = balance_cents - :amount,\n    last_fence_token = :fence_token\nWHERE account_id = :account_id\n  AND last_fence_token < :fence_token;\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-alternatives",
+      "eyebrow": "STAGE 05 · ALTERNATIVES",
+      "title": "Alternatives: Redlock vs. Consensus (etcd/ZK) vs. OCC",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": "Choosing a locking mechanism means choosing your failure model. **Redlock** deploys $N = 5$ independent Redis masters and requires acquiring $\\ge 3$ within `TTL - elapsed - clock_drift`. It tolerates up to 2 node crashes without disk fsync, but relies on bounded wall-clock assumptions and emits no monotonic fencing token. **etcd** (Raft) and **ZooKeeper** (Zab) persist state via quorum consensus and emit monotonic `revision` / `zxid` numbers, trading higher write latency (5–20 ms) for linearizable safety.",
+      "comparison": [
+        {
+          "choice": "etcd (Raft) / ZooKeeper (Zab)",
+          "benefits": [
+            "Linearizable quorum + monotonic `revision`/`zxid` fencing tokens; immune to wall-clock jumps."
+          ],
+          "costs": [
+            "5–20 ms write latency (disk fsync + quorum RTT); heavier cluster operations."
+          ]
+        },
+        {
+          "choice": "Redis Redlock (5 Independent Masters)",
+          "benefits": [
+            "Sub-2 ms in-memory latency; survives 2 of 5 Redis node failures without async-replica loss."
+          ],
+          "costs": [
+            "No monotonic fencing token; vulnerable to NTP clock steps and long GC pauses."
+          ]
+        },
+        {
+          "choice": "Optimistic Concurrency Control (Version / ETag)",
+          "benefits": [
+            "Zero external lock store; scales horizontally under low contention."
+          ],
+          "costs": [
+            "Wastes work on conflicts under high contention; cannot guard non-transactional external APIs."
+          ]
+        }
+      ],
+      "purpose": "The trade-off: compare competing approaches across latency, consistency, and operational cost."
+    },
+    {
+      "id": "06-production-architecture",
+      "eyebrow": "STAGE 06 · PRODUCTION ARCHITECTURE",
+      "title": "Production example: Fenced etcd Lock + Storage Guard",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": "In production payment and inventory pipelines, teams pair an **etcd Lease** (or ZooKeeper ephemeral sequential znode) with **storage-enforced fencing**. The lock service provides the monotonic `revision`, and the authoritative database rejects any write whose `fence_token <= last_fence_token`.",
+      "sectionDiagram": {
+        "kind": "quorum-cluster",
+        "eyebrow": "Production Topology",
+        "title": "3-Node etcd Raft Lock Cluster + Fenced PostgreSQL Store",
+        "nodes": [
+          {
+            "id": "leader",
+            "label": "etcd Leader",
+            "role": "Grants Lease + Rev 413"
+          },
+          {
+            "id": "f1",
+            "label": "etcd Follower 1",
+            "role": "Raft Quorum ACK"
+          },
+          {
+            "id": "f2",
+            "label": "etcd Follower 2",
+            "role": "Raft Quorum ACK"
+          },
+          {
+            "id": "db",
+            "label": "Fenced Postgres",
+            "role": "WHERE fence < 413"
+          }
+        ],
+        "edges": [
+          {
+            "label": "Raft append + fsync"
+          },
+          {
+            "label": "Quorum committed"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Step 1 — Lease + Token",
+            "detail": "Worker acquires an etcd lease; Raft consensus commits and returns monotonic revision 413."
+          },
+          {
+            "label": "Step 2 — Watchdog KeepAlive",
+            "detail": "Background gRPC stream renews the lease every TTL/3; if renewal drops, the worker aborts its critical section."
+          },
+          {
+            "label": "Step 3 — Storage Fencing",
+            "detail": "Postgres atomically checks last_fence_token < 413 on UPDATE, neutralizing any zombie worker with token 412."
+          }
+        ],
+        "summary": "Consensus issues the monotonic token; the database enforces it."
+      },
+      "purpose": "Production architecture: see how the components compose end to end under real load."
+    },
+    {
+      "id": "07-problems-and-further-reading",
+      "eyebrow": "STAGE 07 · PROBLEMS SOLVED & FURTHER DEEP DIVE",
+      "title": "Problems solved by Distributed Locking & System Design Deep Dives",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": "Distributed locking is rarely an end in itself—it is a building block inside high-concurrency system designs. Explore the concrete engineering problems and full system design architectures below to see how fencing tokens, leases, and idempotency work together in production.",
+      "supportingConcepts": [
+        {
+          "slug": "design-distributed-lock-fencing-tokens",
+          "title": "System Design: Distributed Lock Service with Fencing Tokens",
+          "kind": "problem"
+        },
+        {
+          "slug": "design-ticketmaster-flash-sale-system",
+          "title": "System Design: Ticketmaster Flash Sale Seat Locking",
+          "kind": "problem"
+        },
+        {
+          "slug": "design-movie-ticket-booking-lld",
+          "title": "LLD: Movie Ticket Seat Hold & Concurrency",
+          "kind": "problem"
+        },
+        {
+          "slug": "idempotent-apis-preventing-duplicate-charges",
+          "title": "Problem: Idempotent APIs & Preventing Duplicate Charges",
+          "kind": "problem"
+        },
+        {
+          "slug": "idempotency-and-deduplication",
+          "title": "Concept: Idempotency & Deduplication",
+          "kind": "concept"
+        }
+      ],
+      "purpose": "Applied problems: connect these internals to concrete system design and debugging scenarios."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Worker A acquires a 10 s Redis lock, enters a 15 s GC pause, and wakes up while Worker B now holds the lock. Which mechanism guarantees Worker A's delayed database write cannot corrupt Worker B's update?",
+      "options": [
+        {
+          "id": "a",
+          "text": "Using a Lua compare-and-delete script on unlock",
+          "correct": false,
+          "feedback": "Lua compare-and-delete only protects unlock—Worker A still executes its stale database write before calling unlock."
+        },
+        {
+          "id": "b",
+          "text": "Monotonic fencing tokens validated by the database on write",
+          "correct": true,
+          "feedback": "Correct: the database rejects Worker A's write because its fencing token is lower than Worker B's committed token."
+        },
+        {
+          "id": "c",
+          "text": "Increasing the Redis TTL from 10 s to 30 s",
+          "correct": false,
+          "feedback": "Longer TTLs reduce probability but cannot eliminate unbounded GC pauses or network delays—and they slow down crash recovery."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Worker A acquires a 10 s Redis lock, enters a 15 s GC pause, and wakes up while Worker B now holds the lock. Which mechanism guarantees Worker A's delayed database write cannot corrupt Worker B's update?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Using a Lua compare-and-delete script on unlock",
+            "correct": false,
+            "feedback": "Lua compare-and-delete only protects unlock—Worker A still executes its stale database write before calling unlock."
+          },
+          {
+            "id": "b",
+            "text": "Monotonic fencing tokens validated by the database on write",
+            "correct": true,
+            "feedback": "Correct: the database rejects Worker A's write because its fencing token is lower than Worker B's committed token."
+          },
+          {
+            "id": "c",
+            "text": "Increasing the Redis TTL from 10 s to 30 s",
+            "correct": false,
+            "feedback": "Longer TTLs reduce probability but cannot eliminate unbounded GC pauses or network delays—and they slow down crash recovery."
+          }
+        ]
+      },
+      {
+        "question": "What is the main benefit—and corresponding operational trade-off—of using Good Candidate: Payment / Provisioning Side Effects in Distributed Locking & Redlock Algorithm?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Advantage: Ensures only one scheduler or shard rebalancer runs per cluster epoch. It has zero operational or latency overhead compared to Good Candidate: Single-Leader Cron / Compaction.",
+            "correct": false,
+            "feedback": "Not quite: that describes Good Candidate: Single-Leader Cron / Compaction, whereas Good Candidate: Payment / Provisioning Side Effects specifically trades off: Adds 1–20 ms coordination RTT before the external call."
+          },
+          {
+            "id": "b",
+            "text": "Relying solely on High-Throughput Row Updates (>10k QPS) avoids all operational and latency trade-offs",
+            "correct": false,
+            "feedback": "Incorrect: every production option in Distributed Locking & Redlock Algorithm carries concrete latency, consistency, or operational costs."
+          },
+          {
+            "id": "c",
+            "text": "Advantage: Prevents duplicate external API calls (Stripe charge, Terraform apply) when paired with idempotency keys. Cost: Adds 1–20 ms coordination RTT before the external call.",
+            "correct": true,
+            "feedback": "Correct: Good Candidate: Payment / Provisioning Side Effects delivers prevents duplicate external API calls (Stripe charge, Terraform apply) when paired with idempotency keys. while requiring you to manage adds 1–20 ms coordination RTT before the external call."
+          }
+        ]
+      },
+      {
+        "question": "Why is The Slow-vs-Dead Ambiguity critical when operating Distributed Locking & Redlock Algorithm in production?",
+        "options": [
+          {
+            "id": "a",
+            "text": "It only applies during local unit testing and can be disabled in production to save memory.",
+            "correct": false,
+            "feedback": "Incorrect: 'The Slow-vs-Dead Ambiguity' directly governs production reliability and correctness under real traffic."
+          },
+          {
+            "id": "b",
+            "text": "It replaces the need for observability, timeouts, or capacity planning across Distributed Locking & Redlock Algorithm.",
+            "correct": false,
+            "feedback": "Incorrect: 'The Slow-vs-Dead Ambiguity' works alongside proper bounds, monitoring, and failure isolation."
+          },
+          {
+            "id": "c",
+            "text": "A lock service cannot tell whether a silent client crashed or is merely paused in GC.",
+            "correct": true,
+            "feedback": "Correct: A lock service cannot tell whether a silent client crashed or is merely paused in GC."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** On a single machine, a `pthread_mutex` or Java `synchronized` block works because all threads share one kernel, one memory space, and one hardware clock.\n\n**How It Flows:** Think of Distributed Locking & Redlock Algorithm as a clear step-by-step chain: UNLOCKED -> LEASED -> EXPIRED / STALE -> Worker A -> etcd / Lock.\n\n**Why Beginners Should Care:** A distributed lock is only a time-bounded lease—without monotonic fencing tokens verified by the downstream storage engine, GC pauses or network partitions will still cause split-brain corruption.",
+      "spark": {
+        "summary": "On a single machine, a `pthread_mutex` or Java `synchronized` block works because all threads share one kernel, one memory space, and one hardware clock.",
+        "keyTakeaway": "A distributed lock is only a time-bounded lease—without monotonic fencing tokens verified by the downstream storage engine, GC pauses or network partitions will still cause split-brain corruption."
+      },
+      "learningJourney": [
+        {
+          "id": "01-what-is-distributed-locking",
+          "title": "What is Distributed Locking",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Distributed Locking works from first principles.",
+          "explanation": "On a single machine, a `pthread_mutex` or Java `synchronized` block works because all threads share one kernel, one memory space, and one hardware clock. Across multiple servers, there is no shared memory. A **distributed lock** is a **time-bounded lease** stored in an external coordination service (such as Redis, etcd, or ZooKeeper) that grants one caller temporary exclusive permission to act on a resource key.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "state-machine",
+            "eyebrow": "Lease Lifecycle",
+            "title": "Distributed Lock State Machine",
+            "states": [
+              {
+                "id": "free",
+                "label": "UNLOCKED",
+                "sublabel": "Key absent in store",
+                "tone": "blue"
+              },
+              {
+                "id": "leased",
+                "label": "LEASED",
+                "sublabel": "Owner UUID + TTL active",
+                "tone": "green"
+              },
+              {
+                "id": "expired",
+                "label": "EXPIRED / STALE",
+                "sublabel": "TTL elapsed; new token",
+                "tone": "amber"
+              }
+            ],
+            "transitions": [
+              {
+                "from": "free",
+                "to": "leased",
+                "label": "SET key uuid NX PX"
+              },
+              {
+                "from": "leased",
+                "to": "free",
+                "label": "Lua: GET==uuid -> DEL"
+              },
+              {
+                "from": "leased",
+                "to": "expired",
+                "label": "GC pause > TTL"
+              },
+              {
+                "from": "expired",
+                "to": "leased",
+                "label": "Next client (token+1)"
+              }
+            ],
+            "summary": "A lock never stays held forever: either the owner atomically releases it with its UUID, or the TTL expires and a new monotonic token is issued."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-why-we-need-it",
+          "title": "Why we need Distributed Locking (and why naive locks fail)",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without Distributed Locking under real concurrency or scale.",
+          "explanation": "When multiple stateless workers process queues, cron jobs, or checkout requests concurrently, two workers can read the same state (`stock = 1` or `invoice = UNPAID`) and both execute an irreversible side effect—double-charging a credit card or overselling the last item.",
+          "ideas": [
+            {
+              "title": "Efficiency Locks vs. Correctness Locks",
+              "description": "Use an efficiency lock (like single-node Redis or Redlock) when an occasional duplicate execution only wastes CPU or money. Use a correctness lock with monotonic fencing tokens (etcd/ZooKeeper + storage check) when duplicate writes corrupt financial or inventory state."
+            },
+            {
+              "title": "The Slow-vs-Dead Ambiguity",
+              "description": "A lock service cannot tell whether a silent client crashed or is merely paused in GC. That is why every lock must be a finite lease rather than an indefinite hold."
+            }
+          ],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Split-Brain Prevention",
+            "title": "How GC Pauses Break Leases — And How Fencing Tokens Stop Stale Writes",
+            "actors": [
+              {
+                "id": "wa",
+                "label": "Worker A"
+              },
+              {
+                "id": "coord",
+                "label": "etcd / Lock"
+              },
+              {
+                "id": "wb",
+                "label": "Worker B"
+              },
+              {
+                "id": "db",
+                "label": "Fenced DB"
+              }
+            ],
+            "events": [
+              {
+                "from": "wa",
+                "to": "coord",
+                "label": "Acquire lease -> token 412",
+                "status": "ok"
+              },
+              {
+                "from": "wa",
+                "to": "wa",
+                "label": "15s JVM GC Pause (TTL=10s)",
+                "status": "warn"
+              },
+              {
+                "from": "wb",
+                "to": "coord",
+                "label": "Acquire expired -> token 413",
+                "status": "ok"
+              },
+              {
+                "from": "wb",
+                "to": "db",
+                "label": "Write + token 413 (committed)",
+                "status": "ok"
+              },
+              {
+                "from": "wa",
+                "to": "db",
+                "label": "Stale write + token 412 (412 < 413!)",
+                "status": "fail"
+              }
+            ],
+            "summary": "Mutual exclusion over an unreliable network is only safe when the storage layer rejects writes carrying a fencing token older than the highest token seen."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-where-it-is-used",
+          "title": "Where Distributed Locking is used (and where to avoid it)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Distributed locks belong at **coarse-grained coordination boundaries**, not on every database row. They shine when coordinating external side effects that lack native compare-and-swap primitives, or when electing a single active controller.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "06-production-architecture",
+          "title": "Production example: Fenced etcd Lock + Storage Guard",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Production architecture: see how the components compose end to end under real load.",
+          "explanation": "In production payment and inventory pipelines, teams pair an **etcd Lease** (or ZooKeeper ephemeral sequential znode) with **storage-enforced fencing**. The lock service provides the monotonic `revision`, and the authoritative database rejects any write whose `fence_token <= last_fence_token`.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "quorum-cluster",
+            "eyebrow": "Production Topology",
+            "title": "3-Node etcd Raft Lock Cluster + Fenced PostgreSQL Store",
+            "nodes": [
+              {
+                "id": "leader",
+                "label": "etcd Leader",
+                "role": "Grants Lease + Rev 413"
+              },
+              {
+                "id": "f1",
+                "label": "etcd Follower 1",
+                "role": "Raft Quorum ACK"
+              },
+              {
+                "id": "f2",
+                "label": "etcd Follower 2",
+                "role": "Raft Quorum ACK"
+              },
+              {
+                "id": "db",
+                "label": "Fenced Postgres",
+                "role": "WHERE fence < 413"
+              }
+            ],
+            "edges": [
+              {
+                "label": "Raft append + fsync"
+              },
+              {
+                "label": "Quorum committed"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Step 1 — Lease + Token",
+                "detail": "Worker acquires an etcd lease; Raft consensus commits and returns monotonic revision 413."
+              },
+              {
+                "label": "Step 2 — Watchdog KeepAlive",
+                "detail": "Background gRPC stream renews the lease every TTL/3; if renewal drops, the worker aborts its critical section."
+              },
+              {
+                "label": "Step 3 — Storage Fencing",
+                "detail": "Postgres atomically checks last_fence_token < 413 on UPDATE, neutralizing any zombie worker with token 412."
+              }
+            ],
+            "summary": "Consensus issues the monotonic token; the database enforces it."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "A distributed lock is only a time-bounded lease—without monotonic fencing tokens verified by the downstream storage engine, GC pauses or network partitions will still cause split-brain corruption."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** On a single machine, a `pthread_mutex` or Java `synchronized` block works because all threads share one kernel, one memory space, and one hardware clock. Across multiple servers, there is no shared memory.\n\n**Visual & Structural Flow:** Depicts Distributed Lock State Machine (UNLOCKED -> LEASED -> EXPIRED / STALE); How GC Pauses Break Leases — And How Fencing Tokens Stop Stale Writes (Worker A -> etcd / Lock -> Worker B -> Fenced DB); 3-Node etcd Raft Lock Cluster + Fenced PostgreSQL Store (etcd Leader -> etcd Follower 1 -> etcd Follower 2 -> Fenced Postgres).\n\n**Trade-Offs & Production:** Choosing a locking mechanism means choosing your failure model. In production payment and inventory pipelines, teams pair an **etcd Lease** (or ZooKeeper ephemeral sequential znode) with **storage-enforced fencing**.\n\n**Failure Modes & Application:** Distributed locking is rarely an end in itself—it is a building block inside high-concurrency system designs.",
+      "spark": {
+        "summary": "Distributed locking coordinates mutually exclusive access to a shared resource across independent processes that share no memory, using a network-accessible lease store such as Redis, etcd, or ZooKeeper.",
+        "keyTakeaway": "A distributed lock is only a time-bounded lease—without monotonic fencing tokens verified by the downstream storage engine, GC pauses or network partitions will still cause split-brain corruption."
+      }
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** Distributed locking coordinates mutually exclusive access to a shared resource across independent processes that share no memory, using a network-accessible lease store such as Redis, etcd, or ZooKeeper.\n\n**Production Trade-Offs:** Safe lock management requires atomic primitives at every step of the lifecycle: 1. **Atomic Acquisition**: Never run `SETNX` followed by `EXPIRE`—a crash between the two creates an eternal lock.\n\n**Failure Modes & Edge Cases:** Distributed locking is rarely an end in itself—it is a building block inside high-concurrency system designs.\n\n**Principal Takeaway:** A distributed lock is only a time-bounded lease—without monotonic fencing tokens verified by the downstream storage engine, GC pauses or network partitions will still cause split-brain corruption.",
+      "spark": {
+        "summary": "Distributed locking coordinates mutually exclusive access to a shared resource across independent processes that share no memory, using a network-accessible lease store such as Redis, etcd, or ZooKeeper.",
+        "keyTakeaway": "A distributed lock is only a time-bounded lease—without monotonic fencing tokens verified by the downstream storage engine, GC pauses or network partitions will still cause split-brain corruption."
+      },
+      "learningJourney": [
+        {
+          "id": "01-what-is-distributed-locking",
+          "title": "What is Distributed Locking",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Distributed Locking works from first principles.",
+          "explanation": "On a single machine, a `pthread_mutex` or Java `synchronized` block works because all threads share one kernel, one memory space, and one hardware clock. Across multiple servers, there is no shared memory. A **distributed lock** is a **time-bounded lease** stored in an external coordination service (such as Redis, etcd, or ZooKeeper) that grants one caller temporary exclusive permission to act on a resource key.\n\nEvery safe distributed lock has four fields: a **resource key** (`lock:invoice:77`), a **globally unique owner token** (`uuid-a`, so only the holder can release it), a **TTL / lease duration** (`PX 30000`, so a crashed holder does not deadlock the cluster forever), and—for correctness-critical writes—a **monotonic fencing token** (`revision = 412`).",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "state-machine",
+            "eyebrow": "Lease Lifecycle",
+            "title": "Distributed Lock State Machine",
+            "states": [
+              {
+                "id": "free",
+                "label": "UNLOCKED",
+                "sublabel": "Key absent in store",
+                "tone": "blue"
+              },
+              {
+                "id": "leased",
+                "label": "LEASED",
+                "sublabel": "Owner UUID + TTL active",
+                "tone": "green"
+              },
+              {
+                "id": "expired",
+                "label": "EXPIRED / STALE",
+                "sublabel": "TTL elapsed; new token",
+                "tone": "amber"
+              }
+            ],
+            "transitions": [
+              {
+                "from": "free",
+                "to": "leased",
+                "label": "SET key uuid NX PX"
+              },
+              {
+                "from": "leased",
+                "to": "free",
+                "label": "Lua: GET==uuid -> DEL"
+              },
+              {
+                "from": "leased",
+                "to": "expired",
+                "label": "GC pause > TTL"
+              },
+              {
+                "from": "expired",
+                "to": "leased",
+                "label": "Next client (token+1)"
+              }
+            ],
+            "summary": "A lock never stays held forever: either the owner atomically releases it with its UUID, or the TTL expires and a new monotonic token is issued."
+          },
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-why-we-need-it",
+          "title": "Why we need Distributed Locking (and why naive locks fail)",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without Distributed Locking under real concurrency or scale.",
+          "explanation": "When multiple stateless workers process queues, cron jobs, or checkout requests concurrently, two workers can read the same state (`stock = 1` or `invoice = UNPAID`) and both execute an irreversible side effect—double-charging a credit card or overselling the last item. Even if you add a lock, **asynchronous networks and stop-the-world GC pauses** break naive mutual exclusion: Worker A can freeze after acquiring a 10 s lock, wake up at 15 s believing it still holds the lock, and overwrite Worker B's work.",
+          "caveats": null,
+          "ideas": [
+            {
+              "title": "Efficiency Locks vs. Correctness Locks",
+              "description": "Use an efficiency lock (like single-node Redis or Redlock) when an occasional duplicate execution only wastes CPU or money. Use a correctness lock with monotonic fencing tokens (etcd/ZooKeeper + storage check) when duplicate writes corrupt financial or inventory state."
+            },
+            {
+              "title": "The Slow-vs-Dead Ambiguity",
+              "description": "A lock service cannot tell whether a silent client crashed or is merely paused in GC. That is why every lock must be a finite lease rather than an indefinite hold."
+            }
+          ],
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Split-Brain Prevention",
+            "title": "How GC Pauses Break Leases — And How Fencing Tokens Stop Stale Writes",
+            "actors": [
+              {
+                "id": "wa",
+                "label": "Worker A"
+              },
+              {
+                "id": "coord",
+                "label": "etcd / Lock"
+              },
+              {
+                "id": "wb",
+                "label": "Worker B"
+              },
+              {
+                "id": "db",
+                "label": "Fenced DB"
+              }
+            ],
+            "events": [
+              {
+                "from": "wa",
+                "to": "coord",
+                "label": "Acquire lease -> token 412",
+                "status": "ok"
+              },
+              {
+                "from": "wa",
+                "to": "wa",
+                "label": "15s JVM GC Pause (TTL=10s)",
+                "status": "warn"
+              },
+              {
+                "from": "wb",
+                "to": "coord",
+                "label": "Acquire expired -> token 413",
+                "status": "ok"
+              },
+              {
+                "from": "wb",
+                "to": "db",
+                "label": "Write + token 413 (committed)",
+                "status": "ok"
+              },
+              {
+                "from": "wa",
+                "to": "db",
+                "label": "Stale write + token 412 (412 < 413!)",
+                "status": "fail"
+              }
+            ],
+            "summary": "Mutual exclusion over an unreliable network is only safe when the storage layer rejects writes carrying a fencing token older than the highest token seen."
+          },
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "03-where-it-is-used",
+          "title": "Where Distributed Locking is used (and where to avoid it)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Distributed locks belong at **coarse-grained coordination boundaries**, not on every database row. They shine when coordinating external side effects that lack native compare-and-swap primitives, or when electing a single active controller.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-how-it-is-managed",
+          "title": "How Distributed Locks are acquired, renewed, and released",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Safe lock management requires atomic primitives at every step of the lifecycle:\n\n1. **Atomic Acquisition**: Never run `SETNX` followed by `EXPIRE`—a crash between the two creates an eternal lock. Always use `SET lock:sku:4829 <uuid> NX PX 30000`.\n2. **Watchdog / Lease Renewal**: If work can outlive the initial TTL, run a background daemon (e.g., Redisson's watchdog) that extends the TTL at `TTL / 3` intervals—and **aborts local work** if renewal fails.\n3. **Atomic Compare-and-Delete Release**: Never issue a blind `DEL lock:sku:4829`. If your lease expired during a pause, `DEL` will delete another worker's active lock. Execute a server-side Lua script that checks `GET == owner_uuid` before deleting.\n4. **Bounded Retries with Jitter**: Contending callers must back off exponentially with full jitter instead of spinning in a tight `while (!acquire())` loop.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "05-alternatives",
+          "title": "Alternatives: Redlock vs. Consensus (etcd/ZK) vs. OCC",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "The trade-off: compare competing approaches across latency, consistency, and operational cost.",
+          "explanation": "Choosing a locking mechanism means choosing your failure model. **Redlock** deploys $N = 5$ independent Redis masters and requires acquiring $\\ge 3$ within `TTL - elapsed - clock_drift`. It tolerates up to 2 node crashes without disk fsync, but relies on bounded wall-clock assumptions and emits no monotonic fencing token. **etcd** (Raft) and **ZooKeeper** (Zab) persist state via quorum consensus and emit monotonic `revision` / `zxid` numbers, trading higher write latency (5–20 ms) for linearizable safety.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "06-production-architecture",
+          "title": "Production example: Fenced etcd Lock + Storage Guard",
+          "eyebrow": "Advanced Path · Stage 06",
+          "purpose": "Production architecture: see how the components compose end to end under real load.",
+          "explanation": "In production payment and inventory pipelines, teams pair an **etcd Lease** (or ZooKeeper ephemeral sequential znode) with **storage-enforced fencing**. The lock service provides the monotonic `revision`, and the authoritative database rejects any write whose `fence_token <= last_fence_token`.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "quorum-cluster",
+            "eyebrow": "Production Topology",
+            "title": "3-Node etcd Raft Lock Cluster + Fenced PostgreSQL Store",
+            "nodes": [
+              {
+                "id": "leader",
+                "label": "etcd Leader",
+                "role": "Grants Lease + Rev 413"
+              },
+              {
+                "id": "f1",
+                "label": "etcd Follower 1",
+                "role": "Raft Quorum ACK"
+              },
+              {
+                "id": "f2",
+                "label": "etcd Follower 2",
+                "role": "Raft Quorum ACK"
+              },
+              {
+                "id": "db",
+                "label": "Fenced Postgres",
+                "role": "WHERE fence < 413"
+              }
+            ],
+            "edges": [
+              {
+                "label": "Raft append + fsync"
+              },
+              {
+                "label": "Quorum committed"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Step 1 — Lease + Token",
+                "detail": "Worker acquires an etcd lease; Raft consensus commits and returns monotonic revision 413."
+              },
+              {
+                "label": "Step 2 — Watchdog KeepAlive",
+                "detail": "Background gRPC stream renews the lease every TTL/3; if renewal drops, the worker aborts its critical section."
+              },
+              {
+                "label": "Step 3 — Storage Fencing",
+                "detail": "Postgres atomically checks last_fence_token < 413 on UPDATE, neutralizing any zombie worker with token 412."
+              }
+            ],
+            "summary": "Consensus issues the monotonic token; the database enforces it."
+          },
+          "level": "L7 · STAFF / PRINCIPAL"
+        },
+        {
+          "id": "07-problems-and-further-reading",
+          "title": "Problems solved by Distributed Locking & System Design Deep Dives",
+          "eyebrow": "Advanced Path · Stage 07",
+          "purpose": "Applied problems: connect these internals to concrete system design and debugging scenarios.",
+          "explanation": "Distributed locking is rarely an end in itself—it is a building block inside high-concurrency system designs. Explore the concrete engineering problems and full system design architectures below to see how fencing tokens, leases, and idempotency work together in production.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "A distributed lock is only a time-bounded lease—without monotonic fencing tokens verified by the downstream storage engine, GC pauses or network partitions will still cause split-brain corruption."
+    }
+  }
+}

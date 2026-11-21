@@ -1,0 +1,812 @@
+{
+  "id": "concept-database-isolation-levels-anomalies",
+  "slug": "database-isolation-levels-anomalies",
+  "name": "Database Isolation Levels & Transaction Anomalies",
+  "domain": "Distributed Systems & Storage",
+  "tagline": "Navigating Read Committed, Snapshot Isolation, and Serializable (SSI / 2PL) to eliminate lost updates, read skew, and write skew.",
+  "purpose": "Build a progressive mental model of database isolation—from ANSI phenomena and MVCC snapshots to Write Skew detection in PostgreSQL SSI and engine differences.",
+  "spark": {
+    "summary": "Database isolation levels control what concurrent transaction anomalies—dirty reads, non-repeatable reads, phantom reads, and write skew—are permitted in exchange for lower locking or coordination overhead.",
+    "keyTakeaway": "Read Committed does not prevent lost updates or read skew; Snapshot Isolation prevents read anomalies via MVCC but still allows write skew unless you use explicit `SELECT FOR UPDATE` or true Serializable isolation.",
+    "byteSummary": "**Core Mechanics:** Isolation (the **I** in ACID) defines which concurrent transaction side effects are visible.\n\n**Visual & Structural Flow:** Depicts How MVCC Separates Concurrent Readers from Uncommitted Writers (Tx1 Reader (snap=100) -> MVCC Tuple Chain -> WAL + pg_xact -> SIREAD Predicate Lock); Concurrent Room Booking: Snapshot Isolation Double-Books vs. SSI Aborts 40001 (Tx1 (Alice) -> Postgres MVCC -> Tx2 (Bob)); Serializable Transaction Execution & 40001 Retry State Machine (EXEC IN SNAPSHOT -> COMMITTED -> 40001 ABORT).\n\n**Trade-Offs & Production:** Two engines claiming the same ANSI level behave differently under the hood. Combine `SERIALIZABLE` (or parent-row `FOR UPDATE` under high >10% contention) with an application-boundary retry state machine, and monitor `pg_stat_database.deadlocks` and `xact_rollback` alongside oldest `xmin` age.\n\n**Failure Modes & Application:** Explore concrete SQL isolation anomalies, InnoDB gap-lock deadlocks, PostgreSQL XID wraparound, and ACID fundamentals."
+  },
+  "learningJourney": [
+    {
+      "id": "01-what-it-is",
+      "eyebrow": "STAGE 01 · WHAT IT IS",
+      "title": "What are Isolation Levels & MVCC Snapshots",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": "Isolation (the **I** in ACID) defines which concurrent transaction side effects are visible. While ANSI SQL-92 defined four levels around Dirty Reads, Non-Repeatable Reads, and Phantoms, modern MVCC engines (PostgreSQL, InnoDB, CockroachDB) also confront **Read Skew**, **Lost Updates**, and **Write Skew**.\n\nUnder **MVCC**, readers read a consistent snapshot (`xmin/xmax` or HLC timestamp) without blocking writers, and writers don't block readers. However, **Snapshot Isolation** (`REPEATABLE READ` in Postgres) still allows Write Skew unless upgraded to **Serializable Snapshot Isolation (SSI)** or **Two-Phase Locking (2PL)**.",
+      "sectionDiagram": {
+        "kind": "wal-mvcc",
+        "eyebrow": "MVCC Snapshot Visibility",
+        "title": "How MVCC Separates Concurrent Readers from Uncommitted Writers",
+        "nodes": [
+          {
+            "id": "tx1",
+            "label": "Tx1 Reader (snap=100)",
+            "role": "Reads xmin<=100 committed"
+          },
+          {
+            "id": "mvcc",
+            "label": "MVCC Tuple Chain",
+            "role": "xmin=95 / xmax=102"
+          },
+          {
+            "id": "wal",
+            "label": "WAL + pg_xact",
+            "role": "Atomic commit status"
+          },
+          {
+            "id": "ssi",
+            "label": "SIREAD Predicate Lock",
+            "role": "Detects rw-antidependency"
+          }
+        ],
+        "summary": "MVCC lets readers and writers run concurrently without blocking; SSI adds lightweight SIREAD tracking to catch write-skew cycles."
+      },
+      "purpose": "The mechanism: understand how Isolation Levels & MVCC Snapshots works from first principles."
+    },
+    {
+      "id": "02-why-we-need-it",
+      "eyebrow": "STAGE 02 · WHY WE NEED IT",
+      "title": "Why Default Isolation Permits Write Skew & Lost Updates",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": "PostgreSQL defaults to `READ COMMITTED` (which permits lost updates on read-modify-write and read skew across statements), and `REPEATABLE READ` implements Snapshot Isolation (which still permits **Write Skew** when two transactions read an overlapping premise and update disjoint rows).",
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Write Skew vs SSI",
+        "title": "Concurrent Room Booking: Snapshot Isolation Double-Books vs. SSI Aborts 40001",
+        "actors": [
+          {
+            "id": "tx1",
+            "label": "Tx1 (Alice)"
+          },
+          {
+            "id": "db",
+            "label": "Postgres MVCC"
+          },
+          {
+            "id": "tx2",
+            "label": "Tx2 (Bob)"
+          }
+        ],
+        "events": [
+          {
+            "from": "tx1",
+            "to": "db",
+            "label": "SELECT COUNT(*) room=101 -> 0",
+            "status": "ok"
+          },
+          {
+            "from": "tx2",
+            "to": "db",
+            "label": "SELECT COUNT(*) room=101 -> 0",
+            "status": "ok"
+          },
+          {
+            "from": "tx1",
+            "to": "db",
+            "label": "INSERT (id=501, room=101) -> COMMIT",
+            "status": "ok"
+          },
+          {
+            "from": "tx2",
+            "to": "db",
+            "label": "INSERT (id=502, room=101) -> SI: Double-Book!",
+            "status": "warn"
+          },
+          {
+            "from": "db",
+            "to": "tx2",
+            "label": "SSI: rw-cycle detected -> ABORT 40001",
+            "status": "fail"
+          }
+        ],
+        "summary": "Because 501 != 502, Snapshot Isolation sees no write-write conflict and commits both; SSI tracks SIREAD locks and aborts Tx2 with SQLSTATE 40001."
+      },
+      "ideas": [
+        {
+          "title": "On-Call Doctor Write Skew under Snapshot Isolation",
+          "description": "Two doctors both queried `COUNT(*) WHERE on_call = true` (saw 2) and updated their own disjoint rows to `false`, leaving 0 doctors on call. Switching to `SERIALIZABLE` (SSI) aborted the second commit with `40001`."
+        },
+        {
+          "title": "Flash-Sale Lost Update under Read Committed",
+          "description": "Two threads read `stock = 1` in app memory and both wrote `0`. Replacing read-modify-write with `UPDATE inventory SET stock = stock - 1 WHERE sku = 'X' AND stock > 0` eliminated the race at `READ COMMITTED`."
+        }
+      ],
+      "purpose": "The problem: see what breaks without Why Default Isolation Permits Write Skew & Lost Updates under real concurrency or scale."
+    },
+    {
+      "id": "03-where-it-is-used",
+      "eyebrow": "STAGE 03 · WHERE IT IS USED",
+      "title": "Where Each Isolation Level Fits",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "Match isolation level to the invariant scope—you don't always need global `SERIALIZABLE` if an atomic SQL expression or `UNIQUE` / `EXCLUDE` constraint enforces the rule.",
+      "comparison": [
+        {
+          "choice": "Read Committed (PG Default)",
+          "benefits": [
+            "Lowest overhead; safe for independent single-row writes and atomic `SET bal = bal - 50 WHERE bal >= 50`."
+          ],
+          "costs": [
+            "Allows read skew and lost updates on app-level read-modify-write."
+          ]
+        },
+        {
+          "choice": "Repeatable Read / Snapshot Isolation",
+          "benefits": [
+            "Consistent multi-table reporting and backups without blocking writers."
+          ],
+          "costs": [
+            "Allows Write Skew on disjoint rows; long transactions block `VACUUM` / undo purge."
+          ]
+        },
+        {
+          "choice": "Serializable (PG SSI / CockroachDB / Spanner)",
+          "benefits": [
+            "Eliminates all anomalies including Write Skew automatically."
+          ],
+          "costs": [
+            "Requires client-side retry loops for `SQLSTATE 40001` aborts under contention."
+          ]
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    },
+    {
+      "id": "04-how-it-is-managed",
+      "eyebrow": "STAGE 04 · HOW IT IS MANAGED",
+      "title": "How to manage Retries, Deadlocks & MVCC Bloat",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "1. **Retry `40001` & `40P01`**: Always wrap `REPEATABLE READ`/`SERIALIZABLE` transactions in a bounded, jittered retry loop.\n2. **Canonical Lock Ordering**: When using `SELECT ... FOR UPDATE` on multiple rows, sort IDs ascending (`ORDER BY id`) to prevent AB-BA deadlocks.\n3. **Bound Snapshot Lifetime**: Set `idle_in_transaction_session_timeout = '30s'`, never hold DB transactions open across HTTP/RPC calls, and route long exports to read replicas.",
+      "markdownContent": "```python\n# Idempotent PostgreSQL SERIALIZABLE retry wrapper for SQLSTATE 40001 / 40P01 (Python)\nimport time, random\n\ndef run_serializable(conn, fn, max_attempts: int = 5):\n    for attempt in range(max_attempts):\n        try:\n            with conn.cursor() as cur:\n                cur.execute(\"BEGIN ISOLATION LEVEL SERIALIZABLE\")\n                result = fn(cur)\n                conn.commit()\n                return result\n        except Exception as err:\n            conn.rollback()\n            sqlstate = getattr(err, 'sqlstate', None)\n            if sqlstate not in ('40001', '40P01') or attempt == max_attempts - 1:\n                raise\n            time.sleep(random.uniform(0.01, 0.05 * (2 ** attempt)))\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-alternatives",
+      "eyebrow": "STAGE 05 · ALTERNATIVES",
+      "title": "Alternatives: Engine Behavior & Invariant Enforcement",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": "Two engines claiming the same ANSI level behave differently under the hood.",
+      "comparison": [
+        {
+          "choice": "PostgreSQL (Pure MVCC + SSI)",
+          "benefits": [
+            "`REPEATABLE READ` prevents phantoms via Snapshot Isolation; `SERIALIZABLE` uses SSI without blocking readers."
+          ],
+          "costs": [
+            "False-positive `40001` aborts can occur when `SIREAD` locks coarsen to page level."
+          ]
+        },
+        {
+          "choice": "MySQL InnoDB (MVCC + Next-Key Locks)",
+          "benefits": [
+            "Locking reads (`FOR UPDATE`) use record + gap locks to stop phantoms."
+          ],
+          "costs": [
+            "Gap locks frequently cause `Error 1213` deadlocks on concurrent `INSERT ... ON DUPLICATE KEY UPDATE`."
+          ]
+        },
+        {
+          "choice": "DB Constraints (`UNIQUE` / `EXCLUDE USING gist`)",
+          "benefits": [
+            "Enforces non-overlapping bookings or uniqueness at engine level even under `READ COMMITTED`."
+          ],
+          "costs": [
+            "Limited to constraints expressible on a single table/index."
+          ]
+        }
+      ],
+      "purpose": "The trade-off: compare competing approaches across latency, consistency, and operational cost."
+    },
+    {
+      "id": "06-production-architecture",
+      "eyebrow": "STAGE 06 · PRODUCTION ARCHITECTURE",
+      "title": "Production Architecture: SSI Transaction State & Retry Lifecycle",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": "Combine `SERIALIZABLE` (or parent-row `FOR UPDATE` under high >10% contention) with an application-boundary retry state machine, and monitor `pg_stat_database.deadlocks` and `xact_rollback` alongside oldest `xmin` age.",
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "SSI Retry Loop",
+        "title": "Serializable Transaction Execution & 40001 Retry State Machine",
+        "states": [
+          {
+            "id": "exec",
+            "label": "EXEC IN SNAPSHOT",
+            "sublabel": "Track SIREAD locks",
+            "tone": "blue"
+          },
+          {
+            "id": "commit",
+            "label": "COMMITTED",
+            "sublabel": "No rw-cycle found",
+            "tone": "green"
+          },
+          {
+            "id": "abort",
+            "label": "40001 ABORT",
+            "sublabel": "Rollback + jitter retry",
+            "tone": "amber"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "exec",
+            "to": "commit",
+            "label": "No conflict cycle"
+          },
+          {
+            "from": "exec",
+            "to": "abort",
+            "label": "rw-antidependency cycle"
+          },
+          {
+            "from": "abort",
+            "to": "exec",
+            "label": "Backoff < max_attempts"
+          }
+        ],
+        "summary": "SSI aborts with SQLSTATE 40001 are normal concurrency control signals—not bugs—and must be retried idempotently."
+      },
+      "purpose": "Production architecture: see how the components compose end to end under real load."
+    },
+    {
+      "id": "07-problems-and-further-reading",
+      "eyebrow": "STAGE 07 · PROBLEMS SOLVED & FURTHER DEEP DIVE",
+      "title": "Problems solved & Related Concepts",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": "Explore concrete SQL isolation anomalies, InnoDB gap-lock deadlocks, PostgreSQL XID wraparound, and ACID fundamentals.",
+      "supportingConcepts": [
+        {
+          "slug": "sql-isolation-levels-and-phantom-reads",
+          "title": "Problem: SQL Isolation Levels: Preventing Phantom Reads",
+          "kind": "problem"
+        },
+        {
+          "slug": "mysql-innodb-gap-lock-deadlocks",
+          "title": "Problem: Eliminating MySQL InnoDB Gap-Lock Deadlocks",
+          "kind": "problem"
+        },
+        {
+          "slug": "postgresql-xid-wraparound-prevention",
+          "title": "Problem: Preventing PostgreSQL XID Wraparound Shutdowns",
+          "kind": "problem"
+        },
+        {
+          "slug": "acid-transaction-fundamentals",
+          "title": "Concept: ACID Transaction Fundamentals",
+          "kind": "concept"
+        },
+        {
+          "slug": "deadlock-detection",
+          "title": "Concept: Deadlock Detection & Prevention",
+          "kind": "concept"
+        }
+      ],
+      "purpose": "Applied problems: connect these internals to concrete system design and debugging scenarios."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Under PostgreSQL `REPEATABLE READ` (Snapshot Isolation), two concurrent transactions both count 2 on-call doctors and each updates a different doctor row to `on_call = false`, leaving 0 doctors on call. Why did Postgres allow both commits?",
+      "options": [
+        {
+          "id": "a",
+          "text": "Snapshot Isolation only checks for write-write conflicts on the same row; because they updated disjoint rows, write skew is permitted unless using `SERIALIZABLE` (SSI) or explicit locking",
+          "correct": true,
+          "feedback": "Correct: disjoint-row write skew requires `SERIALIZABLE` (SSI) or locking a shared parent row."
+        },
+        {
+          "id": "b",
+          "text": "PostgreSQL `REPEATABLE READ` allows dirty reads",
+          "correct": false,
+          "feedback": "PostgreSQL never allows dirty reads at any isolation level."
+        },
+        {
+          "id": "c",
+          "text": "MVCC disables `WHERE` clause filtering during `UPDATE`",
+          "correct": false,
+          "feedback": "Each transaction simply saw the same pre-commit snapshot and wrote to different rows."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Under PostgreSQL `REPEATABLE READ` (Snapshot Isolation), two concurrent transactions both count 2 on-call doctors and each updates a different doctor row to `on_call = false`, leaving 0 doctors on call. Why did Postgres allow both commits?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Snapshot Isolation only checks for write-write conflicts on the same row; because they updated disjoint rows, write skew is permitted unless using `SERIALIZABLE` (SSI) or explicit locking",
+            "correct": true,
+            "feedback": "Correct: disjoint-row write skew requires `SERIALIZABLE` (SSI) or locking a shared parent row."
+          },
+          {
+            "id": "b",
+            "text": "PostgreSQL `REPEATABLE READ` allows dirty reads",
+            "correct": false,
+            "feedback": "PostgreSQL never allows dirty reads at any isolation level."
+          },
+          {
+            "id": "c",
+            "text": "MVCC disables `WHERE` clause filtering during `UPDATE`",
+            "correct": false,
+            "feedback": "Each transaction simply saw the same pre-commit snapshot and wrote to different rows."
+          }
+        ]
+      },
+      {
+        "question": "What is the main benefit—and corresponding operational trade-off—of using Read Committed (PG Default) in Database Isolation Levels & Transaction Anomalies?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Advantage: Lowest overhead; safe for independent single-row writes and atomic SET bal = bal - 50 WHERE bal >= 50. Cost: Allows read skew and lost updates on app-level read-modify-write.",
+            "correct": true,
+            "feedback": "Correct: Read Committed (PG Default) delivers lowest overhead; safe for independent single-row writes and atomic SET bal = bal - 50 WHERE bal >= 50. while requiring you to manage allows read skew and lost updates on app-level read-modify-write."
+          },
+          {
+            "id": "b",
+            "text": "Advantage: Consistent multi-table reporting and backups without blocking writers. It has zero operational or latency overhead compared to Repeatable Read / Snapshot Isolation.",
+            "correct": false,
+            "feedback": "Not quite: that describes Repeatable Read / Snapshot Isolation, whereas Read Committed (PG Default) specifically trades off: Allows read skew and lost updates on app-level read-modify-write."
+          },
+          {
+            "id": "c",
+            "text": "Using Serializable (PG SSI / CockroachDB / Spanner) eliminates all latency and consistency trade-offs",
+            "correct": false,
+            "feedback": "Incorrect: every production option in Database Isolation Levels & Transaction Anomalies carries concrete latency, consistency, or operational costs."
+          }
+        ]
+      },
+      {
+        "question": "Why is Flash-Sale Lost Update under Read Committed critical when operating Database Isolation Levels & Transaction Anomalies in production?",
+        "options": [
+          {
+            "id": "a",
+            "text": "It only applies during local unit testing and can be disabled in production to save memory.",
+            "correct": false,
+            "feedback": "Incorrect: 'Flash-Sale Lost Update under Read Committed' directly governs production reliability and correctness under real traffic."
+          },
+          {
+            "id": "b",
+            "text": "It replaces the need for observability, timeouts, or capacity planning across Database Isolation Levels & Transaction Anomalies.",
+            "correct": false,
+            "feedback": "Incorrect: 'Flash-Sale Lost Update under Read Committed' works alongside proper bounds, monitoring, and failure isolation."
+          },
+          {
+            "id": "c",
+            "text": "Two threads read stock = 1 in app memory and both wrote 0.",
+            "correct": true,
+            "feedback": "Correct: Two threads read stock = 1 in app memory and both wrote 0."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** Isolation (the **I** in ACID) defines which concurrent transaction side effects are visible.\n\n**How It Flows:** Think of Database Isolation Levels & Transaction Anomalies as a clear step-by-step chain: Tx1 Reader (snap=100) -> MVCC Tuple Chain -> WAL + pg_xact -> SIREAD Predicate Lock -> Tx1 (Alice).\n\n**Why Beginners Should Care:** Read Committed does not prevent lost updates or read skew; Snapshot Isolation prevents read anomalies via MVCC but still allows write skew unless you use explicit `SELECT FOR UPDATE` or true Serializable isolation.",
+      "spark": {
+        "summary": "Isolation (the **I** in ACID) defines which concurrent transaction side effects are visible.",
+        "keyTakeaway": "Read Committed does not prevent lost updates or read skew; Snapshot Isolation prevents read anomalies via MVCC but still allows write skew unless you use explicit `SELECT FOR UPDATE` or true Serializable isolation."
+      },
+      "learningJourney": [
+        {
+          "id": "01-what-it-is",
+          "title": "What are Isolation Levels & MVCC Snapshots",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Isolation Levels & MVCC Snapshots works from first principles.",
+          "explanation": "Isolation (the **I** in ACID) defines which concurrent transaction side effects are visible. While ANSI SQL-92 defined four levels around Dirty Reads, Non-Repeatable Reads, and Phantoms, modern MVCC engines (PostgreSQL, InnoDB, CockroachDB) also confront **Read Skew**, **Lost Updates**, and **Write Skew**.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "wal-mvcc",
+            "eyebrow": "MVCC Snapshot Visibility",
+            "title": "How MVCC Separates Concurrent Readers from Uncommitted Writers",
+            "nodes": [
+              {
+                "id": "tx1",
+                "label": "Tx1 Reader (snap=100)",
+                "role": "Reads xmin<=100 committed"
+              },
+              {
+                "id": "mvcc",
+                "label": "MVCC Tuple Chain",
+                "role": "xmin=95 / xmax=102"
+              },
+              {
+                "id": "wal",
+                "label": "WAL + pg_xact",
+                "role": "Atomic commit status"
+              },
+              {
+                "id": "ssi",
+                "label": "SIREAD Predicate Lock",
+                "role": "Detects rw-antidependency"
+              }
+            ],
+            "summary": "MVCC lets readers and writers run concurrently without blocking; SSI adds lightweight SIREAD tracking to catch write-skew cycles."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-why-we-need-it",
+          "title": "Why Default Isolation Permits Write Skew & Lost Updates",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without Why Default Isolation Permits Write Skew & Lost Updates under real concurrency or scale.",
+          "explanation": "PostgreSQL defaults to `READ COMMITTED` (which permits lost updates on read-modify-write and read skew across statements), and `REPEATABLE READ` implements Snapshot Isolation (which still permits **Write Skew** when two transactions read an overlapping premise and update disjoint rows).",
+          "ideas": [
+            {
+              "title": "On-Call Doctor Write Skew under Snapshot Isolation",
+              "description": "Two doctors both queried `COUNT(*) WHERE on_call = true` (saw 2) and updated their own disjoint rows to `false`, leaving 0 doctors on call. Switching to `SERIALIZABLE` (SSI) aborted the second commit with `40001`."
+            },
+            {
+              "title": "Flash-Sale Lost Update under Read Committed",
+              "description": "Two threads read `stock = 1` in app memory and both wrote `0`. Replacing read-modify-write with `UPDATE inventory SET stock = stock - 1 WHERE sku = 'X' AND stock > 0` eliminated the race at `READ COMMITTED`."
+            }
+          ],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Write Skew vs SSI",
+            "title": "Concurrent Room Booking: Snapshot Isolation Double-Books vs. SSI Aborts 40001",
+            "actors": [
+              {
+                "id": "tx1",
+                "label": "Tx1 (Alice)"
+              },
+              {
+                "id": "db",
+                "label": "Postgres MVCC"
+              },
+              {
+                "id": "tx2",
+                "label": "Tx2 (Bob)"
+              }
+            ],
+            "events": [
+              {
+                "from": "tx1",
+                "to": "db",
+                "label": "SELECT COUNT(*) room=101 -> 0",
+                "status": "ok"
+              },
+              {
+                "from": "tx2",
+                "to": "db",
+                "label": "SELECT COUNT(*) room=101 -> 0",
+                "status": "ok"
+              },
+              {
+                "from": "tx1",
+                "to": "db",
+                "label": "INSERT (id=501, room=101) -> COMMIT",
+                "status": "ok"
+              },
+              {
+                "from": "tx2",
+                "to": "db",
+                "label": "INSERT (id=502, room=101) -> SI: Double-Book!",
+                "status": "warn"
+              },
+              {
+                "from": "db",
+                "to": "tx2",
+                "label": "SSI: rw-cycle detected -> ABORT 40001",
+                "status": "fail"
+              }
+            ],
+            "summary": "Because 501 != 502, Snapshot Isolation sees no write-write conflict and commits both; SSI tracks SIREAD locks and aborts Tx2 with SQLSTATE 40001."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-where-it-is-used",
+          "title": "Where Each Isolation Level Fits",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Match isolation level to the invariant scope—you don't always need global `SERIALIZABLE` if an atomic SQL expression or `UNIQUE` / `EXCLUDE` constraint enforces the rule.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "06-production-architecture",
+          "title": "Production Architecture: SSI Transaction State & Retry Lifecycle",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Production architecture: see how the components compose end to end under real load.",
+          "explanation": "Combine `SERIALIZABLE` (or parent-row `FOR UPDATE` under high >10% contention) with an application-boundary retry state machine, and monitor `pg_stat_database.deadlocks` and `xact_rollback` alongside oldest `xmin` age.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "state-machine",
+            "eyebrow": "SSI Retry Loop",
+            "title": "Serializable Transaction Execution & 40001 Retry State Machine",
+            "states": [
+              {
+                "id": "exec",
+                "label": "EXEC IN SNAPSHOT",
+                "sublabel": "Track SIREAD locks",
+                "tone": "blue"
+              },
+              {
+                "id": "commit",
+                "label": "COMMITTED",
+                "sublabel": "No rw-cycle found",
+                "tone": "green"
+              },
+              {
+                "id": "abort",
+                "label": "40001 ABORT",
+                "sublabel": "Rollback + jitter retry",
+                "tone": "amber"
+              }
+            ],
+            "transitions": [
+              {
+                "from": "exec",
+                "to": "commit",
+                "label": "No conflict cycle"
+              },
+              {
+                "from": "exec",
+                "to": "abort",
+                "label": "rw-antidependency cycle"
+              },
+              {
+                "from": "abort",
+                "to": "exec",
+                "label": "Backoff < max_attempts"
+              }
+            ],
+            "summary": "SSI aborts with SQLSTATE 40001 are normal concurrency control signals—not bugs—and must be retried idempotently."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Read Committed does not prevent lost updates or read skew; Snapshot Isolation prevents read anomalies via MVCC but still allows write skew unless you use explicit `SELECT FOR UPDATE` or true Serializable isolation."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** Isolation (the **I** in ACID) defines which concurrent transaction side effects are visible.\n\n**Visual & Structural Flow:** Depicts How MVCC Separates Concurrent Readers from Uncommitted Writers (Tx1 Reader (snap=100) -> MVCC Tuple Chain -> WAL + pg_xact -> SIREAD Predicate Lock); Concurrent Room Booking: Snapshot Isolation Double-Books vs. SSI Aborts 40001 (Tx1 (Alice) -> Postgres MVCC -> Tx2 (Bob)); Serializable Transaction Execution & 40001 Retry State Machine (EXEC IN SNAPSHOT -> COMMITTED -> 40001 ABORT).\n\n**Trade-Offs & Production:** Two engines claiming the same ANSI level behave differently under the hood. Combine `SERIALIZABLE` (or parent-row `FOR UPDATE` under high >10% contention) with an application-boundary retry state machine, and monitor `pg_stat_database.deadlocks` and `xact_rollback` alongside oldest `xmin` age.\n\n**Failure Modes & Application:** Explore concrete SQL isolation anomalies, InnoDB gap-lock deadlocks, PostgreSQL XID wraparound, and ACID fundamentals.",
+      "spark": {
+        "summary": "Database isolation levels control what concurrent transaction anomalies—dirty reads, non-repeatable reads, phantom reads, and write skew—are permitted in exchange for lower locking or coordination overhead.",
+        "keyTakeaway": "Read Committed does not prevent lost updates or read skew; Snapshot Isolation prevents read anomalies via MVCC but still allows write skew unless you use explicit `SELECT FOR UPDATE` or true Serializable isolation."
+      }
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** Database isolation levels control what concurrent transaction anomalies—dirty reads, non-repeatable reads, phantom reads, and write skew—are permitted in exchange for lower locking or coordination overhead.\n\n**Production Trade-Offs:** 1. **Retry `40001` & `40P01`**: Always wrap `REPEATABLE READ`/`SERIALIZABLE` transactions in a bounded, jittered retry loop.\n\n**Failure Modes & Edge Cases:** Explore concrete SQL isolation anomalies, InnoDB gap-lock deadlocks, PostgreSQL XID wraparound, and ACID fundamentals.\n\n**Principal Takeaway:** Read Committed does not prevent lost updates or read skew; Snapshot Isolation prevents read anomalies via MVCC but still allows write skew unless you use explicit `SELECT FOR UPDATE` or true Serializable isolation.",
+      "spark": {
+        "summary": "Database isolation levels control what concurrent transaction anomalies—dirty reads, non-repeatable reads, phantom reads, and write skew—are permitted in exchange for lower locking or coordination overhead.",
+        "keyTakeaway": "Read Committed does not prevent lost updates or read skew; Snapshot Isolation prevents read anomalies via MVCC but still allows write skew unless you use explicit `SELECT FOR UPDATE` or true Serializable isolation."
+      },
+      "learningJourney": [
+        {
+          "id": "01-what-it-is",
+          "title": "What are Isolation Levels & MVCC Snapshots",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Isolation Levels & MVCC Snapshots works from first principles.",
+          "explanation": "Isolation (the **I** in ACID) defines which concurrent transaction side effects are visible. While ANSI SQL-92 defined four levels around Dirty Reads, Non-Repeatable Reads, and Phantoms, modern MVCC engines (PostgreSQL, InnoDB, CockroachDB) also confront **Read Skew**, **Lost Updates**, and **Write Skew**.\n\nUnder **MVCC**, readers read a consistent snapshot (`xmin/xmax` or HLC timestamp) without blocking writers, and writers don't block readers. However, **Snapshot Isolation** (`REPEATABLE READ` in Postgres) still allows Write Skew unless upgraded to **Serializable Snapshot Isolation (SSI)** or **Two-Phase Locking (2PL)**.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "wal-mvcc",
+            "eyebrow": "MVCC Snapshot Visibility",
+            "title": "How MVCC Separates Concurrent Readers from Uncommitted Writers",
+            "nodes": [
+              {
+                "id": "tx1",
+                "label": "Tx1 Reader (snap=100)",
+                "role": "Reads xmin<=100 committed"
+              },
+              {
+                "id": "mvcc",
+                "label": "MVCC Tuple Chain",
+                "role": "xmin=95 / xmax=102"
+              },
+              {
+                "id": "wal",
+                "label": "WAL + pg_xact",
+                "role": "Atomic commit status"
+              },
+              {
+                "id": "ssi",
+                "label": "SIREAD Predicate Lock",
+                "role": "Detects rw-antidependency"
+              }
+            ],
+            "summary": "MVCC lets readers and writers run concurrently without blocking; SSI adds lightweight SIREAD tracking to catch write-skew cycles."
+          },
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-why-we-need-it",
+          "title": "Why Default Isolation Permits Write Skew & Lost Updates",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without Why Default Isolation Permits Write Skew & Lost Updates under real concurrency or scale.",
+          "explanation": "PostgreSQL defaults to `READ COMMITTED` (which permits lost updates on read-modify-write and read skew across statements), and `REPEATABLE READ` implements Snapshot Isolation (which still permits **Write Skew** when two transactions read an overlapping premise and update disjoint rows).",
+          "caveats": null,
+          "ideas": [
+            {
+              "title": "On-Call Doctor Write Skew under Snapshot Isolation",
+              "description": "Two doctors both queried `COUNT(*) WHERE on_call = true` (saw 2) and updated their own disjoint rows to `false`, leaving 0 doctors on call. Switching to `SERIALIZABLE` (SSI) aborted the second commit with `40001`."
+            },
+            {
+              "title": "Flash-Sale Lost Update under Read Committed",
+              "description": "Two threads read `stock = 1` in app memory and both wrote `0`. Replacing read-modify-write with `UPDATE inventory SET stock = stock - 1 WHERE sku = 'X' AND stock > 0` eliminated the race at `READ COMMITTED`."
+            }
+          ],
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Write Skew vs SSI",
+            "title": "Concurrent Room Booking: Snapshot Isolation Double-Books vs. SSI Aborts 40001",
+            "actors": [
+              {
+                "id": "tx1",
+                "label": "Tx1 (Alice)"
+              },
+              {
+                "id": "db",
+                "label": "Postgres MVCC"
+              },
+              {
+                "id": "tx2",
+                "label": "Tx2 (Bob)"
+              }
+            ],
+            "events": [
+              {
+                "from": "tx1",
+                "to": "db",
+                "label": "SELECT COUNT(*) room=101 -> 0",
+                "status": "ok"
+              },
+              {
+                "from": "tx2",
+                "to": "db",
+                "label": "SELECT COUNT(*) room=101 -> 0",
+                "status": "ok"
+              },
+              {
+                "from": "tx1",
+                "to": "db",
+                "label": "INSERT (id=501, room=101) -> COMMIT",
+                "status": "ok"
+              },
+              {
+                "from": "tx2",
+                "to": "db",
+                "label": "INSERT (id=502, room=101) -> SI: Double-Book!",
+                "status": "warn"
+              },
+              {
+                "from": "db",
+                "to": "tx2",
+                "label": "SSI: rw-cycle detected -> ABORT 40001",
+                "status": "fail"
+              }
+            ],
+            "summary": "Because 501 != 502, Snapshot Isolation sees no write-write conflict and commits both; SSI tracks SIREAD locks and aborts Tx2 with SQLSTATE 40001."
+          },
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "03-where-it-is-used",
+          "title": "Where Each Isolation Level Fits",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Match isolation level to the invariant scope—you don't always need global `SERIALIZABLE` if an atomic SQL expression or `UNIQUE` / `EXCLUDE` constraint enforces the rule.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-how-it-is-managed",
+          "title": "How to manage Retries, Deadlocks & MVCC Bloat",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "1. **Retry `40001` & `40P01`**: Always wrap `REPEATABLE READ`/`SERIALIZABLE` transactions in a bounded, jittered retry loop.\n2. **Canonical Lock Ordering**: When using `SELECT ... FOR UPDATE` on multiple rows, sort IDs ascending (`ORDER BY id`) to prevent AB-BA deadlocks.\n3. **Bound Snapshot Lifetime**: Set `idle_in_transaction_session_timeout = '30s'`, never hold DB transactions open across HTTP/RPC calls, and route long exports to read replicas.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "05-alternatives",
+          "title": "Alternatives: Engine Behavior & Invariant Enforcement",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "The trade-off: compare competing approaches across latency, consistency, and operational cost.",
+          "explanation": "Two engines claiming the same ANSI level behave differently under the hood.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "06-production-architecture",
+          "title": "Production Architecture: SSI Transaction State & Retry Lifecycle",
+          "eyebrow": "Advanced Path · Stage 06",
+          "purpose": "Production architecture: see how the components compose end to end under real load.",
+          "explanation": "Combine `SERIALIZABLE` (or parent-row `FOR UPDATE` under high >10% contention) with an application-boundary retry state machine, and monitor `pg_stat_database.deadlocks` and `xact_rollback` alongside oldest `xmin` age.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "state-machine",
+            "eyebrow": "SSI Retry Loop",
+            "title": "Serializable Transaction Execution & 40001 Retry State Machine",
+            "states": [
+              {
+                "id": "exec",
+                "label": "EXEC IN SNAPSHOT",
+                "sublabel": "Track SIREAD locks",
+                "tone": "blue"
+              },
+              {
+                "id": "commit",
+                "label": "COMMITTED",
+                "sublabel": "No rw-cycle found",
+                "tone": "green"
+              },
+              {
+                "id": "abort",
+                "label": "40001 ABORT",
+                "sublabel": "Rollback + jitter retry",
+                "tone": "amber"
+              }
+            ],
+            "transitions": [
+              {
+                "from": "exec",
+                "to": "commit",
+                "label": "No conflict cycle"
+              },
+              {
+                "from": "exec",
+                "to": "abort",
+                "label": "rw-antidependency cycle"
+              },
+              {
+                "from": "abort",
+                "to": "exec",
+                "label": "Backoff < max_attempts"
+              }
+            ],
+            "summary": "SSI aborts with SQLSTATE 40001 are normal concurrency control signals—not bugs—and must be retried idempotently."
+          },
+          "level": "L7 · STAFF / PRINCIPAL"
+        },
+        {
+          "id": "07-problems-and-further-reading",
+          "title": "Problems solved & Related Concepts",
+          "eyebrow": "Advanced Path · Stage 07",
+          "purpose": "Applied problems: connect these internals to concrete system design and debugging scenarios.",
+          "explanation": "Explore concrete SQL isolation anomalies, InnoDB gap-lock deadlocks, PostgreSQL XID wraparound, and ACID fundamentals.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Read Committed does not prevent lost updates or read skew; Snapshot Isolation prevents read anomalies via MVCC but still allows write skew unless you use explicit `SELECT FOR UPDATE` or true Serializable isolation."
+    }
+  }
+}

@@ -1,0 +1,806 @@
+{
+  "id": "concept-btree-vs-lsmtree",
+  "slug": "btree-vs-lsmtree",
+  "name": "B-Tree vs. LSM-Tree Storage Engines",
+  "domain": "Databases & Storage",
+  "tagline": "Comparing in-place mutable page trees (B+Trees) against append-only MemTable + SSTable compaction engines (LSM-Trees).",
+  "purpose": "Build a progressive mental model of storage engine internals—from page splits and WAL to leveled/size-tiered compaction, Bloom filters, and the RUM conjecture.",
+  "spark": {
+    "summary": "B-Trees update fixed-size disk pages (4-16 KiB) in place for fast, predictable point and range reads, whereas LSM-Trees buffer writes sequentially in memory (MemTable + WAL) and merge immutable sorted runs (SSTables) in the background for orders-of-magnitude higher write throughput.",
+    "keyTakeaway": "B-Trees optimize read latency and predictability at the cost of random-write amplification, while LSM-Trees maximize sequential write throughput at the cost of background compaction I/O and multi-level read amplification.",
+    "byteSummary": "**Core Mechanics:** Storage engines bridge volatile RAM and persistent block storage (NVMe/SSD).\n\n**Visual & Structural Flow:** Depicts B+Tree Mutable Page Lookup vs. LSM-Tree MemTable/SSTable Hierarchy (Root / MemTable -> Internal / L0 SST -> L1..Ln SSTables -> Leaf 8-16KiB); WAL + MemTable -> Immutable L0 -> Leveled Compaction (PUT(user:4812) -> Immutable MemTable -> L0 -> L1 Compaction -> vLog / Titan (opt)); Multi-Raft Consensus -> RocksDB LSM + Bloom + Block Cache (Multi-Raft Leader -> RocksDB / Pebble -> Titan vLog (SSD)).\n\n**Trade-Offs & Production:** Compare page unit, read/write amplification, and compaction behavior across the three dominant disk-backed index families. Distributed NewSQL/KV engines like **TiKV** and **CockroachDB** (Pebble) run an LSM-Tree per node underneath **Multi-Raft** consensus groups.\n\n**Failure Modes & Application:** Explore LSM storage design, Cassandra tombstone scans, and B-Tree index invalidation."
+  },
+  "learningJourney": [
+    {
+      "id": "01-what-it-is",
+      "eyebrow": "STAGE 01 · WHAT IT IS",
+      "title": "What are B-Trees and LSM-Trees",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": "Storage engines bridge volatile RAM and persistent block storage (NVMe/SSD). A **B+Tree** (8 KiB pages in PostgreSQL, 16 KiB in InnoDB) organizes keys in mutable, fixed-size pages linked in sorted order; with height 3–4 for 1B+ rows, internal nodes stay cached in RAM so point lookups need at most 1–2 disk reads.\n\nA **Log-Structured Merge-Tree (LSM-Tree)** (RocksDB, Cassandra, Pebble) never mutates on-disk blocks in place. Writes append to a sequential WAL and an in-memory skiplist (`MemTable`), flushing immutable sorted `SSTables` (~64 MiB) to disk and merging them asynchronously in the background.",
+      "sectionDiagram": {
+        "kind": "tree-index",
+        "eyebrow": "Storage Layout",
+        "title": "B+Tree Mutable Page Lookup vs. LSM-Tree MemTable/SSTable Hierarchy",
+        "nodes": [
+          {
+            "label": "Root / MemTable",
+            "role": "RAM hot index / skiplist"
+          },
+          {
+            "label": "Internal / L0 SST",
+            "role": "Page ptrs / overlapping runs"
+          },
+          {
+            "label": "L1..Ln SSTables",
+            "role": "Sorted disjoint runs"
+          },
+          {
+            "label": "Leaf 8-16KiB",
+            "role": "Bloom + Block Cache"
+          }
+        ],
+        "cards": [
+          {
+            "label": "B+Tree Read Path",
+            "detail": "Traverses 3-4 cached internal pages to a single mutable leaf page (predictable p99)."
+          },
+          {
+            "label": "LSM Write Path",
+            "detail": "Appends sequentially to WAL + MemTable; zero random page rewrites on the hot path."
+          },
+          {
+            "label": "Bloom Filter Guard",
+            "detail": "10 bits/key (~1% FP) lets LSM point reads skip SSTables that do not contain the key."
+          }
+        ],
+        "summary": "B+Trees pay random-write amplification for 1-lookup reads; LSM-Trees batch sequential writes and pay background compaction."
+      },
+      "purpose": "The mechanism: understand how B-Trees and LSM-Trees works from first principles."
+    },
+    {
+      "id": "02-why-we-need-it",
+      "eyebrow": "STAGE 02 · WHY WE NEED IT",
+      "title": "Why we need LSM-Trees (and the RUM Conjecture trade-offs)",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": "Under heavy random-key `INSERT`/`UPDATE` workloads (time-series, IoT, write-heavy KV), B+Trees suffer **10x–30x+ write amplification** because modifying 100 bytes dirties an entire 8–16 KiB page (plus full-page WAL writes).\n\nHowever, the **RUM Conjecture** proves you cannot minimize Read, Update/Write, and Memory/Space overhead simultaneously. LSM-Trees face two signature failure modes: **L0 Compaction Stalls** (hitting `level0_stop_writes_trigger`, default 36 in RocksDB, freezes all writes) and **Tombstone Scan Degradation** on range queries over deleted keys.",
+      "sectionDiagram": {
+        "kind": "wal-mvcc",
+        "eyebrow": "LSM Write & Compaction Path",
+        "title": "WAL + MemTable -> Immutable L0 -> Leveled Compaction",
+        "nodes": [
+          {
+            "label": "PUT(user:4812)",
+            "role": "Sequential WAL + MemTable"
+          },
+          {
+            "label": "Immutable MemTable",
+            "role": "Flush 64 MiB L0 SSTable"
+          },
+          {
+            "label": "L0 -> L1 Compaction",
+            "role": "Merge-sort + drop tombstones"
+          },
+          {
+            "label": "vLog / Titan (opt)",
+            "role": "Separate values > 1 KiB"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Sequential I/O",
+            "detail": "Writes never seek random B-Tree leaf pages; MemTable flushes sequentially."
+          },
+          {
+            "label": "Write-Stall Risk",
+            "detail": "If background compaction falls behind L0 flushes, RocksDB throttles or stops foreground writes."
+          },
+          {
+            "label": "WiscKey / Titan",
+            "detail": "Separating large values (>1 KiB) into an append-only vLog cuts compaction write amplification sharply."
+          }
+        ],
+        "summary": "LSM-Trees convert random writes into sequential flushes, but compaction bandwidth must keep pace with ingestion."
+      },
+      "ideas": [
+        {
+          "title": "PostgreSQL Checkpoint Storms",
+          "description": "In B-Trees, flushing thousands of dirty buffer-pool pages saturates NVMe queues unless checkpoint_completion_target is tuned (e.g. 0.9)."
+        },
+        {
+          "title": "B-epsilon Trees",
+          "description": "Hybrid B-epsilon trees attach small write buffers to internal B-Tree nodes to batch writes while preserving fast range scans."
+        }
+      ],
+      "purpose": "The problem: see what breaks without LSM-Trees under real concurrency or scale."
+    },
+    {
+      "id": "03-where-it-is-used",
+      "eyebrow": "STAGE 03 · WHERE IT IS USED",
+      "title": "Where B-Trees and LSM-Trees belong",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "Match the storage engine to your read/write ratio, range-scan frequency, and latency SLA.",
+      "comparison": [
+        {
+          "choice": "B+Tree (PostgreSQL, MySQL InnoDB)",
+          "benefits": [
+            "Predictable point & range read latency; strong in-place MVCC/row-lock semantics for OLTP."
+          ],
+          "costs": [
+            "High random-write amplification (10-30x+) and page fragmentation under heavy random inserts."
+          ]
+        },
+        {
+          "choice": "Leveled LSM-Tree (RocksDB, Pebble, TiKV)",
+          "benefits": [
+            "High write throughput, ~10x space amplification control, fast point reads with Bloom filters."
+          ],
+          "costs": [
+            "Higher compaction write amplification than Size-Tiered; L0 stalls if compaction lags."
+          ]
+        },
+        {
+          "choice": "Size-Tiered LSM (Cassandra STCS)",
+          "benefits": [
+            "Lowest write amplification for append-heavy time-series and logging workloads."
+          ],
+          "costs": [
+            "Up to 50% temporary disk space overhead during major compactions; slower point/range reads."
+          ]
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    },
+    {
+      "id": "04-how-it-is-managed",
+      "eyebrow": "STAGE 04 · HOW IT IS MANAGED",
+      "title": "How Compaction, Bloom Filters, and Checkpoints are tuned",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "Tune each engine around its bottleneck:\n\n1. **LSM-Tree**: Size `bits_per_key = 10` (~1% false positive Bloom filter), pin L0/L1 index & filter blocks in block cache, and dedicate enough background compaction threads (`max_background_jobs`) so `L0` never hits `level0_stop_writes_trigger`.\n2. **B+Tree**: Keep working set in `shared_buffers` / `innodb_buffer_pool_size` (~70-80% RAM), set `checkpoint_completion_target = 0.9`, and use k-ordered primary keys (UUIDv7 / Snowflake) instead of random UUIDv4 to eliminate page splits.",
+      "markdownContent": "```python\n# Minimal LSM-Tree MemTable + SSTable Bloom Filter & Tombstone lookup (Python)\nclass MiniLsmEngine:\n    def __init__(self, memtable_limit: int = 1024):\n        self.memtable: dict[str, bytes | None] = {}\n        self.sstables: list[tuple[set[str], dict[str, bytes | None]]] = [] # (bloom_approx, sorted_run)\n        self.limit = memtable_limit\n\n    def put(self, key: str, val: bytes | None) -> None:\n        self.memtable[key] = val # None represents a deletion tombstone\n        if len(self.memtable) >= self.limit:\n            self._flush_to_l0()\n\n    def get(self, key: str) -> bytes | None:\n        if key in self.memtable:\n            return self.memtable[key]\n        for bloom, sstable in reversed(self.sstables): # newest L0 -> oldest Ln\n            if key not in bloom: # Bloom filter skips SSTable I/O\n                continue\n            if key in sstable:\n                return sstable[key] # returns None if tombstone\n        return None\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-alternatives",
+      "eyebrow": "STAGE 05 · ALTERNATIVES",
+      "title": "Alternatives: B+Tree vs. Leveled LSM vs. Size-Tiered LSM",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": "Compare page unit, read/write amplification, and compaction behavior across the three dominant disk-backed index families.",
+      "comparison": [
+        {
+          "choice": "B+Tree (InnoDB / PostgreSQL)",
+          "benefits": [
+            "1-2 IOs on cold point reads; zero compaction stalls; fast ordered range scans."
+          ],
+          "costs": [
+            "Random-write amplification and B-Tree page splits on random UUID keys."
+          ]
+        },
+        {
+          "choice": "Leveled Compaction LSM (RocksDB)",
+          "benefits": [
+            "Disjoint key ranges per level L1+; low space amplification (~1.1x) and good read p99."
+          ],
+          "costs": [
+            "10-30x compaction write amplification as levels merge repeatedly."
+          ]
+        },
+        {
+          "choice": "Size-Tiered Compaction LSM (Cassandra STCS)",
+          "benefits": [
+            "Lowest write amplification; ideal for write-once immutable time-series."
+          ],
+          "costs": [
+            "High read amplification and 2x disk headroom required for major compaction."
+          ]
+        }
+      ],
+      "purpose": "The trade-off: compare competing approaches across latency, consistency, and operational cost."
+    },
+    {
+      "id": "06-production-architecture",
+      "eyebrow": "STAGE 06 · PRODUCTION ARCHITECTURE",
+      "title": "Production example: Distributed KV Store (Multi-Raft + RocksDB + Titan)",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": "Distributed NewSQL/KV engines like **TiKV** and **CockroachDB** (Pebble) run an LSM-Tree per node underneath **Multi-Raft** consensus groups. Separating large values (>1 KiB) into an append-only **Titan/vLog** keeps the LSM key-index compact in RAM while bounding compaction I/O.",
+      "sectionDiagram": {
+        "kind": "quorum-cluster",
+        "eyebrow": "Distributed Storage Node",
+        "title": "Multi-Raft Consensus -> RocksDB LSM + Bloom + Block Cache",
+        "nodes": [
+          {
+            "id": "raft",
+            "label": "Multi-Raft Leader",
+            "role": "Replicates write batch"
+          },
+          {
+            "id": "lsm",
+            "label": "RocksDB / Pebble",
+            "role": "WAL + MemTable + SST"
+          },
+          {
+            "id": "vlog",
+            "label": "Titan vLog (SSD)",
+            "role": "Values > 1 KiB"
+          }
+        ],
+        "edges": [
+          {
+            "label": "Quorum commit -> Apply"
+          },
+          {
+            "label": "Compact keys; GC vLog"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Write-Group Batching",
+            "detail": "Coalesces concurrent Raft commits into a single RocksDB WriteBatch + fsync."
+          },
+          {
+            "label": "Block Cache Pinning",
+            "detail": "Pin L0/L1 filter and index blocks in RAM so point reads avoid extra SSD seeks."
+          },
+          {
+            "label": "Rate-Limited Compaction",
+            "detail": "Cap compaction MB/s so background merges never starve foreground read tail latency."
+          }
+        ],
+        "summary": "Pairing Multi-Raft with rate-limited RocksDB compaction delivers linearizable writes and predictable reads."
+      },
+      "purpose": "Production architecture: see how the components compose end to end under real load."
+    },
+    {
+      "id": "07-problems-and-further-reading",
+      "eyebrow": "STAGE 07 · PROBLEMS SOLVED & FURTHER DEEP DIVE",
+      "title": "Problems solved by Storage Engine Tuning & Deep Dives",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": "Explore LSM storage design, Cassandra tombstone scans, and B-Tree index invalidation.",
+      "supportingConcepts": [
+        {
+          "slug": "design-lsm-tree-storage-engine",
+          "title": "System Design: LSM-Tree Storage Engine",
+          "kind": "problem"
+        },
+        {
+          "slug": "cassandra-tombstone-accumulation-scans",
+          "title": "Problem: Cassandra Tombstone Accumulation Scans",
+          "kind": "problem"
+        },
+        {
+          "slug": "b-tree-index-invalidation-type-coercion",
+          "title": "Problem: B-Tree Index Invalidation via Type Coercion",
+          "kind": "problem"
+        },
+        {
+          "slug": "database-indexing",
+          "title": "Concept: Database Indexing",
+          "kind": "concept"
+        },
+        {
+          "slug": "wide-column-databases",
+          "title": "Concept: Wide-Column Databases",
+          "kind": "concept"
+        }
+      ],
+      "purpose": "Applied problems: connect these internals to concrete system design and debugging scenarios."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why does inserting random UUIDv4 primary keys into a large PostgreSQL or InnoDB B+Tree table degrade write throughput far more than inserting monotonic UUIDv7 / Snowflake IDs?",
+      "options": [
+        {
+          "id": "a",
+          "text": "Random keys scatter across cold leaf pages, causing buffer-pool cache misses, page splits, and 10-30x random-write amplification",
+          "correct": true,
+          "feedback": "Correct: monotonic keys append to the rightmost leaf page (staying hot in RAM), whereas random keys dirty pages across the entire tree."
+        },
+        {
+          "id": "b",
+          "text": "UUIDv4 disables the Write-Ahead Log",
+          "correct": false,
+          "feedback": "WAL is always active; the bottleneck is random leaf-page I/O and splits."
+        },
+        {
+          "id": "c",
+          "text": "B+Trees cannot store 128-bit values",
+          "correct": false,
+          "feedback": "B+Trees store 128-bit UUIDs natively; only key ordering affects page locality."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why does inserting random UUIDv4 primary keys into a large PostgreSQL or InnoDB B+Tree table degrade write throughput far more than inserting monotonic UUIDv7 / Snowflake IDs?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Random keys scatter across cold leaf pages, causing buffer-pool cache misses, page splits, and 10-30x random-write amplification",
+            "correct": true,
+            "feedback": "Correct: monotonic keys append to the rightmost leaf page (staying hot in RAM), whereas random keys dirty pages across the entire tree."
+          },
+          {
+            "id": "b",
+            "text": "UUIDv4 disables the Write-Ahead Log",
+            "correct": false,
+            "feedback": "WAL is always active; the bottleneck is random leaf-page I/O and splits."
+          },
+          {
+            "id": "c",
+            "text": "B+Trees cannot store 128-bit values",
+            "correct": false,
+            "feedback": "B+Trees store 128-bit UUIDs natively; only key ordering affects page locality."
+          }
+        ]
+      },
+      {
+        "question": "What is the main benefit—and corresponding operational trade-off—of using B+Tree (PostgreSQL, MySQL InnoDB) in B-Tree vs. LSM-Tree Storage Engines?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Advantage: High write throughput, ~10x space amplification control, fast point reads with Bloom filters. It has zero operational or latency overhead compared to Leveled LSM-Tree (RocksDB, Pebble, TiKV).",
+            "correct": false,
+            "feedback": "Not quite: that describes Leveled LSM-Tree (RocksDB, Pebble, TiKV), whereas B+Tree (PostgreSQL, MySQL InnoDB) specifically trades off: High random-write amplification (10-30x+) and page fragmentation under heavy random inserts."
+          },
+          {
+            "id": "b",
+            "text": "Using Size-Tiered LSM (Cassandra STCS) eliminates all latency and consistency trade-offs",
+            "correct": false,
+            "feedback": "Incorrect: every production option in B-Tree vs. LSM-Tree Storage Engines carries concrete latency, consistency, or operational costs."
+          },
+          {
+            "id": "c",
+            "text": "Advantage: Predictable point & range read latency; strong in-place MVCC/row-lock semantics for OLTP. Cost: High random-write amplification (10-30x+) and page fragmentation under heavy random inserts.",
+            "correct": true,
+            "feedback": "Correct: B+Tree (PostgreSQL, MySQL InnoDB) delivers predictable point & range read latency; strong in-place MVCC/row-lock semantics for OLTP. while requiring you to manage high random-write amplification (10-30x+) and page fragmentation under heavy random inserts."
+          }
+        ]
+      },
+      {
+        "question": "Why is B-epsilon Trees critical when operating B-Tree vs. LSM-Tree Storage Engines in production?",
+        "options": [
+          {
+            "id": "a",
+            "text": "It only applies during local unit testing and can be disabled in production to save memory.",
+            "correct": false,
+            "feedback": "Incorrect: 'B-epsilon Trees' directly governs production reliability and correctness under real traffic."
+          },
+          {
+            "id": "b",
+            "text": "It replaces the need for observability, timeouts, or capacity planning across B-Tree vs. LSM-Tree Storage Engines.",
+            "correct": false,
+            "feedback": "Incorrect: 'B-epsilon Trees' works alongside proper bounds, monitoring, and failure isolation."
+          },
+          {
+            "id": "c",
+            "text": "Hybrid B-epsilon trees attach small write buffers to internal B-Tree nodes to batch writes while preserving fast range scans.",
+            "correct": true,
+            "feedback": "Correct: Hybrid B-epsilon trees attach small write buffers to internal B-Tree nodes to batch writes while preserving fast range scans."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** Storage engines bridge volatile RAM and persistent block storage (NVMe/SSD).\n\n**How It Flows:** Think of B-Tree vs. LSM-Tree Storage Engines as a clear step-by-step chain: Root / MemTable -> Internal / L0 SST -> L1..Ln SSTables -> Leaf 8-16KiB -> PUT(user:4812).\n\n**Why Beginners Should Care:** B-Trees optimize read latency and predictability at the cost of random-write amplification, while LSM-Trees maximize sequential write throughput at the cost of background.",
+      "spark": {
+        "summary": "Storage engines bridge volatile RAM and persistent block storage (NVMe/SSD).",
+        "keyTakeaway": "B-Trees optimize read latency and predictability at the cost of random-write amplification, while LSM-Trees maximize sequential write throughput at the cost of background."
+      },
+      "learningJourney": [
+        {
+          "id": "01-what-it-is",
+          "title": "What are B-Trees and LSM-Trees",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how B-Trees and LSM-Trees works from first principles.",
+          "explanation": "Storage engines bridge volatile RAM and persistent block storage (NVMe/SSD). A **B+Tree** (8 KiB pages in PostgreSQL, 16 KiB in InnoDB) organizes keys in mutable, fixed-size pages linked in sorted order; with height 3–4 for 1B+ rows, internal nodes stay cached in RAM so point lookups need at most 1–2 disk reads.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "tree-index",
+            "eyebrow": "Storage Layout",
+            "title": "B+Tree Mutable Page Lookup vs. LSM-Tree MemTable/SSTable Hierarchy",
+            "nodes": [
+              {
+                "label": "Root / MemTable",
+                "role": "RAM hot index / skiplist"
+              },
+              {
+                "label": "Internal / L0 SST",
+                "role": "Page ptrs / overlapping runs"
+              },
+              {
+                "label": "L1..Ln SSTables",
+                "role": "Sorted disjoint runs"
+              },
+              {
+                "label": "Leaf 8-16KiB",
+                "role": "Bloom + Block Cache"
+              }
+            ],
+            "cards": [
+              {
+                "label": "B+Tree Read Path",
+                "detail": "Traverses 3-4 cached internal pages to a single mutable leaf page (predictable p99)."
+              },
+              {
+                "label": "LSM Write Path",
+                "detail": "Appends sequentially to WAL + MemTable; zero random page rewrites on the hot path."
+              },
+              {
+                "label": "Bloom Filter Guard",
+                "detail": "10 bits/key (~1% FP) lets LSM point reads skip SSTables that do not contain the key."
+              }
+            ],
+            "summary": "B+Trees pay random-write amplification for 1-lookup reads; LSM-Trees batch sequential writes and pay background compaction."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-why-we-need-it",
+          "title": "Why we need LSM-Trees (and the RUM Conjecture trade-offs)",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without LSM-Trees under real concurrency or scale.",
+          "explanation": "Under heavy random-key `INSERT`/`UPDATE` workloads (time-series, IoT, write-heavy KV), B+Trees suffer **10x–30x+ write amplification** because modifying 100 bytes dirties an entire 8–16 KiB page (plus full-page WAL writes). However, the **RUM Conjecture** proves you cannot minimize Read, Update/Write, and Memory/Space overhead simultaneously.",
+          "ideas": [
+            {
+              "title": "PostgreSQL Checkpoint Storms",
+              "description": "In B-Trees, flushing thousands of dirty buffer-pool pages saturates NVMe queues unless checkpoint_completion_target is tuned (e.g. 0.9)."
+            },
+            {
+              "title": "B-epsilon Trees",
+              "description": "Hybrid B-epsilon trees attach small write buffers to internal B-Tree nodes to batch writes while preserving fast range scans."
+            }
+          ],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "wal-mvcc",
+            "eyebrow": "LSM Write & Compaction Path",
+            "title": "WAL + MemTable -> Immutable L0 -> Leveled Compaction",
+            "nodes": [
+              {
+                "label": "PUT(user:4812)",
+                "role": "Sequential WAL + MemTable"
+              },
+              {
+                "label": "Immutable MemTable",
+                "role": "Flush 64 MiB L0 SSTable"
+              },
+              {
+                "label": "L0 -> L1 Compaction",
+                "role": "Merge-sort + drop tombstones"
+              },
+              {
+                "label": "vLog / Titan (opt)",
+                "role": "Separate values > 1 KiB"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Sequential I/O",
+                "detail": "Writes never seek random B-Tree leaf pages; MemTable flushes sequentially."
+              },
+              {
+                "label": "Write-Stall Risk",
+                "detail": "If background compaction falls behind L0 flushes, RocksDB throttles or stops foreground writes."
+              },
+              {
+                "label": "WiscKey / Titan",
+                "detail": "Separating large values (>1 KiB) into an append-only vLog cuts compaction write amplification sharply."
+              }
+            ],
+            "summary": "LSM-Trees convert random writes into sequential flushes, but compaction bandwidth must keep pace with ingestion."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-where-it-is-used",
+          "title": "Where B-Trees and LSM-Trees belong",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Match the storage engine to your read/write ratio, range-scan frequency, and latency SLA.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "06-production-architecture",
+          "title": "Production example: Distributed KV Store (Multi-Raft + RocksDB + Titan)",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Production architecture: see how the components compose end to end under real load.",
+          "explanation": "Distributed NewSQL/KV engines like **TiKV** and **CockroachDB** (Pebble) run an LSM-Tree per node underneath **Multi-Raft** consensus groups. Separating large values (>1 KiB) into an append-only **Titan/vLog** keeps the LSM key-index compact in RAM while bounding compaction I/O.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "quorum-cluster",
+            "eyebrow": "Distributed Storage Node",
+            "title": "Multi-Raft Consensus -> RocksDB LSM + Bloom + Block Cache",
+            "nodes": [
+              {
+                "id": "raft",
+                "label": "Multi-Raft Leader",
+                "role": "Replicates write batch"
+              },
+              {
+                "id": "lsm",
+                "label": "RocksDB / Pebble",
+                "role": "WAL + MemTable + SST"
+              },
+              {
+                "id": "vlog",
+                "label": "Titan vLog (SSD)",
+                "role": "Values > 1 KiB"
+              }
+            ],
+            "edges": [
+              {
+                "label": "Quorum commit -> Apply"
+              },
+              {
+                "label": "Compact keys; GC vLog"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Write-Group Batching",
+                "detail": "Coalesces concurrent Raft commits into a single RocksDB WriteBatch + fsync."
+              },
+              {
+                "label": "Block Cache Pinning",
+                "detail": "Pin L0/L1 filter and index blocks in RAM so point reads avoid extra SSD seeks."
+              },
+              {
+                "label": "Rate-Limited Compaction",
+                "detail": "Cap compaction MB/s so background merges never starve foreground read tail latency."
+              }
+            ],
+            "summary": "Pairing Multi-Raft with rate-limited RocksDB compaction delivers linearizable writes and predictable reads."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "B-Trees optimize read latency and predictability at the cost of random-write amplification, while LSM-Trees maximize sequential write throughput at the cost of background."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** Storage engines bridge volatile RAM and persistent block storage (NVMe/SSD).\n\n**Visual & Structural Flow:** Depicts B+Tree Mutable Page Lookup vs. LSM-Tree MemTable/SSTable Hierarchy (Root / MemTable -> Internal / L0 SST -> L1..Ln SSTables -> Leaf 8-16KiB); WAL + MemTable -> Immutable L0 -> Leveled Compaction (PUT(user:4812) -> Immutable MemTable -> L0 -> L1 Compaction -> vLog / Titan (opt)); Multi-Raft Consensus -> RocksDB LSM + Bloom + Block Cache (Multi-Raft Leader -> RocksDB / Pebble -> Titan vLog (SSD)).\n\n**Trade-Offs & Production:** Compare page unit, read/write amplification, and compaction behavior across the three dominant disk-backed index families. Distributed NewSQL/KV engines like **TiKV** and **CockroachDB** (Pebble) run an LSM-Tree per node underneath **Multi-Raft** consensus groups.\n\n**Failure Modes & Application:** Explore LSM storage design, Cassandra tombstone scans, and B-Tree index invalidation.",
+      "spark": {
+        "summary": "B-Trees update fixed-size disk pages (4-16 KiB) in place for fast, predictable point and range reads, whereas LSM-Trees buffer writes sequentially in memory (MemTable + WAL) and merge immutable sorted runs (SSTables) in the background for orders-of-magnitude higher write throughput.",
+        "keyTakeaway": "B-Trees optimize read latency and predictability at the cost of random-write amplification, while LSM-Trees maximize sequential write throughput at the cost of background compaction I/O and multi-level read amplification."
+      }
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** B-Trees update fixed-size disk pages (4-16 KiB) in place for fast, predictable point and range reads, whereas LSM-Trees buffer writes sequentially in memory (MemTable + WAL) and merge immutable sorted runs (SSTables) in the background for.\n\n**Production Trade-Offs:** Tune each engine around its bottleneck: 1.\n\n**Failure Modes & Edge Cases:** Explore LSM storage design, Cassandra tombstone scans, and B-Tree index invalidation.\n\n**Principal Takeaway:** B-Trees optimize read latency and predictability at the cost of random-write amplification, while LSM-Trees maximize sequential write throughput at the cost of background compaction I/O and multi-level read amplification.",
+      "spark": {
+        "summary": "B-Trees update fixed-size disk pages (4-16 KiB) in place for fast, predictable point and range reads, whereas LSM-Trees buffer writes sequentially in memory (MemTable + WAL) and merge immutable sorted runs (SSTables) in the background for.",
+        "keyTakeaway": "B-Trees optimize read latency and predictability at the cost of random-write amplification, while LSM-Trees maximize sequential write throughput at the cost of background compaction I/O and multi-level read amplification."
+      },
+      "learningJourney": [
+        {
+          "id": "01-what-it-is",
+          "title": "What are B-Trees and LSM-Trees",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how B-Trees and LSM-Trees works from first principles.",
+          "explanation": "Storage engines bridge volatile RAM and persistent block storage (NVMe/SSD). A **B+Tree** (8 KiB pages in PostgreSQL, 16 KiB in InnoDB) organizes keys in mutable, fixed-size pages linked in sorted order; with height 3–4 for 1B+ rows, internal nodes stay cached in RAM so point lookups need at most 1–2 disk reads.\n\nA **Log-Structured Merge-Tree (LSM-Tree)** (RocksDB, Cassandra, Pebble) never mutates on-disk blocks in place. Writes append to a sequential WAL and an in-memory skiplist (`MemTable`), flushing immutable sorted `SSTables` (~64 MiB) to disk and merging them asynchronously in the background.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "tree-index",
+            "eyebrow": "Storage Layout",
+            "title": "B+Tree Mutable Page Lookup vs. LSM-Tree MemTable/SSTable Hierarchy",
+            "nodes": [
+              {
+                "label": "Root / MemTable",
+                "role": "RAM hot index / skiplist"
+              },
+              {
+                "label": "Internal / L0 SST",
+                "role": "Page ptrs / overlapping runs"
+              },
+              {
+                "label": "L1..Ln SSTables",
+                "role": "Sorted disjoint runs"
+              },
+              {
+                "label": "Leaf 8-16KiB",
+                "role": "Bloom + Block Cache"
+              }
+            ],
+            "cards": [
+              {
+                "label": "B+Tree Read Path",
+                "detail": "Traverses 3-4 cached internal pages to a single mutable leaf page (predictable p99)."
+              },
+              {
+                "label": "LSM Write Path",
+                "detail": "Appends sequentially to WAL + MemTable; zero random page rewrites on the hot path."
+              },
+              {
+                "label": "Bloom Filter Guard",
+                "detail": "10 bits/key (~1% FP) lets LSM point reads skip SSTables that do not contain the key."
+              }
+            ],
+            "summary": "B+Trees pay random-write amplification for 1-lookup reads; LSM-Trees batch sequential writes and pay background compaction."
+          },
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-why-we-need-it",
+          "title": "Why we need LSM-Trees (and the RUM Conjecture trade-offs)",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without LSM-Trees under real concurrency or scale.",
+          "explanation": "Under heavy random-key `INSERT`/`UPDATE` workloads (time-series, IoT, write-heavy KV), B+Trees suffer **10x–30x+ write amplification** because modifying 100 bytes dirties an entire 8–16 KiB page (plus full-page WAL writes).\n\nHowever, the **RUM Conjecture** proves you cannot minimize Read, Update/Write, and Memory/Space overhead simultaneously. LSM-Trees face two signature failure modes: **L0 Compaction Stalls** (hitting `level0_stop_writes_trigger`, default 36 in RocksDB, freezes all writes) and **Tombstone Scan Degradation** on range queries over deleted keys.",
+          "caveats": null,
+          "ideas": [
+            {
+              "title": "PostgreSQL Checkpoint Storms",
+              "description": "In B-Trees, flushing thousands of dirty buffer-pool pages saturates NVMe queues unless checkpoint_completion_target is tuned (e.g. 0.9)."
+            },
+            {
+              "title": "B-epsilon Trees",
+              "description": "Hybrid B-epsilon trees attach small write buffers to internal B-Tree nodes to batch writes while preserving fast range scans."
+            }
+          ],
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "wal-mvcc",
+            "eyebrow": "LSM Write & Compaction Path",
+            "title": "WAL + MemTable -> Immutable L0 -> Leveled Compaction",
+            "nodes": [
+              {
+                "label": "PUT(user:4812)",
+                "role": "Sequential WAL + MemTable"
+              },
+              {
+                "label": "Immutable MemTable",
+                "role": "Flush 64 MiB L0 SSTable"
+              },
+              {
+                "label": "L0 -> L1 Compaction",
+                "role": "Merge-sort + drop tombstones"
+              },
+              {
+                "label": "vLog / Titan (opt)",
+                "role": "Separate values > 1 KiB"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Sequential I/O",
+                "detail": "Writes never seek random B-Tree leaf pages; MemTable flushes sequentially."
+              },
+              {
+                "label": "Write-Stall Risk",
+                "detail": "If background compaction falls behind L0 flushes, RocksDB throttles or stops foreground writes."
+              },
+              {
+                "label": "WiscKey / Titan",
+                "detail": "Separating large values (>1 KiB) into an append-only vLog cuts compaction write amplification sharply."
+              }
+            ],
+            "summary": "LSM-Trees convert random writes into sequential flushes, but compaction bandwidth must keep pace with ingestion."
+          },
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "03-where-it-is-used",
+          "title": "Where B-Trees and LSM-Trees belong",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Match the storage engine to your read/write ratio, range-scan frequency, and latency SLA.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-how-it-is-managed",
+          "title": "How Compaction, Bloom Filters, and Checkpoints are tuned",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Tune each engine around its bottleneck:\n\n1. **LSM-Tree**: Size `bits_per_key = 10` (~1% false positive Bloom filter), pin L0/L1 index & filter blocks in block cache, and dedicate enough background compaction threads (`max_background_jobs`) so `L0` never hits `level0_stop_writes_trigger`.\n2. **B+Tree**: Keep working set in `shared_buffers` / `innodb_buffer_pool_size` (~70-80% RAM), set `checkpoint_completion_target = 0.9`, and use k-ordered primary keys (UUIDv7 / Snowflake) instead of random UUIDv4 to eliminate page splits.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "05-alternatives",
+          "title": "Alternatives: B+Tree vs. Leveled LSM vs. Size-Tiered LSM",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "The trade-off: compare competing approaches across latency, consistency, and operational cost.",
+          "explanation": "Compare page unit, read/write amplification, and compaction behavior across the three dominant disk-backed index families.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "06-production-architecture",
+          "title": "Production example: Distributed KV Store (Multi-Raft + RocksDB + Titan)",
+          "eyebrow": "Advanced Path · Stage 06",
+          "purpose": "Production architecture: see how the components compose end to end under real load.",
+          "explanation": "Distributed NewSQL/KV engines like **TiKV** and **CockroachDB** (Pebble) run an LSM-Tree per node underneath **Multi-Raft** consensus groups. Separating large values (>1 KiB) into an append-only **Titan/vLog** keeps the LSM key-index compact in RAM while bounding compaction I/O.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "quorum-cluster",
+            "eyebrow": "Distributed Storage Node",
+            "title": "Multi-Raft Consensus -> RocksDB LSM + Bloom + Block Cache",
+            "nodes": [
+              {
+                "id": "raft",
+                "label": "Multi-Raft Leader",
+                "role": "Replicates write batch"
+              },
+              {
+                "id": "lsm",
+                "label": "RocksDB / Pebble",
+                "role": "WAL + MemTable + SST"
+              },
+              {
+                "id": "vlog",
+                "label": "Titan vLog (SSD)",
+                "role": "Values > 1 KiB"
+              }
+            ],
+            "edges": [
+              {
+                "label": "Quorum commit -> Apply"
+              },
+              {
+                "label": "Compact keys; GC vLog"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Write-Group Batching",
+                "detail": "Coalesces concurrent Raft commits into a single RocksDB WriteBatch + fsync."
+              },
+              {
+                "label": "Block Cache Pinning",
+                "detail": "Pin L0/L1 filter and index blocks in RAM so point reads avoid extra SSD seeks."
+              },
+              {
+                "label": "Rate-Limited Compaction",
+                "detail": "Cap compaction MB/s so background merges never starve foreground read tail latency."
+              }
+            ],
+            "summary": "Pairing Multi-Raft with rate-limited RocksDB compaction delivers linearizable writes and predictable reads."
+          },
+          "level": "L7 · STAFF / PRINCIPAL"
+        },
+        {
+          "id": "07-problems-and-further-reading",
+          "title": "Problems solved by Storage Engine Tuning & Deep Dives",
+          "eyebrow": "Advanced Path · Stage 07",
+          "purpose": "Applied problems: connect these internals to concrete system design and debugging scenarios.",
+          "explanation": "Explore LSM storage design, Cassandra tombstone scans, and B-Tree index invalidation.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "B-Trees optimize read latency and predictability at the cost of random-write amplification, while LSM-Trees maximize sequential write throughput at the cost of background compaction I/O and multi-level read amplification."
+    }
+  }
+}

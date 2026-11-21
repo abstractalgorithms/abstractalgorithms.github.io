@@ -1,0 +1,630 @@
+{
+  "id": "problem-low-pause-gc-and-fencing-tokens",
+  "slug": "low-pause-gc-and-fencing-tokens",
+  "title": "Surviving JVM Stop-the-World GC Pauses",
+  "problemType": "system-design",
+  "difficulty": "hard",
+  "prompt": "A stateful Java cluster node holds an etcd/ZooKeeper distributed leader lease with a 5-second TTL and 1-second heartbeat interval. Under peak traffic on a 32 GB Parallel/G1 heap, occasional 6.5-second Stop-the-World Full GC (or safepoint TTPS) freezes occur. The cluster elects a new leader, and when the paused JVM resumes, it still thinks it is leader and overwrites state (split-brain). Fix both the JVM pause and the split-brain safety.",
+  "spark": {
+    "summary": "A 6-second JVM Stop-the-World GC or safepoint pause freezes all application and heartbeat threads, causing ZooKeeper/etcd/cluster peers to declare the node dead and elect a new leader while the paused node still believes it holds the lease.",
+    "keyTakeaway": "Reduce STW pauses below 10 ms via Generational ZGC + GC-safe off-heap/pool allocation, and pair heartbeats with monotonic fencing tokens so a zombie node waking from a GC freeze cannot corrupt shared state.",
+    "byteSummary": "**Core Mechanics:** A stateful Java node on a **32 GB heap** (allocating **4 GB/sec**) holds an etcd/ZooKeeper leader lease (**5s TTL**, 1s heartbeat).\n\n**Visual & Structural Flow:** Depicts Zombie Split-Brain vs. Storage-Enforced Fencing Token (Node 1 (tok=41) -> etcd Lease (5s) -> Node 2 (tok=42) -> Storage CAS); etcd Mod-Revision Fencing + Generational ZGC (etcd / ZK Quorum -> Leader (Gen ZGC) -> Zombie (Paused) -> Storage Engine).\n\n**Trade-Offs & Production:** Checking `System.currentTimeMillis() < leaseExpiry` before writing is broken: the JVM can freeze for 6.5s *between* the `if` check and the network `write()` call, and wall clocks can skew. Combine sub-millisecond GC pauses with cryptographic/monotonic storage fencing: **Generational ZGC (`-XX:+UseZGC -XX:+ZGenerational`)**: Performs concurrent marking and relocation.\n\n**Failure Modes & Application:** Fencing tokens are mandatory whenever distributed leases protect mutable state: **Distributed Lock Services & Partition Leaders**: Prevents split-brain writes in shard coordinators and cron schedulers."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why Low-Pause GC & Fencing Tokens Matter",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": "A stateful Java node on a **32 GB heap** (allocating **4 GB/sec**) holds an etcd/ZooKeeper leader lease (**5s TTL**, 1s heartbeat). When a **6.5-second Stop-the-World (STW) Full GC** or safepoint freeze hits, etcd expires the lease and elects a new leader. When the paused JVM wakes up, its local `isLeader` boolean is still `true`—writing stale state and causing split-brain data corruption.",
+      "purpose": "The mechanism: understand how Why Low-Pause GC & Fencing Tokens Matter works from first principles."
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "Real-World Impact of GC-Induced Split-Brain",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "Clock/GC freezes break naive distributed leases:\n\n1. **Zombie Writes**: A paused node wakes up mid-method (`if (isLeader) writeStorage()`) long after its 5s lease expired.\n2. **Concurrent Two-Leader Window**: Both the old zombie and the newly elected leader mutate storage simultaneously.\n3. **Safepoint TTSP Delays**: Even with low-pause GC, uncounted loops or JNI calls can stall all threads waiting for a JVM safepoint.",
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "GC Freeze & Monotonic Fencing Token",
+        "title": "Zombie Split-Brain vs. Storage-Enforced Fencing Token",
+        "actors": [
+          {
+            "id": "n1",
+            "label": "Node 1 (tok=41)"
+          },
+          {
+            "id": "etcd",
+            "label": "etcd Lease (5s)"
+          },
+          {
+            "id": "n2",
+            "label": "Node 2 (tok=42)"
+          },
+          {
+            "id": "db",
+            "label": "Storage CAS"
+          }
+        ],
+        "events": [
+          {
+            "from": "n1",
+            "to": "n1",
+            "label": "6.5s STW Full GC freeze!",
+            "status": "fail"
+          },
+          {
+            "from": "etcd",
+            "to": "n2",
+            "label": "5s TTL expires -> N2 elected (tok=42)",
+            "status": "ok"
+          },
+          {
+            "from": "n2",
+            "to": "db",
+            "label": "write(tok=42) -> current_tok=42",
+            "status": "ok"
+          },
+          {
+            "from": "n1",
+            "to": "db",
+            "label": "Zombie wakes: write(tok=41)",
+            "status": "warn"
+          },
+          {
+            "from": "db",
+            "to": "n1",
+            "label": "Rejected! 41 < 42 (Fenced)",
+            "status": "ok"
+          }
+        ],
+        "summary": "GC tuning reduces pause frequency, while monotonic fencing tokens enforced by the storage layer make zombie writes impossible."
+      },
+      "purpose": "The problem: see what breaks without Real-World Impact of GC-Induced Split-Brain under real concurrency or scale."
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Naive Solution (and Why It Breaks)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "Checking `System.currentTimeMillis() < leaseExpiry` before writing is broken: the JVM can freeze for 6.5s *between* the `if` check and the network `write()` call, and wall clocks can skew. Relying solely on GC tuning without fencing tokens is also unsafe because kernel swapping or VM live-migration can still pause a process.",
+      "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale."
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise Solution: Generational ZGC + Monotonic Fencing Tokens",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": "Combine sub-millisecond GC pauses with cryptographic/monotonic storage fencing:\n\n- **Generational ZGC (`-XX:+UseZGC -XX:+ZGenerational`)**: Performs concurrent marking and relocation on a 32 GB heap at 4 GB/sec allocation, keeping STW pauses **< 1 ms** (far below the 5s lease TTL).\n- **Monotonic Fencing Tokens**: Every lease acquisition from etcd (`mod_revision`) or ZooKeeper (`zxid`) issues a strictly increasing integer token. Pass that token on every storage write.\n- **Storage-Side CAS Rejection**: The storage layer atomically executes `WHERE fencing_token <= :token` (or rejects `token < max_seen_token`), fencing any zombie node regardless of pause duration.",
+      "sectionDiagram": {
+        "kind": "quorum-cluster",
+        "eyebrow": "Fenced Leader Election",
+        "title": "etcd Mod-Revision Fencing + Generational ZGC",
+        "nodes": [
+          {
+            "label": "etcd / ZK Quorum",
+            "role": "Issues monotonic token"
+          },
+          {
+            "label": "Leader (Gen ZGC)",
+            "role": "<1ms STW | token=42"
+          },
+          {
+            "label": "Zombie (Paused)",
+            "role": "Stale token=41"
+          },
+          {
+            "label": "Storage Engine",
+            "role": "CAS: token >= max_token"
+          }
+        ],
+        "edges": [
+          {
+            "label": "Acquire lease -> 42"
+          },
+          {
+            "label": "Reject 41 < 42"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Generational ZGC",
+            "detail": "Handles 4 GB/s alloc rate on 32 GB heap with <1 ms STW pauses."
+          },
+          {
+            "label": "Fencing Token",
+            "detail": "Strictly monotonic ID (etcd revision / ZK zxid) per lease grant."
+          },
+          {
+            "label": "Storage Enforcement",
+            "detail": "Only the storage layer can prevent split-brain by rejecting stale tokens."
+          },
+          {
+            "label": "Safepoint Checks",
+            "detail": "Enable -Xlog:gc*,safepoint to catch non-GC TTSP pauses."
+          }
+        ],
+        "summary": "ZGC prevents 6.5s GC freezes in practice, while storage-enforced fencing tokens guarantee correctness even under arbitrary pauses."
+      },
+      "markdownContent": "```java\n// JVM Flags:\n// -XX:+UseZGC -XX:+ZGenerational -Xms32g -Xmx32g -XX:+AlwaysPreTouch\n// -XX:+PerfDisableSharedMem -Xlog:gc*,safepoint:file=/var/log/gc.log:time,uptime\n\npublic final class FencedLeaderClient {\n    public record Lease(long fencingToken, long expiresAtNano) {}\n    private volatile Lease currentLease = new Lease(-1L, 0L);\n\n    public void renewLease(long ttlNs) {\n        long sendNano = System.nanoTime(); // Anchor BEFORE RPC!\n        long token = etcdRenewRpc(ttlNs);\n        if (token > 0) {\n            this.currentLease = new Lease(token, sendNano + ttlNs);\n        }\n    }\n\n    public void fencedWrite(String key, String value) {\n        Lease lease = this.currentLease;\n        if (System.nanoTime() > lease.expiresAtNano() - 500_000_000L) {\n            throw new IllegalStateException(\"Local lease near expiry; stepping down\");\n        }\n        int updated = executeSql(\n            \"UPDATE kv_store SET val = ?, fencing_token = ? WHERE k = ? AND fencing_token <= ?\",\n            value, lease.fencingToken(), key, lease.fencingToken()\n        );\n        if (updated == 0) {\n            this.currentLease = new Lease(-1L, 0L);\n            throw new IllegalStateException(\"Fenced out by newer leader\");\n        }\n    }\n}\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where Low-Pause GC & Fencing Tokens Apply in System Design",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": "Fencing tokens are mandatory whenever distributed leases protect mutable state:\n\n- **Distributed Lock Services & Partition Leaders**: Prevents split-brain writes in shard coordinators and cron schedulers.\n- **Kafka & Stream Processors**: `producer_epoch` is Kafka's built-in fencing token.\n- **Low-Latency JVM Services**: Generational ZGC / Shenandoah keeps tail latency flat under multi-GB/sec allocation.",
+      "supportingConcepts": [
+        {
+          "slug": "distributed-locking",
+          "title": "Concept: Distributed Locking",
+          "kind": "concept"
+        },
+        {
+          "slug": "jvm-internals-and-garbage-collection",
+          "title": "Concept: JVM Internals & GC",
+          "kind": "concept"
+        },
+        {
+          "slug": "split-brain-prevention",
+          "title": "Concept: Split-Brain Prevention",
+          "kind": "concept"
+        },
+        {
+          "slug": "design-distributed-lock-fencing-tokens",
+          "title": "System Design: Distributed Lock Fencing Tokens",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why can't a leader node prevent split-brain solely by checking its local lease expiration timestamp before writing to storage?",
+      "options": [
+        {
+          "id": "a",
+          "text": "A 6.5s GC pause or OS scheduling freeze can occur right after the timestamp check and before the write packet reaches storage",
+          "correct": true,
+          "feedback": "Correct: only monotonic fencing tokens checked atomically at the storage layer eliminate the check-then-act race."
+        },
+        {
+          "id": "b",
+          "text": "Because `System.currentTimeMillis()` always returns UTC-1",
+          "correct": false,
+          "feedback": "The core issue is the pause window between checking and writing (plus clock drift)."
+        },
+        {
+          "id": "c",
+          "text": "Because Generational ZGC disables `System.currentTimeMillis()`",
+          "correct": false,
+          "feedback": "ZGC has no effect on clock APIs."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why can't a leader node prevent split-brain solely by checking its local lease expiration timestamp before writing to storage?",
+        "options": [
+          {
+            "id": "a",
+            "text": "A 6.5s GC pause or OS scheduling freeze can occur right after the timestamp check and before the write packet reaches storage",
+            "correct": true,
+            "feedback": "Correct: only monotonic fencing tokens checked atomically at the storage layer eliminate the check-then-act race."
+          },
+          {
+            "id": "b",
+            "text": "Because `System.currentTimeMillis()` always returns UTC-1",
+            "correct": false,
+            "feedback": "The core issue is the pause window between checking and writing (plus clock drift)."
+          },
+          {
+            "id": "c",
+            "text": "Because Generational ZGC disables `System.currentTimeMillis()`",
+            "correct": false,
+            "feedback": "ZGC has no effect on clock APIs."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why Low-Pause GC & Fencing Tokens Matter', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "b",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "c",
+            "text": "A stateful Java node on a **32 GB heap** (allocating **4 GB/sec**) holds an etcd/ZooKeeper leader lease (**5s TTL**, 1s heartbeat).",
+            "correct": true,
+            "feedback": "Correct: A stateful Java node on a **32 GB heap** (allocating **4 GB/sec**) holds an etcd/ZooKeeper leader lease (**5s TTL**, 1s heartbeat)."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Real-World Impact of GC-Induced Split-Brain', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "b",
+            "text": "Clock/GC freezes break naive distributed leases: 1.",
+            "correct": true,
+            "feedback": "Correct: Clock/GC freezes break naive distributed leases: 1."
+          },
+          {
+            "id": "c",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** A stateful Java node on a **32 GB heap** (allocating **4 GB/sec**) holds an etcd/ZooKeeper leader lease (**5s TTL**, 1s heartbeat).\n\n**How It Flows:** Think of Surviving JVM Stop-the-World GC Pauses as a clear step-by-step chain: Node 1 (tok=41) -> etcd Lease (5s) -> Node 2 (tok=42) -> Storage CAS -> etcd / ZK Quorum.\n\n**Why Beginners Should Care:** Reduce STW pauses below 10 ms via Generational ZGC + GC-safe off-heap/pool allocation, and pair heartbeats with monotonic fencing tokens so a zombie node waking from a GC freeze cannot corrupt shared state.",
+      "spark": {
+        "summary": "A stateful Java node on a **32 GB heap** (allocating **4 GB/sec**) holds an etcd/ZooKeeper leader lease (**5s TTL**, 1s heartbeat).",
+        "keyTakeaway": "Reduce STW pauses below 10 ms via Generational ZGC + GC-safe off-heap/pool allocation, and pair heartbeats with monotonic fencing tokens so a zombie node waking from a GC freeze cannot corrupt shared state."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why Low-Pause GC & Fencing Tokens Matter",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why Low-Pause GC & Fencing Tokens Matter works from first principles.",
+          "explanation": "A stateful Java node on a **32 GB heap** (allocating **4 GB/sec**) holds an etcd/ZooKeeper leader lease (**5s TTL**, 1s heartbeat). When a **6.5-second Stop-the-World (STW) Full GC** or safepoint freeze hits, etcd expires the lease and elects a new leader. When the paused JVM wakes up, its local `isLeader` boolean is still `true`—writing stale state and causing split-brain data corruption.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Real-World Impact of GC-Induced Split-Brain",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without Real-World Impact of GC-Induced Split-Brain under real concurrency or scale.",
+          "explanation": "Clock/GC freezes break naive distributed leases: 1. **Zombie Writes**: A paused node wakes up mid-method (`if (isLeader) writeStorage()`) long after its 5s lease expired. 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "GC Freeze & Monotonic Fencing Token",
+            "title": "Zombie Split-Brain vs. Storage-Enforced Fencing Token",
+            "actors": [
+              {
+                "id": "n1",
+                "label": "Node 1 (tok=41)"
+              },
+              {
+                "id": "etcd",
+                "label": "etcd Lease (5s)"
+              },
+              {
+                "id": "n2",
+                "label": "Node 2 (tok=42)"
+              },
+              {
+                "id": "db",
+                "label": "Storage CAS"
+              }
+            ],
+            "events": [
+              {
+                "from": "n1",
+                "to": "n1",
+                "label": "6.5s STW Full GC freeze!",
+                "status": "fail"
+              },
+              {
+                "from": "etcd",
+                "to": "n2",
+                "label": "5s TTL expires -> N2 elected (tok=42)",
+                "status": "ok"
+              },
+              {
+                "from": "n2",
+                "to": "db",
+                "label": "write(tok=42) -> current_tok=42",
+                "status": "ok"
+              },
+              {
+                "from": "n1",
+                "to": "db",
+                "label": "Zombie wakes: write(tok=41)",
+                "status": "warn"
+              },
+              {
+                "from": "db",
+                "to": "n1",
+                "label": "Rejected! 41 < 42 (Fenced)",
+                "status": "ok"
+              }
+            ],
+            "summary": "GC tuning reduces pause frequency, while monotonic fencing tokens enforced by the storage layer make zombie writes impossible."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive Solution (and Why It Breaks)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+          "explanation": "Checking `System.currentTimeMillis() < leaseExpiry` before writing is broken: the JVM can freeze for 6.5s *between* the `if` check and the network `write()` call, and wall clocks can skew. Relying solely on GC tuning without fencing tokens is also unsafe because kernel swapping or VM live-migration can still pause a process.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise Solution: Generational ZGC + Monotonic Fencing Tokens",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Combine sub-millisecond GC pauses with cryptographic/monotonic storage fencing: **Generational ZGC (`-XX:+UseZGC -XX:+ZGenerational`)**: Performs concurrent marking and relocation on a 32 GB heap at 4 GB/sec allocation, keeping STW pauses **< 1 ms** (far below the 5s lease TTL).",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "quorum-cluster",
+            "eyebrow": "Fenced Leader Election",
+            "title": "etcd Mod-Revision Fencing + Generational ZGC",
+            "nodes": [
+              {
+                "label": "etcd / ZK Quorum",
+                "role": "Issues monotonic token"
+              },
+              {
+                "label": "Leader (Gen ZGC)",
+                "role": "<1ms STW | token=42"
+              },
+              {
+                "label": "Zombie (Paused)",
+                "role": "Stale token=41"
+              },
+              {
+                "label": "Storage Engine",
+                "role": "CAS: token >= max_token"
+              }
+            ],
+            "edges": [
+              {
+                "label": "Acquire lease -> 42"
+              },
+              {
+                "label": "Reject 41 < 42"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Generational ZGC",
+                "detail": "Handles 4 GB/s alloc rate on 32 GB heap with <1 ms STW pauses."
+              },
+              {
+                "label": "Fencing Token",
+                "detail": "Strictly monotonic ID (etcd revision / ZK zxid) per lease grant."
+              },
+              {
+                "label": "Storage Enforcement",
+                "detail": "Only the storage layer can prevent split-brain by rejecting stale tokens."
+              },
+              {
+                "label": "Safepoint Checks",
+                "detail": "Enable -Xlog:gc*,safepoint to catch non-GC TTSP pauses."
+              }
+            ],
+            "summary": "ZGC prevents 6.5s GC freezes in practice, while storage-enforced fencing tokens guarantee correctness even under arbitrary pauses."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Reduce STW pauses below 10 ms via Generational ZGC + GC-safe off-heap/pool allocation, and pair heartbeats with monotonic fencing tokens so a zombie node waking from a GC freeze cannot corrupt shared state."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** A stateful Java node on a **32 GB heap** (allocating **4 GB/sec**) holds an etcd/ZooKeeper leader lease (**5s TTL**, 1s heartbeat).\n\n**Visual & Structural Flow:** Depicts Zombie Split-Brain vs. Storage-Enforced Fencing Token (Node 1 (tok=41) -> etcd Lease (5s) -> Node 2 (tok=42) -> Storage CAS); etcd Mod-Revision Fencing + Generational ZGC (etcd / ZK Quorum -> Leader (Gen ZGC) -> Zombie (Paused) -> Storage Engine).\n\n**Trade-Offs & Production:** Checking `System.currentTimeMillis() < leaseExpiry` before writing is broken: the JVM can freeze for 6.5s *between* the `if` check and the network `write()` call, and wall clocks can skew. Combine sub-millisecond GC pauses with cryptographic/monotonic storage fencing: **Generational ZGC (`-XX:+UseZGC -XX:+ZGenerational`)**: Performs concurrent marking and relocation.\n\n**Failure Modes & Application:** Fencing tokens are mandatory whenever distributed leases protect mutable state: **Distributed Lock Services & Partition Leaders**: Prevents split-brain writes in shard coordinators and cron schedulers.",
+      "spark": {
+        "summary": "A 6-second JVM Stop-the-World GC or safepoint pause freezes all application and heartbeat threads, causing ZooKeeper/etcd/cluster peers to declare the node dead and elect a new leader while the paused node still believes it holds the lease.",
+        "keyTakeaway": "Reduce STW pauses below 10 ms via Generational ZGC + GC-safe off-heap/pool allocation, and pair heartbeats with monotonic fencing tokens so a zombie node waking from a GC freeze cannot corrupt shared state."
+      }
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** A 6-second JVM Stop-the-World GC or safepoint pause freezes all application and heartbeat threads, causing ZooKeeper/etcd/cluster peers to declare the node dead and elect a new leader while the paused node still believes it holds the lease.\n\n**Production Trade-Offs:** Checking `System.currentTimeMillis() < leaseExpiry` before writing is broken: the JVM can freeze for 6.5s *between* the `if` check and the network `write()` call, and wall clocks can skew.\n\n**Failure Modes & Edge Cases:** Fencing tokens are mandatory whenever distributed leases protect mutable state: **Distributed Lock Services & Partition Leaders**: Prevents split-brain writes in shard coordinators and cron schedulers.\n\n**Principal Takeaway:** Reduce STW pauses below 10 ms via Generational ZGC + GC-safe off-heap/pool allocation, and pair heartbeats with monotonic fencing tokens so a zombie node waking from a GC freeze cannot corrupt shared state.",
+      "spark": {
+        "summary": "A 6-second JVM Stop-the-World GC or safepoint pause freezes all application and heartbeat threads, causing ZooKeeper/etcd/cluster peers to declare the node dead and elect a new leader while the paused node still believes it holds the lease.",
+        "keyTakeaway": "Reduce STW pauses below 10 ms via Generational ZGC + GC-safe off-heap/pool allocation, and pair heartbeats with monotonic fencing tokens so a zombie node waking from a GC freeze cannot corrupt shared state."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why Low-Pause GC & Fencing Tokens Matter",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why Low-Pause GC & Fencing Tokens Matter works from first principles.",
+          "explanation": "A stateful Java node on a **32 GB heap** (allocating **4 GB/sec**) holds an etcd/ZooKeeper leader lease (**5s TTL**, 1s heartbeat). When a **6.5-second Stop-the-World (STW) Full GC** or safepoint freeze hits, etcd expires the lease and elects a new leader. When the paused JVM wakes up, its local `isLeader` boolean is still `true`—writing stale state and causing split-brain data corruption.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Real-World Impact of GC-Induced Split-Brain",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without Real-World Impact of GC-Induced Split-Brain under real concurrency or scale.",
+          "explanation": "Clock/GC freezes break naive distributed leases:\n\n1. **Zombie Writes**: A paused node wakes up mid-method (`if (isLeader) writeStorage()`) long after its 5s lease expired.\n2. **Concurrent Two-Leader Window**: Both the old zombie and the newly elected leader mutate storage simultaneously.\n3. **Safepoint TTSP Delays**: Even with low-pause GC, uncounted loops or JNI calls can stall all threads waiting for a JVM safepoint.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "GC Freeze & Monotonic Fencing Token",
+            "title": "Zombie Split-Brain vs. Storage-Enforced Fencing Token",
+            "actors": [
+              {
+                "id": "n1",
+                "label": "Node 1 (tok=41)"
+              },
+              {
+                "id": "etcd",
+                "label": "etcd Lease (5s)"
+              },
+              {
+                "id": "n2",
+                "label": "Node 2 (tok=42)"
+              },
+              {
+                "id": "db",
+                "label": "Storage CAS"
+              }
+            ],
+            "events": [
+              {
+                "from": "n1",
+                "to": "n1",
+                "label": "6.5s STW Full GC freeze!",
+                "status": "fail"
+              },
+              {
+                "from": "etcd",
+                "to": "n2",
+                "label": "5s TTL expires -> N2 elected (tok=42)",
+                "status": "ok"
+              },
+              {
+                "from": "n2",
+                "to": "db",
+                "label": "write(tok=42) -> current_tok=42",
+                "status": "ok"
+              },
+              {
+                "from": "n1",
+                "to": "db",
+                "label": "Zombie wakes: write(tok=41)",
+                "status": "warn"
+              },
+              {
+                "from": "db",
+                "to": "n1",
+                "label": "Rejected! 41 < 42 (Fenced)",
+                "status": "ok"
+              }
+            ],
+            "summary": "GC tuning reduces pause frequency, while monotonic fencing tokens enforced by the storage layer make zombie writes impossible."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive Solution (and Why It Breaks)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+          "explanation": "Checking `System.currentTimeMillis() < leaseExpiry` before writing is broken: the JVM can freeze for 6.5s *between* the `if` check and the network `write()` call, and wall clocks can skew. Relying solely on GC tuning without fencing tokens is also unsafe because kernel swapping or VM live-migration can still pause a process.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise Solution: Generational ZGC + Monotonic Fencing Tokens",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Combine sub-millisecond GC pauses with cryptographic/monotonic storage fencing:\n\n- **Generational ZGC (`-XX:+UseZGC -XX:+ZGenerational`)**: Performs concurrent marking and relocation on a 32 GB heap at 4 GB/sec allocation, keeping STW pauses **< 1 ms** (far below the 5s lease TTL).\n- **Monotonic Fencing Tokens**: Every lease acquisition from etcd (`mod_revision`) or ZooKeeper (`zxid`) issues a strictly increasing integer token. Pass that token on every storage write.\n- **Storage-Side CAS Rejection**: The storage layer atomically executes `WHERE fencing_token <= :token` (or rejects `token < max_seen_token`), fencing any zombie node regardless of pause duration.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "quorum-cluster",
+            "eyebrow": "Fenced Leader Election",
+            "title": "etcd Mod-Revision Fencing + Generational ZGC",
+            "nodes": [
+              {
+                "label": "etcd / ZK Quorum",
+                "role": "Issues monotonic token"
+              },
+              {
+                "label": "Leader (Gen ZGC)",
+                "role": "<1ms STW | token=42"
+              },
+              {
+                "label": "Zombie (Paused)",
+                "role": "Stale token=41"
+              },
+              {
+                "label": "Storage Engine",
+                "role": "CAS: token >= max_token"
+              }
+            ],
+            "edges": [
+              {
+                "label": "Acquire lease -> 42"
+              },
+              {
+                "label": "Reject 41 < 42"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Generational ZGC",
+                "detail": "Handles 4 GB/s alloc rate on 32 GB heap with <1 ms STW pauses."
+              },
+              {
+                "label": "Fencing Token",
+                "detail": "Strictly monotonic ID (etcd revision / ZK zxid) per lease grant."
+              },
+              {
+                "label": "Storage Enforcement",
+                "detail": "Only the storage layer can prevent split-brain by rejecting stale tokens."
+              },
+              {
+                "label": "Safepoint Checks",
+                "detail": "Enable -Xlog:gc*,safepoint to catch non-GC TTSP pauses."
+              }
+            ],
+            "summary": "ZGC prevents 6.5s GC freezes in practice, while storage-enforced fencing tokens guarantee correctness even under arbitrary pauses."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where Low-Pause GC & Fencing Tokens Apply in System Design",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Fencing tokens are mandatory whenever distributed leases protect mutable state:\n\n- **Distributed Lock Services & Partition Leaders**: Prevents split-brain writes in shard coordinators and cron schedulers.\n- **Kafka & Stream Processors**: `producer_epoch` is Kafka's built-in fencing token.\n- **Low-Latency JVM Services**: Generational ZGC / Shenandoah keeps tail latency flat under multi-GB/sec allocation.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Reduce STW pauses below 10 ms via Generational ZGC + GC-safe off-heap/pool allocation, and pair heartbeats with monotonic fencing tokens so a zombie node waking from a GC freeze cannot corrupt shared state."
+    }
+  }
+}

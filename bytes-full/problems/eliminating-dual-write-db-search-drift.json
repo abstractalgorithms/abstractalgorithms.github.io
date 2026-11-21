@@ -1,0 +1,593 @@
+{
+  "id": "problem-eliminating-dual-write-db-search-drift",
+  "slug": "eliminating-dual-write-db-search-drift",
+  "title": "Eliminating Dual-Write Drift Between DB & Search",
+  "problemType": "system-design",
+  "difficulty": "hard",
+  "prompt": "Your marketplace catalog service updates product prices and inventory in PostgreSQL and immediately calls Elasticsearch's REST `_doc` API in the same request handler. Over 6 months, 3.2% of 15M SKUs have drifted: sold-out items still appear in search results, and flash-sale price drops show stale prices for hours. Root causes include: (1) PostgreSQL transaction rollbacks after ES already succeeded, (2) ES 429/timeout failures after PG committed, and (3) concurrent updates arriving at ES out of order. Redesign the sync pipeline for eventual consistency with zero permanent drift.",
+  "spark": {
+    "summary": "Eliminating dual-write drift between PostgreSQL and Elasticsearch requires replacing application-level REST calls with a Transactional Outbox + Debezium WAL CDC pipeline and Elasticsearch external_version concurrency control.",
+    "keyTakeaway": "Never dual-write to Postgres and Elasticsearch in an HTTP handler—commit mutations to Postgres (with an Outbox or WAL CDC), stream via Kafka/Debezium, and apply version_type=external on ES upserts.",
+    "byteSummary": "**Core Mechanics:** Calling `es.index(doc)` inside the same request handler that writes to PostgreSQL (`15M` SKUs, `2,500` writes/sec peak) guarantees permanent index drift (`3.2%` stale prices and phantom in-stock items).\n\n**Visual & Structural Flow:** Depicts Out-of-Order Dual-Write Overwrite vs. Debezium + ES External Version (Catalog API -> Postgres WAL -> Debezium/Kafka -> Elasticsearch); Postgres ACID Commit -> WAL Logical Replication -> Kafka -> ES Bulk (Catalog API -> PG WAL / Outbox -> Debezium + Kafka -> Elasticsearch).\n\n**Trade-Offs & Production:** Two common patches still lose or reorder data: **Async Fire-and-Forget**: Spawning a background HTTP call to ES still drops updates on pod crashes and reorders concurrent edits. Zero-drift search sync decouples the write path completely: **Single Source of Truth**: The API writes **only** to PostgreSQL (optionally writing a compact `outbox` row in the same ACID transaction).\n\n**Failure Modes & Application:** The Outbox/CDC + idempotent sink pattern is the universal antidote to dual-write drift: **DB-to-Search Sync**: Keeping Postgres/MySQL synchronized with Elasticsearch or OpenSearch."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why dual-write drift between PostgreSQL and Elasticsearch is inevitable",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": "Calling `es.index(doc)` inside the same request handler that writes to PostgreSQL (`15M` SKUs, `2,500` writes/sec peak) guarantees permanent index drift (`3.2%` stale prices and phantom in-stock items). Without a distributed 2PC transaction, Postgres can roll back after ES succeeded, ES can 429/timeout after Postgres committed, or concurrent updates can arrive at ES out of order.",
+      "purpose": "The mechanism: understand how Why dual-write drift between PostgreSQL and Elasticsearch is inevitable works from first principles."
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "What happens under partial failures and out-of-order updates",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "Application-level dual writes fail in three ways:\n\n1. **Phantom Stock**: Postgres transaction rolls back, but ES already indexed `stock = 5`.\n2. **Silent Missing Updates**: ES returns `429` or times out after Postgres committed, leaving old prices live for hours.\n3. **Out-of-Order Overwrites**: Thread A's older `$100` update arrives at ES after Thread B's newer `$80` flash-sale update, overwriting `$80` with `$100`.",
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Dual-Write Race vs. Versioned CDC",
+        "title": "Out-of-Order Dual-Write Overwrite vs. Debezium + ES External Version",
+        "actors": [
+          {
+            "id": "app",
+            "label": "Catalog API"
+          },
+          {
+            "id": "pg",
+            "label": "Postgres WAL"
+          },
+          {
+            "id": "cdc",
+            "label": "Debezium/Kafka"
+          },
+          {
+            "id": "es",
+            "label": "Elasticsearch"
+          }
+        ],
+        "events": [
+          {
+            "from": "app",
+            "to": "pg",
+            "label": "TX1 ($100) then TX2 ($80) commit",
+            "status": "ok"
+          },
+          {
+            "from": "pg",
+            "to": "cdc",
+            "label": "WAL streams LSN 101 ($100), 102 ($80)",
+            "status": "ok"
+          },
+          {
+            "from": "cdc",
+            "to": "es",
+            "label": "Bulk upsert version=102 ($80)",
+            "status": "ok"
+          },
+          {
+            "from": "cdc",
+            "to": "es",
+            "label": "Stale retry version=101 -> 409 Drop!",
+            "status": "warn"
+          }
+        ],
+        "summary": "Passing the monotonic LSN/version with version_type=external ensures Elasticsearch drops any stale out-of-order write."
+      },
+      "purpose": "The problem: see what breaks without What happens under partial failures and out-of-order updates under real concurrency or scale."
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Naive solution (and why async fire-and-forget or updated_at polling breaks)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "Two common patches still lose or reorder data:\n\n- **Async Fire-and-Forget**: Spawning a background HTTP call to ES still drops updates on pod crashes and reorders concurrent edits.\n- **`SELECT * WHERE updated_at > last_poll`**: Polls miss hard deletes, struggle at `2,500` writes/sec, and hammer the primary DB.",
+      "purpose": "The problem: see what breaks without Naive solution under real concurrency or scale."
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise solution: Postgres WAL CDC (Debezium) + Kafka + ES External Versioning",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": "Zero-drift search sync decouples the write path completely:\n\n- **Single Source of Truth**: The API writes **only** to PostgreSQL (optionally writing a compact `outbox` row in the same ACID transaction).\n- **WAL-Based CDC (Debezium -> Kafka)**: Debezium tails Postgres logical replication (`pgoutput`) with zero polling load on primary tables and publishes ordered events keyed by `sku_id`.\n- **Idempotent Bulk Sink (`<= 2 s` p99)**: A Kafka Connect / consumer worker batches updates into ES `_bulk` using `version=<lsn_or_epoch>&version_type=external` so ES rejects stale versions (`409 Conflict`).\n- **Backfill**: Run an initial Debezium snapshot or `sku_id`-range backfill job to heal the existing `3.2%` drift.",
+      "sectionDiagram": {
+        "kind": "wal-mvcc",
+        "eyebrow": "Zero-Drift CDC Pipeline",
+        "title": "Postgres ACID Commit -> WAL Logical Replication -> Kafka -> ES Bulk",
+        "nodes": [
+          {
+            "label": "Catalog API",
+            "role": "Writes PG only"
+          },
+          {
+            "label": "PG WAL / Outbox",
+            "role": "Monotonic LSN"
+          },
+          {
+            "label": "Debezium + Kafka",
+            "role": "Keyed by sku_id"
+          },
+          {
+            "label": "Elasticsearch",
+            "role": "version_type=external"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Atomic Capture",
+            "detail": "Every committed PG mutation is guaranteed to appear in the WAL."
+          },
+          {
+            "label": "Zero DB Polling",
+            "detail": "Logical replication streams changes without SELECT * load on primary."
+          },
+          {
+            "label": "Ordered Partition",
+            "detail": "Keying Kafka by sku_id preserves per-SKU mutation order."
+          },
+          {
+            "label": "External Version",
+            "detail": "ES drops out-of-order/replayed updates with version <= current."
+          }
+        ],
+        "summary": "WAL CDC + ES external versioning eliminates partial failures and out-of-order overwrites within <= 2s p99."
+      },
+      "markdownContent": "```json\n// Elasticsearch _bulk upsert with monotonic external version (LSN / row_version)\n{ \"index\": { \"_index\": \"catalog_skus\", \"_id\": \"sku_98124\", \"version\": 48291044, \"version_type\": \"external\" } }\n{ \"sku_id\": \"sku_98124\", \"price_cents\": 7999, \"in_stock\": true, \"updated_at\": \"2026-11-18T09:00:01Z\" }\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where CDC + External Versioning applies in System Design",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": "The Outbox/CDC + idempotent sink pattern is the universal antidote to dual-write drift:\n\n- **DB-to-Search Sync**: Keeping Postgres/MySQL synchronized with Elasticsearch or OpenSearch.\n- **DB-to-Cache Invalidation**: Invalidating or updating Redis keys from Debezium WAL streams.\n- **CQRS Read Projections**: Building denormalized read models and analytical lakes from OLTP primaries.",
+      "supportingConcepts": [
+        {
+          "slug": "change-data-capture",
+          "title": "Concept: Change Data Capture (CDC)",
+          "kind": "concept"
+        },
+        {
+          "slug": "transactional-outbox-pattern",
+          "title": "Concept: Transactional Outbox Pattern",
+          "kind": "concept"
+        },
+        {
+          "slug": "cqrs-and-event-sourcing",
+          "title": "Concept: CQRS & Event Sourcing",
+          "kind": "concept"
+        },
+        {
+          "slug": "reliable-cdc-debezium-pipelines",
+          "title": "Problem: Reliable CDC Debezium Pipelines",
+          "kind": "problem"
+        },
+        {
+          "slug": "transactional-outbox-with-cdc",
+          "title": "Problem: Transactional Outbox with CDC",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "How does Elasticsearch version_type=external prevent out-of-order updates from corrupting catalog prices during retries or parallel consumers?",
+      "options": [
+        {
+          "id": "a",
+          "text": "Elasticsearch compares the incoming monotonic version (e.g., Postgres LSN) against the stored document version and rejects any write with a lower or equal version (409 Conflict)",
+          "correct": true,
+          "feedback": "Correct: external versioning makes ES writes order-safe and idempotent."
+        },
+        {
+          "id": "b",
+          "text": "It locks the PostgreSQL row until Elasticsearch finishes indexing",
+          "correct": false,
+          "feedback": "ES versioning is decoupled from Postgres locks."
+        },
+        {
+          "id": "c",
+          "text": "It automatically runs a 2PC distributed transaction across Postgres and ES",
+          "correct": false,
+          "feedback": "No 2PC is used; eventual consistency is achieved via CDC + versioned upserts."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "How does Elasticsearch version_type=external prevent out-of-order updates from corrupting catalog prices during retries or parallel consumers?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Elasticsearch compares the incoming monotonic version (e.g., Postgres LSN) against the stored document version and rejects any write with a lower or equal version (409 Conflict)",
+            "correct": true,
+            "feedback": "Correct: external versioning makes ES writes order-safe and idempotent."
+          },
+          {
+            "id": "b",
+            "text": "It locks the PostgreSQL row until Elasticsearch finishes indexing",
+            "correct": false,
+            "feedback": "ES versioning is decoupled from Postgres locks."
+          },
+          {
+            "id": "c",
+            "text": "It automatically runs a 2PC distributed transaction across Postgres and ES",
+            "correct": false,
+            "feedback": "No 2PC is used; eventual consistency is achieved via CDC + versioned upserts."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why dual-write drift between PostgreSQL and Elasticsearch is inevitable', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "b",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "c",
+            "text": "Calling es.index(doc) inside the same request handler that writes to PostgreSQL (15M SKUs, 2,500 writes/sec peak) guarantees permanent index drift (3.2% stale prices and…",
+            "correct": true,
+            "feedback": "Correct: Calling es.index(doc) inside the same request handler that writes to PostgreSQL (15M SKUs, 2,500 writes/sec peak) guarantees permanent index drift (3.2% stale prices and…"
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'What happens under partial failures and out-of-order updates', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Application-level dual writes fail in three ways: 1.",
+            "correct": true,
+            "feedback": "Correct: Application-level dual writes fail in three ways: 1."
+          },
+          {
+            "id": "b",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "c",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** Calling `es.index(doc)` inside the same request handler that writes to PostgreSQL (`15M` SKUs, `2,500` writes/sec peak) guarantees permanent index drift (`3.2%` stale prices and phantom in-stock items).\n\n**How It Flows:** Think of Eliminating Dual-Write Drift Between DB & Search as a clear step-by-step chain: Catalog API -> Postgres WAL -> Debezium/Kafka -> Elasticsearch -> PG WAL / Outbox.\n\n**Why Beginners Should Care:** Never dual-write to Postgres and Elasticsearch in an HTTP handler—commit mutations to Postgres (with an Outbox or WAL CDC), stream via Kafka/Debezium, and apply version_type=external on ES upserts.",
+      "spark": {
+        "summary": "Calling `es.index(doc)` inside the same request handler that writes to PostgreSQL (`15M` SKUs, `2,500` writes/sec peak) guarantees permanent index drift (`3.2%` stale prices and phantom in-stock items).",
+        "keyTakeaway": "Never dual-write to Postgres and Elasticsearch in an HTTP handler—commit mutations to Postgres (with an Outbox or WAL CDC), stream via Kafka/Debezium, and apply version_type=external on ES upserts."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why dual-write drift between PostgreSQL and Elasticsearch is inevitable",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why dual-write drift between PostgreSQL and Elasticsearch is inevitable works from first principles.",
+          "explanation": "Calling `es.index(doc)` inside the same request handler that writes to PostgreSQL (`15M` SKUs, `2,500` writes/sec peak) guarantees permanent index drift (`3.2%` stale prices and phantom in-stock items). Without a distributed 2PC transaction, Postgres can roll back after ES succeeded, ES can 429/timeout after Postgres committed, or concurrent updates can arrive at ES out of order.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "What happens under partial failures and out-of-order updates",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without What happens under partial failures and out-of-order updates under real concurrency or scale.",
+          "explanation": "Application-level dual writes fail in three ways: 1. **Phantom Stock**: Postgres transaction rolls back, but ES already indexed `stock = 5`. 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Dual-Write Race vs. Versioned CDC",
+            "title": "Out-of-Order Dual-Write Overwrite vs. Debezium + ES External Version",
+            "actors": [
+              {
+                "id": "app",
+                "label": "Catalog API"
+              },
+              {
+                "id": "pg",
+                "label": "Postgres WAL"
+              },
+              {
+                "id": "cdc",
+                "label": "Debezium/Kafka"
+              },
+              {
+                "id": "es",
+                "label": "Elasticsearch"
+              }
+            ],
+            "events": [
+              {
+                "from": "app",
+                "to": "pg",
+                "label": "TX1 ($100) then TX2 ($80) commit",
+                "status": "ok"
+              },
+              {
+                "from": "pg",
+                "to": "cdc",
+                "label": "WAL streams LSN 101 ($100), 102 ($80)",
+                "status": "ok"
+              },
+              {
+                "from": "cdc",
+                "to": "es",
+                "label": "Bulk upsert version=102 ($80)",
+                "status": "ok"
+              },
+              {
+                "from": "cdc",
+                "to": "es",
+                "label": "Stale retry version=101 -> 409 Drop!",
+                "status": "warn"
+              }
+            ],
+            "summary": "Passing the monotonic LSN/version with version_type=external ensures Elasticsearch drops any stale out-of-order write."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive solution (and why async fire-and-forget or updated_at polling breaks)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "The problem: see what breaks without Naive solution under real concurrency or scale.",
+          "explanation": "Two common patches still lose or reorder data: **Async Fire-and-Forget**: Spawning a background HTTP call to ES still drops updates on pod crashes and reorders concurrent edits. **`SELECT * WHERE updated_at > last_poll`**: Polls miss hard deletes, struggle at `2,500` writes/sec, and hammer the primary DB.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Postgres WAL CDC (Debezium) + Kafka + ES External Versioning",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Zero-drift search sync decouples the write path completely: **Single Source of Truth**: The API writes **only** to PostgreSQL (optionally writing a compact `outbox` row in the same ACID transaction). **WAL-Based CDC (Debezium -> Kafka)**: Debezium tails Postgres logical replication (`pgoutput`) with zero polling load on primary tables and publishes ordered events keyed by `sku_id`.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "wal-mvcc",
+            "eyebrow": "Zero-Drift CDC Pipeline",
+            "title": "Postgres ACID Commit -> WAL Logical Replication -> Kafka -> ES Bulk",
+            "nodes": [
+              {
+                "label": "Catalog API",
+                "role": "Writes PG only"
+              },
+              {
+                "label": "PG WAL / Outbox",
+                "role": "Monotonic LSN"
+              },
+              {
+                "label": "Debezium + Kafka",
+                "role": "Keyed by sku_id"
+              },
+              {
+                "label": "Elasticsearch",
+                "role": "version_type=external"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Atomic Capture",
+                "detail": "Every committed PG mutation is guaranteed to appear in the WAL."
+              },
+              {
+                "label": "Zero DB Polling",
+                "detail": "Logical replication streams changes without SELECT * load on primary."
+              },
+              {
+                "label": "Ordered Partition",
+                "detail": "Keying Kafka by sku_id preserves per-SKU mutation order."
+              },
+              {
+                "label": "External Version",
+                "detail": "ES drops out-of-order/replayed updates with version <= current."
+              }
+            ],
+            "summary": "WAL CDC + ES external versioning eliminates partial failures and out-of-order overwrites within <= 2s p99."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Never dual-write to Postgres and Elasticsearch in an HTTP handler—commit mutations to Postgres (with an Outbox or WAL CDC), stream via Kafka/Debezium, and apply version_type=external on ES upserts."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** Calling `es.index(doc)` inside the same request handler that writes to PostgreSQL (`15M` SKUs, `2,500` writes/sec peak) guarantees permanent index drift (`3.2%` stale prices and phantom in-stock items).\n\n**Visual & Structural Flow:** Depicts Out-of-Order Dual-Write Overwrite vs. Debezium + ES External Version (Catalog API -> Postgres WAL -> Debezium/Kafka -> Elasticsearch); Postgres ACID Commit -> WAL Logical Replication -> Kafka -> ES Bulk (Catalog API -> PG WAL / Outbox -> Debezium + Kafka -> Elasticsearch).\n\n**Trade-Offs & Production:** Two common patches still lose or reorder data: **Async Fire-and-Forget**: Spawning a background HTTP call to ES still drops updates on pod crashes and reorders concurrent edits. Zero-drift search sync decouples the write path completely: **Single Source of Truth**: The API writes **only** to PostgreSQL (optionally writing a compact `outbox` row in the same ACID transaction).\n\n**Failure Modes & Application:** The Outbox/CDC + idempotent sink pattern is the universal antidote to dual-write drift: **DB-to-Search Sync**: Keeping Postgres/MySQL synchronized with Elasticsearch or OpenSearch.",
+      "spark": {
+        "summary": "Eliminating dual-write drift between PostgreSQL and Elasticsearch requires replacing application-level REST calls with a Transactional Outbox + Debezium WAL CDC pipeline and Elasticsearch external_version concurrency control.",
+        "keyTakeaway": "Never dual-write to Postgres and Elasticsearch in an HTTP handler—commit mutations to Postgres (with an Outbox or WAL CDC), stream via Kafka/Debezium, and apply version_type=external on ES upserts."
+      }
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** Eliminating dual-write drift between PostgreSQL and Elasticsearch requires replacing application-level REST calls with a Transactional Outbox + Debezium WAL CDC pipeline and Elasticsearch external_version concurrency control.\n\n**Production Trade-Offs:** Two common patches still lose or reorder data: **Async Fire-and-Forget**: Spawning a background HTTP call to ES still drops updates on pod crashes and reorders concurrent edits.\n\n**Failure Modes & Edge Cases:** The Outbox/CDC + idempotent sink pattern is the universal antidote to dual-write drift: **DB-to-Search Sync**: Keeping Postgres/MySQL synchronized with Elasticsearch or OpenSearch.\n\n**Principal Takeaway:** Never dual-write to Postgres and Elasticsearch in an HTTP handler—commit mutations to Postgres (with an Outbox or WAL CDC), stream via Kafka/Debezium, and apply version_type=external on ES upserts.",
+      "spark": {
+        "summary": "Eliminating dual-write drift between PostgreSQL and Elasticsearch requires replacing application-level REST calls with a Transactional Outbox + Debezium WAL CDC pipeline and Elasticsearch external_version concurrency control.",
+        "keyTakeaway": "Never dual-write to Postgres and Elasticsearch in an HTTP handler—commit mutations to Postgres (with an Outbox or WAL CDC), stream via Kafka/Debezium, and apply version_type=external on ES upserts."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why dual-write drift between PostgreSQL and Elasticsearch is inevitable",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why dual-write drift between PostgreSQL and Elasticsearch is inevitable works from first principles.",
+          "explanation": "Calling `es.index(doc)` inside the same request handler that writes to PostgreSQL (`15M` SKUs, `2,500` writes/sec peak) guarantees permanent index drift (`3.2%` stale prices and phantom in-stock items). Without a distributed 2PC transaction, Postgres can roll back after ES succeeded, ES can 429/timeout after Postgres committed, or concurrent updates can arrive at ES out of order.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "What happens under partial failures and out-of-order updates",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without What happens under partial failures and out-of-order updates under real concurrency or scale.",
+          "explanation": "Application-level dual writes fail in three ways:\n\n1. **Phantom Stock**: Postgres transaction rolls back, but ES already indexed `stock = 5`.\n2. **Silent Missing Updates**: ES returns `429` or times out after Postgres committed, leaving old prices live for hours.\n3. **Out-of-Order Overwrites**: Thread A's older `$100` update arrives at ES after Thread B's newer `$80` flash-sale update, overwriting `$80` with `$100`.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Dual-Write Race vs. Versioned CDC",
+            "title": "Out-of-Order Dual-Write Overwrite vs. Debezium + ES External Version",
+            "actors": [
+              {
+                "id": "app",
+                "label": "Catalog API"
+              },
+              {
+                "id": "pg",
+                "label": "Postgres WAL"
+              },
+              {
+                "id": "cdc",
+                "label": "Debezium/Kafka"
+              },
+              {
+                "id": "es",
+                "label": "Elasticsearch"
+              }
+            ],
+            "events": [
+              {
+                "from": "app",
+                "to": "pg",
+                "label": "TX1 ($100) then TX2 ($80) commit",
+                "status": "ok"
+              },
+              {
+                "from": "pg",
+                "to": "cdc",
+                "label": "WAL streams LSN 101 ($100), 102 ($80)",
+                "status": "ok"
+              },
+              {
+                "from": "cdc",
+                "to": "es",
+                "label": "Bulk upsert version=102 ($80)",
+                "status": "ok"
+              },
+              {
+                "from": "cdc",
+                "to": "es",
+                "label": "Stale retry version=101 -> 409 Drop!",
+                "status": "warn"
+              }
+            ],
+            "summary": "Passing the monotonic LSN/version with version_type=external ensures Elasticsearch drops any stale out-of-order write."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive solution (and why async fire-and-forget or updated_at polling breaks)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "The problem: see what breaks without Naive solution under real concurrency or scale.",
+          "explanation": "Two common patches still lose or reorder data:\n\n- **Async Fire-and-Forget**: Spawning a background HTTP call to ES still drops updates on pod crashes and reorders concurrent edits.\n- **`SELECT * WHERE updated_at > last_poll`**: Polls miss hard deletes, struggle at `2,500` writes/sec, and hammer the primary DB.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Postgres WAL CDC (Debezium) + Kafka + ES External Versioning",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Zero-drift search sync decouples the write path completely:\n\n- **Single Source of Truth**: The API writes **only** to PostgreSQL (optionally writing a compact `outbox` row in the same ACID transaction).\n- **WAL-Based CDC (Debezium -> Kafka)**: Debezium tails Postgres logical replication (`pgoutput`) with zero polling load on primary tables and publishes ordered events keyed by `sku_id`.\n- **Idempotent Bulk Sink (`<= 2 s` p99)**: A Kafka Connect / consumer worker batches updates into ES `_bulk` using `version=<lsn_or_epoch>&version_type=external` so ES rejects stale versions (`409 Conflict`).\n- **Backfill**: Run an initial Debezium snapshot or `sku_id`-range backfill job to heal the existing `3.2%` drift.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "wal-mvcc",
+            "eyebrow": "Zero-Drift CDC Pipeline",
+            "title": "Postgres ACID Commit -> WAL Logical Replication -> Kafka -> ES Bulk",
+            "nodes": [
+              {
+                "label": "Catalog API",
+                "role": "Writes PG only"
+              },
+              {
+                "label": "PG WAL / Outbox",
+                "role": "Monotonic LSN"
+              },
+              {
+                "label": "Debezium + Kafka",
+                "role": "Keyed by sku_id"
+              },
+              {
+                "label": "Elasticsearch",
+                "role": "version_type=external"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Atomic Capture",
+                "detail": "Every committed PG mutation is guaranteed to appear in the WAL."
+              },
+              {
+                "label": "Zero DB Polling",
+                "detail": "Logical replication streams changes without SELECT * load on primary."
+              },
+              {
+                "label": "Ordered Partition",
+                "detail": "Keying Kafka by sku_id preserves per-SKU mutation order."
+              },
+              {
+                "label": "External Version",
+                "detail": "ES drops out-of-order/replayed updates with version <= current."
+              }
+            ],
+            "summary": "WAL CDC + ES external versioning eliminates partial failures and out-of-order overwrites within <= 2s p99."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where CDC + External Versioning applies in System Design",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "The Outbox/CDC + idempotent sink pattern is the universal antidote to dual-write drift:\n\n- **DB-to-Search Sync**: Keeping Postgres/MySQL synchronized with Elasticsearch or OpenSearch.\n- **DB-to-Cache Invalidation**: Invalidating or updating Redis keys from Debezium WAL streams.\n- **CQRS Read Projections**: Building denormalized read models and analytical lakes from OLTP primaries.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Never dual-write to Postgres and Elasticsearch in an HTTP handler—commit mutations to Postgres (with an Outbox or WAL CDC), stream via Kafka/Debezium, and apply version_type=external on ES upserts."
+    }
+  }
+}

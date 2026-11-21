@@ -1,0 +1,734 @@
+{
+  "id": "concept-lld-concurrency-thread-safe-queues",
+  "slug": "lld-concurrency-thread-safe-queues",
+  "name": "Thread-Safe LLD: Locking, Condition Variables & In-Memory Pub-Sub Queues",
+  "domain": "Concurrency",
+  "tagline": "Balancing correctness and throughput using fine-grained per-entity locks, Condition signaling, and canonical lock ordering.",
+  "purpose": "Build a progressive mental model of thread-safe low-level design—from why coarse global mutexes stall throughput to how per-topic locks, Condition.await(), and lock ordering prevent deadlocks.",
+  "spark": {
+    "summary": "Thread-safe Low-Level Design balances correctness and throughput using fine-grained per-entity locks (per-seat, per-topic, per-floor), Condition/BlockingQueue signaling, and optimistic versioning rather than coarse global mutexes.",
+    "keyTakeaway": "Lock at the smallest independent boundary (e.g., per-topic or per-seat) and always acquire multiple locks in a canonical global order to prevent deadlocks.",
+    "byteSummary": "**Core Mechanics:** Thread-safe Low-Level Design structures shared in-memory state—bounded blocking queues, pub-sub topics, and seat reservation maps—so concurrent threads never corrupt invariants or busy-wait CPU cores.\n\n**Visual & Structural Flow:** Depicts Bounded Queue Producer/Consumer Thread States (HOLDING LOCK -> AWAITING COND -> SIGNALED); Canonical Lock Ordering (min(id) -> max(id)) (Thread 1 (B, A) -> Lock(Seat A) -> Lock(Seat B) -> Thread 2 (A, B)).\n\n**Trade-Offs & Production:** Choose the simplest synchronization boundary that meets your contention profile. In an in-memory pub-sub broker, publishers append to the topic ring buffer under the per-topic lock, then **dispatch to subscribers outside the lock** (or via per-subscriber.\n\n**Failure Modes & Application:** Practice implementing bounded queues, pub-sub brokers, and deadlock-free booking systems."
+  },
+  "learningJourney": [
+    {
+      "id": "01-what-it-is",
+      "eyebrow": "STAGE 01 · WHAT IT IS",
+      "title": "What is Thread-Safe Concurrency LLD",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": "Thread-safe Low-Level Design structures shared in-memory state—bounded blocking queues, pub-sub topics, and seat reservation maps—so concurrent threads never corrupt invariants or busy-wait CPU cores.\n\nThree primitives form the core toolkit: **fine-grained per-entity locks** (`ReentrantLock` per topic or seat), **Condition variables** (`notFull` / `notEmpty`) so waiting threads sleep without spinning, and **canonical lock ordering** to prevent AB-BA deadlocks.",
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "Condition Signaling",
+        "title": "Bounded Queue Producer/Consumer Thread States",
+        "states": [
+          {
+            "id": "running",
+            "label": "HOLDING LOCK",
+            "sublabel": "Check while(full/empty)",
+            "tone": "green"
+          },
+          {
+            "id": "waiting",
+            "label": "AWAITING COND",
+            "sublabel": "Lock released; sleeping",
+            "tone": "amber"
+          },
+          {
+            "id": "signaled",
+            "label": "SIGNALED",
+            "sublabel": "Re-acquire & re-check",
+            "tone": "blue"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "running",
+            "to": "waiting",
+            "label": "cond.await() inside while"
+          },
+          {
+            "from": "waiting",
+            "to": "signaled",
+            "label": "Peer calls cond.signalAll()"
+          },
+          {
+            "from": "signaled",
+            "to": "running",
+            "label": "Re-verify predicate"
+          }
+        ],
+        "summary": "Always wrap Condition.await() in a while loop: spurious wakeups or competing threads can change the predicate before the thread resumes."
+      },
+      "purpose": "The mechanism: understand how Thread-Safe Concurrency LLD works from first principles."
+    },
+    {
+      "id": "02-why-we-need-it",
+      "eyebrow": "STAGE 02 · WHY WE NEED IT",
+      "title": "Why coarse locks and slow callbacks break concurrent LLD",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": "A single `synchronized` method on a broker or booking service serializes unrelated topics and seats, collapsing multi-core throughput. Conversely, naive fine-grained locking introduces two classic bugs:\n- **AB-BA Deadlocks**: Thread 1 locks Seat A then Seat B while Thread 2 locks Seat B then Seat A.\n- **Lock-Held Callback Stalls**: Invoking slow external subscriber callbacks while holding the topic lock blocks all publishers.",
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Deadlock Avoidance",
+        "title": "Canonical Lock Ordering (min(id) -> max(id))",
+        "actors": [
+          {
+            "id": "t1",
+            "label": "Thread 1 (B, A)"
+          },
+          {
+            "id": "la",
+            "label": "Lock(Seat A)"
+          },
+          {
+            "id": "lb",
+            "label": "Lock(Seat B)"
+          },
+          {
+            "id": "t2",
+            "label": "Thread 2 (A, B)"
+          }
+        ],
+        "events": [
+          {
+            "from": "t1",
+            "to": "la",
+            "label": "Sort [B,A]->[A,B]: lock A",
+            "status": "ok"
+          },
+          {
+            "from": "t2",
+            "to": "la",
+            "label": "Waits for A (no cycle)",
+            "status": "warn"
+          },
+          {
+            "from": "t1",
+            "to": "lb",
+            "label": "Acquires B, commits",
+            "status": "ok"
+          },
+          {
+            "from": "t1",
+            "to": "la",
+            "label": "Releases A & B -> T2 runs",
+            "status": "ok"
+          }
+        ],
+        "summary": "Sorting lock IDs globally guarantees a strict acquisition DAG, making circular wait mathematically impossible."
+      },
+      "purpose": "The problem: see what breaks without Why coarse locks and slow callbacks break concurrent LLD under real concurrency or scale."
+    },
+    {
+      "id": "03-where-it-is-used",
+      "eyebrow": "STAGE 03 · WHERE IT IS USED",
+      "title": "Where In-Memory Concurrency LLD applies (and where it does not)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "In-process concurrency primitives govern single-node engines, while multi-node deployments require distributed coordination.",
+      "comparison": [
+        {
+          "choice": "Good Candidate: In-Memory Pub-Sub & Worker Pools",
+          "benefits": [
+            "ConcurrentHashMap + per-topic ReentrantLock/Condition scales across cores cleanly."
+          ],
+          "costs": [
+            "State is ephemeral unless backed by a WAL or external broker."
+          ]
+        },
+        {
+          "choice": "Good Candidate: Single-Node Seat/Slot Hold Engines",
+          "benefits": [
+            "Sub-millisecond per-seat locking with TTL expiry sweeps."
+          ],
+          "costs": [
+            "Cannot coordinate across multiple JVM/service instances."
+          ]
+        },
+        {
+          "choice": "Avoid: Cross-Process Distributed State",
+          "benefits": [
+            "Use Redis Lua scripts, DB row locks (`SELECT ... FOR UPDATE`), or etcd leases instead."
+          ],
+          "costs": [
+            "In-JVM locks only protect memory inside one OS process."
+          ]
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    },
+    {
+      "id": "04-how-it-is-managed",
+      "eyebrow": "STAGE 04 · HOW IT IS MANAGED",
+      "title": "Implementing a Bounded Blocking Queue with Condition Variables",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "Separate `notFull` and `notEmpty` `Condition` queues on a `ReentrantLock`, always guard `await()` with a `while` loop, and always release the lock in a `finally` block.",
+      "markdownContent": "```java\nimport java.util.concurrent.locks.*;\n\npublic final class BoundedQueue<T> {\n    private final Object[] items;\n    private int head = 0, tail = 0, count = 0;\n    private final ReentrantLock lock = new ReentrantLock();\n    private final Condition notFull = lock.newCondition();\n    private final Condition notEmpty = lock.newCondition();\n\n    public BoundedQueue(int capacity) { this.items = new Object[capacity]; }\n\n    public void put(T item) throws InterruptedException {\n        lock.lock();\n        try {\n            while (count == items.length) notFull.await();\n            items[tail] = item;\n            tail = (tail + 1) % items.length;\n            count++;\n            notEmpty.signal();\n        } finally {\n            lock.unlock();\n        }\n    }\n}\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-alternatives",
+      "eyebrow": "STAGE 05 · ALTERNATIVES",
+      "title": "Alternatives: Coarse Mutex vs. Fine-Grained Lock vs. Lock-Free CAS",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": "Choose the simplest synchronization boundary that meets your contention profile.",
+      "comparison": [
+        {
+          "choice": "Coarse Global Lock",
+          "benefits": [
+            "Trivial to reason about; zero multi-lock deadlock risk."
+          ],
+          "costs": [
+            "Serializes unrelated topics/seats; poor multi-core scaling."
+          ]
+        },
+        {
+          "choice": "Fine-Grained Per-Entity Lock",
+          "benefits": [
+            "High parallel throughput across independent entities."
+          ],
+          "costs": [
+            "Requires strict canonical lock ordering on multi-entity operations."
+          ]
+        },
+        {
+          "choice": "Lock-Free Ring Buffer (Disruptor / CAS)",
+          "benefits": [
+            "Zero OS mutex context switches; ultra-low tail latency."
+          ],
+          "costs": [
+            "Complex memory-ordering invariants and harder debugging."
+          ]
+        }
+      ],
+      "purpose": "The trade-off: compare competing approaches across latency, consistency, and operational cost."
+    },
+    {
+      "id": "06-production-architecture",
+      "eyebrow": "STAGE 06 · PRODUCTION ARCHITECTURE",
+      "title": "Snapshot-and-Dispatch Pub-Sub Pattern",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": "In an in-memory pub-sub broker, publishers append to the topic ring buffer under the per-topic lock, then **dispatch to subscribers outside the lock** (or via per-subscriber worker threads with offset pointers) so slow consumers never stall publishers.",
+      "ideas": [
+        {
+          "title": "Per-Subscriber Offset Tracking",
+          "description": "Each subscriber maintains an atomic offset into the topic's immutable message array, allowing independent consumption speeds."
+        },
+        {
+          "title": "TryLock with Timeout",
+          "description": "For latency-sensitive APIs, pair canonical ordering with `tryLock(50, MILLISECONDS)` to fail fast instead of piling up threads."
+        }
+      ],
+      "purpose": "Production architecture: see how the components compose end to end under real load."
+    },
+    {
+      "id": "07-problems-and-further-reading",
+      "eyebrow": "STAGE 07 · PROBLEMS SOLVED & FURTHER DEEP DIVE",
+      "title": "Concurrency LLD Problems & Related Concepts",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": "Practice implementing bounded queues, pub-sub brokers, and deadlock-free booking systems.",
+      "supportingConcepts": [
+        {
+          "slug": "implement-bounded-blocking-queue",
+          "title": "Problem: Implement Bounded Blocking Queue",
+          "kind": "problem"
+        },
+        {
+          "slug": "design-in-memory-pubsub-queue-lld",
+          "title": "LLD: In-Memory Pub-Sub Queue",
+          "kind": "problem"
+        },
+        {
+          "slug": "design-movie-ticket-booking-lld",
+          "title": "LLD: Movie Ticket Booking Concurrency",
+          "kind": "problem"
+        },
+        {
+          "slug": "preventing-ab-ba-lock-deadlocks",
+          "title": "Problem: Preventing AB-BA Lock Deadlocks",
+          "kind": "problem"
+        },
+        {
+          "slug": "thread-pool-design",
+          "title": "Concept: Thread Pool Design",
+          "kind": "concept"
+        },
+        {
+          "slug": "deadlock-detection",
+          "title": "Concept: Deadlock Detection",
+          "kind": "concept"
+        },
+        {
+          "slug": "lock-free-atomics",
+          "title": "Concept: Lock-Free Atomics",
+          "kind": "concept"
+        }
+      ],
+      "purpose": "Applied problems: connect these internals to concrete system design and debugging scenarios."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why must a consumer thread check its wait condition in a `while` loop rather than an `if` statement around `Condition.await()`?",
+      "options": [
+        {
+          "id": "a",
+          "text": "Condition.await() throws an exception if called inside an if block",
+          "correct": false,
+          "feedback": "The compiler allows if, but it is unsafe at runtime."
+        },
+        {
+          "id": "b",
+          "text": "Spurious wakeups or another competing consumer waking first can leave the queue empty again before this thread re-acquires the lock",
+          "correct": true,
+          "feedback": "Correct: Mesa-style condition variables do not guarantee the predicate still holds when a thread resumes, so re-checking in a while loop is mandatory."
+        },
+        {
+          "id": "c",
+          "text": "A while loop prevents the thread from releasing the ReentrantLock",
+          "correct": false,
+          "feedback": "Condition.await() always atomically releases the lock while sleeping."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why must a consumer thread check its wait condition in a `while` loop rather than an `if` statement around `Condition.await()`?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Condition.await() throws an exception if called inside an if block",
+            "correct": false,
+            "feedback": "The compiler allows if, but it is unsafe at runtime."
+          },
+          {
+            "id": "b",
+            "text": "Spurious wakeups or another competing consumer waking first can leave the queue empty again before this thread re-acquires the lock",
+            "correct": true,
+            "feedback": "Correct: Mesa-style condition variables do not guarantee the predicate still holds when a thread resumes, so re-checking in a while loop is mandatory."
+          },
+          {
+            "id": "c",
+            "text": "A while loop prevents the thread from releasing the ReentrantLock",
+            "correct": false,
+            "feedback": "Condition.await() always atomically releases the lock while sleeping."
+          }
+        ]
+      },
+      {
+        "question": "What is the main benefit—and corresponding operational trade-off—of using Good Candidate: In-Memory Pub-Sub & Worker Pools in Thread-Safe LLD: Locking, Condition Variables & In-Memory Pub-Sub Queues?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Relying solely on Cross-Process Distributed State avoids all operational and latency trade-offs",
+            "correct": false,
+            "feedback": "Incorrect: every production option in Thread-Safe LLD: Locking, Condition Variables & In-Memory Pub-Sub Queues carries concrete latency, consistency, or operational costs."
+          },
+          {
+            "id": "b",
+            "text": "Advantage: ConcurrentHashMap + per-topic ReentrantLock/Condition scales across cores cleanly. Cost: State is ephemeral unless backed by a WAL or external broker.",
+            "correct": true,
+            "feedback": "Correct: Good Candidate: In-Memory Pub-Sub & Worker Pools delivers concurrentHashMap + per-topic ReentrantLock/Condition scales across cores cleanly. while requiring you to manage state is ephemeral unless backed by a WAL or external broker."
+          },
+          {
+            "id": "c",
+            "text": "Advantage: Sub-millisecond per-seat locking with TTL expiry sweeps. It has zero operational or latency overhead compared to Good Candidate: Single-Node Seat/Slot Hold Engines.",
+            "correct": false,
+            "feedback": "Not quite: that describes Good Candidate: Single-Node Seat/Slot Hold Engines, whereas Good Candidate: In-Memory Pub-Sub & Worker Pools specifically trades off: State is ephemeral unless backed by a WAL or external broker."
+          }
+        ]
+      },
+      {
+        "question": "Why is TryLock with Timeout critical when operating Thread-Safe LLD: Locking, Condition Variables & In-Memory Pub-Sub Queues in production?",
+        "options": [
+          {
+            "id": "a",
+            "text": "For latency-sensitive APIs, pair canonical ordering with tryLock(50, MILLISECONDS) to fail fast instead of piling up threads.",
+            "correct": true,
+            "feedback": "Correct: For latency-sensitive APIs, pair canonical ordering with tryLock(50, MILLISECONDS) to fail fast instead of piling up threads."
+          },
+          {
+            "id": "b",
+            "text": "It only applies during local unit testing and can be disabled in production to save memory.",
+            "correct": false,
+            "feedback": "Incorrect: 'TryLock with Timeout' directly governs production reliability and correctness under real traffic."
+          },
+          {
+            "id": "c",
+            "text": "It replaces the need for observability, timeouts, or capacity planning across Thread-Safe LLD: Locking, Condition Variables & In-Memory Pub-Sub Queues.",
+            "correct": false,
+            "feedback": "Incorrect: 'TryLock with Timeout' works alongside proper bounds, monitoring, and failure isolation."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** Thread-safe Low-Level Design structures shared in-memory state—bounded blocking queues, pub-sub topics, and seat reservation maps—so concurrent threads never corrupt invariants or busy-wait CPU cores.\n\n**How It Flows:** Think of Thread-Safe LLD: Locking, Condition Variables & In-Memory Pub-Sub Queues as a clear step-by-step chain: HOLDING LOCK -> AWAITING COND -> SIGNALED -> Thread 1 (B, A) -> Lock(Seat A).\n\n**Why Beginners Should Care:** Lock at the smallest independent boundary (e.g., per-topic or per-seat) and always acquire multiple locks in a canonical global order to prevent deadlocks.",
+      "spark": {
+        "summary": "Thread-safe Low-Level Design structures shared in-memory state—bounded blocking queues, pub-sub topics, and seat reservation maps—so concurrent threads never corrupt invariants or busy-wait CPU cores.",
+        "keyTakeaway": "Lock at the smallest independent boundary (e.g., per-topic or per-seat) and always acquire multiple locks in a canonical global order to prevent deadlocks."
+      },
+      "learningJourney": [
+        {
+          "id": "01-what-it-is",
+          "title": "What is Thread-Safe Concurrency LLD",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Thread-Safe Concurrency LLD works from first principles.",
+          "explanation": "Thread-safe Low-Level Design structures shared in-memory state—bounded blocking queues, pub-sub topics, and seat reservation maps—so concurrent threads never corrupt invariants or busy-wait CPU cores.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "state-machine",
+            "eyebrow": "Condition Signaling",
+            "title": "Bounded Queue Producer/Consumer Thread States",
+            "states": [
+              {
+                "id": "running",
+                "label": "HOLDING LOCK",
+                "sublabel": "Check while(full/empty)",
+                "tone": "green"
+              },
+              {
+                "id": "waiting",
+                "label": "AWAITING COND",
+                "sublabel": "Lock released; sleeping",
+                "tone": "amber"
+              },
+              {
+                "id": "signaled",
+                "label": "SIGNALED",
+                "sublabel": "Re-acquire & re-check",
+                "tone": "blue"
+              }
+            ],
+            "transitions": [
+              {
+                "from": "running",
+                "to": "waiting",
+                "label": "cond.await() inside while"
+              },
+              {
+                "from": "waiting",
+                "to": "signaled",
+                "label": "Peer calls cond.signalAll()"
+              },
+              {
+                "from": "signaled",
+                "to": "running",
+                "label": "Re-verify predicate"
+              }
+            ],
+            "summary": "Always wrap Condition.await() in a while loop: spurious wakeups or competing threads can change the predicate before the thread resumes."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-why-we-need-it",
+          "title": "Why coarse locks and slow callbacks break concurrent LLD",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without Why coarse locks and slow callbacks break concurrent LLD under real concurrency or scale.",
+          "explanation": "A single `synchronized` method on a broker or booking service serializes unrelated topics and seats, collapsing multi-core throughput. Conversely, naive fine-grained locking introduces two classic bugs: **AB-BA Deadlocks**: Thread 1 locks Seat A then Seat B while Thread 2 locks Seat B then Seat A.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Deadlock Avoidance",
+            "title": "Canonical Lock Ordering (min(id) -> max(id))",
+            "actors": [
+              {
+                "id": "t1",
+                "label": "Thread 1 (B, A)"
+              },
+              {
+                "id": "la",
+                "label": "Lock(Seat A)"
+              },
+              {
+                "id": "lb",
+                "label": "Lock(Seat B)"
+              },
+              {
+                "id": "t2",
+                "label": "Thread 2 (A, B)"
+              }
+            ],
+            "events": [
+              {
+                "from": "t1",
+                "to": "la",
+                "label": "Sort [B,A]->[A,B]: lock A",
+                "status": "ok"
+              },
+              {
+                "from": "t2",
+                "to": "la",
+                "label": "Waits for A (no cycle)",
+                "status": "warn"
+              },
+              {
+                "from": "t1",
+                "to": "lb",
+                "label": "Acquires B, commits",
+                "status": "ok"
+              },
+              {
+                "from": "t1",
+                "to": "la",
+                "label": "Releases A & B -> T2 runs",
+                "status": "ok"
+              }
+            ],
+            "summary": "Sorting lock IDs globally guarantees a strict acquisition DAG, making circular wait mathematically impossible."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-where-it-is-used",
+          "title": "Where In-Memory Concurrency LLD applies (and where it does not)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "In-process concurrency primitives govern single-node engines, while multi-node deployments require distributed coordination.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "06-production-architecture",
+          "title": "Snapshot-and-Dispatch Pub-Sub Pattern",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Production architecture: see how the components compose end to end under real load.",
+          "explanation": "In an in-memory pub-sub broker, publishers append to the topic ring buffer under the per-topic lock, then **dispatch to subscribers outside the lock** (or via per-subscriber worker threads with offset pointers) so slow consumers never stall publishers.",
+          "ideas": [
+            {
+              "title": "Per-Subscriber Offset Tracking",
+              "description": "Each subscriber maintains an atomic offset into the topic's immutable message array, allowing independent consumption speeds."
+            },
+            {
+              "title": "TryLock with Timeout",
+              "description": "For latency-sensitive APIs, pair canonical ordering with `tryLock(50, MILLISECONDS)` to fail fast instead of piling up threads."
+            }
+          ],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Lock at the smallest independent boundary (e.g., per-topic or per-seat) and always acquire multiple locks in a canonical global order to prevent deadlocks."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** Thread-safe Low-Level Design structures shared in-memory state—bounded blocking queues, pub-sub topics, and seat reservation maps—so concurrent threads never corrupt invariants or busy-wait CPU cores.\n\n**Visual & Structural Flow:** Depicts Bounded Queue Producer/Consumer Thread States (HOLDING LOCK -> AWAITING COND -> SIGNALED); Canonical Lock Ordering (min(id) -> max(id)) (Thread 1 (B, A) -> Lock(Seat A) -> Lock(Seat B) -> Thread 2 (A, B)).\n\n**Trade-Offs & Production:** Choose the simplest synchronization boundary that meets your contention profile. In an in-memory pub-sub broker, publishers append to the topic ring buffer under the per-topic lock, then **dispatch to subscribers outside the lock** (or via per-subscriber.\n\n**Failure Modes & Application:** Practice implementing bounded queues, pub-sub brokers, and deadlock-free booking systems.",
+      "spark": {
+        "summary": "Thread-safe Low-Level Design balances correctness and throughput using fine-grained per-entity locks (per-seat, per-topic, per-floor), Condition/BlockingQueue signaling, and optimistic versioning rather than coarse global mutexes.",
+        "keyTakeaway": "Lock at the smallest independent boundary (e.g., per-topic or per-seat) and always acquire multiple locks in a canonical global order to prevent deadlocks."
+      }
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** Thread-safe Low-Level Design balances correctness and throughput using fine-grained per-entity locks (per-seat, per-topic, per-floor), Condition/BlockingQueue signaling, and optimistic versioning rather than coarse global mutexes.\n\n**Production Trade-Offs:** Separate `notFull` and `notEmpty` `Condition` queues on a `ReentrantLock`, always guard `await()` with a `while` loop, and always release the lock in a `finally` block.\n\n**Failure Modes & Edge Cases:** Practice implementing bounded queues, pub-sub brokers, and deadlock-free booking systems.\n\n**Principal Takeaway:** Lock at the smallest independent boundary (e.g., per-topic or per-seat) and always acquire multiple locks in a canonical global order to prevent deadlocks.",
+      "spark": {
+        "summary": "Thread-safe Low-Level Design balances correctness and throughput using fine-grained per-entity locks (per-seat, per-topic, per-floor), Condition/BlockingQueue signaling, and optimistic versioning rather than coarse global mutexes.",
+        "keyTakeaway": "Lock at the smallest independent boundary (e.g., per-topic or per-seat) and always acquire multiple locks in a canonical global order to prevent deadlocks."
+      },
+      "learningJourney": [
+        {
+          "id": "01-what-it-is",
+          "title": "What is Thread-Safe Concurrency LLD",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Thread-Safe Concurrency LLD works from first principles.",
+          "explanation": "Thread-safe Low-Level Design structures shared in-memory state—bounded blocking queues, pub-sub topics, and seat reservation maps—so concurrent threads never corrupt invariants or busy-wait CPU cores.\n\nThree primitives form the core toolkit: **fine-grained per-entity locks** (`ReentrantLock` per topic or seat), **Condition variables** (`notFull` / `notEmpty`) so waiting threads sleep without spinning, and **canonical lock ordering** to prevent AB-BA deadlocks.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "state-machine",
+            "eyebrow": "Condition Signaling",
+            "title": "Bounded Queue Producer/Consumer Thread States",
+            "states": [
+              {
+                "id": "running",
+                "label": "HOLDING LOCK",
+                "sublabel": "Check while(full/empty)",
+                "tone": "green"
+              },
+              {
+                "id": "waiting",
+                "label": "AWAITING COND",
+                "sublabel": "Lock released; sleeping",
+                "tone": "amber"
+              },
+              {
+                "id": "signaled",
+                "label": "SIGNALED",
+                "sublabel": "Re-acquire & re-check",
+                "tone": "blue"
+              }
+            ],
+            "transitions": [
+              {
+                "from": "running",
+                "to": "waiting",
+                "label": "cond.await() inside while"
+              },
+              {
+                "from": "waiting",
+                "to": "signaled",
+                "label": "Peer calls cond.signalAll()"
+              },
+              {
+                "from": "signaled",
+                "to": "running",
+                "label": "Re-verify predicate"
+              }
+            ],
+            "summary": "Always wrap Condition.await() in a while loop: spurious wakeups or competing threads can change the predicate before the thread resumes."
+          },
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-why-we-need-it",
+          "title": "Why coarse locks and slow callbacks break concurrent LLD",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without Why coarse locks and slow callbacks break concurrent LLD under real concurrency or scale.",
+          "explanation": "A single `synchronized` method on a broker or booking service serializes unrelated topics and seats, collapsing multi-core throughput. Conversely, naive fine-grained locking introduces two classic bugs:\n- **AB-BA Deadlocks**: Thread 1 locks Seat A then Seat B while Thread 2 locks Seat B then Seat A.\n- **Lock-Held Callback Stalls**: Invoking slow external subscriber callbacks while holding the topic lock blocks all publishers.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Deadlock Avoidance",
+            "title": "Canonical Lock Ordering (min(id) -> max(id))",
+            "actors": [
+              {
+                "id": "t1",
+                "label": "Thread 1 (B, A)"
+              },
+              {
+                "id": "la",
+                "label": "Lock(Seat A)"
+              },
+              {
+                "id": "lb",
+                "label": "Lock(Seat B)"
+              },
+              {
+                "id": "t2",
+                "label": "Thread 2 (A, B)"
+              }
+            ],
+            "events": [
+              {
+                "from": "t1",
+                "to": "la",
+                "label": "Sort [B,A]->[A,B]: lock A",
+                "status": "ok"
+              },
+              {
+                "from": "t2",
+                "to": "la",
+                "label": "Waits for A (no cycle)",
+                "status": "warn"
+              },
+              {
+                "from": "t1",
+                "to": "lb",
+                "label": "Acquires B, commits",
+                "status": "ok"
+              },
+              {
+                "from": "t1",
+                "to": "la",
+                "label": "Releases A & B -> T2 runs",
+                "status": "ok"
+              }
+            ],
+            "summary": "Sorting lock IDs globally guarantees a strict acquisition DAG, making circular wait mathematically impossible."
+          },
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "03-where-it-is-used",
+          "title": "Where In-Memory Concurrency LLD applies (and where it does not)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "In-process concurrency primitives govern single-node engines, while multi-node deployments require distributed coordination.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-how-it-is-managed",
+          "title": "Implementing a Bounded Blocking Queue with Condition Variables",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Separate `notFull` and `notEmpty` `Condition` queues on a `ReentrantLock`, always guard `await()` with a `while` loop, and always release the lock in a `finally` block.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "05-alternatives",
+          "title": "Alternatives: Coarse Mutex vs. Fine-Grained Lock vs. Lock-Free CAS",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "The trade-off: compare competing approaches across latency, consistency, and operational cost.",
+          "explanation": "Choose the simplest synchronization boundary that meets your contention profile.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "06-production-architecture",
+          "title": "Snapshot-and-Dispatch Pub-Sub Pattern",
+          "eyebrow": "Advanced Path · Stage 06",
+          "purpose": "Production architecture: see how the components compose end to end under real load.",
+          "explanation": "In an in-memory pub-sub broker, publishers append to the topic ring buffer under the per-topic lock, then **dispatch to subscribers outside the lock** (or via per-subscriber worker threads with offset pointers) so slow consumers never stall publishers.",
+          "caveats": null,
+          "ideas": [
+            {
+              "title": "Per-Subscriber Offset Tracking",
+              "description": "Each subscriber maintains an atomic offset into the topic's immutable message array, allowing independent consumption speeds."
+            },
+            {
+              "title": "TryLock with Timeout",
+              "description": "For latency-sensitive APIs, pair canonical ordering with `tryLock(50, MILLISECONDS)` to fail fast instead of piling up threads."
+            }
+          ],
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        },
+        {
+          "id": "07-problems-and-further-reading",
+          "title": "Concurrency LLD Problems & Related Concepts",
+          "eyebrow": "Advanced Path · Stage 07",
+          "purpose": "Applied problems: connect these internals to concrete system design and debugging scenarios.",
+          "explanation": "Practice implementing bounded queues, pub-sub brokers, and deadlock-free booking systems.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Lock at the smallest independent boundary (e.g., per-topic or per-seat) and always acquire multiple locks in a canonical global order to prevent deadlocks."
+    }
+  }
+}

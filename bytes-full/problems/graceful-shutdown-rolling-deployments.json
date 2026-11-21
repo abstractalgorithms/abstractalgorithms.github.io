@@ -1,0 +1,615 @@
+{
+  "id": "problem-graceful-shutdown-rolling-deployments",
+  "slug": "graceful-shutdown-rolling-deployments",
+  "title": "Graceful Shutdown in Rolling Deployments",
+  "problemType": "production-debugging",
+  "difficulty": "hard",
+  "prompt": "Every time a high-throughput API gateway / payment service (20,000 RPS across 40 Kubernetes pods behind an AWS ALB and Envoy ingress) runs a rolling deployment, clients observe a spike of 502 Bad Gateway errors and TCP RSTs for 15–30 seconds. Investigation shows pods immediately close Netty/Tomcat listener sockets upon receiving SIGTERM while kube-proxy and Envoy still route new and keep-alive requests to the terminating pod IP. Design a zero-downtime rolling deployment and graceful shutdown architecture.",
+  "spark": {
+    "summary": "Stopping 502s during 20k RPS Kubernetes rolling deploys requires a preStop sleep (10–15s) to cover EndpointSlice/ALB deregistration lag, followed by graceful HTTP/1.1 keep-alive & HTTP/2 GOAWAY draining within a 45s terminationGracePeriodSeconds.",
+    "keyTakeaway": "Never close server sockets immediately on SIGTERM—use a preStop hook sleep to let kube-proxy/Envoy/ALB remove the pod IP first, then drain in-flight requests (up to 25s) with HTTP/2 GOAWAY and Connection: close.",
+    "byteSummary": "**Core Mechanics:** When Kubernetes terminates a pod during a rolling update, two things happen **asynchronously in parallel**: kubelet sends `SIGTERM` to the container immediately, while the control plane propagates `EndpointSlice` / AWS ALB target.\n\n**Visual & Structural Flow:** Depicts preStop Sleep (12s) -> SIGTERM Graceful Drain (25s) -> SIGKILL (45s) (Kubelet / API -> ALB / Envoy -> Spring Pod); Serving -> Terminating (preStop 12s) -> Draining (25s) -> Exited (SERVING -> PRESTOP_WAIT -> DRAINING -> EXIT_0).\n\n**Trade-Offs & Production:** Enabling `server.shutdown=graceful` without a `preStop` hook still causes `502`s: the moment `SIGTERM` arrives at `t=0s`, Tomcat/Netty stops accepting new connections—**before**. Coordinated `preStop` + graceful drain is mandatory for zero-downtime cloud deployments: **High-QPS API Gateways & Payment Services**: Deploying 20+ times/day at `20k+ RPS` with zero 502s.\n\n**Failure Modes & Application:** Coordinated `preStop` + graceful drain is mandatory for zero-downtime cloud deployments: **High-QPS API Gateways & Payment Services**: Deploying 20+ times/day at `20k+ RPS` with zero 502s."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why rolling deployments cause 15–30 second 502 spikes at 20k RPS",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": "When Kubernetes terminates a pod during a rolling update, two things happen **asynchronously in parallel**: kubelet sends `SIGTERM` to the container immediately, while the control plane propagates `EndpointSlice` / AWS ALB target deregistration to `kube-proxy` and `Envoy` over `2–10 seconds`. If Spring Boot/Netty closes its listener socket immediately on `SIGTERM`, Envoy and ALB keep routing `20,000 RPS` of new and keep-alive requests to a dead socket—spiking `502 Bad Gateway` and TCP `RST`s.",
+      "purpose": "The mechanism: understand how Why rolling deployments cause 15–30 second 502 spikes at 20k RPS works from first principles."
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "What happens during the EndpointSlice propagation race",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "Immediate `SIGTERM` shutdown breaks both new and existing connections:\n\n1. **Propagation Race**: Envoy/ALB still holds the terminating pod IP as `HEALTHY` for `2–10 s` after `SIGTERM`.\n2. **Keep-Alive & HTTP/2 Pinning**: Without an HTTP/2 `GOAWAY` frame or `Connection: close` on responses, proxies keep sending new requests down already-open TCP sockets.\n3. **Premature Kill**: In-flight `25-second` requests get severed if `terminationGracePeriodSeconds` defaults to `30 s` minus `preStop`.",
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Zero-Drop Termination Timeline",
+        "title": "preStop Sleep (12s) -> SIGTERM Graceful Drain (25s) -> SIGKILL (45s)",
+        "actors": [
+          {
+            "id": "k8s",
+            "label": "Kubelet / API"
+          },
+          {
+            "id": "lb",
+            "label": "ALB / Envoy"
+          },
+          {
+            "id": "pod",
+            "label": "Spring Pod"
+          }
+        ],
+        "events": [
+          {
+            "from": "k8s",
+            "to": "lb",
+            "label": "t=0s: Mark Terminating -> deregister IP",
+            "status": "warn"
+          },
+          {
+            "from": "k8s",
+            "to": "pod",
+            "label": "t=0s: Run preStop sleep 12s (still serving!)",
+            "status": "ok"
+          },
+          {
+            "from": "lb",
+            "to": "lb",
+            "label": "t=8s: Envoy/ALB removes pod IP",
+            "status": "ok"
+          },
+          {
+            "from": "k8s",
+            "to": "pod",
+            "label": "t=12s: Send SIGTERM -> HTTP/2 GOAWAY",
+            "status": "ok"
+          },
+          {
+            "from": "pod",
+            "to": "pod",
+            "label": "t=12..37s: Drain 25s in-flight -> exit 0",
+            "status": "ok"
+          }
+        ],
+        "summary": "The 12s preStop sleep absorbs EndpointSlice propagation lag while Spring Boot continues serving until Envoy drains."
+      },
+      "purpose": "The problem: see what breaks without What happens during the EndpointSlice propagation race under real concurrency or scale."
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Naive solution (and why server.shutdown=graceful alone still drops 502s)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "Enabling `server.shutdown=graceful` without a `preStop` hook still causes `502`s: the moment `SIGTERM` arrives at `t=0s`, Tomcat/Netty stops accepting new connections—**before** Envoy and AWS ALB finish removing the pod IP (`t=2..10s`).",
+      "purpose": "The problem: see what breaks without Naive solution under real concurrency or scale."
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise solution: preStop Propagation Buffer + Graceful Drain + GOAWAY",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": "Zero-downtime rolling deployments coordinate three timers within `terminationGracePeriodSeconds: 45`:\n\n- **1. `preStop` Sleep (`12 s`)**: Blocks `SIGTERM` for `12 s` while `/readyz` fails and `EndpointSlice` + AWS ALB deregister the pod; the server keeps accepting straggler requests routed during propagation.\n- **2. Graceful Shutdown (`25 s` timeout)**: At `t=12 s`, `SIGTERM` triggers Spring Boot `server.shutdown=graceful` (`spring.lifecycle.timeout-per-shutdown-phase=25s`), sending HTTP/2 `GOAWAY` frames and `Connection: close` on HTTP/1.1 responses while finishing active `<= 25 s` requests.\n- **3. Bounded Rollout Velocity**: Set `maxSurge: 25%`, `maxUnavailable: 0` so capacity never dips during the `45 s` drain window.",
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "Pod Shutdown Lifecycle",
+        "title": "Serving -> Terminating (preStop 12s) -> Draining (25s) -> Exited",
+        "states": [
+          {
+            "id": "srv",
+            "label": "SERVING",
+            "sublabel": "In Endpoints + ALB",
+            "tone": "green"
+          },
+          {
+            "id": "pre",
+            "label": "PRESTOP_WAIT",
+            "sublabel": "12s: deregister + serve",
+            "tone": "amber"
+          },
+          {
+            "id": "drn",
+            "label": "DRAINING",
+            "sublabel": "GOAWAY + finish <=25s",
+            "tone": "blue"
+          },
+          {
+            "id": "ext",
+            "label": "EXIT_0",
+            "sublabel": "Clean exit < 45s",
+            "tone": "green"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "srv",
+            "to": "pre",
+            "label": "Pod deleted / rolling update"
+          },
+          {
+            "from": "pre",
+            "to": "drn",
+            "label": "12s elapsed -> SIGTERM"
+          },
+          {
+            "from": "drn",
+            "to": "ext",
+            "label": "Active requests == 0"
+          }
+        ],
+        "summary": "12s preStop + 25s drain fits safely inside terminationGracePeriodSeconds: 45 with zero dropped requests."
+      },
+      "markdownContent": "```yaml\n# Kubernetes PodSpec + Spring Boot 3 graceful shutdown config\n# application.yaml:\n#   server.shutdown: graceful\n#   spring.lifecycle.timeout-per-shutdown-phase: 25s\nspec:\n  terminationGracePeriodSeconds: 45   # >= preStop (12s) + drain (25s) + buffer (8s)\n  containers:\n    - name: payment-api\n      lifecycle:\n        preStop:\n          exec:\n            command: [\"sh\", \"-c\", \"sleep 12\"]\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where Graceful Shutdown applies in Production Kubernetes",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": "Coordinated `preStop` + graceful drain is mandatory for zero-downtime cloud deployments:\n\n- **High-QPS API Gateways & Payment Services**: Deploying 20+ times/day at `20k+ RPS` with zero 502s.\n- **gRPC & WebSocket Servers**: Emitting HTTP/2 `GOAWAY` frames so long-lived streams migrate cleanly.\n- **Spot / Preemptible Node Drains**: Finishing in-flight jobs before `PDB` / autoscaler evictions.",
+      "supportingConcepts": [
+        {
+          "slug": "rolling-deployment-strategy",
+          "title": "Concept: Rolling Deployment Strategy",
+          "kind": "concept"
+        },
+        {
+          "slug": "kubernetes-workloads",
+          "title": "Concept: Kubernetes Workloads",
+          "kind": "concept"
+        },
+        {
+          "slug": "http2-connection-multiplexing",
+          "title": "Concept: HTTP/2 Multiplexing",
+          "kind": "concept"
+        },
+        {
+          "slug": "kubernetes-pdb-safe-node-drains",
+          "title": "Problem: Kubernetes PDB Safe Node Drains",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why is a preStop sleep (e.g. 12 seconds) needed even when Spring Boot has server.shutdown=graceful enabled?",
+      "options": [
+        {
+          "id": "a",
+          "text": "Because SIGTERM is sent in parallel with EndpointSlice/ALB deregistration; preStop keeps the pod accepting straggler traffic until load balancers stop routing to it",
+          "correct": true,
+          "feedback": "Correct: without preStop, the server stops accepting new requests on SIGTERM while Envoy/ALB still route traffic to it for 2–10 seconds."
+        },
+        {
+          "id": "b",
+          "text": "Because Kubernetes does not send SIGTERM unless a preStop hook exists",
+          "correct": false,
+          "feedback": "Kubernetes always sends SIGTERM; preStop simply delays SIGTERM until the hook completes."
+        },
+        {
+          "id": "c",
+          "text": "Because preStop increases terminationGracePeriodSeconds automatically",
+          "correct": false,
+          "feedback": "terminationGracePeriodSeconds must be explicitly set >= preStop + drain timeout."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why is a preStop sleep (e.g. 12 seconds) needed even when Spring Boot has server.shutdown=graceful enabled?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Because SIGTERM is sent in parallel with EndpointSlice/ALB deregistration; preStop keeps the pod accepting straggler traffic until load balancers stop routing to it",
+            "correct": true,
+            "feedback": "Correct: without preStop, the server stops accepting new requests on SIGTERM while Envoy/ALB still route traffic to it for 2–10 seconds."
+          },
+          {
+            "id": "b",
+            "text": "Because Kubernetes does not send SIGTERM unless a preStop hook exists",
+            "correct": false,
+            "feedback": "Kubernetes always sends SIGTERM; preStop simply delays SIGTERM until the hook completes."
+          },
+          {
+            "id": "c",
+            "text": "Because preStop increases terminationGracePeriodSeconds automatically",
+            "correct": false,
+            "feedback": "terminationGracePeriodSeconds must be explicitly set >= preStop + drain timeout."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why rolling deployments cause 15–30 second 502 spikes at 20k RPS', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "b",
+            "text": "When Kubernetes terminates a pod during a rolling update, two things happen **asynchronously in parallel**: kubelet sends SIGTERM to the container immediately, while the…",
+            "correct": true,
+            "feedback": "Correct: When Kubernetes terminates a pod during a rolling update, two things happen **asynchronously in parallel**: kubelet sends SIGTERM to the container immediately, while the…"
+          },
+          {
+            "id": "c",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'What happens during the EndpointSlice propagation race', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Immediate SIGTERM shutdown breaks both new and existing connections: 1.",
+            "correct": true,
+            "feedback": "Correct: Immediate SIGTERM shutdown breaks both new and existing connections: 1."
+          },
+          {
+            "id": "b",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "c",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** When Kubernetes terminates a pod during a rolling update, two things happen **asynchronously in parallel**: kubelet sends `SIGTERM` to the container immediately, while the control plane propagates `EndpointSlice` / AWS.\n\n**How It Flows:** Think of Graceful Shutdown in Rolling Deployments as a clear step-by-step chain: Kubelet / API -> ALB / Envoy -> Spring Pod -> SERVING -> PRESTOP_WAIT.\n\n**Why Beginners Should Care:** Never close server sockets immediately on SIGTERM—use a preStop hook sleep to let kube-proxy/Envoy/ALB remove the pod IP first, then drain in-flight requests (up to 25s) with HTTP/2 GOAWAY and Connection: close.",
+      "spark": {
+        "summary": "When Kubernetes terminates a pod during a rolling update, two things happen **asynchronously in parallel**: kubelet sends `SIGTERM` to the container immediately, while the control plane propagates `EndpointSlice` / AWS.",
+        "keyTakeaway": "Never close server sockets immediately on SIGTERM—use a preStop hook sleep to let kube-proxy/Envoy/ALB remove the pod IP first, then drain in-flight requests (up to 25s) with HTTP/2 GOAWAY and Connection: close."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why rolling deployments cause 15–30 second 502 spikes at 20k RPS",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why rolling deployments cause 15–30 second 502 spikes at 20k RPS works from first principles.",
+          "explanation": "When Kubernetes terminates a pod during a rolling update, two things happen **asynchronously in parallel**: kubelet sends `SIGTERM` to the container immediately, while the control plane propagates `EndpointSlice` / AWS ALB target deregistration to `kube-proxy` and `Envoy` over `2–10 seconds`.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "What happens during the EndpointSlice propagation race",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without What happens during the EndpointSlice propagation race under real concurrency or scale.",
+          "explanation": "Immediate `SIGTERM` shutdown breaks both new and existing connections: 1. **Propagation Race**: Envoy/ALB still holds the terminating pod IP as `HEALTHY` for `2–10 s` after `SIGTERM`. 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Zero-Drop Termination Timeline",
+            "title": "preStop Sleep (12s) -> SIGTERM Graceful Drain (25s) -> SIGKILL (45s)",
+            "actors": [
+              {
+                "id": "k8s",
+                "label": "Kubelet / API"
+              },
+              {
+                "id": "lb",
+                "label": "ALB / Envoy"
+              },
+              {
+                "id": "pod",
+                "label": "Spring Pod"
+              }
+            ],
+            "events": [
+              {
+                "from": "k8s",
+                "to": "lb",
+                "label": "t=0s: Mark Terminating -> deregister IP",
+                "status": "warn"
+              },
+              {
+                "from": "k8s",
+                "to": "pod",
+                "label": "t=0s: Run preStop sleep 12s (still serving!)",
+                "status": "ok"
+              },
+              {
+                "from": "lb",
+                "to": "lb",
+                "label": "t=8s: Envoy/ALB removes pod IP",
+                "status": "ok"
+              },
+              {
+                "from": "k8s",
+                "to": "pod",
+                "label": "t=12s: Send SIGTERM -> HTTP/2 GOAWAY",
+                "status": "ok"
+              },
+              {
+                "from": "pod",
+                "to": "pod",
+                "label": "t=12..37s: Drain 25s in-flight -> exit 0",
+                "status": "ok"
+              }
+            ],
+            "summary": "The 12s preStop sleep absorbs EndpointSlice propagation lag while Spring Boot continues serving until Envoy drains."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive solution (and why server.shutdown=graceful alone still drops 502s)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "The problem: see what breaks without Naive solution under real concurrency or scale.",
+          "explanation": "Enabling `server.shutdown=graceful` without a `preStop` hook still causes `502`s: the moment `SIGTERM` arrives at `t=0s`, Tomcat/Netty stops accepting new connections—**before** Envoy and AWS ALB finish removing the pod IP (`t=2..10s`).",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: preStop Propagation Buffer + Graceful Drain + GOAWAY",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Zero-downtime rolling deployments coordinate three timers within `terminationGracePeriodSeconds: 45`: **1. `preStop` Sleep (`12 s`)**: Blocks `SIGTERM` for `12 s` while `/readyz` fails and `EndpointSlice` + AWS ALB deregister the pod; the server keeps accepting straggler requests routed during propagation. **2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "state-machine",
+            "eyebrow": "Pod Shutdown Lifecycle",
+            "title": "Serving -> Terminating (preStop 12s) -> Draining (25s) -> Exited",
+            "states": [
+              {
+                "id": "srv",
+                "label": "SERVING",
+                "sublabel": "In Endpoints + ALB",
+                "tone": "green"
+              },
+              {
+                "id": "pre",
+                "label": "PRESTOP_WAIT",
+                "sublabel": "12s: deregister + serve",
+                "tone": "amber"
+              },
+              {
+                "id": "drn",
+                "label": "DRAINING",
+                "sublabel": "GOAWAY + finish <=25s",
+                "tone": "blue"
+              },
+              {
+                "id": "ext",
+                "label": "EXIT_0",
+                "sublabel": "Clean exit < 45s",
+                "tone": "green"
+              }
+            ],
+            "transitions": [
+              {
+                "from": "srv",
+                "to": "pre",
+                "label": "Pod deleted / rolling update"
+              },
+              {
+                "from": "pre",
+                "to": "drn",
+                "label": "12s elapsed -> SIGTERM"
+              },
+              {
+                "from": "drn",
+                "to": "ext",
+                "label": "Active requests == 0"
+              }
+            ],
+            "summary": "12s preStop + 25s drain fits safely inside terminationGracePeriodSeconds: 45 with zero dropped requests."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Never close server sockets immediately on SIGTERM—use a preStop hook sleep to let kube-proxy/Envoy/ALB remove the pod IP first, then drain in-flight requests (up to 25s) with HTTP/2 GOAWAY and Connection: close."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** When Kubernetes terminates a pod during a rolling update, two things happen **asynchronously in parallel**: kubelet sends `SIGTERM` to the container immediately, while the control plane propagates `EndpointSlice` / AWS ALB target.\n\n**Visual & Structural Flow:** Depicts preStop Sleep (12s) -> SIGTERM Graceful Drain (25s) -> SIGKILL (45s) (Kubelet / API -> ALB / Envoy -> Spring Pod); Serving -> Terminating (preStop 12s) -> Draining (25s) -> Exited (SERVING -> PRESTOP_WAIT -> DRAINING -> EXIT_0).\n\n**Trade-Offs & Production:** Enabling `server.shutdown=graceful` without a `preStop` hook still causes `502`s: the moment `SIGTERM` arrives at `t=0s`, Tomcat/Netty stops accepting new connections—**before**. Coordinated `preStop` + graceful drain is mandatory for zero-downtime cloud deployments: **High-QPS API Gateways & Payment Services**: Deploying 20+ times/day at `20k+ RPS` with zero 502s.\n\n**Failure Modes & Application:** Coordinated `preStop` + graceful drain is mandatory for zero-downtime cloud deployments: **High-QPS API Gateways & Payment Services**: Deploying 20+ times/day at `20k+ RPS` with zero 502s.",
+      "spark": {
+        "summary": "Stopping 502s during 20k RPS Kubernetes rolling deploys requires a preStop sleep (10–15s) to cover EndpointSlice/ALB deregistration lag, followed by graceful HTTP/1.1 keep-alive & HTTP/2 GOAWAY draining within a 45s terminationGracePeriodSeconds.",
+        "keyTakeaway": "Never close server sockets immediately on SIGTERM—use a preStop hook sleep to let kube-proxy/Envoy/ALB remove the pod IP first, then drain in-flight requests (up to 25s) with HTTP/2 GOAWAY and Connection: close."
+      }
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** Stopping 502s during 20k RPS Kubernetes rolling deploys requires a preStop sleep (10–15s) to cover EndpointSlice/ALB deregistration lag, followed by graceful HTTP/1.1 keep-alive & HTTP/2 GOAWAY draining within a 45s terminationGracePeriodSeconds.\n\n**Production Trade-Offs:** Enabling `server.shutdown=graceful` without a `preStop` hook still causes `502`s: the moment `SIGTERM` arrives at `t=0s`, Tomcat/Netty stops accepting new connections—**before** Envoy and AWS ALB finish removing the pod IP (`t=2..10s`).\n\n**Failure Modes & Edge Cases:** Coordinated `preStop` + graceful drain is mandatory for zero-downtime cloud deployments: **High-QPS API Gateways & Payment Services**: Deploying 20+ times/day at `20k+ RPS` with zero 502s.\n\n**Principal Takeaway:** Never close server sockets immediately on SIGTERM—use a preStop hook sleep to let kube-proxy/Envoy/ALB remove the pod IP first, then drain in-flight requests (up to 25s) with HTTP/2 GOAWAY and Connection: close.",
+      "spark": {
+        "summary": "Stopping 502s during 20k RPS Kubernetes rolling deploys requires a preStop sleep (10–15s) to cover EndpointSlice/ALB deregistration lag, followed by graceful HTTP/1.1 keep-alive & HTTP/2 GOAWAY draining within a 45s terminationGracePeriodSeconds.",
+        "keyTakeaway": "Never close server sockets immediately on SIGTERM—use a preStop hook sleep to let kube-proxy/Envoy/ALB remove the pod IP first, then drain in-flight requests (up to 25s) with HTTP/2 GOAWAY and Connection: close."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why rolling deployments cause 15–30 second 502 spikes at 20k RPS",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why rolling deployments cause 15–30 second 502 spikes at 20k RPS works from first principles.",
+          "explanation": "When Kubernetes terminates a pod during a rolling update, two things happen **asynchronously in parallel**: kubelet sends `SIGTERM` to the container immediately, while the control plane propagates `EndpointSlice` / AWS ALB target deregistration to `kube-proxy` and `Envoy` over `2–10 seconds`. If Spring Boot/Netty closes its listener socket immediately on `SIGTERM`, Envoy and ALB keep routing `20,000 RPS` of new and keep-alive requests to a dead socket—spiking `502 Bad Gateway` and TCP `RST`s.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "What happens during the EndpointSlice propagation race",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without What happens during the EndpointSlice propagation race under real concurrency or scale.",
+          "explanation": "Immediate `SIGTERM` shutdown breaks both new and existing connections:\n\n1. **Propagation Race**: Envoy/ALB still holds the terminating pod IP as `HEALTHY` for `2–10 s` after `SIGTERM`.\n2. **Keep-Alive & HTTP/2 Pinning**: Without an HTTP/2 `GOAWAY` frame or `Connection: close` on responses, proxies keep sending new requests down already-open TCP sockets.\n3. **Premature Kill**: In-flight `25-second` requests get severed if `terminationGracePeriodSeconds` defaults to `30 s` minus `preStop`.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Zero-Drop Termination Timeline",
+            "title": "preStop Sleep (12s) -> SIGTERM Graceful Drain (25s) -> SIGKILL (45s)",
+            "actors": [
+              {
+                "id": "k8s",
+                "label": "Kubelet / API"
+              },
+              {
+                "id": "lb",
+                "label": "ALB / Envoy"
+              },
+              {
+                "id": "pod",
+                "label": "Spring Pod"
+              }
+            ],
+            "events": [
+              {
+                "from": "k8s",
+                "to": "lb",
+                "label": "t=0s: Mark Terminating -> deregister IP",
+                "status": "warn"
+              },
+              {
+                "from": "k8s",
+                "to": "pod",
+                "label": "t=0s: Run preStop sleep 12s (still serving!)",
+                "status": "ok"
+              },
+              {
+                "from": "lb",
+                "to": "lb",
+                "label": "t=8s: Envoy/ALB removes pod IP",
+                "status": "ok"
+              },
+              {
+                "from": "k8s",
+                "to": "pod",
+                "label": "t=12s: Send SIGTERM -> HTTP/2 GOAWAY",
+                "status": "ok"
+              },
+              {
+                "from": "pod",
+                "to": "pod",
+                "label": "t=12..37s: Drain 25s in-flight -> exit 0",
+                "status": "ok"
+              }
+            ],
+            "summary": "The 12s preStop sleep absorbs EndpointSlice propagation lag while Spring Boot continues serving until Envoy drains."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive solution (and why server.shutdown=graceful alone still drops 502s)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "The problem: see what breaks without Naive solution under real concurrency or scale.",
+          "explanation": "Enabling `server.shutdown=graceful` without a `preStop` hook still causes `502`s: the moment `SIGTERM` arrives at `t=0s`, Tomcat/Netty stops accepting new connections—**before** Envoy and AWS ALB finish removing the pod IP (`t=2..10s`).",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: preStop Propagation Buffer + Graceful Drain + GOAWAY",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Zero-downtime rolling deployments coordinate three timers within `terminationGracePeriodSeconds: 45`:\n\n- **1. `preStop` Sleep (`12 s`)**: Blocks `SIGTERM` for `12 s` while `/readyz` fails and `EndpointSlice` + AWS ALB deregister the pod; the server keeps accepting straggler requests routed during propagation.\n- **2. Graceful Shutdown (`25 s` timeout)**: At `t=12 s`, `SIGTERM` triggers Spring Boot `server.shutdown=graceful` (`spring.lifecycle.timeout-per-shutdown-phase=25s`), sending HTTP/2 `GOAWAY` frames and `Connection: close` on HTTP/1.1 responses while finishing active `<= 25 s` requests.\n- **3. Bounded Rollout Velocity**: Set `maxSurge: 25%`, `maxUnavailable: 0` so capacity never dips during the `45 s` drain window.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "state-machine",
+            "eyebrow": "Pod Shutdown Lifecycle",
+            "title": "Serving -> Terminating (preStop 12s) -> Draining (25s) -> Exited",
+            "states": [
+              {
+                "id": "srv",
+                "label": "SERVING",
+                "sublabel": "In Endpoints + ALB",
+                "tone": "green"
+              },
+              {
+                "id": "pre",
+                "label": "PRESTOP_WAIT",
+                "sublabel": "12s: deregister + serve",
+                "tone": "amber"
+              },
+              {
+                "id": "drn",
+                "label": "DRAINING",
+                "sublabel": "GOAWAY + finish <=25s",
+                "tone": "blue"
+              },
+              {
+                "id": "ext",
+                "label": "EXIT_0",
+                "sublabel": "Clean exit < 45s",
+                "tone": "green"
+              }
+            ],
+            "transitions": [
+              {
+                "from": "srv",
+                "to": "pre",
+                "label": "Pod deleted / rolling update"
+              },
+              {
+                "from": "pre",
+                "to": "drn",
+                "label": "12s elapsed -> SIGTERM"
+              },
+              {
+                "from": "drn",
+                "to": "ext",
+                "label": "Active requests == 0"
+              }
+            ],
+            "summary": "12s preStop + 25s drain fits safely inside terminationGracePeriodSeconds: 45 with zero dropped requests."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where Graceful Shutdown applies in Production Kubernetes",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Coordinated `preStop` + graceful drain is mandatory for zero-downtime cloud deployments:\n\n- **High-QPS API Gateways & Payment Services**: Deploying 20+ times/day at `20k+ RPS` with zero 502s.\n- **gRPC & WebSocket Servers**: Emitting HTTP/2 `GOAWAY` frames so long-lived streams migrate cleanly.\n- **Spot / Preemptible Node Drains**: Finishing in-flight jobs before `PDB` / autoscaler evictions.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Never close server sockets immediately on SIGTERM—use a preStop hook sleep to let kube-proxy/Envoy/ALB remove the pod IP first, then drain in-flight requests (up to 25s) with HTTP/2 GOAWAY and Connection: close."
+    }
+  }
+}

@@ -1,0 +1,842 @@
+{
+  "id": "concept-backpressure-flow-control",
+  "slug": "backpressure-flow-control",
+  "name": "Backpressure & Flow Control",
+  "domain": "Distributed Systems & Networking",
+  "tagline": "Closing the feedback loop between slow consumers and fast producers via credit-based pull, sliding windows, and load shedding.",
+  "purpose": "Build a progressive mental model of backpressure—from Little's Law and BDP window sizing to hysteresis watermarks and graceful load shedding.",
+  "spark": {
+    "summary": "Backpressure lets a slow consumer signal an upstream producer to slow down or pause, preventing unbounded memory growth and out-of-memory crashes.",
+    "keyTakeaway": "Every asynchronous pipeline needs bounded queues plus an explicit feedback signal—either credit-based pull, window updates, or fast shedding—before memory saturates.",
+    "byteSummary": "**Core Mechanics:** **Little's Law** ($L = \\lambda \\cdot W$) guarantees that if arrival rate $\\lambda$ exceeds service rate $\\mu$, queue depth $L$ grows without bound until the process OOMs.\n\n**Visual & Structural Flow:** Depicts Bounded Queue High/Low Watermark Backpressure State Machine (FLOWING -> PAUSED -> LOAD SHED); Reactive Streams Demand Grants Preventing Consumer OOM (Upstream Source -> Transformer -> DB Writer (4k/s)); Edge Shedder -> Bounded Watermark Queue -> Credit-Based DB Sink (Edge Load Shedder -> Watermark Buffer -> Worker Pool -> DB / Kafka Sink).\n\n**Trade-Offs & Production:** Each layer enforces flow control at a different granularity. Production gateways combine **adaptive concurrency limits** (e.g., Little's Law / Vegas-style RTT tracking) with **priority-aware load shedding** at the edge and **bounded.\n\n**Failure Modes & Application:** Explore bounded queues, priority-aware load shedding, and retry storm prevention in production."
+  },
+  "learningJourney": [
+    {
+      "id": "01-what-it-is",
+      "eyebrow": "STAGE 01 · WHAT IT IS",
+      "title": "What is Backpressure & Flow Control",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": "**Little's Law** ($L = \\lambda \\cdot W$) guarantees that if arrival rate $\\lambda$ exceeds service rate $\\mu$, queue depth $L$ grows without bound until the process OOMs. **Backpressure** closes the feedback loop between consumer and producer so $\\lambda$ cannot outrun $\\mu$.\n\nIt operates through three mechanisms: **credit-based pull** (Reactive Streams `Subscription.request(n)`), **sliding byte windows** (TCP `RWND` and HTTP/2 `WINDOW_UPDATE` frames, default 64 KB initial window), and **explicit load shedding** (`429 Too Many Requests` / `503` + `Retry-After`) at ingress.",
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "Hysteresis Watermarks",
+        "title": "Bounded Queue High/Low Watermark Backpressure State Machine",
+        "states": [
+          {
+            "id": "flowing",
+            "label": "FLOWING",
+            "sublabel": "Depth < 40% (low mark)",
+            "tone": "green"
+          },
+          {
+            "id": "paused",
+            "label": "PAUSED",
+            "sublabel": "Depth > 80% (high mark)",
+            "tone": "amber"
+          },
+          {
+            "id": "shedding",
+            "label": "LOAD SHED",
+            "sublabel": "100% full -> 429/503",
+            "tone": "red"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "flowing",
+            "to": "paused",
+            "label": "Queue >= 80% (pause read)"
+          },
+          {
+            "from": "paused",
+            "to": "flowing",
+            "label": "Drained <= 40% (resume)"
+          },
+          {
+            "from": "paused",
+            "to": "shedding",
+            "label": "In-flight burst hits 100%"
+          }
+        ],
+        "summary": "High/low watermark hysteresis (80% / 40%) prevents rapid flip-flopping and syscall thrashing at the boundary."
+      },
+      "purpose": "The mechanism: understand how Backpressure & Flow Control works from first principles."
+    },
+    {
+      "id": "02-why-we-need-it",
+      "eyebrow": "STAGE 02 · WHY WE NEED IT",
+      "title": "Why we need Bounded Queues (and why unbounded buffers fail)",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": "Unbounded queues (`LinkedBlockingQueue()` without capacity, `mpsc::unbounded_channel`) merely hide overload until the JVM or container hits OOMKill. Even with bounded queues, three subtler failure modes occur:\n\n1. **Bufferbloat**: Oversized TCP or proxy buffers (tens of MBs) absorb bursts instead of signaling backpressure, inflating queuing latency to seconds.\n2. **BDP Window Starvation**: Leaving HTTP/2's default 64 KB window on a 1 Gbps / 20 ms RTT link (`BDP = 2.5 MB`) caps throughput at `64 KB / 0.02 s = 3.2 MB/s` (~25 Mbps).\n3. **Retry-Amplified Collapse**: Returning `503` without `Retry-After` or jittered backoff causes clients to retry immediately, multiplying load.",
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Credit-Based Pull",
+        "title": "Reactive Streams Demand Grants Preventing Consumer OOM",
+        "actors": [
+          {
+            "id": "prod",
+            "label": "Upstream Source"
+          },
+          {
+            "id": "xform",
+            "label": "Transformer"
+          },
+          {
+            "id": "sink",
+            "label": "DB Writer (4k/s)"
+          }
+        ],
+        "events": [
+          {
+            "from": "sink",
+            "to": "xform",
+            "label": "request(1024) credits",
+            "status": "ok"
+          },
+          {
+            "from": "xform",
+            "to": "prod",
+            "label": "Read 1024 items; credit=0",
+            "status": "ok"
+          },
+          {
+            "from": "xform",
+            "to": "prod",
+            "label": "Pause socket reads (credit=0)",
+            "status": "warn"
+          },
+          {
+            "from": "sink",
+            "to": "sink",
+            "label": "Batch flush 512 rows to DB",
+            "status": "ok"
+          },
+          {
+            "from": "sink",
+            "to": "xform",
+            "label": "request(512) -> resume flow",
+            "status": "ok"
+          }
+        ],
+        "summary": "Consumers only grant credits for buffer slots they actually have, propagating backpressure cleanly upstream."
+      },
+      "ideas": [
+        {
+          "title": "Size Windows with BDP",
+          "description": "Bandwidth-Delay Product = Bandwidth * RTT. On 1 Gbps x 20 ms, BDP is 2.5 MB—size HTTP/2 and TCP buffers accordingly."
+        },
+        {
+          "title": "Avoid Cyclic Blocking",
+          "description": "If Actor A blocks pushing to Actor B while B blocks pushing to A, both bounded channels fill and deadlock."
+        }
+      ],
+      "purpose": "The problem: see what breaks without Bounded Queues under real concurrency or scale."
+    },
+    {
+      "id": "03-where-it-is-used",
+      "eyebrow": "STAGE 03 · WHERE IT IS USED",
+      "title": "Where Backpressure Mechanisms operate across the stack",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "Backpressure must be wired end-to-end—from edge HTTP load shedding down to Kafka `pause()`/`resume()` and TCP `RWND`.",
+      "comparison": [
+        {
+          "choice": "Reactive Streams / gRPC Flow Control",
+          "benefits": [
+            "Item-level request(n) or stream-level WINDOW_UPDATE prevents single slow streams from stalling peers."
+          ],
+          "costs": [
+            "Requires async non-blocking operators throughout the pipeline."
+          ]
+        },
+        {
+          "choice": "Netty / Kafka `pause()` & `resume()` Watermarks",
+          "benefits": [
+            "Pauses partition/socket polling at 80% buffer depth while keeping consumer heartbeats alive."
+          ],
+          "costs": [
+            "Must tune poll intervals (max.poll.interval.ms) so paused Kafka consumers aren't evicted."
+          ]
+        },
+        {
+          "choice": "Edge Load Shedding (LIFO + Priority)",
+          "benefits": [
+            "Drops lowest-priority or oldest-queued work fast with 429 + Retry-After before queues bloat."
+          ],
+          "costs": [
+            "Clients must respect Retry-After and exponential backoff with jitter."
+          ]
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    },
+    {
+      "id": "04-how-it-is-managed",
+      "eyebrow": "STAGE 04 · HOW IT IS MANAGED",
+      "title": "How Bounded Queues, Watermarks, and Load Shedding are managed",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "Implement backpressure with explicit capacity bounds and hysteresis:\n\n1. **Never Use Unbounded Channels**: Always pass explicit capacity to `BlockingQueue`, `asyncio.Queue(maxsize=...)`, or `tokio::sync::mpsc::channel(cap)`.\n2. **80% / 40% Watermarks**: Pause upstream reads at 80% full; resume at 40%.\n3. **Priority Shedding**: Under overload, shed `best-effort` traffic before `critical` checkout/payment traffic.\n4. **Monitor Queue Age, Not Just Depth**: Alert on p99 queue wait time so bufferbloat is caught early.",
+      "markdownContent": "```python\n# Bounded async queue with high/low watermark backpressure & fast load shedding (Python)\nimport asyncio\n\nclass WatermarkBuffer:\n    def __init__(self, maxsize: int = 1000, high_pct: float = 0.8, low_pct: float = 0.4):\n        self.queue = asyncio.Queue(maxsize=maxsize)\n        self.high = int(maxsize * high_pct)\n        self.low = int(maxsize * low_pct)\n        self.paused = False\n\n    def try_enqueue(self, item, priority: int = 1) -> bool:\n        if self.queue.full() or (self.paused and priority > 0):\n            return False # fast-shed non-critical work with 429/503\n        self.queue.put_nowait(item)\n        if self.queue.qsize() >= self.high:\n            self.paused = True # signal upstream to pause\n        return True\n\n    async def dequeue(self):\n        item = await self.queue.get()\n        if self.paused and self.queue.qsize() <= self.low:\n            self.paused = False # hysteresis resume\n        return item\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-alternatives",
+      "eyebrow": "STAGE 05 · ALTERNATIVES",
+      "title": "Alternatives: TCP RWND vs. HTTP/2 Windows vs. Credit Pull vs. Shedding",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": "Each layer enforces flow control at a different granularity.",
+      "comparison": [
+        {
+          "choice": "TCP Flow Control (`RWND`)",
+          "benefits": [
+            "Built into OS kernel; automatically pauses sender when socket buffer fills."
+          ],
+          "costs": [
+            "Connection-level only; head-of-line blocks multiplexed HTTP/2 streams on one socket."
+          ]
+        },
+        {
+          "choice": "HTTP/2 / gRPC (`WINDOW_UPDATE`)",
+          "benefits": [
+            "Per-stream byte flow control; slow stream pauses independently of fast streams."
+          ],
+          "costs": [
+            "Default 64 KB window bottlenecks high-BDP WAN links unless tuned upward."
+          ]
+        },
+        {
+          "choice": "Load Shedding (CoDel / Token Bucket)",
+          "benefits": [
+            "Protects interactive latency SLAs by dropping excess work immediately instead of queuing."
+          ],
+          "costs": [
+            "Drops requests; best for synchronous APIs where waiting > deadline is useless."
+          ]
+        }
+      ],
+      "purpose": "The trade-off: compare competing approaches across latency, consistency, and operational cost."
+    },
+    {
+      "id": "06-production-architecture",
+      "eyebrow": "STAGE 06 · PRODUCTION ARCHITECTURE",
+      "title": "Production example: Priority Load Shedder + Bounded Worker Pool",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": "Production gateways combine **adaptive concurrency limits** (e.g., Little's Law / Vegas-style RTT tracking) with **priority-aware load shedding** at the edge and **bounded watermark queues** feeding downstream DB writers.",
+      "sectionDiagram": {
+        "kind": "cache-tier",
+        "eyebrow": "End-to-End Flow Control",
+        "title": "Edge Shedder -> Bounded Watermark Queue -> Credit-Based DB Sink",
+        "nodes": [
+          {
+            "label": "Edge Load Shedder",
+            "role": "429 + Retry-After"
+          },
+          {
+            "label": "Watermark Buffer",
+            "role": "80% pause / 40% resume"
+          },
+          {
+            "label": "Worker Pool",
+            "role": "Bounded concurrency"
+          },
+          {
+            "label": "DB / Kafka Sink",
+            "role": "Batch flush + ACK"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Little's Law Guard",
+            "detail": "Adaptive concurrency caps in-flight requests before queue wait time blows past the client deadline."
+          },
+          {
+            "label": "Priority Lanes",
+            "detail": "Critical mutations bypass shedding until 95% saturation; analytics traffic sheds at 70%."
+          },
+          {
+            "label": "Jittered Retry-After",
+            "detail": "429/503 responses include randomized Retry-After headers to prevent synchronized retry storms."
+          }
+        ],
+        "summary": "Combining edge load shedding with internal watermark buffers keeps tail latency bounded under extreme bursts."
+      },
+      "purpose": "Production architecture: see how the components compose end to end under real load."
+    },
+    {
+      "id": "07-problems-and-further-reading",
+      "eyebrow": "STAGE 07 · PROBLEMS SOLVED & FURTHER DEEP DIVE",
+      "title": "Problems solved by Backpressure & System Design Deep Dives",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": "Explore bounded queues, priority-aware load shedding, and retry storm prevention in production.",
+      "supportingConcepts": [
+        {
+          "slug": "bounded-task-queues-backpressure",
+          "title": "Problem: Bounded Task Queues & Backpressure",
+          "kind": "problem"
+        },
+        {
+          "slug": "priority-aware-load-shedding",
+          "title": "Problem: Priority-Aware Load Shedding",
+          "kind": "problem"
+        },
+        {
+          "slug": "preventing-retry-storms-jitter-budgets",
+          "title": "Problem: Preventing Retry Storms with Jitter Budgets",
+          "kind": "problem"
+        },
+        {
+          "slug": "custom-thread-pool-rejection-policies",
+          "title": "Problem: Custom Thread Pool Rejection Policies",
+          "kind": "problem"
+        },
+        {
+          "slug": "reactive-streams-backpressure",
+          "title": "Concept: Reactive Streams Backpressure",
+          "kind": "concept"
+        }
+      ],
+      "purpose": "Applied problems: connect these internals to concrete system design and debugging scenarios."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "A gRPC stream runs over a 1 Gbps WAN link with a 20 ms RTT (`BDP = 2.5 MB`), but throughput is stuck at ~25 Mbps even though CPU and disk are idle. What is the most likely bottleneck?",
+      "options": [
+        {
+          "id": "a",
+          "text": "HTTP/2's default 64 KB initial flow-control window is smaller than the 2.5 MB Bandwidth-Delay Product",
+          "correct": true,
+          "feedback": "Correct: 64 KB / 0.02 s = 3.2 MB/s (~25 Mbps). Increase HTTP/2 initial window size to >= BDP."
+        },
+        {
+          "id": "b",
+          "text": "Protobuf serialization caps throughput at 25 Mbps",
+          "correct": false,
+          "feedback": "Protobuf easily saturates multi-Gbps links; the limit here is the 64 KB window per RTT."
+        },
+        {
+          "id": "c",
+          "text": "Reactive Streams require 2x memory",
+          "correct": false,
+          "feedback": "The bottleneck is the byte window size relative to BDP."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "A gRPC stream runs over a 1 Gbps WAN link with a 20 ms RTT (`BDP = 2.5 MB`), but throughput is stuck at ~25 Mbps even though CPU and disk are idle. What is the most likely bottleneck?",
+        "options": [
+          {
+            "id": "a",
+            "text": "HTTP/2's default 64 KB initial flow-control window is smaller than the 2.5 MB Bandwidth-Delay Product",
+            "correct": true,
+            "feedback": "Correct: 64 KB / 0.02 s = 3.2 MB/s (~25 Mbps). Increase HTTP/2 initial window size to >= BDP."
+          },
+          {
+            "id": "b",
+            "text": "Protobuf serialization caps throughput at 25 Mbps",
+            "correct": false,
+            "feedback": "Protobuf easily saturates multi-Gbps links; the limit here is the 64 KB window per RTT."
+          },
+          {
+            "id": "c",
+            "text": "Reactive Streams require 2x memory",
+            "correct": false,
+            "feedback": "The bottleneck is the byte window size relative to BDP."
+          }
+        ]
+      },
+      {
+        "question": "What is the main benefit—and corresponding operational trade-off—of using Reactive Streams / gRPC Flow Control in Backpressure & Flow Control?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Using Edge Load Shedding (LIFO + Priority) eliminates all latency and consistency trade-offs",
+            "correct": false,
+            "feedback": "Incorrect: every production option in Backpressure & Flow Control carries concrete latency, consistency, or operational costs."
+          },
+          {
+            "id": "b",
+            "text": "Advantage: Item-level request(n) or stream-level WINDOW_UPDATE prevents single slow streams from stalling peers. Cost: Requires async non-blocking operators throughout the pipeline.",
+            "correct": true,
+            "feedback": "Correct: Reactive Streams / gRPC Flow Control delivers item-level request(n) or stream-level WINDOW_UPDATE prevents single slow streams from stalling peers. while requiring you to manage requires async non-blocking operators throughout the pipeline."
+          },
+          {
+            "id": "c",
+            "text": "Advantage: Pauses partition/socket polling at 80% buffer depth while keeping consumer heartbeats alive. It has zero operational or latency overhead compared to Netty / Kafka pause() & resume() Watermarks.",
+            "correct": false,
+            "feedback": "Not quite: that describes Netty / Kafka pause() & resume() Watermarks, whereas Reactive Streams / gRPC Flow Control specifically trades off: Requires async non-blocking operators throughout the pipeline."
+          }
+        ]
+      },
+      {
+        "question": "Why is Avoid Cyclic Blocking critical when operating Backpressure & Flow Control in production?",
+        "options": [
+          {
+            "id": "a",
+            "text": "If Actor A blocks pushing to Actor B while B blocks pushing to A, both bounded channels fill and deadlock.",
+            "correct": true,
+            "feedback": "Correct: If Actor A blocks pushing to Actor B while B blocks pushing to A, both bounded channels fill and deadlock."
+          },
+          {
+            "id": "b",
+            "text": "It only applies during local unit testing and can be disabled in production to save memory.",
+            "correct": false,
+            "feedback": "Incorrect: 'Avoid Cyclic Blocking' directly governs production reliability and correctness under real traffic."
+          },
+          {
+            "id": "c",
+            "text": "It replaces the need for observability, timeouts, or capacity planning across Backpressure & Flow Control.",
+            "correct": false,
+            "feedback": "Incorrect: 'Avoid Cyclic Blocking' works alongside proper bounds, monitoring, and failure isolation."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** **Little's Law** ($L = \\lambda \\cdot W$) guarantees that if arrival rate $\\lambda$ exceeds service rate $\\mu$, queue depth $L$ grows without bound until the process OOMs.\n\n**How It Flows:** Think of Backpressure & Flow Control as a clear step-by-step chain: FLOWING -> PAUSED -> LOAD SHED -> Upstream Source -> Transformer.\n\n**Why Beginners Should Care:** Every asynchronous pipeline needs bounded queues plus an explicit feedback signal—either credit-based pull, window updates, or fast shedding—before memory saturates.",
+      "spark": {
+        "summary": "**Little's Law** ($L = \\lambda \\cdot W$) guarantees that if arrival rate $\\lambda$ exceeds service rate $\\mu$, queue depth $L$ grows without bound until the process OOMs.",
+        "keyTakeaway": "Every asynchronous pipeline needs bounded queues plus an explicit feedback signal—either credit-based pull, window updates, or fast shedding—before memory saturates."
+      },
+      "learningJourney": [
+        {
+          "id": "01-what-it-is",
+          "title": "What is Backpressure & Flow Control",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Backpressure & Flow Control works from first principles.",
+          "explanation": "**Little's Law** ($L = \\lambda \\cdot W$) guarantees that if arrival rate $\\lambda$ exceeds service rate $\\mu$, queue depth $L$ grows without bound until the process OOMs. **Backpressure** closes the feedback loop between consumer and producer so $\\lambda$ cannot outrun $\\mu$.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "state-machine",
+            "eyebrow": "Hysteresis Watermarks",
+            "title": "Bounded Queue High/Low Watermark Backpressure State Machine",
+            "states": [
+              {
+                "id": "flowing",
+                "label": "FLOWING",
+                "sublabel": "Depth < 40% (low mark)",
+                "tone": "green"
+              },
+              {
+                "id": "paused",
+                "label": "PAUSED",
+                "sublabel": "Depth > 80% (high mark)",
+                "tone": "amber"
+              },
+              {
+                "id": "shedding",
+                "label": "LOAD SHED",
+                "sublabel": "100% full -> 429/503",
+                "tone": "red"
+              }
+            ],
+            "transitions": [
+              {
+                "from": "flowing",
+                "to": "paused",
+                "label": "Queue >= 80% (pause read)"
+              },
+              {
+                "from": "paused",
+                "to": "flowing",
+                "label": "Drained <= 40% (resume)"
+              },
+              {
+                "from": "paused",
+                "to": "shedding",
+                "label": "In-flight burst hits 100%"
+              }
+            ],
+            "summary": "High/low watermark hysteresis (80% / 40%) prevents rapid flip-flopping and syscall thrashing at the boundary."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-why-we-need-it",
+          "title": "Why we need Bounded Queues (and why unbounded buffers fail)",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without Bounded Queues under real concurrency or scale.",
+          "explanation": "Unbounded queues (`LinkedBlockingQueue()` without capacity, `mpsc::unbounded_channel`) merely hide overload until the JVM or container hits OOMKill. Even with bounded queues, three subtler failure modes occur: 1. **Bufferbloat**: Oversized TCP or proxy buffers (tens of MBs) absorb bursts instead of signaling backpressure, inflating queuing latency to seconds.",
+          "ideas": [
+            {
+              "title": "Size Windows with BDP",
+              "description": "Bandwidth-Delay Product = Bandwidth * RTT. On 1 Gbps x 20 ms, BDP is 2.5 MB—size HTTP/2 and TCP buffers accordingly."
+            },
+            {
+              "title": "Avoid Cyclic Blocking",
+              "description": "If Actor A blocks pushing to Actor B while B blocks pushing to A, both bounded channels fill and deadlock."
+            }
+          ],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Credit-Based Pull",
+            "title": "Reactive Streams Demand Grants Preventing Consumer OOM",
+            "actors": [
+              {
+                "id": "prod",
+                "label": "Upstream Source"
+              },
+              {
+                "id": "xform",
+                "label": "Transformer"
+              },
+              {
+                "id": "sink",
+                "label": "DB Writer (4k/s)"
+              }
+            ],
+            "events": [
+              {
+                "from": "sink",
+                "to": "xform",
+                "label": "request(1024) credits",
+                "status": "ok"
+              },
+              {
+                "from": "xform",
+                "to": "prod",
+                "label": "Read 1024 items; credit=0",
+                "status": "ok"
+              },
+              {
+                "from": "xform",
+                "to": "prod",
+                "label": "Pause socket reads (credit=0)",
+                "status": "warn"
+              },
+              {
+                "from": "sink",
+                "to": "sink",
+                "label": "Batch flush 512 rows to DB",
+                "status": "ok"
+              },
+              {
+                "from": "sink",
+                "to": "xform",
+                "label": "request(512) -> resume flow",
+                "status": "ok"
+              }
+            ],
+            "summary": "Consumers only grant credits for buffer slots they actually have, propagating backpressure cleanly upstream."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-where-it-is-used",
+          "title": "Where Backpressure Mechanisms operate across the stack",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Backpressure must be wired end-to-end—from edge HTTP load shedding down to Kafka `pause()`/`resume()` and TCP `RWND`.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "06-production-architecture",
+          "title": "Production example: Priority Load Shedder + Bounded Worker Pool",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Production architecture: see how the components compose end to end under real load.",
+          "explanation": "Production gateways combine **adaptive concurrency limits** (e.g., Little's Law / Vegas-style RTT tracking) with **priority-aware load shedding** at the edge and **bounded watermark queues** feeding downstream DB writers.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "End-to-End Flow Control",
+            "title": "Edge Shedder -> Bounded Watermark Queue -> Credit-Based DB Sink",
+            "nodes": [
+              {
+                "label": "Edge Load Shedder",
+                "role": "429 + Retry-After"
+              },
+              {
+                "label": "Watermark Buffer",
+                "role": "80% pause / 40% resume"
+              },
+              {
+                "label": "Worker Pool",
+                "role": "Bounded concurrency"
+              },
+              {
+                "label": "DB / Kafka Sink",
+                "role": "Batch flush + ACK"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Little's Law Guard",
+                "detail": "Adaptive concurrency caps in-flight requests before queue wait time blows past the client deadline."
+              },
+              {
+                "label": "Priority Lanes",
+                "detail": "Critical mutations bypass shedding until 95% saturation; analytics traffic sheds at 70%."
+              },
+              {
+                "label": "Jittered Retry-After",
+                "detail": "429/503 responses include randomized Retry-After headers to prevent synchronized retry storms."
+              }
+            ],
+            "summary": "Combining edge load shedding with internal watermark buffers keeps tail latency bounded under extreme bursts."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Every asynchronous pipeline needs bounded queues plus an explicit feedback signal—either credit-based pull, window updates, or fast shedding—before memory saturates."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** **Little's Law** ($L = \\lambda \\cdot W$) guarantees that if arrival rate $\\lambda$ exceeds service rate $\\mu$, queue depth $L$ grows without bound until the process OOMs.\n\n**Visual & Structural Flow:** Depicts Bounded Queue High/Low Watermark Backpressure State Machine (FLOWING -> PAUSED -> LOAD SHED); Reactive Streams Demand Grants Preventing Consumer OOM (Upstream Source -> Transformer -> DB Writer (4k/s)); Edge Shedder -> Bounded Watermark Queue -> Credit-Based DB Sink (Edge Load Shedder -> Watermark Buffer -> Worker Pool -> DB / Kafka Sink).\n\n**Trade-Offs & Production:** Each layer enforces flow control at a different granularity. Production gateways combine **adaptive concurrency limits** (e.g., Little's Law / Vegas-style RTT tracking) with **priority-aware load shedding** at the edge and **bounded.\n\n**Failure Modes & Application:** Explore bounded queues, priority-aware load shedding, and retry storm prevention in production.",
+      "spark": {
+        "summary": "Backpressure lets a slow consumer signal an upstream producer to slow down or pause, preventing unbounded memory growth and out-of-memory crashes.",
+        "keyTakeaway": "Every asynchronous pipeline needs bounded queues plus an explicit feedback signal—either credit-based pull, window updates, or fast shedding—before memory saturates."
+      }
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** Backpressure lets a slow consumer signal an upstream producer to slow down or pause, preventing unbounded memory growth and out-of-memory crashes.\n\n**Production Trade-Offs:** Implement backpressure with explicit capacity bounds and hysteresis: 1.\n\n**Failure Modes & Edge Cases:** Explore bounded queues, priority-aware load shedding, and retry storm prevention in production.\n\n**Principal Takeaway:** Every asynchronous pipeline needs bounded queues plus an explicit feedback signal—either credit-based pull, window updates, or fast shedding—before memory saturates.",
+      "spark": {
+        "summary": "Backpressure lets a slow consumer signal an upstream producer to slow down or pause, preventing unbounded memory growth and out-of-memory crashes.",
+        "keyTakeaway": "Every asynchronous pipeline needs bounded queues plus an explicit feedback signal—either credit-based pull, window updates, or fast shedding—before memory saturates."
+      },
+      "learningJourney": [
+        {
+          "id": "01-what-it-is",
+          "title": "What is Backpressure & Flow Control",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Backpressure & Flow Control works from first principles.",
+          "explanation": "**Little's Law** ($L = \\lambda \\cdot W$) guarantees that if arrival rate $\\lambda$ exceeds service rate $\\mu$, queue depth $L$ grows without bound until the process OOMs. **Backpressure** closes the feedback loop between consumer and producer so $\\lambda$ cannot outrun $\\mu$.\n\nIt operates through three mechanisms: **credit-based pull** (Reactive Streams `Subscription.request(n)`), **sliding byte windows** (TCP `RWND` and HTTP/2 `WINDOW_UPDATE` frames, default 64 KB initial window), and **explicit load shedding** (`429 Too Many Requests` / `503` + `Retry-After`) at ingress.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "state-machine",
+            "eyebrow": "Hysteresis Watermarks",
+            "title": "Bounded Queue High/Low Watermark Backpressure State Machine",
+            "states": [
+              {
+                "id": "flowing",
+                "label": "FLOWING",
+                "sublabel": "Depth < 40% (low mark)",
+                "tone": "green"
+              },
+              {
+                "id": "paused",
+                "label": "PAUSED",
+                "sublabel": "Depth > 80% (high mark)",
+                "tone": "amber"
+              },
+              {
+                "id": "shedding",
+                "label": "LOAD SHED",
+                "sublabel": "100% full -> 429/503",
+                "tone": "red"
+              }
+            ],
+            "transitions": [
+              {
+                "from": "flowing",
+                "to": "paused",
+                "label": "Queue >= 80% (pause read)"
+              },
+              {
+                "from": "paused",
+                "to": "flowing",
+                "label": "Drained <= 40% (resume)"
+              },
+              {
+                "from": "paused",
+                "to": "shedding",
+                "label": "In-flight burst hits 100%"
+              }
+            ],
+            "summary": "High/low watermark hysteresis (80% / 40%) prevents rapid flip-flopping and syscall thrashing at the boundary."
+          },
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-why-we-need-it",
+          "title": "Why we need Bounded Queues (and why unbounded buffers fail)",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without Bounded Queues under real concurrency or scale.",
+          "explanation": "Unbounded queues (`LinkedBlockingQueue()` without capacity, `mpsc::unbounded_channel`) merely hide overload until the JVM or container hits OOMKill. Even with bounded queues, three subtler failure modes occur:\n\n1. **Bufferbloat**: Oversized TCP or proxy buffers (tens of MBs) absorb bursts instead of signaling backpressure, inflating queuing latency to seconds.\n2. **BDP Window Starvation**: Leaving HTTP/2's default 64 KB window on a 1 Gbps / 20 ms RTT link (`BDP = 2.5 MB`) caps throughput at `64 KB / 0.02 s = 3.2 MB/s` (~25 Mbps).\n3. **Retry-Amplified Collapse**: Returning `503` without `Retry-After` or jittered backoff causes clients to retry immediately, multiplying load.",
+          "caveats": null,
+          "ideas": [
+            {
+              "title": "Size Windows with BDP",
+              "description": "Bandwidth-Delay Product = Bandwidth * RTT. On 1 Gbps x 20 ms, BDP is 2.5 MB—size HTTP/2 and TCP buffers accordingly."
+            },
+            {
+              "title": "Avoid Cyclic Blocking",
+              "description": "If Actor A blocks pushing to Actor B while B blocks pushing to A, both bounded channels fill and deadlock."
+            }
+          ],
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Credit-Based Pull",
+            "title": "Reactive Streams Demand Grants Preventing Consumer OOM",
+            "actors": [
+              {
+                "id": "prod",
+                "label": "Upstream Source"
+              },
+              {
+                "id": "xform",
+                "label": "Transformer"
+              },
+              {
+                "id": "sink",
+                "label": "DB Writer (4k/s)"
+              }
+            ],
+            "events": [
+              {
+                "from": "sink",
+                "to": "xform",
+                "label": "request(1024) credits",
+                "status": "ok"
+              },
+              {
+                "from": "xform",
+                "to": "prod",
+                "label": "Read 1024 items; credit=0",
+                "status": "ok"
+              },
+              {
+                "from": "xform",
+                "to": "prod",
+                "label": "Pause socket reads (credit=0)",
+                "status": "warn"
+              },
+              {
+                "from": "sink",
+                "to": "sink",
+                "label": "Batch flush 512 rows to DB",
+                "status": "ok"
+              },
+              {
+                "from": "sink",
+                "to": "xform",
+                "label": "request(512) -> resume flow",
+                "status": "ok"
+              }
+            ],
+            "summary": "Consumers only grant credits for buffer slots they actually have, propagating backpressure cleanly upstream."
+          },
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "03-where-it-is-used",
+          "title": "Where Backpressure Mechanisms operate across the stack",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Backpressure must be wired end-to-end—from edge HTTP load shedding down to Kafka `pause()`/`resume()` and TCP `RWND`.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-how-it-is-managed",
+          "title": "How Bounded Queues, Watermarks, and Load Shedding are managed",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Implement backpressure with explicit capacity bounds and hysteresis:\n\n1. **Never Use Unbounded Channels**: Always pass explicit capacity to `BlockingQueue`, `asyncio.Queue(maxsize=...)`, or `tokio::sync::mpsc::channel(cap)`.\n2. **80% / 40% Watermarks**: Pause upstream reads at 80% full; resume at 40%.\n3. **Priority Shedding**: Under overload, shed `best-effort` traffic before `critical` checkout/payment traffic.\n4. **Monitor Queue Age, Not Just Depth**: Alert on p99 queue wait time so bufferbloat is caught early.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "05-alternatives",
+          "title": "Alternatives: TCP RWND vs. HTTP/2 Windows vs. Credit Pull vs. Shedding",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "The trade-off: compare competing approaches across latency, consistency, and operational cost.",
+          "explanation": "Each layer enforces flow control at a different granularity.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "06-production-architecture",
+          "title": "Production example: Priority Load Shedder + Bounded Worker Pool",
+          "eyebrow": "Advanced Path · Stage 06",
+          "purpose": "Production architecture: see how the components compose end to end under real load.",
+          "explanation": "Production gateways combine **adaptive concurrency limits** (e.g., Little's Law / Vegas-style RTT tracking) with **priority-aware load shedding** at the edge and **bounded watermark queues** feeding downstream DB writers.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "End-to-End Flow Control",
+            "title": "Edge Shedder -> Bounded Watermark Queue -> Credit-Based DB Sink",
+            "nodes": [
+              {
+                "label": "Edge Load Shedder",
+                "role": "429 + Retry-After"
+              },
+              {
+                "label": "Watermark Buffer",
+                "role": "80% pause / 40% resume"
+              },
+              {
+                "label": "Worker Pool",
+                "role": "Bounded concurrency"
+              },
+              {
+                "label": "DB / Kafka Sink",
+                "role": "Batch flush + ACK"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Little's Law Guard",
+                "detail": "Adaptive concurrency caps in-flight requests before queue wait time blows past the client deadline."
+              },
+              {
+                "label": "Priority Lanes",
+                "detail": "Critical mutations bypass shedding until 95% saturation; analytics traffic sheds at 70%."
+              },
+              {
+                "label": "Jittered Retry-After",
+                "detail": "429/503 responses include randomized Retry-After headers to prevent synchronized retry storms."
+              }
+            ],
+            "summary": "Combining edge load shedding with internal watermark buffers keeps tail latency bounded under extreme bursts."
+          },
+          "level": "L7 · STAFF / PRINCIPAL"
+        },
+        {
+          "id": "07-problems-and-further-reading",
+          "title": "Problems solved by Backpressure & System Design Deep Dives",
+          "eyebrow": "Advanced Path · Stage 07",
+          "purpose": "Applied problems: connect these internals to concrete system design and debugging scenarios.",
+          "explanation": "Explore bounded queues, priority-aware load shedding, and retry storm prevention in production.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Every asynchronous pipeline needs bounded queues plus an explicit feedback signal—either credit-based pull, window updates, or fast shedding—before memory saturates."
+    }
+  }
+}

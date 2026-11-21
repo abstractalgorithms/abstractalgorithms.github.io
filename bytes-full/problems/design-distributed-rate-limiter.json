@@ -1,0 +1,563 @@
+{
+  "id": "problem-design-distributed-rate-limiter",
+  "slug": "design-distributed-rate-limiter",
+  "title": "Design a Distributed Rate Limiter",
+  "problemType": "system-design",
+  "difficulty": "medium",
+  "prompt": "Design a distributed rate limiter at the API gateway handling 500,000 req/sec across 10+ stateless API nodes, 10M active identity-policy pairs (~2 GB primary state), enforcing per-user and per-IP quotas across second/minute/hour windows within <= 2 ms p99 overhead and graceful Redis failover.",
+  "spark": {
+    "summary": "Enforcing shared per-user and per-IP quotas across 10+ stateless API nodes at 500,000 RPS requires atomic distributed counters without exceeding a 2 ms p99 latency budget.",
+    "keyTakeaway": "Run an atomic Token Bucket / Sliding-Window Counter Lua script on a sharded Redis Cluster at the API gateway, and degrade cleanly via fail-open or local bounded fallback if a shard fails.",
+    "byteSummary": "**Core Mechanics:** A rate limiter shields backend services and databases from abuse, DDoS bursts, and noisy tenants by rejecting excess traffic with `HTTP 429` at the API gateway.\n\n**Visual & Structural Flow:** Depicts Atomic Redis Lua Check (<2ms) & Outage Fallback (Client -> API Gateway (10+ nodes) -> Redis Cluster (10+ shards)); Redis Cluster Hash-Slot Sharding for 10M Identity Pairs (Shard 0-3 -> Shard 4-7 -> Shard 8-11 -> Shard 12-15 -> S0).\n\n**Trade-Offs & Production:** Local per-node counters fail to coordinate across `10+` nodes, while querying PostgreSQL/MySQL at `500,000 RPS` blows past the `2 ms` p99 budget and saturates database connections. Size and harden the distributed limiter for `500,000 RPS`: **Sharded Redis Cluster**: `10M` identity-policy pairs × `~200 B` = `~2 GB` primary state; at `~50K evals/sec/shard`.\n\n**Failure Modes & Application:** Distributed rate limiting is a core building block of high-scale API platforms: **Envoy Global Rate Limit / Cloudflare**: Combines edge token buckets with regional Redis clusters and local circuit-breaker fallbacks."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why rate limiting belongs at the edge with shared state",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": "A rate limiter shields backend services and databases from abuse, DDoS bursts, and noisy tenants by rejecting excess traffic with `HTTP 429` at the API gateway. Because `10+` stateless gateway nodes handle `500,000 RPS`, local in-memory counters let a client multiply its quota by `N` nodes.\n\n## Interview Requirements & API Contract\n- **Functional**: Enforce configurable per-user, per-IP, and per-API-key quotas across `second / minute / hour` windows; return standard headers `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `Retry-After` on `429`.\n- **Non-Functional**: `500,000 RPS` total ingress, `10M` active identity-policy pairs (`~2 GB` primary state), `<= 2 ms` p99 added latency, and graceful degradation if Redis fails.",
+      "purpose": "The mechanism: understand how Why rate limiting belongs at the edge with shared state works from first principles."
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "2x boundary bursts, race conditions, and Redis outage cascades",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "Three failure modes break naive distributed rate limiters at `500,000 RPS`:\n\n1. **Fixed-Window Boundary Burst**: Sending `1,000` requests at `00:59` and `1,000` at `01:01` lets `2x` quota through in 2 seconds.\n2. **Non-Atomic Read-Modify-Write**: Separate `GET` + `INCR` calls race under concurrency, overshooting limits.\n3. **Redis Failover Stall**: A `10-30 s` Redis primary promotion can stall all `500,000 RPS` if gateways lack strict `< 2 ms` timeouts and fail-open/local fallback.",
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Gateway Rate-Limit Path",
+        "title": "Atomic Redis Lua Check (<2ms) & Outage Fallback",
+        "actors": [
+          {
+            "id": "client",
+            "label": "Client"
+          },
+          {
+            "id": "gw",
+            "label": "API Gateway (10+ nodes)"
+          },
+          {
+            "id": "redis",
+            "label": "Redis Cluster (10+ shards)"
+          }
+        ],
+        "events": [
+          {
+            "from": "client",
+            "to": "gw",
+            "label": "500k RPS -> hash(user_id) shard",
+            "status": "ok"
+          },
+          {
+            "from": "gw",
+            "to": "redis",
+            "label": "EVALSHA token_bucket.lua (<2ms p99)",
+            "status": "ok"
+          },
+          {
+            "from": "redis",
+            "to": "gw",
+            "label": "0 tokens -> HTTP 429 + Retry-After",
+            "status": "warn"
+          },
+          {
+            "from": "gw",
+            "to": "client",
+            "label": "Redis timeout -> fail-open / local cap",
+            "status": "ok"
+          }
+        ],
+        "summary": "Single-RTT Redis Lua scripts enforce atomic quotas in <2 ms while strict timeouts trigger local fallback on shard failure."
+      },
+      "purpose": "The problem: see what breaks without 2x boundary bursts, race conditions, and Redis outage cascades under real concurrency or scale."
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Naive local counters and SQL-backed limiters",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "Local per-node counters fail to coordinate across `10+` nodes, while querying PostgreSQL/MySQL at `500,000 RPS` blows past the `2 ms` p99 budget and saturates database connections. Choosing the right rate-limiting algorithm also determines memory footprint and burst behavior:",
+      "comparison": [
+        {
+          "choice": "Token Bucket (Lazy Refill)",
+          "benefits": [
+            "Allows controlled short bursts up to bucket capacity; O(1) memory per key (2 numbers: tokens + last_ts)"
+          ],
+          "costs": [
+            "Requires atomic read-refill-write (Redis Lua) to avoid TOCTOU races"
+          ]
+        },
+        {
+          "choice": "Leaky Bucket (Queue / FIFO)",
+          "benefits": [
+            "Smooths traffic into a constant, predictable downstream outflow rate"
+          ],
+          "costs": [
+            "Drops or delays legitimate burst traffic even when downstream has spare capacity"
+          ]
+        },
+        {
+          "choice": "Fixed Window Counter",
+          "benefits": [
+            "Simplest O(1) INCR + EXPIRE; tiny memory footprint"
+          ],
+          "costs": [
+            "Allows up to 2x quota bursts across window boundaries (e.g. 00:59 + 01:01)"
+          ]
+        },
+        {
+          "choice": "Sliding Window Counter",
+          "benefits": [
+            "Weighted interpolation across previous + current window eliminates 2x bursts in O(1) memory"
+          ],
+          "costs": [
+            "Approximate for sub-second spikes compared to Sliding Window Log (which costs O(K) memory)"
+          ]
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise solution: Sharded Redis Cluster + Atomic Lua + Local Fallback",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": "Size and harden the distributed limiter for `500,000 RPS`:\n\n- **Sharded Redis Cluster**: `10M` identity-policy pairs × `~200 B` = `~2 GB` primary state; at `~50K evals/sec/shard`, `10-16` Redis shards handle `500K RPS` comfortably.\n- **Atomic Token Bucket / Sliding Window Lua**: Executes `GET`, refill calculation, `SET`, and `EXPIRE` in a single atomic Redis event-loop call (`< 2 ms` p99).\n- **Outage Behavior**: Configure `fail-open` for read/public endpoints and `local-fallback` (`limit / node_count`) or `fail-closed` for auth/payment endpoints behind a circuit breaker.",
+      "sectionDiagram": {
+        "kind": "ring",
+        "eyebrow": "Sharded Quota State",
+        "title": "Redis Cluster Hash-Slot Sharding for 10M Identity Pairs",
+        "nodes": [
+          "Shard 0-3",
+          "Shard 4-7",
+          "Shard 8-11",
+          "Shard 12-15"
+        ],
+        "vnodes": [
+          "S0",
+          "S1",
+          "S2",
+          "S3",
+          "S4",
+          "S5",
+          "S6",
+          "S7"
+        ],
+        "ringLabel": "16,384 slots",
+        "ringSub": "CRC16({u:8841}) mod 16384",
+        "sampleKey": "{u:8841}:rl",
+        "summary": "Each user's token bucket hashes deterministically to 1 of 16 Redis shards (~31k ops/sec per shard)."
+      },
+      "markdownContent": "```lua\n-- Atomic Redis Token Bucket (KEYS[1]=tokens, KEYS[2]=ts)\nlocal rate, cap = tonumber(ARGV[1]), tonumber(ARGV[2])\nlocal now, req = tonumber(ARGV[3]), tonumber(ARGV[4])\nlocal cur = tonumber(redis.call('get', KEYS[1])) or cap\nlocal last = tonumber(redis.call('get', KEYS[2])) or now\nlocal tokens = math.min(cap, cur + math.max(0, now - last) * rate)\nif tokens >= req then\n  redis.call('set', KEYS[1], tokens - req, 'EX', 3600)\n  redis.call('set', KEYS[2], now, 'EX', 3600)\n  return 1\nend\nreturn 0\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where distributed rate limiters are deployed",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": "Distributed rate limiting is a core building block of high-scale API platforms:\n- **Envoy Global Rate Limit / Cloudflare**: Combines edge token buckets with regional Redis clusters and local circuit-breaker fallbacks.\n- **Multi-Tenant LLM & SaaS APIs**: Enforces both RPM (requests/min) and TPM (tokens/min) quotas per API key in a single Lua call.\n- **Multi-Region & Hot-Key Follow-Ups**: Route users to their home region or accept bounded eventual drift via async gossip; for hot celebrity keys, batch increments locally for `50–100 ms` before flushing to Redis.",
+      "supportingConcepts": [
+        {
+          "slug": "rate-limiting",
+          "title": "Concept: Rate Limiting",
+          "kind": "concept"
+        },
+        {
+          "slug": "api-gateway",
+          "title": "Concept: API Gateway",
+          "kind": "concept"
+        },
+        {
+          "slug": "consistent-hashing",
+          "title": "Concept: Consistent Hashing",
+          "kind": "concept"
+        },
+        {
+          "slug": "design-token-bucket-rate-limiter",
+          "title": "System Design: Token Bucket Rate Limiter",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why do production Redis rate limiters execute Token Bucket or Sliding-Window updates inside a single Lua script?",
+      "options": [
+        {
+          "id": "a",
+          "text": "Redis executes Lua scripts atomically in one network round-trip, preventing concurrent API gateways from racing past the quota",
+          "correct": true,
+          "feedback": "Correct: atomic Lua execution eliminates check-then-act races and keeps overhead under 2 ms."
+        },
+        {
+          "id": "b",
+          "text": "Lua scripts automatically synchronize quotas synchronously across continents with zero WAN latency",
+          "correct": false,
+          "feedback": "Lua runs on a single regional Redis shard; global sync still requires cross-region coordination."
+        },
+        {
+          "id": "c",
+          "text": "Lua scripts allow a single Redis node to bypass its single-threaded event loop across 64 cores",
+          "correct": false,
+          "feedback": "Scaling beyond one shard's ~50k ops/sec comes from sharding across Redis Cluster nodes, not multi-threading Lua."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why do production Redis rate limiters execute Token Bucket or Sliding-Window updates inside a single Lua script?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Redis executes Lua scripts atomically in one network round-trip, preventing concurrent API gateways from racing past the quota",
+            "correct": true,
+            "feedback": "Correct: atomic Lua execution eliminates check-then-act races and keeps overhead under 2 ms."
+          },
+          {
+            "id": "b",
+            "text": "Lua scripts automatically synchronize quotas synchronously across continents with zero WAN latency",
+            "correct": false,
+            "feedback": "Lua runs on a single regional Redis shard; global sync still requires cross-region coordination."
+          },
+          {
+            "id": "c",
+            "text": "Lua scripts allow a single Redis node to bypass its single-threaded event loop across 64 cores",
+            "correct": false,
+            "feedback": "Scaling beyond one shard's ~50k ops/sec comes from sharding across Redis Cluster nodes, not multi-threading Lua."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why rate limiting belongs at the edge with shared state', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "b",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "c",
+            "text": "A rate limiter shields backend services and databases from abuse, DDoS bursts, and noisy tenants by rejecting excess traffic with HTTP 429 + Retry-After at the API gateway.",
+            "correct": true,
+            "feedback": "Correct: A rate limiter shields backend services and databases from abuse, DDoS bursts, and noisy tenants by rejecting excess traffic with HTTP 429 + Retry-After at the API gateway."
+          }
+        ]
+      },
+      {
+        "question": "Regarding '2x boundary bursts, race conditions, and Redis outage cascades', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "b",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "c",
+            "text": "Three failure modes break naive distributed rate limiters at 500,000 RPS: 1.",
+            "correct": true,
+            "feedback": "Correct: Three failure modes break naive distributed rate limiters at 500,000 RPS: 1."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** A rate limiter shields backend services and databases from abuse, DDoS bursts, and noisy tenants by rejecting excess traffic with `HTTP 429` at the API gateway.\n\n**How It Flows:** Think of Design a Distributed Rate Limiter as a clear step-by-step chain: Client -> API Gateway (10+ nodes) -> Redis Cluster (10+ shards) -> Shard 0-3 -> Shard 4-7.\n\n**Why Beginners Should Care:** Run an atomic Token Bucket / Sliding-Window Counter Lua script on a sharded Redis Cluster at the API gateway, and degrade cleanly via fail-open or local bounded fallback if a shard fails.",
+      "spark": {
+        "summary": "A rate limiter shields backend services and databases from abuse, DDoS bursts, and noisy tenants by rejecting excess traffic with `HTTP 429` at the API gateway.",
+        "keyTakeaway": "Run an atomic Token Bucket / Sliding-Window Counter Lua script on a sharded Redis Cluster at the API gateway, and degrade cleanly via fail-open or local bounded fallback if a shard fails."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why rate limiting belongs at the edge with shared state",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why rate limiting belongs at the edge with shared state works from first principles.",
+          "explanation": "A rate limiter shields backend services and databases from abuse, DDoS bursts, and noisy tenants by rejecting excess traffic with `HTTP 429` at the API gateway. Because `10+` stateless gateway nodes handle `500,000 RPS`, local in-memory counters let a client multiply its quota by `N` nodes.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "2x boundary bursts, race conditions, and Redis outage cascades",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without 2x boundary bursts, race conditions, and Redis outage cascades under real concurrency or scale.",
+          "explanation": "Three failure modes break naive distributed rate limiters at `500,000 RPS`: 1. **Fixed-Window Boundary Burst**: Sending `1,000` requests at `00:59` and `1,000` at `01:01` lets `2x` quota through in 2 seconds. 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Gateway Rate-Limit Path",
+            "title": "Atomic Redis Lua Check (<2ms) & Outage Fallback",
+            "actors": [
+              {
+                "id": "client",
+                "label": "Client"
+              },
+              {
+                "id": "gw",
+                "label": "API Gateway (10+ nodes)"
+              },
+              {
+                "id": "redis",
+                "label": "Redis Cluster (10+ shards)"
+              }
+            ],
+            "events": [
+              {
+                "from": "client",
+                "to": "gw",
+                "label": "500k RPS -> hash(user_id) shard",
+                "status": "ok"
+              },
+              {
+                "from": "gw",
+                "to": "redis",
+                "label": "EVALSHA token_bucket.lua (<2ms p99)",
+                "status": "ok"
+              },
+              {
+                "from": "redis",
+                "to": "gw",
+                "label": "0 tokens -> HTTP 429 + Retry-After",
+                "status": "warn"
+              },
+              {
+                "from": "gw",
+                "to": "client",
+                "label": "Redis timeout -> fail-open / local cap",
+                "status": "ok"
+              }
+            ],
+            "summary": "Single-RTT Redis Lua scripts enforce atomic quotas in <2 ms while strict timeouts trigger local fallback on shard failure."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive local counters and SQL-backed limiters",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Local per-node counters fail to coordinate across `10+` nodes, while querying PostgreSQL/MySQL at `500,000 RPS` blows past the `2 ms` p99 budget and saturates database connections. Choosing the right rate-limiting algorithm also determines memory footprint and burst behavior:.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Sharded Redis Cluster + Atomic Lua + Local Fallback",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Size and harden the distributed limiter for `500,000 RPS`: **Sharded Redis Cluster**: `10M` identity-policy pairs × `~200 B` = `~2 GB` primary state; at `~50K evals/sec/shard`, `10-16` Redis shards handle `500K RPS` comfortably. **Atomic Token Bucket / Sliding Window Lua**: Executes `GET`, refill calculation, `SET`, and `EXPIRE` in a single atomic Redis event-loop call (`< 2 ms` p99).",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "ring",
+            "eyebrow": "Sharded Quota State",
+            "title": "Redis Cluster Hash-Slot Sharding for 10M Identity Pairs",
+            "nodes": [
+              "Shard 0-3",
+              "Shard 4-7",
+              "Shard 8-11",
+              "Shard 12-15"
+            ],
+            "vnodes": [
+              "S0",
+              "S1",
+              "S2",
+              "S3",
+              "S4",
+              "S5",
+              "S6",
+              "S7"
+            ],
+            "ringLabel": "16,384 slots",
+            "ringSub": "CRC16({u:8841}) mod 16384",
+            "sampleKey": "{u:8841}:rl",
+            "summary": "Each user's token bucket hashes deterministically to 1 of 16 Redis shards (~31k ops/sec per shard)."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Run an atomic Token Bucket / Sliding-Window Counter Lua script on a sharded Redis Cluster at the API gateway, and degrade cleanly via fail-open or local bounded fallback if a shard fails."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** A rate limiter shields backend services and databases from abuse, DDoS bursts, and noisy tenants by rejecting excess traffic with `HTTP 429` at the API gateway.\n\n**Visual & Structural Flow:** Depicts Atomic Redis Lua Check (<2ms) & Outage Fallback (Client -> API Gateway (10+ nodes) -> Redis Cluster (10+ shards)); Redis Cluster Hash-Slot Sharding for 10M Identity Pairs (Shard 0-3 -> Shard 4-7 -> Shard 8-11 -> Shard 12-15 -> S0).\n\n**Trade-Offs & Production:** Local per-node counters fail to coordinate across `10+` nodes, while querying PostgreSQL/MySQL at `500,000 RPS` blows past the `2 ms` p99 budget and saturates database connections. Size and harden the distributed limiter for `500,000 RPS`: **Sharded Redis Cluster**: `10M` identity-policy pairs × `~200 B` = `~2 GB` primary state; at `~50K evals/sec/shard`.\n\n**Failure Modes & Application:** Distributed rate limiting is a core building block of high-scale API platforms: **Envoy Global Rate Limit / Cloudflare**: Combines edge token buckets with regional Redis clusters and local circuit-breaker fallbacks.",
+      "spark": {
+        "summary": "Enforcing shared per-user and per-IP quotas across 10+ stateless API nodes at 500,000 RPS requires atomic distributed counters without exceeding a 2 ms p99 latency budget.",
+        "keyTakeaway": "Run an atomic Token Bucket / Sliding-Window Counter Lua script on a sharded Redis Cluster at the API gateway, and degrade cleanly via fail-open or local bounded fallback if a shard fails."
+      }
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** Enforcing shared per-user and per-IP quotas across 10+ stateless API nodes at 500,000 RPS requires atomic distributed counters without exceeding a 2 ms p99 latency budget.\n\n**Production Trade-Offs:** Local per-node counters fail to coordinate across `10+` nodes, while querying PostgreSQL/MySQL at `500,000 RPS` blows past the `2 ms` p99 budget and saturates database connections.\n\n**Failure Modes & Edge Cases:** Distributed rate limiting is a core building block of high-scale API platforms: **Envoy Global Rate Limit / Cloudflare**: Combines edge token buckets with regional Redis clusters and local circuit-breaker fallbacks.\n\n**Principal Takeaway:** Run an atomic Token Bucket / Sliding-Window Counter Lua script on a sharded Redis Cluster at the API gateway, and degrade cleanly via fail-open or local bounded fallback if a shard fails.",
+      "spark": {
+        "summary": "Enforcing shared per-user and per-IP quotas across 10+ stateless API nodes at 500,000 RPS requires atomic distributed counters without exceeding a 2 ms p99 latency budget.",
+        "keyTakeaway": "Run an atomic Token Bucket / Sliding-Window Counter Lua script on a sharded Redis Cluster at the API gateway, and degrade cleanly via fail-open or local bounded fallback if a shard fails."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why rate limiting belongs at the edge with shared state",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why rate limiting belongs at the edge with shared state works from first principles.",
+          "explanation": "A rate limiter shields backend services and databases from abuse, DDoS bursts, and noisy tenants by rejecting excess traffic with `HTTP 429` at the API gateway. Because `10+` stateless gateway nodes handle `500,000 RPS`, local in-memory counters let a client multiply its quota by `N` nodes.\n\n## Interview Requirements & API Contract\n- **Functional**: Enforce configurable per-user, per-IP, and per-API-key quotas across `second / minute / hour` windows; return standard headers `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `Retry-After` on `429`.\n- **Non-Functional**: `500,000 RPS` total ingress, `10M` active identity-policy pairs (`~2 GB` primary state), `<= 2 ms` p99 added latency, and graceful degradation if Redis fails.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "2x boundary bursts, race conditions, and Redis outage cascades",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without 2x boundary bursts, race conditions, and Redis outage cascades under real concurrency or scale.",
+          "explanation": "Three failure modes break naive distributed rate limiters at `500,000 RPS`:\n\n1. **Fixed-Window Boundary Burst**: Sending `1,000` requests at `00:59` and `1,000` at `01:01` lets `2x` quota through in 2 seconds.\n2. **Non-Atomic Read-Modify-Write**: Separate `GET` + `INCR` calls race under concurrency, overshooting limits.\n3. **Redis Failover Stall**: A `10-30 s` Redis primary promotion can stall all `500,000 RPS` if gateways lack strict `< 2 ms` timeouts and fail-open/local fallback.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Gateway Rate-Limit Path",
+            "title": "Atomic Redis Lua Check (<2ms) & Outage Fallback",
+            "actors": [
+              {
+                "id": "client",
+                "label": "Client"
+              },
+              {
+                "id": "gw",
+                "label": "API Gateway (10+ nodes)"
+              },
+              {
+                "id": "redis",
+                "label": "Redis Cluster (10+ shards)"
+              }
+            ],
+            "events": [
+              {
+                "from": "client",
+                "to": "gw",
+                "label": "500k RPS -> hash(user_id) shard",
+                "status": "ok"
+              },
+              {
+                "from": "gw",
+                "to": "redis",
+                "label": "EVALSHA token_bucket.lua (<2ms p99)",
+                "status": "ok"
+              },
+              {
+                "from": "redis",
+                "to": "gw",
+                "label": "0 tokens -> HTTP 429 + Retry-After",
+                "status": "warn"
+              },
+              {
+                "from": "gw",
+                "to": "client",
+                "label": "Redis timeout -> fail-open / local cap",
+                "status": "ok"
+              }
+            ],
+            "summary": "Single-RTT Redis Lua scripts enforce atomic quotas in <2 ms while strict timeouts trigger local fallback on shard failure."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive local counters and SQL-backed limiters",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Local per-node counters fail to coordinate across `10+` nodes, while querying PostgreSQL/MySQL at `500,000 RPS` blows past the `2 ms` p99 budget and saturates database connections. Choosing the right rate-limiting algorithm also determines memory footprint and burst behavior:",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Sharded Redis Cluster + Atomic Lua + Local Fallback",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Size and harden the distributed limiter for `500,000 RPS`:\n\n- **Sharded Redis Cluster**: `10M` identity-policy pairs × `~200 B` = `~2 GB` primary state; at `~50K evals/sec/shard`, `10-16` Redis shards handle `500K RPS` comfortably.\n- **Atomic Token Bucket / Sliding Window Lua**: Executes `GET`, refill calculation, `SET`, and `EXPIRE` in a single atomic Redis event-loop call (`< 2 ms` p99).\n- **Outage Behavior**: Configure `fail-open` for read/public endpoints and `local-fallback` (`limit / node_count`) or `fail-closed` for auth/payment endpoints behind a circuit breaker.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "ring",
+            "eyebrow": "Sharded Quota State",
+            "title": "Redis Cluster Hash-Slot Sharding for 10M Identity Pairs",
+            "nodes": [
+              "Shard 0-3",
+              "Shard 4-7",
+              "Shard 8-11",
+              "Shard 12-15"
+            ],
+            "vnodes": [
+              "S0",
+              "S1",
+              "S2",
+              "S3",
+              "S4",
+              "S5",
+              "S6",
+              "S7"
+            ],
+            "ringLabel": "16,384 slots",
+            "ringSub": "CRC16({u:8841}) mod 16384",
+            "sampleKey": "{u:8841}:rl",
+            "summary": "Each user's token bucket hashes deterministically to 1 of 16 Redis shards (~31k ops/sec per shard)."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where distributed rate limiters are deployed",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Distributed rate limiting is a core building block of high-scale API platforms:\n- **Envoy Global Rate Limit / Cloudflare**: Combines edge token buckets with regional Redis clusters and local circuit-breaker fallbacks.\n- **Multi-Tenant LLM & SaaS APIs**: Enforces both RPM (requests/min) and TPM (tokens/min) quotas per API key in a single Lua call.\n- **Multi-Region & Hot-Key Follow-Ups**: Route users to their home region or accept bounded eventual drift via async gossip; for hot celebrity keys, batch increments locally for `50–100 ms` before flushing to Redis.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Run an atomic Token Bucket / Sliding-Window Counter Lua script on a sharded Redis Cluster at the API gateway, and degrade cleanly via fail-open or local bounded fallback if a shard fails."
+    }
+  }
+}

@@ -1,0 +1,540 @@
+{
+  "id": "problem-design-log-analytics-pipeline",
+  "slug": "design-log-analytics-pipeline",
+  "title": "Design a Real-Time Log Analytics Pipeline",
+  "problemType": "system-design",
+  "difficulty": "hard",
+  "prompt": "Architect a centralized log analytics platform for 4,000 Kubernetes nodes emitting 600,000 JSON logs/sec (~50 TB/day raw, bursting to 2.5M/sec) with <= 5 s end-to-end searchability, 7-day hot SSD (< 1.5 s p95, <= 80 TB budget), 365-day cold archive, and protection against noisy tenants and dynamic JSON key explosion.",
+  "spark": {
+    "summary": "At 600K events/sec (50 TB/day raw, 2.5M/sec bursts), traditional Elasticsearch clusters blow past 80 TB SSD budgets and crash on dynamic JSON field explosions.",
+    "keyTakeaway": "Buffer zstd-compressed batches in Kafka, enforce a strict top-level schema + bounded `Map(String, String)` in Flink/Vector, store 7-day hot logs in ClickHouse `MergeTree` (~65 TB with `ZSTD(3)` + `tokenbf_v1`), and tier older partitions to S3 Parquet.",
+    "byteSummary": "**Core Mechanics:** Across `4,000` Kubernetes nodes generating `600,000` JSON events/sec (`576 MB/s` = `49.8 TB/day`), traditional inverted-index stacks inflate `50 TB/day` into `90+ TB/day`—exceeding an `80 TB` 7-day hot SSD budget by **7x**.\n\n**Visual & Structural Flow:** Depicts Fluent Bit -> Kafka (zstd) -> Flink Schema Guard -> ClickHouse + S3 (Fluent Bit (<150MB) -> Kafka (20TB zstd) -> ClickHouse (65TB 7d) -> S3 Parquet (365d)); Primary Sparse Index (tenant, service, ts) + tokenbf_v1 Bloom Filter (Daily Partitions -> Primary Key Granules -> tokenbf_v1 Filter -> ZSTD(3) Columns).\n\n**Trade-Offs & Production:** Shipping directly from Fluent Bit to Elasticsearch couples `2.5M/sec` incident bursts to storage, drops logs when indexers stall, and allows dynamic JSON mapping to explode cluster state. Meet `< 5 s` freshness, `<= 80 TB` hot SSD, and `365-day` retention: **Node Agent (`Fluent Bit` in C)**: Stays under `150 MB` RAM / `2%` CPU with a `2 GB` filesystem ring buffer.\n\n**Failure Modes & Application:** Columnar analytical stores have largely replaced full-text clusters for high-volume observability: **Cloudflare, Uber & Datadog-Scale Telemetry**: Pair Kafka buffering with ClickHouse `MergeTree` + S3 cold tiering to cut SSD costs 5x-8x."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why 50 TB/day log pipelines break on storage amplification and bursts",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": "Across `4,000` Kubernetes nodes generating `600,000` JSON events/sec (`576 MB/s` = `49.8 TB/day`), traditional inverted-index stacks inflate `50 TB/day` into `90+ TB/day`—exceeding an `80 TB` 7-day hot SSD budget by **7x**. Worse, an outage triggers a `4x` (`2.5M/sec`) log storm right when engineers need `trace_id` lookups in `< 5 seconds`.",
+      "purpose": "The mechanism: understand how Why 50 TB/day log pipelines break on storage amplification and bursts works from first principles."
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "Mapping explosions, log storms, and ClickHouse `Too many parts`",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "Three failure modes hit production log platforms:\n\n1. **Dynamic JSON Key Explosion**: Logging UUIDs as top-level JSON keys creates `500K+` columns/mappings, crashing metadata coordinators.\n2. **Incident Feedback Loops**: 2,000 pods logging stack traces saturate brokers and drop root-cause `ERROR` logs.\n3. **Small-Insert Part Overload**: Unbatched inserts into ClickHouse trigger `Too many parts (300)` rejections.",
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Burst-Decoupled Log Pipeline",
+        "title": "Fluent Bit -> Kafka (zstd) -> Flink Schema Guard -> ClickHouse + S3",
+        "actors": [
+          {
+            "id": "fb",
+            "label": "Fluent Bit (<150MB)"
+          },
+          {
+            "id": "kafka",
+            "label": "Kafka (20TB zstd)"
+          },
+          {
+            "id": "ch",
+            "label": "ClickHouse (65TB 7d)"
+          },
+          {
+            "id": "s3",
+            "label": "S3 Parquet (365d)"
+          }
+        ],
+        "events": [
+          {
+            "from": "fb",
+            "to": "kafka",
+            "label": "2GB ring buffer + drop DEBUG on storm",
+            "status": "warn"
+          },
+          {
+            "from": "kafka",
+            "to": "ch",
+            "label": "Micro-batch 100k rows/2s -> ZSTD(3) 8:1",
+            "status": "ok"
+          },
+          {
+            "from": "ch",
+            "to": "s3",
+            "label": "TTL > 7d moves partitions to Parquet",
+            "status": "ok"
+          }
+        ],
+        "summary": "5:1 Kafka zstd compression and 8:1 ClickHouse columnar compression fit 7 hot days into ~65 TB inside the 80 TB cap."
+      },
+      "purpose": "The problem: see what breaks without Mapping explosions, log storms, and ClickHouse `Too many parts` under real concurrency or scale."
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Naive direct-to-Elasticsearch shipping and schemaless indexing",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "Shipping directly from Fluent Bit to Elasticsearch couples `2.5M/sec` incident bursts to storage, drops logs when indexers stall, and allows dynamic JSON mapping to explode cluster state.",
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise solution: Priority Fluent Bit + Kafka + ClickHouse MergeTree + S3",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": "Meet `< 5 s` freshness, `<= 80 TB` hot SSD, and `365-day` retention:\n\n- **Node Agent (`Fluent Bit` in C)**: Stays under `150 MB` RAM / `2%` CPU with a `2 GB` filesystem ring buffer, priority shedding (drop `DEBUG/INFO` first during storms, preserve `ERROR/FATAL`), and `zstd` batching.\n- **Kafka Buffer**: `24 h` retention at `5:1` zstd (`~20 TB` at `RF=2` across 18 brokers), with per-tenant quotas.\n- **ClickHouse Hot Tier (7 days)**: Promote `15-20` typed columns (`LowCardinality(String)` for `service/env/level`) and pack arbitrary keys into a bounded `Map(String, String)` (preventing schema explosion). `ORDER BY (tenant_id, service, timestamp)` with `tokenbf_v1` bloom filters on `message`/`trace_id` and `ZSTD(3)` (`~8:1` compression) fits `7` days at `RF=2` in `~65 TB`.\n- **Cold Tier**: ClickHouse `TTL` offloads `>7d` partitions to S3 Parquet for `365-day` compliance.",
+      "sectionDiagram": {
+        "kind": "tree-index",
+        "eyebrow": "ClickHouse MergeTree Layout",
+        "title": "Primary Sparse Index (tenant, service, ts) + tokenbf_v1 Bloom Filter",
+        "nodes": [
+          {
+            "label": "Daily Partitions",
+            "role": "TTL >7d -> S3 Parquet"
+          },
+          {
+            "label": "Primary Key Granules",
+            "role": "8,192 rows: (tenant, svc, ts)"
+          },
+          {
+            "label": "tokenbf_v1 Filter",
+            "role": "Skips granules for trace_id"
+          },
+          {
+            "label": "ZSTD(3) Columns",
+            "role": "8:1 ratio -> 65TB (RF=2)"
+          }
+        ],
+        "edges": [
+          {
+            "label": "prunes 99% granules"
+          },
+          {
+            "label": "100k-row batch insert"
+          }
+        ],
+        "summary": "Sparse primary indexes and tokenbf_v1 bloom filters deliver <1.5 s p95 trace_id lookups without full inverted-index bloat."
+      },
+      "markdownContent": "```sql\nCREATE TABLE logs_hot (\n    tenant_id LowCardinality(String),\n    service   LowCardinality(String),\n    level     LowCardinality(String),\n    ts        DateTime64(3),\n    trace_id  String,\n    message   String,\n    attrs     Map(String, String), -- Capped dynamic keys\n    INDEX idx_trace trace_id TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 4,\n    INDEX idx_msg   message  TYPE tokenbf_v1(65536, 3, 0) GRANULARITY 4\n) ENGINE = MergeTree()\nPARTITION BY toYYYYMMDD(ts)\nORDER BY (tenant_id, service, ts)\nTTL toDateTime(ts) + INTERVAL 7 DAY TO VOLUME 's3_cold';\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where ClickHouse + Kafka log pipelines are used",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": "Columnar analytical stores have largely replaced full-text clusters for high-volume observability:\n\n- **Cloudflare, Uber & Datadog-Scale Telemetry**: Pair Kafka buffering with ClickHouse `MergeTree` + S3 cold tiering to cut SSD costs 5x-8x.\n- **Security & Audit SIEMs**: Retain 365 days of Parquet in S3 queried via Trino/ClickHouse external tables.",
+      "supportingConcepts": [
+        {
+          "slug": "columnar-analytics-engines",
+          "title": "Concept: Columnar Analytics Engines",
+          "kind": "concept"
+        },
+        {
+          "slug": "structured-logging-correlation",
+          "title": "Concept: Structured Logging & Correlation",
+          "kind": "concept"
+        },
+        {
+          "slug": "hash-tables-and-bloom-filters",
+          "title": "Concept: Hash Tables & Bloom Filters",
+          "kind": "concept"
+        },
+        {
+          "slug": "async-structured-logging-pipelines",
+          "title": "System Design: Async Structured Logging",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why does ClickHouse with `LowCardinality(String)`, `ZSTD(3)`, and `tokenbf_v1` bloom filters replace Elasticsearch for a 50 TB/day log pipeline under an 80 TB SSD cap?",
+      "options": [
+        {
+          "id": "a",
+          "text": "Columnar compression (~8:1) + sparse granule indexes + bloom filters fit 7 hot days (RF=2) in ~65 TB while still hitting <1.5 s p95 trace_id lookups",
+          "correct": true,
+          "feedback": "Correct: avoiding full inverted-index amplification slashes SSD usage while keeping trace_id/keyword queries fast."
+        },
+        {
+          "id": "b",
+          "text": "ClickHouse stores all 365 days of raw JSON uncompressed inside Fluent Bit's 150 MB RAM",
+          "correct": false,
+          "feedback": "Fluent Bit only buffers briefly in a 2 GB local ring; ClickHouse stores 7 days hot and tiers 365 days to S3 Parquet."
+        },
+        {
+          "id": "c",
+          "text": "Micro-batching 100K rows per insert prevents `Too many parts` errors by creating 300 unmerged parts per second",
+          "correct": false,
+          "feedback": "100K-row micro-batches *reduce* part creation rate so background merges keep active parts well below the 300 limit."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why does ClickHouse with `LowCardinality(String)`, `ZSTD(3)`, and `tokenbf_v1` bloom filters replace Elasticsearch for a 50 TB/day log pipeline under an 80 TB SSD cap?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Columnar compression (~8:1) + sparse granule indexes + bloom filters fit 7 hot days (RF=2) in ~65 TB while still hitting <1.5 s p95 trace_id lookups",
+            "correct": true,
+            "feedback": "Correct: avoiding full inverted-index amplification slashes SSD usage while keeping trace_id/keyword queries fast."
+          },
+          {
+            "id": "b",
+            "text": "ClickHouse stores all 365 days of raw JSON uncompressed inside Fluent Bit's 150 MB RAM",
+            "correct": false,
+            "feedback": "Fluent Bit only buffers briefly in a 2 GB local ring; ClickHouse stores 7 days hot and tiers 365 days to S3 Parquet."
+          },
+          {
+            "id": "c",
+            "text": "Micro-batching 100K rows per insert prevents `Too many parts` errors by creating 300 unmerged parts per second",
+            "correct": false,
+            "feedback": "100K-row micro-batches *reduce* part creation rate so background merges keep active parts well below the 300 limit."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why 50 TB/day log pipelines break on storage amplification and bursts', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Across 4,000 Kubernetes nodes generating 600,000 JSON events/sec (576 MB/s = 49.8 TB/day), traditional inverted-index stacks inflate 50 TB/day into 90+ TB/day—exceeding an…",
+            "correct": true,
+            "feedback": "Correct: Across 4,000 Kubernetes nodes generating 600,000 JSON events/sec (576 MB/s = 49.8 TB/day), traditional inverted-index stacks inflate 50 TB/day into 90+ TB/day—exceeding an…"
+          },
+          {
+            "id": "b",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "c",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Mapping explosions, log storms, and ClickHouse Too many parts', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Three failure modes hit production log platforms: 1.",
+            "correct": true,
+            "feedback": "Correct: Three failure modes hit production log platforms: 1."
+          },
+          {
+            "id": "b",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "c",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** Across `4,000` Kubernetes nodes generating `600,000` JSON events/sec (`576 MB/s` = `49.8 TB/day`), traditional inverted-index stacks inflate `50 TB/day` into `90+ TB/day`—exceeding an `80 TB` 7-day hot SSD budget by **7x**.\n\n**How It Flows:** Think of Design a Real-Time Log Analytics Pipeline as a clear step-by-step chain: Fluent Bit (<150MB) -> Kafka (20TB zstd) -> ClickHouse (65TB 7d) -> S3 Parquet (365d) -> Daily Partitions.\n\n**Why Beginners Should Care:** Buffer zstd-compressed batches in Kafka, enforce a strict top-level schema + bounded `Map(String, String)` in Flink/Vector, store 7-day hot logs in ClickHouse `MergeTree` (~65 TB.",
+      "spark": {
+        "summary": "Across `4,000` Kubernetes nodes generating `600,000` JSON events/sec (`576 MB/s` = `49.8 TB/day`), traditional inverted-index stacks inflate `50 TB/day` into `90+ TB/day`—exceeding an `80 TB` 7-day hot SSD budget by **7x**.",
+        "keyTakeaway": "Buffer zstd-compressed batches in Kafka, enforce a strict top-level schema + bounded `Map(String, String)` in Flink/Vector, store 7-day hot logs in ClickHouse `MergeTree` (~65 TB."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why 50 TB/day log pipelines break on storage amplification and bursts",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why 50 TB/day log pipelines break on storage amplification and bursts works from first principles.",
+          "explanation": "Across `4,000` Kubernetes nodes generating `600,000` JSON events/sec (`576 MB/s` = `49.8 TB/day`), traditional inverted-index stacks inflate `50 TB/day` into `90+ TB/day`—exceeding an `80 TB` 7-day hot SSD budget by **7x**. Worse, an outage triggers a `4x` (`2.5M/sec`) log storm right when engineers need `trace_id` lookups in `< 5 seconds`.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Mapping explosions, log storms, and ClickHouse `Too many parts`",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without Mapping explosions, log storms, and ClickHouse `Too many parts` under real concurrency or scale.",
+          "explanation": "Three failure modes hit production log platforms: 1. **Dynamic JSON Key Explosion**: Logging UUIDs as top-level JSON keys creates `500K+` columns/mappings, crashing metadata coordinators. 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Burst-Decoupled Log Pipeline",
+            "title": "Fluent Bit -> Kafka (zstd) -> Flink Schema Guard -> ClickHouse + S3",
+            "actors": [
+              {
+                "id": "fb",
+                "label": "Fluent Bit (<150MB)"
+              },
+              {
+                "id": "kafka",
+                "label": "Kafka (20TB zstd)"
+              },
+              {
+                "id": "ch",
+                "label": "ClickHouse (65TB 7d)"
+              },
+              {
+                "id": "s3",
+                "label": "S3 Parquet (365d)"
+              }
+            ],
+            "events": [
+              {
+                "from": "fb",
+                "to": "kafka",
+                "label": "2GB ring buffer + drop DEBUG on storm",
+                "status": "warn"
+              },
+              {
+                "from": "kafka",
+                "to": "ch",
+                "label": "Micro-batch 100k rows/2s -> ZSTD(3) 8:1",
+                "status": "ok"
+              },
+              {
+                "from": "ch",
+                "to": "s3",
+                "label": "TTL > 7d moves partitions to Parquet",
+                "status": "ok"
+              }
+            ],
+            "summary": "5:1 Kafka zstd compression and 8:1 ClickHouse columnar compression fit 7 hot days into ~65 TB inside the 80 TB cap."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive direct-to-Elasticsearch shipping and schemaless indexing",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Shipping directly from Fluent Bit to Elasticsearch couples `2.5M/sec` incident bursts to storage, drops logs when indexers stall, and allows dynamic JSON mapping to explode cluster state.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Priority Fluent Bit + Kafka + ClickHouse MergeTree + S3",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Meet `< 5 s` freshness, `<= 80 TB` hot SSD, and `365-day` retention: **Node Agent (`Fluent Bit` in C)**: Stays under `150 MB` RAM / `2%` CPU with a `2 GB` filesystem ring buffer, priority shedding (drop `DEBUG/INFO` first during storms, preserve `ERROR/FATAL`), and `zstd` batching. **Kafka Buffer**: `24 h` retention at `5:1` zstd (`~20 TB` at `RF=2` across 18 brokers), with per-tenant quotas.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "tree-index",
+            "eyebrow": "ClickHouse MergeTree Layout",
+            "title": "Primary Sparse Index (tenant, service, ts) + tokenbf_v1 Bloom Filter",
+            "nodes": [
+              {
+                "label": "Daily Partitions",
+                "role": "TTL >7d -> S3 Parquet"
+              },
+              {
+                "label": "Primary Key Granules",
+                "role": "8,192 rows: (tenant, svc, ts)"
+              },
+              {
+                "label": "tokenbf_v1 Filter",
+                "role": "Skips granules for trace_id"
+              },
+              {
+                "label": "ZSTD(3) Columns",
+                "role": "8:1 ratio -> 65TB (RF=2)"
+              }
+            ],
+            "edges": [
+              {
+                "label": "prunes 99% granules"
+              },
+              {
+                "label": "100k-row batch insert"
+              }
+            ],
+            "summary": "Sparse primary indexes and tokenbf_v1 bloom filters deliver <1.5 s p95 trace_id lookups without full inverted-index bloat."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Buffer zstd-compressed batches in Kafka, enforce a strict top-level schema + bounded `Map(String, String)` in Flink/Vector, store 7-day hot logs in ClickHouse `MergeTree` (~65 TB."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** Across `4,000` Kubernetes nodes generating `600,000` JSON events/sec (`576 MB/s` = `49.8 TB/day`), traditional inverted-index stacks inflate `50 TB/day` into `90+ TB/day`—exceeding an `80 TB` 7-day hot SSD budget by **7x**.\n\n**Visual & Structural Flow:** Depicts Fluent Bit -> Kafka (zstd) -> Flink Schema Guard -> ClickHouse + S3 (Fluent Bit (<150MB) -> Kafka (20TB zstd) -> ClickHouse (65TB 7d) -> S3 Parquet (365d)); Primary Sparse Index (tenant, service, ts) + tokenbf_v1 Bloom Filter (Daily Partitions -> Primary Key Granules -> tokenbf_v1 Filter -> ZSTD(3) Columns).\n\n**Trade-Offs & Production:** Shipping directly from Fluent Bit to Elasticsearch couples `2.5M/sec` incident bursts to storage, drops logs when indexers stall, and allows dynamic JSON mapping to explode cluster state. Meet `< 5 s` freshness, `<= 80 TB` hot SSD, and `365-day` retention: **Node Agent (`Fluent Bit` in C)**: Stays under `150 MB` RAM / `2%` CPU with a `2 GB` filesystem ring buffer.\n\n**Failure Modes & Application:** Columnar analytical stores have largely replaced full-text clusters for high-volume observability: **Cloudflare, Uber & Datadog-Scale Telemetry**: Pair Kafka buffering with ClickHouse `MergeTree` + S3 cold tiering to cut SSD costs 5x-8x.",
+      "spark": {
+        "summary": "At 600K events/sec (50 TB/day raw, 2.5M/sec bursts), traditional Elasticsearch clusters blow past 80 TB SSD budgets and crash on dynamic JSON field explosions.",
+        "keyTakeaway": "Buffer zstd-compressed batches in Kafka, enforce a strict top-level schema + bounded `Map(String, String)` in Flink/Vector, store 7-day hot logs in ClickHouse `MergeTree` (~65 TB with `ZSTD(3)` + `tokenbf_v1`), and tier older partitions to S3 Parquet."
+      }
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** At 600K events/sec (50 TB/day raw, 2.5M/sec bursts), traditional Elasticsearch clusters blow past 80 TB SSD budgets and crash on dynamic JSON field explosions.\n\n**Production Trade-Offs:** Shipping directly from Fluent Bit to Elasticsearch couples `2.5M/sec` incident bursts to storage, drops logs when indexers stall, and allows dynamic JSON mapping to explode cluster state.\n\n**Failure Modes & Edge Cases:** Columnar analytical stores have largely replaced full-text clusters for high-volume observability: **Cloudflare, Uber & Datadog-Scale Telemetry**: Pair Kafka buffering with ClickHouse `MergeTree` + S3 cold tiering to cut SSD costs 5x-8x.\n\n**Principal Takeaway:** Buffer zstd-compressed batches in Kafka, enforce a strict top-level schema + bounded `Map(String, String)` in Flink/Vector, store 7-day hot logs in ClickHouse `MergeTree` (~65 TB with `ZSTD(3)` + `tokenbf_v1`), and tier older partitions to S3 Parquet.",
+      "spark": {
+        "summary": "At 600K events/sec (50 TB/day raw, 2.5M/sec bursts), traditional Elasticsearch clusters blow past 80 TB SSD budgets and crash on dynamic JSON field explosions.",
+        "keyTakeaway": "Buffer zstd-compressed batches in Kafka, enforce a strict top-level schema + bounded `Map(String, String)` in Flink/Vector, store 7-day hot logs in ClickHouse `MergeTree` (~65 TB with `ZSTD(3)` + `tokenbf_v1`), and tier older partitions to S3 Parquet."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why 50 TB/day log pipelines break on storage amplification and bursts",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why 50 TB/day log pipelines break on storage amplification and bursts works from first principles.",
+          "explanation": "Across `4,000` Kubernetes nodes generating `600,000` JSON events/sec (`576 MB/s` = `49.8 TB/day`), traditional inverted-index stacks inflate `50 TB/day` into `90+ TB/day`—exceeding an `80 TB` 7-day hot SSD budget by **7x**. Worse, an outage triggers a `4x` (`2.5M/sec`) log storm right when engineers need `trace_id` lookups in `< 5 seconds`.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Mapping explosions, log storms, and ClickHouse `Too many parts`",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without Mapping explosions, log storms, and ClickHouse `Too many parts` under real concurrency or scale.",
+          "explanation": "Three failure modes hit production log platforms:\n\n1. **Dynamic JSON Key Explosion**: Logging UUIDs as top-level JSON keys creates `500K+` columns/mappings, crashing metadata coordinators.\n2. **Incident Feedback Loops**: 2,000 pods logging stack traces saturate brokers and drop root-cause `ERROR` logs.\n3. **Small-Insert Part Overload**: Unbatched inserts into ClickHouse trigger `Too many parts (300)` rejections.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Burst-Decoupled Log Pipeline",
+            "title": "Fluent Bit -> Kafka (zstd) -> Flink Schema Guard -> ClickHouse + S3",
+            "actors": [
+              {
+                "id": "fb",
+                "label": "Fluent Bit (<150MB)"
+              },
+              {
+                "id": "kafka",
+                "label": "Kafka (20TB zstd)"
+              },
+              {
+                "id": "ch",
+                "label": "ClickHouse (65TB 7d)"
+              },
+              {
+                "id": "s3",
+                "label": "S3 Parquet (365d)"
+              }
+            ],
+            "events": [
+              {
+                "from": "fb",
+                "to": "kafka",
+                "label": "2GB ring buffer + drop DEBUG on storm",
+                "status": "warn"
+              },
+              {
+                "from": "kafka",
+                "to": "ch",
+                "label": "Micro-batch 100k rows/2s -> ZSTD(3) 8:1",
+                "status": "ok"
+              },
+              {
+                "from": "ch",
+                "to": "s3",
+                "label": "TTL > 7d moves partitions to Parquet",
+                "status": "ok"
+              }
+            ],
+            "summary": "5:1 Kafka zstd compression and 8:1 ClickHouse columnar compression fit 7 hot days into ~65 TB inside the 80 TB cap."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive direct-to-Elasticsearch shipping and schemaless indexing",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Shipping directly from Fluent Bit to Elasticsearch couples `2.5M/sec` incident bursts to storage, drops logs when indexers stall, and allows dynamic JSON mapping to explode cluster state.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Priority Fluent Bit + Kafka + ClickHouse MergeTree + S3",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Meet `< 5 s` freshness, `<= 80 TB` hot SSD, and `365-day` retention:\n\n- **Node Agent (`Fluent Bit` in C)**: Stays under `150 MB` RAM / `2%` CPU with a `2 GB` filesystem ring buffer, priority shedding (drop `DEBUG/INFO` first during storms, preserve `ERROR/FATAL`), and `zstd` batching.\n- **Kafka Buffer**: `24 h` retention at `5:1` zstd (`~20 TB` at `RF=2` across 18 brokers), with per-tenant quotas.\n- **ClickHouse Hot Tier (7 days)**: Promote `15-20` typed columns (`LowCardinality(String)` for `service/env/level`) and pack arbitrary keys into a bounded `Map(String, String)` (preventing schema explosion). `ORDER BY (tenant_id, service, timestamp)` with `tokenbf_v1` bloom filters on `message`/`trace_id` and `ZSTD(3)` (`~8:1` compression) fits `7` days at `RF=2` in `~65 TB`.\n- **Cold Tier**: ClickHouse `TTL` offloads `>7d` partitions to S3 Parquet for `365-day` compliance.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "tree-index",
+            "eyebrow": "ClickHouse MergeTree Layout",
+            "title": "Primary Sparse Index (tenant, service, ts) + tokenbf_v1 Bloom Filter",
+            "nodes": [
+              {
+                "label": "Daily Partitions",
+                "role": "TTL >7d -> S3 Parquet"
+              },
+              {
+                "label": "Primary Key Granules",
+                "role": "8,192 rows: (tenant, svc, ts)"
+              },
+              {
+                "label": "tokenbf_v1 Filter",
+                "role": "Skips granules for trace_id"
+              },
+              {
+                "label": "ZSTD(3) Columns",
+                "role": "8:1 ratio -> 65TB (RF=2)"
+              }
+            ],
+            "edges": [
+              {
+                "label": "prunes 99% granules"
+              },
+              {
+                "label": "100k-row batch insert"
+              }
+            ],
+            "summary": "Sparse primary indexes and tokenbf_v1 bloom filters deliver <1.5 s p95 trace_id lookups without full inverted-index bloat."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where ClickHouse + Kafka log pipelines are used",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Columnar analytical stores have largely replaced full-text clusters for high-volume observability:\n\n- **Cloudflare, Uber & Datadog-Scale Telemetry**: Pair Kafka buffering with ClickHouse `MergeTree` + S3 cold tiering to cut SSD costs 5x-8x.\n- **Security & Audit SIEMs**: Retain 365 days of Parquet in S3 queried via Trino/ClickHouse external tables.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Buffer zstd-compressed batches in Kafka, enforce a strict top-level schema + bounded `Map(String, String)` in Flink/Vector, store 7-day hot logs in ClickHouse `MergeTree` (~65 TB with `ZSTD(3)` + `tokenbf_v1`), and tier older partitions to S3 Parquet."
+    }
+  }
+}

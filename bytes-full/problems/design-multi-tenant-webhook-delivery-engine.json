@@ -1,0 +1,341 @@
+{
+  "id": "prob-design-multi-tenant-webhook-delivery-engine",
+  "slug": "design-multi-tenant-webhook-delivery-engine",
+  "title": "Design a Reliable Multi-Tenant Webhook Delivery Engine",
+  "problemType": "system-design",
+  "difficulty": "hard",
+  "prompt": "Design a Stripe/GitHub-scale webhook delivery engine dispatching 30,000 outbound events/sec across 200,000 tenant endpoints with HMAC-SHA256 verification, SSRF protection, noisy-neighbor isolation, exponential backoff retries, and Dead Letter Queue (DLQ) replay.",
+  "spark": {
+    "summary": "A production webhook engine pairs a Transactional Outbox + tenant-partitioned queue with per-tenant concurrency bulkheads, per-endpoint circuit breakers, DNS-pinned SSRF egress guards, HMAC-SHA256 replay-resistant signatures, and tiered retry + DLQ replay.",
+    "keyTakeaway": "Never share one unbounded worker queue across all webhook tenants—one slow or dead customer endpoint will fill every worker thread and stall healthy tenants unless isolated by per-endpoint circuit breakers and bulkheads.",
+    "byteSummary": "**Core Mechanics:** Outbound webhooks hit untrusted, unpredictable third-party servers. Sharing one queue causes head-of-line blocking when one customer endpoint stalls at 30s timeouts, while unsanitized URLs invite Server-Side Request Forgery (**SSRF**).\n\n**Visual & Structural Flow:** Depicts `Domain Event` -> `Transaction Outbox` -> `Partitioned Kafka Queue (by tenant_id)` -> `Per-Tenant Bulkhead Worker Pool` (`HMAC-SHA256 Signer` + `Circuit Breaker per endpoint`) -> `SSRF Egress Guard (Block 169.254/10.x)` -> `Customer HTTPS Endpoint`, with failures routed to `Exponential Backoff + Jitter -> DLQ -> Replay`.\n\n**Trade-Offs & Production:** Partitioning by `tenant_id` preserves per-tenant ordering, while per-endpoint circuit breakers trip after consecutive 5xx/timeouts so dead endpoints move to slow retry queues without blocking healthy tenants.\n\n**Failure Modes & Application:** Resolve DNS once at egress and validate the target IP is public (blocking `127.0.0.0/8`, `10.0.0.0/8`, `169.254.169.254`) before connecting to stop DNS-rebinding SSRF attacks."
+  },
+  "learningJourney": [
+    {
+      "id": "01-requirements-and-scale",
+      "eyebrow": "STAGE 01 · REQUIREMENTS & MATH",
+      "title": "Clarify Delivery SLOs, Security & Noisy-Neighbor Bounds",
+      "level": "L5 · APPLIED DESIGN",
+      "purpose": "The problem: size outbound throughput, retry fanout, and security boundaries.",
+      "explanation": "At **30,000 events/sec** (~2 KB payload = ~60 MB/s outbound), healthy endpoints respond in `<300 ms`, while degraded endpoints stall for `5–10s`. The engine must guarantee **at-least-once** delivery with `HMAC-SHA256(timestamp + '.' + payload)` headers, strict **SSRF** blocking, and zero cross-tenant head-of-line blocking."
+    },
+    {
+      "id": "02-noisy-neighbor-and-ssrf",
+      "eyebrow": "STAGE 02 · NAIVE BOTTLENECKS",
+      "title": "Why Global Worker Pools & Naive URL Fetches Fail",
+      "level": "L5 · APPLIED DESIGN",
+      "purpose": "The failure mode: see how one stalled endpoint exhausts workers and how DNS rebinding bypasses naive URL checks.",
+      "explanation": "If 100 global workers pull from one shared queue and Tenant X's webhook hangs for `10s` per call, Tenant X quickly occupies all 100 workers—dropping healthy Tenant Y's delivery rate to zero. Separately, validating a hostname with `getaddrinfo()` and then letting `requests.post(url)` re-resolve DNS allows **DNS rebinding** to hit internal `169.254.169.254` cloud metadata IPs."
+    },
+    {
+      "id": "03-enterprise-solution",
+      "eyebrow": "STAGE 03 · ENTERPRISE ARCHITECTURE",
+      "title": "Outbox -> Tenant Bulkheads -> Circuit Breakers -> SSRF-Pinned Egress",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "purpose": "The mechanism: isolate tenants with bulkheads/circuit breakers and pin validated public IPs.",
+      "explanation": "Capture events via a **Transactional Outbox** into a `tenant_id`-partitioned Kafka topic. Workers enforce **per-endpoint concurrency caps** (bulkheads) and trip a **Circuit Breaker** after e.g. 10 consecutive timeouts—routing failing endpoints to delayed retry topics (`1m, 5m, 30m, 2h` with jitter) and finally a **DLQ** with manual/API replay. At egress, an **SSRF-safe HTTP proxy** resolves DNS once, rejects private/link-local CIDRs, and connects directly to the validated IP with the original `Host` and TLS SNI.",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Webhook Dispatch Pipeline",
+        "title": "Isolated Multi-Tenant Webhook Delivery & SSRF Guard",
+        "nodes": [
+          {
+            "label": "Outbox + Kafka",
+            "role": "Key by tenant_id"
+          },
+          {
+            "label": "Bulkhead + CB",
+            "role": "Per-endpoint cap"
+          },
+          {
+            "label": "HMAC + SSRF Guard",
+            "role": "IP-pinned HTTPS"
+          },
+          {
+            "label": "Retry / DLQ",
+            "role": "Jittered backoff"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Replay-Safe HMAC",
+            "detail": "Sign t=<unix_ts>.<body> so receivers reject signatures older than 5m."
+          },
+          {
+            "label": "Circuit Breaker",
+            "detail": "Trips on dead endpoints so workers never stall on 10s timeouts."
+          },
+          {
+            "label": "DNS-Pinned SSRF",
+            "detail": "Validates resolved IP is public and connects to that IP directly."
+          }
+        ],
+        "summary": "Caption: Combining per-endpoint circuit breakers, DNS-pinned SSRF egress guards, and tiered retry topics keeps healthy tenants fast."
+      },
+      "markdownContent": "```python\nimport hmac, hashlib, ipaddress, socket, time\n\ndef sign_webhook_payload(secret: str, payload: bytes, timestamp: int | None = None) -> tuple[str, int]:\n    \"\"\"Generate replay-resistant Stripe-style HMAC-SHA256 signature header.\"\"\"\n    ts = int(timestamp or time.time())\n    signed = f\"{ts}.\".encode(\"utf-8\") + payload\n    sig = hmac.new(secret.encode(\"utf-8\"), signed, hashlib.sha256).hexdigest()\n    return f\"t={ts},v1={sig}\", ts\n\ndef resolve_safe_public_ip(hostname: str) -> str:\n    \"\"\"Resolve hostname once and reject private, loopback, or cloud metadata IPs.\"\"\"\n    ip_str = socket.gethostbyname(hostname)\n    ip = ipaddress.ip_address(ip_str)\n    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:\n        raise ValueError(f\"Blocked non-public webhook target IP: {ip_str}\")\n    return ip_str\n```"
+    },
+    {
+      "id": "04-retry-tiers-and-dlq",
+      "eyebrow": "STAGE 04 · RETRIES & DLQ REPLAY",
+      "title": "Tiered Delay Queues, Secret Rotation & Customer DLQ Replay",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "purpose": "Operational control: support zero-downtime secret rotation and safe DLQ replay.",
+      "explanation": "Never `sleep()` inside Kafka consumer threads—publish failed deliveries to dedicated **delay topics** (`retry_1m`, `retry_15m`, `retry_2h`) with jitter, then park exhausted events in a **DLQ** for 14 days. During **secret rotation**, emit dual `v1` signatures (old + new secret) for 24 hours so customers deploy zero-downtime key updates."
+    },
+    {
+      "id": "05-follow-ups",
+      "eyebrow": "STAGE 05 · INTERVIEW FOLLOW-UPS",
+      "title": "Ordering vs. Throughput & Auto-Disabling Dead Endpoints",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "purpose": "Applied problems: balance strict FIFO ordering against head-of-line blocking.",
+      "explanation": "Default to **unordered parallel delivery** (most webhooks include `created_at` and `event_id` for receiver-side idempotency) and auto-disable endpoints that return 100% 4xx/5xx for 7 consecutive days after emailing the tenant."
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "question": "Why must an SSRF guard resolve DNS once, validate the IP, and connect directly to that IP instead of validating the URL and letting the HTTP library re-resolve DNS?",
+        "options": [
+          {
+            "id": "a",
+            "text": "To prevent DNS-rebinding (TOCTOU) attacks where a malicious domain returns a public IP on check and 169.254.169.254 on connect",
+            "correct": true,
+            "feedback": "Correct: pinning the validated IP eliminates the time-of-check to time-of-use gap."
+          },
+          {
+            "id": "b",
+            "text": "To bypass TLS certificate verification",
+            "correct": false,
+            "feedback": "Incorrect: you still verify TLS using the original hostname for SNI/cert matching."
+          },
+          {
+            "id": "c",
+            "text": "Because Kafka cannot store domain names",
+            "correct": false,
+            "feedback": "Incorrect: DNS pinning is strictly a security defense against SSRF."
+          }
+        ]
+      },
+      {
+        "question": "Why should a webhook HMAC-SHA256 signature cover `timestamp + '.' + body` instead of only `body`?",
+        "options": [
+          {
+            "id": "a",
+            "text": "So receivers can reject captured requests older than a tolerance window (e.g., 5 minutes), preventing replay attacks",
+            "correct": true,
+            "feedback": "Correct: binding the timestamp into the HMAC prevents attackers from replaying valid signed payloads later."
+          },
+          {
+            "id": "b",
+            "text": "To compress the JSON payload by 50%",
+            "correct": false,
+            "feedback": "Incorrect: HMAC headers authenticate integrity and freshness, not compression."
+          },
+          {
+            "id": "c",
+            "text": "To allow HTTP GET instead of POST",
+            "correct": false,
+            "feedback": "Incorrect: webhooks still use HTTPS POST."
+          }
+        ]
+      },
+      {
+        "question": "How do you prevent a single dead customer webhook endpoint from blocking deliveries to 199,999 healthy tenants?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Enforce per-endpoint concurrency bulkheads, short connect/read timeouts, and per-endpoint circuit breakers routing failures to async retry/DLQ queues",
+            "correct": true,
+            "feedback": "Correct: isolating slow endpoints and tripping circuit breakers preserves worker capacity for healthy tenants."
+          },
+          {
+            "id": "b",
+            "text": "Increase the synchronous HTTP timeout from 5s to 120s",
+            "correct": false,
+            "feedback": "Incorrect: longer timeouts make worker starvation 24x worse."
+          },
+          {
+            "id": "c",
+            "text": "Drop all webhook events globally whenever any 1 tenant returns HTTP 500",
+            "correct": false,
+            "feedback": "Incorrect: failures must be isolated per endpoint/tenant."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** A production webhook engine pairs a Transactional Outbox + tenant-partitioned queue with per-tenant concurrency bulkheads, per-endpoint circuit breakers, DNS-pinned SSRF egress guards, HMAC-SHA256 replay-resistant signatures, and tiered retry + DLQ replay.\n\n**Key Takeaway:** Never share one unbounded worker queue across all webhook tenants—one slow or dead customer endpoint will fill every worker thread and stall healthy tenants unless isolated by per-endpoint circuit breakers and bulkheads.",
+      "spark": {
+        "summary": "A production webhook engine pairs a Transactional Outbox + tenant-partitioned queue with per-tenant concurrency bulkheads, per-endpoint circuit breakers, DNS-pinned SSRF egress guards, HMAC-SHA256 replay-resistant signatures, and tiered retry + DLQ replay.",
+        "keyTakeaway": "Never share one unbounded worker queue across all webhook tenants—one slow or dead customer endpoint will fill every worker thread and stall healthy tenants unless isolated by per-endpoint circuit breakers and bulkheads.",
+        "byteSummary": "**Core Mechanics:** Outbound webhooks hit untrusted, unpredictable third-party servers. Sharing one queue causes head-of-line blocking when one customer endpoint stalls at 30s timeouts, while unsanitized URLs invite Server-Side Request Forgery (**SSRF**).\n\n**Visual & Structural Flow:** Depicts `Domain Event` -> `Transaction Outbox` -> `Partitioned Kafka Queue (by tenant_id)` -> `Per-Tenant Bulkhead Worker Pool` (`HMAC-SHA256 Signer` + `Circuit Breaker per endpoint`) -> `SSRF Egress Guard (Block 169.254/10.x)` -> `Customer HTTPS Endpoint`, with failures routed to `Exponential Backoff + Jitter -> DLQ -> Replay`.\n\n**Trade-Offs & Production:** Partitioning by `tenant_id` preserves per-tenant ordering, while per-endpoint circuit breakers trip after consecutive 5xx/timeouts so dead endpoints move to slow retry queues without blocking healthy tenants.\n\n**Failure Modes & Application:** Resolve DNS once at egress and validate the target IP is public (blocking `127.0.0.0/8`, `10.0.0.0/8`, `169.254.169.254`) before connecting to stop DNS-rebinding SSRF attacks."
+      },
+      "learningJourney": [
+        {
+          "id": "01-requirements-and-scale",
+          "eyebrow": "STAGE 01 · REQUIREMENTS & MATH",
+          "title": "Clarify Delivery SLOs, Security & Noisy-Neighbor Bounds",
+          "level": "L5 · APPLIED DESIGN",
+          "purpose": "The problem: size outbound throughput, retry fanout, and security boundaries.",
+          "explanation": "At **30,000 events/sec** (~2 KB payload = ~60 MB/s outbound), healthy endpoints respond in `<300 ms`, while degraded endpoints stall for `5–10s`. The engine must guarantee **at-least-once** delivery with `HMAC-SHA256(timestamp + '.' + payload)` headers, strict **SSRF** blocking, and zero cross-tenant head-of-line blocking."
+        },
+        {
+          "id": "02-noisy-neighbor-and-ssrf",
+          "eyebrow": "STAGE 02 · NAIVE BOTTLENECKS",
+          "title": "Why Global Worker Pools & Naive URL Fetches Fail",
+          "level": "L5 · APPLIED DESIGN",
+          "purpose": "The failure mode: see how one stalled endpoint exhausts workers and how DNS rebinding bypasses naive URL checks.",
+          "explanation": "If 100 global workers pull from one shared queue and Tenant X's webhook hangs for `10s` per call, Tenant X quickly occupies all 100 workers—dropping healthy Tenant Y's delivery rate to zero. Separately, validating a hostname with `getaddrinfo()` and then letting `requests.post(url)` re-resolve DNS allows **DNS rebinding** to hit internal `169.254.169.254` cloud metadata IPs."
+        },
+        {
+          "id": "03-enterprise-solution",
+          "eyebrow": "STAGE 03 · ENTERPRISE ARCHITECTURE",
+          "title": "Outbox -> Tenant Bulkheads -> Circuit Breakers -> SSRF-Pinned Egress",
+          "level": "L6 · SCALE & TRADE-OFFS",
+          "purpose": "The mechanism: isolate tenants with bulkheads/circuit breakers and pin validated public IPs.",
+          "explanation": "Capture events via a **Transactional Outbox** into a `tenant_id`-partitioned Kafka topic. Workers enforce **per-endpoint concurrency caps** (bulkheads) and trip a **Circuit Breaker** after e.g. 10 consecutive timeouts—routing failing endpoints to delayed retry topics (`1m, 5m, 30m, 2h` with jitter) and finally a **DLQ** with manual/API replay. At egress, an **SSRF-safe HTTP proxy** resolves DNS once, rejects private/link-local CIDRs, and connects directly to the validated IP with the original `Host` and TLS SNI.",
+          "sectionDiagram": {
+            "kind": "pipeline",
+            "eyebrow": "Webhook Dispatch Pipeline",
+            "title": "Isolated Multi-Tenant Webhook Delivery & SSRF Guard",
+            "nodes": [
+              {
+                "label": "Outbox + Kafka",
+                "role": "Key by tenant_id"
+              },
+              {
+                "label": "Bulkhead + CB",
+                "role": "Per-endpoint cap"
+              },
+              {
+                "label": "HMAC + SSRF Guard",
+                "role": "IP-pinned HTTPS"
+              },
+              {
+                "label": "Retry / DLQ",
+                "role": "Jittered backoff"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Replay-Safe HMAC",
+                "detail": "Sign t=<unix_ts>.<body> so receivers reject signatures older than 5m."
+              },
+              {
+                "label": "Circuit Breaker",
+                "detail": "Trips on dead endpoints so workers never stall on 10s timeouts."
+              },
+              {
+                "label": "DNS-Pinned SSRF",
+                "detail": "Validates resolved IP is public and connects to that IP directly."
+              }
+            ],
+            "summary": "Caption: Combining per-endpoint circuit breakers, DNS-pinned SSRF egress guards, and tiered retry topics keeps healthy tenants fast."
+          },
+          "markdownContent": "```python\nimport hmac, hashlib, ipaddress, socket, time\n\ndef sign_webhook_payload(secret: str, payload: bytes, timestamp: int | None = None) -> tuple[str, int]:\n    \"\"\"Generate replay-resistant Stripe-style HMAC-SHA256 signature header.\"\"\"\n    ts = int(timestamp or time.time())\n    signed = f\"{ts}.\".encode(\"utf-8\") + payload\n    sig = hmac.new(secret.encode(\"utf-8\"), signed, hashlib.sha256).hexdigest()\n    return f\"t={ts},v1={sig}\", ts\n\ndef resolve_safe_public_ip(hostname: str) -> str:\n    \"\"\"Resolve hostname once and reject private, loopback, or cloud metadata IPs.\"\"\"\n    ip_str = socket.gethostbyname(hostname)\n    ip = ipaddress.ip_address(ip_str)\n    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:\n        raise ValueError(f\"Blocked non-public webhook target IP: {ip_str}\")\n    return ip_str\n```"
+        }
+      ],
+      "finalSummary": "Never share one unbounded worker queue across all webhook tenants—one slow or dead customer endpoint will fill every worker thread and stall healthy tenants unless isolated by per-endpoint circuit breakers and bulkheads."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** Outbound webhooks hit untrusted, unpredictable third-party servers. Sharing one queue causes head-of-line blocking when one customer endpoint stalls at 30s timeouts, while unsanitized URLs invite Server-Side Request Forgery (**SSRF**).\n\n**Visual & Structural Flow:** Depicts `Domain Event` -> `Transaction Outbox` -> `Partitioned Kafka Queue (by tenant_id)` -> `Per-Tenant Bulkhead Worker Pool` (`HMAC-SHA256 Signer` + `Circuit Breaker per endpoint`) -> `SSRF Egress Guard (Block 169.254/10.x)` -> `Customer HTTPS Endpoint`, with failures routed to `Exponential Backoff + Jitter -> DLQ -> Replay`.\n\n**Trade-Offs & Production:** Partitioning by `tenant_id` preserves per-tenant ordering, while per-endpoint circuit breakers trip after consecutive 5xx/timeouts so dead endpoints move to slow retry queues without blocking healthy tenants.\n\n**Failure Modes & Application:** Resolve DNS once at egress and validate the target IP is public (blocking `127.0.0.0/8`, `10.0.0.0/8`, `169.254.169.254`) before connecting to stop DNS-rebinding SSRF attacks.",
+      "spark": {
+        "summary": "A production webhook engine pairs a Transactional Outbox + tenant-partitioned queue with per-tenant concurrency bulkheads, per-endpoint circuit breakers, DNS-pinned SSRF egress guards, HMAC-SHA256 replay-resistant signatures, and tiered retry + DLQ replay.",
+        "keyTakeaway": "Never share one unbounded worker queue across all webhook tenants—one slow or dead customer endpoint will fill every worker thread and stall healthy tenants unless isolated by per-endpoint circuit breakers and bulkheads.",
+        "byteSummary": "**Core Mechanics:** Outbound webhooks hit untrusted, unpredictable third-party servers. Sharing one queue causes head-of-line blocking when one customer endpoint stalls at 30s timeouts, while unsanitized URLs invite Server-Side Request Forgery (**SSRF**).\n\n**Visual & Structural Flow:** Depicts `Domain Event` -> `Transaction Outbox` -> `Partitioned Kafka Queue (by tenant_id)` -> `Per-Tenant Bulkhead Worker Pool` (`HMAC-SHA256 Signer` + `Circuit Breaker per endpoint`) -> `SSRF Egress Guard (Block 169.254/10.x)` -> `Customer HTTPS Endpoint`, with failures routed to `Exponential Backoff + Jitter -> DLQ -> Replay`.\n\n**Trade-Offs & Production:** Partitioning by `tenant_id` preserves per-tenant ordering, while per-endpoint circuit breakers trip after consecutive 5xx/timeouts so dead endpoints move to slow retry queues without blocking healthy tenants.\n\n**Failure Modes & Application:** Resolve DNS once at egress and validate the target IP is public (blocking `127.0.0.0/8`, `10.0.0.0/8`, `169.254.169.254`) before connecting to stop DNS-rebinding SSRF attacks."
+      }
+    },
+    "advanced": {
+      "byteSummary": "**Core Mechanics:** Outbound webhooks hit untrusted, unpredictable third-party servers. Sharing one queue causes head-of-line blocking when one customer endpoint stalls at 30s timeouts, while unsanitized URLs invite Server-Side Request Forgery (**SSRF**).\n\n**Visual & Structural Flow:** Depicts `Domain Event` -> `Transaction Outbox` -> `Partitioned Kafka Queue (by tenant_id)` -> `Per-Tenant Bulkhead Worker Pool` (`HMAC-SHA256 Signer` + `Circuit Breaker per endpoint`) -> `SSRF Egress Guard (Block 169.254/10.x)` -> `Customer HTTPS Endpoint`, with failures routed to `Exponential Backoff + Jitter -> DLQ -> Replay`.\n\n**Trade-Offs & Production:** Partitioning by `tenant_id` preserves per-tenant ordering, while per-endpoint circuit breakers trip after consecutive 5xx/timeouts so dead endpoints move to slow retry queues without blocking healthy tenants.\n\n**Failure Modes & Application:** Resolve DNS once at egress and validate the target IP is public (blocking `127.0.0.0/8`, `10.0.0.0/8`, `169.254.169.254`) before connecting to stop DNS-rebinding SSRF attacks.",
+      "spark": {
+        "summary": "A production webhook engine pairs a Transactional Outbox + tenant-partitioned queue with per-tenant concurrency bulkheads, per-endpoint circuit breakers, DNS-pinned SSRF egress guards, HMAC-SHA256 replay-resistant signatures, and tiered retry + DLQ replay.",
+        "keyTakeaway": "Never share one unbounded worker queue across all webhook tenants—one slow or dead customer endpoint will fill every worker thread and stall healthy tenants unless isolated by per-endpoint circuit breakers and bulkheads.",
+        "byteSummary": "**Core Mechanics:** Outbound webhooks hit untrusted, unpredictable third-party servers. Sharing one queue causes head-of-line blocking when one customer endpoint stalls at 30s timeouts, while unsanitized URLs invite Server-Side Request Forgery (**SSRF**).\n\n**Visual & Structural Flow:** Depicts `Domain Event` -> `Transaction Outbox` -> `Partitioned Kafka Queue (by tenant_id)` -> `Per-Tenant Bulkhead Worker Pool` (`HMAC-SHA256 Signer` + `Circuit Breaker per endpoint`) -> `SSRF Egress Guard (Block 169.254/10.x)` -> `Customer HTTPS Endpoint`, with failures routed to `Exponential Backoff + Jitter -> DLQ -> Replay`.\n\n**Trade-Offs & Production:** Partitioning by `tenant_id` preserves per-tenant ordering, while per-endpoint circuit breakers trip after consecutive 5xx/timeouts so dead endpoints move to slow retry queues without blocking healthy tenants.\n\n**Failure Modes & Application:** Resolve DNS once at egress and validate the target IP is public (blocking `127.0.0.0/8`, `10.0.0.0/8`, `169.254.169.254`) before connecting to stop DNS-rebinding SSRF attacks."
+      },
+      "learningJourney": [
+        {
+          "id": "01-requirements-and-scale",
+          "eyebrow": "STAGE 01 · REQUIREMENTS & MATH",
+          "title": "Clarify Delivery SLOs, Security & Noisy-Neighbor Bounds",
+          "level": "L5 · APPLIED DESIGN",
+          "purpose": "The problem: size outbound throughput, retry fanout, and security boundaries.",
+          "explanation": "At **30,000 events/sec** (~2 KB payload = ~60 MB/s outbound), healthy endpoints respond in `<300 ms`, while degraded endpoints stall for `5–10s`. The engine must guarantee **at-least-once** delivery with `HMAC-SHA256(timestamp + '.' + payload)` headers, strict **SSRF** blocking, and zero cross-tenant head-of-line blocking."
+        },
+        {
+          "id": "02-noisy-neighbor-and-ssrf",
+          "eyebrow": "STAGE 02 · NAIVE BOTTLENECKS",
+          "title": "Why Global Worker Pools & Naive URL Fetches Fail",
+          "level": "L5 · APPLIED DESIGN",
+          "purpose": "The failure mode: see how one stalled endpoint exhausts workers and how DNS rebinding bypasses naive URL checks.",
+          "explanation": "If 100 global workers pull from one shared queue and Tenant X's webhook hangs for `10s` per call, Tenant X quickly occupies all 100 workers—dropping healthy Tenant Y's delivery rate to zero. Separately, validating a hostname with `getaddrinfo()` and then letting `requests.post(url)` re-resolve DNS allows **DNS rebinding** to hit internal `169.254.169.254` cloud metadata IPs."
+        },
+        {
+          "id": "03-enterprise-solution",
+          "eyebrow": "STAGE 03 · ENTERPRISE ARCHITECTURE",
+          "title": "Outbox -> Tenant Bulkheads -> Circuit Breakers -> SSRF-Pinned Egress",
+          "level": "L6 · SCALE & TRADE-OFFS",
+          "purpose": "The mechanism: isolate tenants with bulkheads/circuit breakers and pin validated public IPs.",
+          "explanation": "Capture events via a **Transactional Outbox** into a `tenant_id`-partitioned Kafka topic. Workers enforce **per-endpoint concurrency caps** (bulkheads) and trip a **Circuit Breaker** after e.g. 10 consecutive timeouts—routing failing endpoints to delayed retry topics (`1m, 5m, 30m, 2h` with jitter) and finally a **DLQ** with manual/API replay. At egress, an **SSRF-safe HTTP proxy** resolves DNS once, rejects private/link-local CIDRs, and connects directly to the validated IP with the original `Host` and TLS SNI.",
+          "sectionDiagram": {
+            "kind": "pipeline",
+            "eyebrow": "Webhook Dispatch Pipeline",
+            "title": "Isolated Multi-Tenant Webhook Delivery & SSRF Guard",
+            "nodes": [
+              {
+                "label": "Outbox + Kafka",
+                "role": "Key by tenant_id"
+              },
+              {
+                "label": "Bulkhead + CB",
+                "role": "Per-endpoint cap"
+              },
+              {
+                "label": "HMAC + SSRF Guard",
+                "role": "IP-pinned HTTPS"
+              },
+              {
+                "label": "Retry / DLQ",
+                "role": "Jittered backoff"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Replay-Safe HMAC",
+                "detail": "Sign t=<unix_ts>.<body> so receivers reject signatures older than 5m."
+              },
+              {
+                "label": "Circuit Breaker",
+                "detail": "Trips on dead endpoints so workers never stall on 10s timeouts."
+              },
+              {
+                "label": "DNS-Pinned SSRF",
+                "detail": "Validates resolved IP is public and connects to that IP directly."
+              }
+            ],
+            "summary": "Caption: Combining per-endpoint circuit breakers, DNS-pinned SSRF egress guards, and tiered retry topics keeps healthy tenants fast."
+          },
+          "markdownContent": "```python\nimport hmac, hashlib, ipaddress, socket, time\n\ndef sign_webhook_payload(secret: str, payload: bytes, timestamp: int | None = None) -> tuple[str, int]:\n    \"\"\"Generate replay-resistant Stripe-style HMAC-SHA256 signature header.\"\"\"\n    ts = int(timestamp or time.time())\n    signed = f\"{ts}.\".encode(\"utf-8\") + payload\n    sig = hmac.new(secret.encode(\"utf-8\"), signed, hashlib.sha256).hexdigest()\n    return f\"t={ts},v1={sig}\", ts\n\ndef resolve_safe_public_ip(hostname: str) -> str:\n    \"\"\"Resolve hostname once and reject private, loopback, or cloud metadata IPs.\"\"\"\n    ip_str = socket.gethostbyname(hostname)\n    ip = ipaddress.ip_address(ip_str)\n    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:\n        raise ValueError(f\"Blocked non-public webhook target IP: {ip_str}\")\n    return ip_str\n```"
+        },
+        {
+          "id": "04-retry-tiers-and-dlq",
+          "eyebrow": "STAGE 04 · RETRIES & DLQ REPLAY",
+          "title": "Tiered Delay Queues, Secret Rotation & Customer DLQ Replay",
+          "level": "L6 · SCALE & TRADE-OFFS",
+          "purpose": "Operational control: support zero-downtime secret rotation and safe DLQ replay.",
+          "explanation": "Never `sleep()` inside Kafka consumer threads—publish failed deliveries to dedicated **delay topics** (`retry_1m`, `retry_15m`, `retry_2h`) with jitter, then park exhausted events in a **DLQ** for 14 days. During **secret rotation**, emit dual `v1` signatures (old + new secret) for 24 hours so customers deploy zero-downtime key updates."
+        },
+        {
+          "id": "05-follow-ups",
+          "eyebrow": "STAGE 05 · INTERVIEW FOLLOW-UPS",
+          "title": "Ordering vs. Throughput & Auto-Disabling Dead Endpoints",
+          "level": "L7 · STAFF / PRINCIPAL",
+          "purpose": "Applied problems: balance strict FIFO ordering against head-of-line blocking.",
+          "explanation": "Default to **unordered parallel delivery** (most webhooks include `created_at` and `event_id` for receiver-side idempotency) and auto-disable endpoints that return 100% 4xx/5xx for 7 consecutive days after emailing the tenant."
+        }
+      ],
+      "finalSummary": "Never share one unbounded worker queue across all webhook tenants—one slow or dead customer endpoint will fill every worker thread and stall healthy tenants unless isolated by per-endpoint circuit breakers and bulkheads."
+    }
+  }
+}

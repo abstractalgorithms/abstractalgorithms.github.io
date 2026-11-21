@@ -1,0 +1,598 @@
+{
+  "id": "problem-transactional-outbox-with-cdc",
+  "slug": "transactional-outbox-with-cdc",
+  "title": "Scaling the Transactional Outbox with CDC",
+  "problemType": "architecture",
+  "difficulty": "hard",
+  "prompt": "Your payment ledger writes 15,000 transactions/sec into PostgreSQL 16, inserting one row into `outbox_events` per transaction. Eight relay workers poll `outbox_events` every 50ms using `SELECT ... WHERE status = 'PENDING' ORDER BY id LIMIT 500 FOR UPDATE SKIP LOCKED` and then `UPDATE status = 'SENT'` (or `DELETE`). Within 4 hours of peak load, `outbox_events` bloats from 200 MB to 48 GB despite holding only 50,000 pending rows, autovacuum lags behind due to long-running analytics queries, polling p99 jumps from 8ms to 1,400ms, and Kafka lag exceeds 400,000 events. Redesign the outbox ingestion and relay pipeline to sustain 20,000+ events/sec with < 50ms end-to-end publish latency and zero table bloat.",
+  "spark": {
+    "summary": "Under 15,000+ writes/sec, polling a PostgreSQL transactional outbox table with `SELECT ... FOR UPDATE SKIP LOCKED` and `DELETE`/`UPDATE` generates massive MVCC dead tuples, starves autovacuum, bloats B-tree indexes, and stalls event relay.",
+    "keyTakeaway": "Replace SQL polling on high-throughput outbox tables with PostgreSQL WAL Logical Replication (Debezium `pgoutput`), or pair time-partitioned outbox tables with `DROP`/`TRUNCATE` rotation to eliminate MVCC bloat.",
+    "byteSummary": "**Core Mechanics:** Writing payment ledger rows and `outbox_events` in one ACID transaction eliminates dual-write bugs. However, when 8 relay workers poll `outbox_events` every `50 ms` using `SELECT ...\n\n**Visual & Structural Flow:** Depicts FOR UPDATE SKIP LOCKED Polling vs. Debezium pgoutput (Ledger Tx (15k/s) -> outbox_events Heap -> 8x SQL Pollers -> WAL + Debezium); Append-Only Partitioned Outbox + Sequential WAL CDC (Payment Service (20k/s) -> Postgres WAL (pgoutput) -> Partitioned outbox_events -> Debezium -> Kafka (<50ms)).\n\n**Trade-Offs & Production:** Aggressive `autovacuum_vacuum_cost_limit` cannot reclaim dead tuples pinned by a 15-minute read-replica or analytics `xmin` snapshot. Sustain `20,000` outbox inserts/sec with `< 50 ms` p99 Kafka relay lag: **Append-Only `outbox_events` (Zero `UPDATE`/`DELETE`)**: Insert events in the same ACID transaction as the ledger, and never update or delete rows.\n\n**Failure Modes & Application:** The CDC-backed Transactional Outbox is the gold standard for atomic DB-to-Kafka publishing: **Payment Ledgers & Order State Machines**: Guarantees every committed balance change emits an ordered domain event."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why SQL polling breaks PostgreSQL MVCC at 15,000+ outbox writes/sec",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": "Writing payment ledger rows and `outbox_events` in one ACID transaction eliminates dual-write bugs. However, when 8 relay workers poll `outbox_events` every `50 ms` using `SELECT ... WHERE status = 'PENDING' LIMIT 500 FOR UPDATE SKIP LOCKED` followed by `UPDATE status = 'SENT'` (or `DELETE`) at `15,000–20,000 writes/sec`, PostgreSQL's MVCC engine collapses within 4 hours.",
+      "purpose": "The mechanism: understand how Why SQL polling breaks PostgreSQL MVCC at 15,000+ outbox writes/sec works from first principles."
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "Dead-tuple explosion, autovacuum starvation, and bloated B-trees",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "PostgreSQL MVCC never overwrites rows in place—every `UPDATE` or `DELETE` creates dead tuples:\n\n1. **2x Dead-Tuple Churn**: `15k/s` inserts + `15k/s` updates/deletes generate `30k` tuple versions/sec that cannot be vacuumed while any analytics `xmin` snapshot is open (`15 min`).\n2. **Index & Lock Thrashing**: The `status = 'PENDING'` B-tree bloats to gigabytes of dead entries, blowing past `40,000` IOPS.",
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "SQL Polling Collapse vs. WAL CDC",
+        "title": "FOR UPDATE SKIP LOCKED Polling vs. Debezium pgoutput",
+        "actors": [
+          {
+            "id": "pay",
+            "label": "Ledger Tx (15k/s)"
+          },
+          {
+            "id": "heap",
+            "label": "outbox_events Heap"
+          },
+          {
+            "id": "poll",
+            "label": "8x SQL Pollers"
+          },
+          {
+            "id": "wal",
+            "label": "WAL + Debezium"
+          }
+        ],
+        "events": [
+          {
+            "from": "pay",
+            "to": "heap",
+            "label": "INSERT outbox + ledger (ACID)",
+            "status": "ok"
+          },
+          {
+            "from": "poll",
+            "to": "heap",
+            "label": "Naive: SKIP LOCKED + UPDATE/DEL",
+            "status": "warn"
+          },
+          {
+            "from": "heap",
+            "to": "heap",
+            "label": "Dead tuples + B-tree bloat (>40k IOPS)",
+            "status": "fail"
+          },
+          {
+            "from": "pay",
+            "to": "wal",
+            "label": "Append-only INSERT -> seq WAL",
+            "status": "ok"
+          },
+          {
+            "from": "wal",
+            "to": "wal",
+            "label": "Debezium pgoutput (<50ms p99)",
+            "status": "ok"
+          }
+        ],
+        "summary": "Replacing SQL polling with WAL-based CDC (Debezium pgoutput) eliminates UPDATE/DELETE dead tuples and polling IOPS."
+      },
+      "purpose": "The problem: see what breaks without Dead-tuple explosion, autovacuum starvation, and bloated B-trees under real concurrency or scale."
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Why tuning autovacuum or adding partial indexes is not enough",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "Aggressive `autovacuum_vacuum_cost_limit` cannot reclaim dead tuples pinned by a 15-minute read-replica or analytics `xmin` snapshot. Meanwhile, polling every `50 ms` still wastes thousands of random heap/index IOPS competing directly with payment transactions.",
+      "purpose": "The problem: see what breaks without Why tuning autovacuum or adding partial indexes is not enough under real concurrency or scale."
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise solution: Append-Only Partitioned Outbox + Debezium pgoutput",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": "Sustain `20,000` outbox inserts/sec with `< 50 ms` p99 Kafka relay lag:\n\n- **Append-Only `outbox_events` (Zero `UPDATE`/`DELETE`)**: Insert events in the same ACID transaction as the ledger, and never update or delete rows.\n- **Debezium `pgoutput` WAL Streaming**: Read sequential Write-Ahead Log records directly from the replication slot (zero polling queries, zero lock contention), using `OutboxEventRouter` SMT to partition Kafka by `aggregate_id` for per-aggregate ordering.\n- **Hourly Range Partitions + `DROP TABLE`**: Partition `outbox_events` by `created_at` (hourly/daily) and drop expired partitions in `O(1)` metadata time—bypassing `VACUUM` completely.",
+      "sectionDiagram": {
+        "kind": "wal-mvcc",
+        "eyebrow": "Zero-Bloat Outbox Architecture",
+        "title": "Append-Only Partitioned Outbox + Sequential WAL CDC",
+        "nodes": [
+          {
+            "label": "Payment Service (20k/s)",
+            "role": "ACID ledger + outbox INSERT"
+          },
+          {
+            "label": "Postgres WAL (pgoutput)",
+            "role": "Sequential log; zero polling"
+          },
+          {
+            "label": "Partitioned outbox_events",
+            "role": "Hourly partitions; DROP old"
+          },
+          {
+            "label": "Debezium -> Kafka (<50ms)",
+            "role": "Keyed by aggregate_id"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Zero Dead Tuples",
+            "detail": "No UPDATE/DELETE means zero MVCC bloat even with 15-min analytics xmin snapshots."
+          },
+          {
+            "label": "Sequential WAL Read",
+            "detail": "Debezium tails the WAL sequentially instead of random B-tree index scans."
+          },
+          {
+            "label": "DROP Partition Rotation",
+            "detail": "Hourly range partitions are dropped instantly without triggering VACUUM."
+          }
+        ],
+        "summary": "Append-only partitioned outbox tables paired with Debezium WAL CDC eliminate MVCC bloat and sustain 20k+ events/sec."
+      },
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where CDC-backed outboxes power event-driven platforms",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": "The CDC-backed Transactional Outbox is the gold standard for atomic DB-to-Kafka publishing:\n\n- **Payment Ledgers & Order State Machines**: Guarantees every committed balance change emits an ordered domain event.\n- **Saga Orchestrators**: Atomically persists saga state transitions and outgoing command events.\n- **Microservice Event Buses**: Decouples OLTP throughput from downstream consumer lag.",
+      "supportingConcepts": [
+        {
+          "slug": "transactional-outbox-pattern",
+          "title": "Concept: Transactional Outbox Pattern",
+          "kind": "concept"
+        },
+        {
+          "slug": "change-data-capture",
+          "title": "Concept: Change Data Capture",
+          "kind": "concept"
+        },
+        {
+          "slug": "event-driven-architecture",
+          "title": "Concept: Event-Driven Architecture",
+          "kind": "concept"
+        },
+        {
+          "slug": "reliable-cdc-debezium-pipelines",
+          "title": "Problem: Reliable CDC Debezium Pipelines",
+          "kind": "problem"
+        },
+        {
+          "slug": "two-phase-commit-vs-saga-pattern",
+          "title": "Problem: Two-Phase Commit vs. Saga Pattern",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why does an append-only partitioned `outbox_events` table paired with Debezium `pgoutput` outperform `SELECT ... FOR UPDATE SKIP LOCKED` polling at 15,000+ writes/sec?",
+      "options": [
+        {
+          "id": "a",
+          "text": "It eliminates UPDATE/DELETE MVCC dead-tuple bloat and random polling IOPS, reading the sequential WAL instead and dropping old partitions without VACUUM",
+          "correct": true,
+          "feedback": "Correct: append-only + WAL CDC removes both MVCC dead tuples and polling lock contention."
+        },
+        {
+          "id": "b",
+          "text": "Debezium disables PostgreSQL ACID transactions on the ledger table",
+          "correct": false,
+          "feedback": "The outbox INSERT still runs inside the exact same ACID transaction as the ledger write."
+        },
+        {
+          "id": "c",
+          "text": "FOR UPDATE SKIP LOCKED is not supported in PostgreSQL 16",
+          "correct": false,
+          "feedback": "It is supported, but polling + UPDATE/DELETE creates severe MVCC bloat at 15k+ writes/sec."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why does an append-only partitioned `outbox_events` table paired with Debezium `pgoutput` outperform `SELECT ... FOR UPDATE SKIP LOCKED` polling at 15,000+ writes/sec?",
+        "options": [
+          {
+            "id": "a",
+            "text": "It eliminates UPDATE/DELETE MVCC dead-tuple bloat and random polling IOPS, reading the sequential WAL instead and dropping old partitions without VACUUM",
+            "correct": true,
+            "feedback": "Correct: append-only + WAL CDC removes both MVCC dead tuples and polling lock contention."
+          },
+          {
+            "id": "b",
+            "text": "Debezium disables PostgreSQL ACID transactions on the ledger table",
+            "correct": false,
+            "feedback": "The outbox INSERT still runs inside the exact same ACID transaction as the ledger write."
+          },
+          {
+            "id": "c",
+            "text": "FOR UPDATE SKIP LOCKED is not supported in PostgreSQL 16",
+            "correct": false,
+            "feedback": "It is supported, but polling + UPDATE/DELETE creates severe MVCC bloat at 15k+ writes/sec."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why SQL polling breaks PostgreSQL MVCC at 15,000+ outbox writes/sec', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Writing payment ledger rows and outbox_events in one ACID transaction eliminates dual-write bugs.",
+            "correct": true,
+            "feedback": "Correct: Writing payment ledger rows and outbox_events in one ACID transaction eliminates dual-write bugs."
+          },
+          {
+            "id": "b",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "c",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Dead-tuple explosion, autovacuum starvation, and bloated B-trees', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "b",
+            "text": "PostgreSQL MVCC never overwrites rows in place—every UPDATE or DELETE creates dead tuples: 1.",
+            "correct": true,
+            "feedback": "Correct: PostgreSQL MVCC never overwrites rows in place—every UPDATE or DELETE creates dead tuples: 1."
+          },
+          {
+            "id": "c",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** Writing payment ledger rows and `outbox_events` in one ACID transaction eliminates dual-write bugs.\n\n**How It Flows:** Think of Scaling the Transactional Outbox with CDC as a clear step-by-step chain: Ledger Tx (15k/s) -> outbox_events Heap -> 8x SQL Pollers -> WAL + Debezium -> Payment Service (20k/s).\n\n**Why Beginners Should Care:** Replace SQL polling on high-throughput outbox tables with PostgreSQL WAL Logical Replication (Debezium `pgoutput`), or pair time-partitioned outbox tables with `DROP`/`TRUNCATE` rotation to eliminate MVCC bloat.",
+      "spark": {
+        "summary": "Writing payment ledger rows and `outbox_events` in one ACID transaction eliminates dual-write bugs.",
+        "keyTakeaway": "Replace SQL polling on high-throughput outbox tables with PostgreSQL WAL Logical Replication (Debezium `pgoutput`), or pair time-partitioned outbox tables with `DROP`/`TRUNCATE` rotation to eliminate MVCC bloat."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why SQL polling breaks PostgreSQL MVCC at 15,000+ outbox writes/sec",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why SQL polling breaks PostgreSQL MVCC at 15,000+ outbox writes/sec works from first principles.",
+          "explanation": "Writing payment ledger rows and `outbox_events` in one ACID transaction eliminates dual-write bugs. However, when 8 relay workers poll `outbox_events` every `50 ms` using `SELECT ... WHERE status = 'PENDING' LIMIT 500 FOR UPDATE SKIP LOCKED` followed by `UPDATE status = 'SENT'` (or `DELETE`) at `15,000–20,000 writes/sec`, PostgreSQL's MVCC engine collapses within 4 hours.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Dead-tuple explosion, autovacuum starvation, and bloated B-trees",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without Dead-tuple explosion, autovacuum starvation, and bloated B-trees under real concurrency or scale.",
+          "explanation": "PostgreSQL MVCC never overwrites rows in place—every `UPDATE` or `DELETE` creates dead tuples: 1. **2x Dead-Tuple Churn**: `15k/s` inserts + `15k/s` updates/deletes generate `30k` tuple versions/sec that cannot be vacuumed while any analytics `xmin` snapshot is open (`15 min`). 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "SQL Polling Collapse vs. WAL CDC",
+            "title": "FOR UPDATE SKIP LOCKED Polling vs. Debezium pgoutput",
+            "actors": [
+              {
+                "id": "pay",
+                "label": "Ledger Tx (15k/s)"
+              },
+              {
+                "id": "heap",
+                "label": "outbox_events Heap"
+              },
+              {
+                "id": "poll",
+                "label": "8x SQL Pollers"
+              },
+              {
+                "id": "wal",
+                "label": "WAL + Debezium"
+              }
+            ],
+            "events": [
+              {
+                "from": "pay",
+                "to": "heap",
+                "label": "INSERT outbox + ledger (ACID)",
+                "status": "ok"
+              },
+              {
+                "from": "poll",
+                "to": "heap",
+                "label": "Naive: SKIP LOCKED + UPDATE/DEL",
+                "status": "warn"
+              },
+              {
+                "from": "heap",
+                "to": "heap",
+                "label": "Dead tuples + B-tree bloat (>40k IOPS)",
+                "status": "fail"
+              },
+              {
+                "from": "pay",
+                "to": "wal",
+                "label": "Append-only INSERT -> seq WAL",
+                "status": "ok"
+              },
+              {
+                "from": "wal",
+                "to": "wal",
+                "label": "Debezium pgoutput (<50ms p99)",
+                "status": "ok"
+              }
+            ],
+            "summary": "Replacing SQL polling with WAL-based CDC (Debezium pgoutput) eliminates UPDATE/DELETE dead tuples and polling IOPS."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Why tuning autovacuum or adding partial indexes is not enough",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "The problem: see what breaks without Why tuning autovacuum or adding partial indexes is not enough under real concurrency or scale.",
+          "explanation": "Aggressive `autovacuum_vacuum_cost_limit` cannot reclaim dead tuples pinned by a 15-minute read-replica or analytics `xmin` snapshot. Meanwhile, polling every `50 ms` still wastes thousands of random heap/index IOPS competing directly with payment transactions.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Append-Only Partitioned Outbox + Debezium pgoutput",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Sustain `20,000` outbox inserts/sec with `< 50 ms` p99 Kafka relay lag: **Append-Only `outbox_events` (Zero `UPDATE`/`DELETE`)**: Insert events in the same ACID transaction as the ledger, and never update or delete rows.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "wal-mvcc",
+            "eyebrow": "Zero-Bloat Outbox Architecture",
+            "title": "Append-Only Partitioned Outbox + Sequential WAL CDC",
+            "nodes": [
+              {
+                "label": "Payment Service (20k/s)",
+                "role": "ACID ledger + outbox INSERT"
+              },
+              {
+                "label": "Postgres WAL (pgoutput)",
+                "role": "Sequential log; zero polling"
+              },
+              {
+                "label": "Partitioned outbox_events",
+                "role": "Hourly partitions; DROP old"
+              },
+              {
+                "label": "Debezium -> Kafka (<50ms)",
+                "role": "Keyed by aggregate_id"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Zero Dead Tuples",
+                "detail": "No UPDATE/DELETE means zero MVCC bloat even with 15-min analytics xmin snapshots."
+              },
+              {
+                "label": "Sequential WAL Read",
+                "detail": "Debezium tails the WAL sequentially instead of random B-tree index scans."
+              },
+              {
+                "label": "DROP Partition Rotation",
+                "detail": "Hourly range partitions are dropped instantly without triggering VACUUM."
+              }
+            ],
+            "summary": "Append-only partitioned outbox tables paired with Debezium WAL CDC eliminate MVCC bloat and sustain 20k+ events/sec."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Replace SQL polling on high-throughput outbox tables with PostgreSQL WAL Logical Replication (Debezium `pgoutput`), or pair time-partitioned outbox tables with `DROP`/`TRUNCATE` rotation to eliminate MVCC bloat."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** Writing payment ledger rows and `outbox_events` in one ACID transaction eliminates dual-write bugs. However, when 8 relay workers poll `outbox_events` every `50 ms` using `SELECT ...\n\n**Visual & Structural Flow:** Depicts FOR UPDATE SKIP LOCKED Polling vs. Debezium pgoutput (Ledger Tx (15k/s) -> outbox_events Heap -> 8x SQL Pollers -> WAL + Debezium); Append-Only Partitioned Outbox + Sequential WAL CDC (Payment Service (20k/s) -> Postgres WAL (pgoutput) -> Partitioned outbox_events -> Debezium -> Kafka (<50ms)).\n\n**Trade-Offs & Production:** Aggressive `autovacuum_vacuum_cost_limit` cannot reclaim dead tuples pinned by a 15-minute read-replica or analytics `xmin` snapshot. Sustain `20,000` outbox inserts/sec with `< 50 ms` p99 Kafka relay lag: **Append-Only `outbox_events` (Zero `UPDATE`/`DELETE`)**: Insert events in the same ACID transaction as the ledger, and never update or delete rows.\n\n**Failure Modes & Application:** The CDC-backed Transactional Outbox is the gold standard for atomic DB-to-Kafka publishing: **Payment Ledgers & Order State Machines**: Guarantees every committed balance change emits an ordered domain event.",
+      "spark": {
+        "summary": "Under 15,000+ writes/sec, polling a PostgreSQL transactional outbox table with `SELECT ... FOR UPDATE SKIP LOCKED` and `DELETE`/`UPDATE` generates massive MVCC dead tuples, starves autovacuum, bloats B-tree indexes, and stalls event relay.",
+        "keyTakeaway": "Replace SQL polling on high-throughput outbox tables with PostgreSQL WAL Logical Replication (Debezium `pgoutput`), or pair time-partitioned outbox tables with `DROP`/`TRUNCATE` rotation to eliminate MVCC bloat."
+      }
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** Under 15,000+ writes/sec, polling a PostgreSQL transactional outbox table with `SELECT ... FOR UPDATE SKIP LOCKED` and `DELETE`/`UPDATE` generates massive MVCC dead tuples, starves autovacuum, bloats B-tree indexes, and stalls event relay.\n\n**Production Trade-Offs:** Aggressive `autovacuum_vacuum_cost_limit` cannot reclaim dead tuples pinned by a 15-minute read-replica or analytics `xmin` snapshot.\n\n**Failure Modes & Edge Cases:** The CDC-backed Transactional Outbox is the gold standard for atomic DB-to-Kafka publishing: **Payment Ledgers & Order State Machines**: Guarantees every committed balance change emits an ordered domain event.\n\n**Principal Takeaway:** Replace SQL polling on high-throughput outbox tables with PostgreSQL WAL Logical Replication (Debezium `pgoutput`), or pair time-partitioned outbox tables with `DROP`/`TRUNCATE` rotation to eliminate MVCC bloat.",
+      "spark": {
+        "summary": "Under 15,000+ writes/sec, polling a PostgreSQL transactional outbox table with `SELECT ... FOR UPDATE SKIP LOCKED` and `DELETE`/`UPDATE` generates massive MVCC dead tuples, starves autovacuum, bloats B-tree indexes, and stalls event relay.",
+        "keyTakeaway": "Replace SQL polling on high-throughput outbox tables with PostgreSQL WAL Logical Replication (Debezium `pgoutput`), or pair time-partitioned outbox tables with `DROP`/`TRUNCATE` rotation to eliminate MVCC bloat."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why SQL polling breaks PostgreSQL MVCC at 15,000+ outbox writes/sec",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why SQL polling breaks PostgreSQL MVCC at 15,000+ outbox writes/sec works from first principles.",
+          "explanation": "Writing payment ledger rows and `outbox_events` in one ACID transaction eliminates dual-write bugs. However, when 8 relay workers poll `outbox_events` every `50 ms` using `SELECT ... WHERE status = 'PENDING' LIMIT 500 FOR UPDATE SKIP LOCKED` followed by `UPDATE status = 'SENT'` (or `DELETE`) at `15,000–20,000 writes/sec`, PostgreSQL's MVCC engine collapses within 4 hours.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Dead-tuple explosion, autovacuum starvation, and bloated B-trees",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without Dead-tuple explosion, autovacuum starvation, and bloated B-trees under real concurrency or scale.",
+          "explanation": "PostgreSQL MVCC never overwrites rows in place—every `UPDATE` or `DELETE` creates dead tuples:\n\n1. **2x Dead-Tuple Churn**: `15k/s` inserts + `15k/s` updates/deletes generate `30k` tuple versions/sec that cannot be vacuumed while any analytics `xmin` snapshot is open (`15 min`).\n2. **Index & Lock Thrashing**: The `status = 'PENDING'` B-tree bloats to gigabytes of dead entries, blowing past `40,000` IOPS.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "SQL Polling Collapse vs. WAL CDC",
+            "title": "FOR UPDATE SKIP LOCKED Polling vs. Debezium pgoutput",
+            "actors": [
+              {
+                "id": "pay",
+                "label": "Ledger Tx (15k/s)"
+              },
+              {
+                "id": "heap",
+                "label": "outbox_events Heap"
+              },
+              {
+                "id": "poll",
+                "label": "8x SQL Pollers"
+              },
+              {
+                "id": "wal",
+                "label": "WAL + Debezium"
+              }
+            ],
+            "events": [
+              {
+                "from": "pay",
+                "to": "heap",
+                "label": "INSERT outbox + ledger (ACID)",
+                "status": "ok"
+              },
+              {
+                "from": "poll",
+                "to": "heap",
+                "label": "Naive: SKIP LOCKED + UPDATE/DEL",
+                "status": "warn"
+              },
+              {
+                "from": "heap",
+                "to": "heap",
+                "label": "Dead tuples + B-tree bloat (>40k IOPS)",
+                "status": "fail"
+              },
+              {
+                "from": "pay",
+                "to": "wal",
+                "label": "Append-only INSERT -> seq WAL",
+                "status": "ok"
+              },
+              {
+                "from": "wal",
+                "to": "wal",
+                "label": "Debezium pgoutput (<50ms p99)",
+                "status": "ok"
+              }
+            ],
+            "summary": "Replacing SQL polling with WAL-based CDC (Debezium pgoutput) eliminates UPDATE/DELETE dead tuples and polling IOPS."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Why tuning autovacuum or adding partial indexes is not enough",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "The problem: see what breaks without Why tuning autovacuum or adding partial indexes is not enough under real concurrency or scale.",
+          "explanation": "Aggressive `autovacuum_vacuum_cost_limit` cannot reclaim dead tuples pinned by a 15-minute read-replica or analytics `xmin` snapshot. Meanwhile, polling every `50 ms` still wastes thousands of random heap/index IOPS competing directly with payment transactions.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Append-Only Partitioned Outbox + Debezium pgoutput",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Sustain `20,000` outbox inserts/sec with `< 50 ms` p99 Kafka relay lag:\n\n- **Append-Only `outbox_events` (Zero `UPDATE`/`DELETE`)**: Insert events in the same ACID transaction as the ledger, and never update or delete rows.\n- **Debezium `pgoutput` WAL Streaming**: Read sequential Write-Ahead Log records directly from the replication slot (zero polling queries, zero lock contention), using `OutboxEventRouter` SMT to partition Kafka by `aggregate_id` for per-aggregate ordering.\n- **Hourly Range Partitions + `DROP TABLE`**: Partition `outbox_events` by `created_at` (hourly/daily) and drop expired partitions in `O(1)` metadata time—bypassing `VACUUM` completely.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "wal-mvcc",
+            "eyebrow": "Zero-Bloat Outbox Architecture",
+            "title": "Append-Only Partitioned Outbox + Sequential WAL CDC",
+            "nodes": [
+              {
+                "label": "Payment Service (20k/s)",
+                "role": "ACID ledger + outbox INSERT"
+              },
+              {
+                "label": "Postgres WAL (pgoutput)",
+                "role": "Sequential log; zero polling"
+              },
+              {
+                "label": "Partitioned outbox_events",
+                "role": "Hourly partitions; DROP old"
+              },
+              {
+                "label": "Debezium -> Kafka (<50ms)",
+                "role": "Keyed by aggregate_id"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Zero Dead Tuples",
+                "detail": "No UPDATE/DELETE means zero MVCC bloat even with 15-min analytics xmin snapshots."
+              },
+              {
+                "label": "Sequential WAL Read",
+                "detail": "Debezium tails the WAL sequentially instead of random B-tree index scans."
+              },
+              {
+                "label": "DROP Partition Rotation",
+                "detail": "Hourly range partitions are dropped instantly without triggering VACUUM."
+              }
+            ],
+            "summary": "Append-only partitioned outbox tables paired with Debezium WAL CDC eliminate MVCC bloat and sustain 20k+ events/sec."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where CDC-backed outboxes power event-driven platforms",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "The CDC-backed Transactional Outbox is the gold standard for atomic DB-to-Kafka publishing:\n\n- **Payment Ledgers & Order State Machines**: Guarantees every committed balance change emits an ordered domain event.\n- **Saga Orchestrators**: Atomically persists saga state transitions and outgoing command events.\n- **Microservice Event Buses**: Decouples OLTP throughput from downstream consumer lag.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Replace SQL polling on high-throughput outbox tables with PostgreSQL WAL Logical Replication (Debezium `pgoutput`), or pair time-partitioned outbox tables with `DROP`/`TRUNCATE` rotation to eliminate MVCC bloat."
+    }
+  }
+}

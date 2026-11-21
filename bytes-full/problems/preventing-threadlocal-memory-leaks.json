@@ -1,0 +1,594 @@
+{
+  "id": "problem-preventing-threadlocal-memory-leaks",
+  "slug": "preventing-threadlocal-memory-leaks",
+  "title": "Preventing ThreadLocal Leaks in Worker Pools",
+  "problemType": "low-level-design",
+  "difficulty": "medium",
+  "prompt": "A Spring Boot / Tomcat service running 200 long-lived HTTP worker threads stores a `RequestContext` (containing a 256 KB parsed JWT/permission payload and user ID) in a `private static final ThreadLocal<RequestContext> CTX = new ThreadLocal<>()`. Over 48 hours of uptime, old-gen heap climbs steadily to 92%, GC pauses spike to 1.8 seconds, and intermittent bug reports show User B occasionally seeing User A's permissions when an upstream auth filter throws an exception before overwriting `CTX`. Diagnose both the memory leak and the cross-tenant security bug, and design a leak-proof context propagation mechanism.",
+  "spark": {
+    "summary": "`ThreadLocal` keys are `WeakReference`s, but their values are strongly referenced inside `ThreadLocalMap.Entry` for as long as the pooled worker thread lives—leaking megabytes of request/tenant state and causing cross-request data corruption.",
+    "keyTakeaway": "Always clear `ThreadLocal`s in a deterministic `finally` filter/interceptor, avoid storing large buffers or classloader-bound objects in `ThreadLocal`, and migrate to Java 21+ `ScopedValue` where possible.",
+    "byteSummary": "**Core Mechanics:** In a Spring Boot / Tomcat service with 200 long-lived worker threads, `ThreadLocalMap.Entry` holds a `WeakReference` to the `ThreadLocal` key, **but a strong reference to the value** (`RequestContext`, 256 KB).\n\n**Visual & Structural Flow:** Depicts Missing ThreadLocal.remove() Leaks Context Across Users (User A Req -> Tomcat Thread-17 -> ThreadLocalMap -> User B Req); Scoped Binding & Guaranteed Cleanup on Pooled Threads (UNBOUND -> BOUND (try) -> REMOVED (finally)).\n\n**Trade-Offs & Production:** Two common fixes still leak or bleed: **Calling `CTX.set(null)`**: Clears the value reference, but leaves the `Entry` slot allocated inside `ThreadLocalMap`. Safe thread-scoped context management is critical whenever request metadata crosses framework boundaries: **Multi-Tenant Auth & RBAC Filters**: Prevents tenant IDs or JWT claims from bleeding between requests.\n\n**Failure Modes & Application:** Safe thread-scoped context management is critical whenever request metadata crosses framework boundaries: **Multi-Tenant Auth & RBAC Filters**: Prevents tenant IDs or JWT claims from bleeding between requests."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why ThreadLocal values outlive HTTP requests in worker pools",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": "In a Spring Boot / Tomcat service with 200 long-lived worker threads, `ThreadLocalMap.Entry` holds a `WeakReference` to the `ThreadLocal` key, **but a strong reference to the value** (`RequestContext`, 256 KB). Because `private static final ThreadLocal<RequestContext> CTX` is never garbage-collected and pooled worker threads never terminate, every unremoved `RequestContext` stays pinned as a GC root.",
+      "purpose": "The mechanism: understand how Why ThreadLocal values outlive HTTP requests in worker pools works from first principles."
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "Heap exhaustion and cross-tenant data bleed on recycled threads",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "Forgetting `CTX.remove()` across 200 pooled threads causes two production failures:\n\n1. **Old-Gen Heap Exhaustion**: Over 48 hours, retained 256 KB payloads push Old Gen to 92%, spiking GC pauses to `1.8 s` before crashing with `OutOfMemoryError`.\n2. **Cross-Request Security Bleed**: If an auth filter throws early or an unauthenticated route skips `CTX.set()`, the recycled thread still holds User A's `RequestContext` when serving User B.",
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Recycled Worker Thread Leak",
+        "title": "Missing ThreadLocal.remove() Leaks Context Across Users",
+        "actors": [
+          {
+            "id": "ua",
+            "label": "User A Req"
+          },
+          {
+            "id": "pool",
+            "label": "Tomcat Thread-17"
+          },
+          {
+            "id": "map",
+            "label": "ThreadLocalMap"
+          },
+          {
+            "id": "ub",
+            "label": "User B Req"
+          }
+        ],
+        "events": [
+          {
+            "from": "ua",
+            "to": "pool",
+            "label": "CTX.set(UserA_256KB)",
+            "status": "ok"
+          },
+          {
+            "from": "pool",
+            "to": "map",
+            "label": "Strong ref stored in Entry",
+            "status": "warn"
+          },
+          {
+            "from": "pool",
+            "to": "ua",
+            "label": "Exception skips remove()",
+            "status": "fail"
+          },
+          {
+            "from": "ub",
+            "to": "pool",
+            "label": "Thread-17 recycled for User B",
+            "status": "warn"
+          },
+          {
+            "from": "map",
+            "to": "ub",
+            "label": "Reads stale UserA_256KB!",
+            "status": "fail"
+          }
+        ],
+        "summary": "Because pooled threads never die, an uncleaned ThreadLocalMap.Entry both leaks heap memory and bleeds User A's identity into User B's request."
+      },
+      "purpose": "The problem: see what breaks without Heap exhaustion and cross-tenant data bleed on recycled threads under real concurrency or scale."
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Why CTX.set(null) and InheritableThreadLocal fail in thread pools",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "Two common fixes still leak or bleed:\n\n- **Calling `CTX.set(null)`**: Clears the value reference, but leaves the `Entry` slot allocated inside `ThreadLocalMap`.\n- **Using `InheritableThreadLocal` with `ExecutorService`**: Values are copied only when a thread is *created*, not when a pooled worker picks up a `CompletableFuture`, causing async tasks to see stale or missing contexts.",
+      "purpose": "The problem: see what breaks without Why CTX.set under real concurrency or scale."
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise solution: Deterministic finally remove() & Java 21 ScopedValue",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": "Eliminate both memory leaks and cross-request bleed with three rules:\n\n- **Filter-Level `try/finally` `CTX.remove()`**: Wrap the outermost `OncePerRequestFilter` in `try { CTX.set(...); chain.doFilter(...); } finally { CTX.remove(); }` so exceptions never bypass cleanup.\n- **Explicit Async Context Decorator**: Wrap `CompletableFuture` / `@Async` tasks with a `TaskDecorator` that snapshots the caller's `RequestContext`, binds it on the worker thread, and calls `remove()` in `finally`.\n- **Java 21+ `ScopedValue`**: Prefer immutable `ScopedValue.where(CTX, val).run(...)`, which automatically unbinds on scope exit and propagates safely across `StructuredTaskScope`.",
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "Deterministic Lifecycle",
+        "title": "Scoped Binding & Guaranteed Cleanup on Pooled Threads",
+        "states": [
+          {
+            "id": "clean",
+            "label": "UNBOUND",
+            "sublabel": "Thread idle in pool",
+            "tone": "green"
+          },
+          {
+            "id": "bound",
+            "label": "BOUND (try)",
+            "sublabel": "RequestContext active",
+            "tone": "blue"
+          },
+          {
+            "id": "cleared",
+            "label": "REMOVED (finally)",
+            "sublabel": "CTX.remove() on exit",
+            "tone": "green"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "clean",
+            "to": "bound",
+            "label": "CTX.set(reqCtx)"
+          },
+          {
+            "from": "bound",
+            "to": "cleared",
+            "label": "return OR exception"
+          }
+        ],
+        "summary": "Binding in a top-level filter and calling CTX.remove() in finally guarantees zero retained entries between pooled requests."
+      },
+      "markdownContent": "```java\npublic class RequestContextFilter extends OncePerRequestFilter {\n    public static final ThreadLocal<RequestContext> CTX = new ThreadLocal<>();\n\n    @Override\n    protected void doFilterInternal(HttpServletRequest req, HttpServletResponse res, FilterChain chain)\n            throws ServletException, IOException {\n        try {\n            CTX.set(RequestContext.from(req));\n            chain.doFilter(req, res);\n        } finally {\n            CTX.remove(); // Mandatory: prevents heap leak and cross-user bleed\n        }\n    }\n}\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where context isolation matters in production backends",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": "Safe thread-scoped context management is critical whenever request metadata crosses framework boundaries:\n\n- **Multi-Tenant Auth & RBAC Filters**: Prevents tenant IDs or JWT claims from bleeding between requests.\n- **MDC Structured Logging & OpenTelemetry**: Ensures `trace_id` and `span_id` are cleared on thread return and propagated across async executors.\n- **Database Routing & Read-Your-Own-Writes**: Safely scopes sticky-primary hints to a single request.",
+      "supportingConcepts": [
+        {
+          "slug": "java-virtual-threads-structured-concurrency",
+          "title": "Concept: Virtual Threads & Structured Concurrency",
+          "kind": "concept"
+        },
+        {
+          "slug": "thread-pool-design",
+          "title": "Concept: Thread Pool Design",
+          "kind": "concept"
+        },
+        {
+          "slug": "garbage-collection-algorithms",
+          "title": "Concept: Garbage Collection Algorithms",
+          "kind": "concept"
+        },
+        {
+          "slug": "thread-pool-priority-inversion-bulkheads",
+          "title": "Problem: Thread Pool Priority Inversion & Bulkheads",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why does a `private static final ThreadLocal<RequestContext>` leak memory in a Tomcat worker pool even though `ThreadLocalMap.Entry` uses a `WeakReference`?",
+      "options": [
+        {
+          "id": "a",
+          "text": "Only the ThreadLocal key is weakly referenced; the RequestContext value is strongly referenced by the long-lived worker thread until remove() is called",
+          "correct": true,
+          "feedback": "Correct: because the static final key stays strongly reachable and the worker thread stays alive, the Entry value is never reclaimed."
+        },
+        {
+          "id": "b",
+          "text": "WeakReferences are never collected by G1GC in Java 21",
+          "correct": false,
+          "feedback": "G1GC collects WeakReferences normally, but the static final key is still strongly reachable."
+        },
+        {
+          "id": "c",
+          "text": "Tomcat disables garbage collection on HTTP worker threads",
+          "correct": false,
+          "feedback": "Tomcat threads are normal JVM threads; their ThreadLocalMaps stay alive because the threads are pooled."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why does a `private static final ThreadLocal<RequestContext>` leak memory in a Tomcat worker pool even though `ThreadLocalMap.Entry` uses a `WeakReference`?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Only the ThreadLocal key is weakly referenced; the RequestContext value is strongly referenced by the long-lived worker thread until remove() is called",
+            "correct": true,
+            "feedback": "Correct: because the static final key stays strongly reachable and the worker thread stays alive, the Entry value is never reclaimed."
+          },
+          {
+            "id": "b",
+            "text": "WeakReferences are never collected by G1GC in Java 21",
+            "correct": false,
+            "feedback": "G1GC collects WeakReferences normally, but the static final key is still strongly reachable."
+          },
+          {
+            "id": "c",
+            "text": "Tomcat disables garbage collection on HTTP worker threads",
+            "correct": false,
+            "feedback": "Tomcat threads are normal JVM threads; their ThreadLocalMaps stay alive because the threads are pooled."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why ThreadLocal values outlive HTTP requests in worker pools', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "b",
+            "text": "In a Spring Boot / Tomcat service with 200 long-lived worker threads, ThreadLocalMap.Entry holds a WeakReference to the ThreadLocal key, **but a strong reference to the…",
+            "correct": true,
+            "feedback": "Correct: In a Spring Boot / Tomcat service with 200 long-lived worker threads, ThreadLocalMap.Entry holds a WeakReference to the ThreadLocal key, **but a strong reference to the…"
+          },
+          {
+            "id": "c",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Heap exhaustion and cross-tenant data bleed on recycled threads', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Forgetting CTX.remove() across 200 pooled threads causes two production failures: 1.",
+            "correct": true,
+            "feedback": "Correct: Forgetting CTX.remove() across 200 pooled threads causes two production failures: 1."
+          },
+          {
+            "id": "b",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "c",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** In a Spring Boot / Tomcat service with 200 long-lived worker threads, `ThreadLocalMap.Entry` holds a `WeakReference` to the `ThreadLocal` key, **but a strong reference to the value** (`RequestContext`, 256 KB).\n\n**How It Flows:** Think of Preventing ThreadLocal Leaks in Worker Pools as a clear step-by-step chain: User A Req -> Tomcat Thread-17 -> ThreadLocalMap -> User B Req -> UNBOUND.\n\n**Why Beginners Should Care:** Always clear `ThreadLocal`s in a deterministic `finally` filter/interceptor, avoid storing large buffers or classloader-bound objects in `ThreadLocal`, and migrate to Java 21+ `ScopedValue` where possible.",
+      "spark": {
+        "summary": "In a Spring Boot / Tomcat service with 200 long-lived worker threads, `ThreadLocalMap.Entry` holds a `WeakReference` to the `ThreadLocal` key, **but a strong reference to the value** (`RequestContext`, 256 KB).",
+        "keyTakeaway": "Always clear `ThreadLocal`s in a deterministic `finally` filter/interceptor, avoid storing large buffers or classloader-bound objects in `ThreadLocal`, and migrate to Java 21+ `ScopedValue` where possible."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why ThreadLocal values outlive HTTP requests in worker pools",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why ThreadLocal values outlive HTTP requests in worker pools works from first principles.",
+          "explanation": "In a Spring Boot / Tomcat service with 200 long-lived worker threads, `ThreadLocalMap.Entry` holds a `WeakReference` to the `ThreadLocal` key, **but a strong reference to the value** (`RequestContext`, 256 KB). Because `private static final ThreadLocal<RequestContext> CTX` is never garbage-collected and pooled worker threads never terminate, every unremoved `RequestContext` stays pinned as a GC root.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Heap exhaustion and cross-tenant data bleed on recycled threads",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without Heap exhaustion and cross-tenant data bleed on recycled threads under real concurrency or scale.",
+          "explanation": "Forgetting `CTX.remove()` across 200 pooled threads causes two production failures: 1. **Old-Gen Heap Exhaustion**: Over 48 hours, retained 256 KB payloads push Old Gen to 92%, spiking GC pauses to `1.8 s` before crashing with `OutOfMemoryError`. 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Recycled Worker Thread Leak",
+            "title": "Missing ThreadLocal.remove() Leaks Context Across Users",
+            "actors": [
+              {
+                "id": "ua",
+                "label": "User A Req"
+              },
+              {
+                "id": "pool",
+                "label": "Tomcat Thread-17"
+              },
+              {
+                "id": "map",
+                "label": "ThreadLocalMap"
+              },
+              {
+                "id": "ub",
+                "label": "User B Req"
+              }
+            ],
+            "events": [
+              {
+                "from": "ua",
+                "to": "pool",
+                "label": "CTX.set(UserA_256KB)",
+                "status": "ok"
+              },
+              {
+                "from": "pool",
+                "to": "map",
+                "label": "Strong ref stored in Entry",
+                "status": "warn"
+              },
+              {
+                "from": "pool",
+                "to": "ua",
+                "label": "Exception skips remove()",
+                "status": "fail"
+              },
+              {
+                "from": "ub",
+                "to": "pool",
+                "label": "Thread-17 recycled for User B",
+                "status": "warn"
+              },
+              {
+                "from": "map",
+                "to": "ub",
+                "label": "Reads stale UserA_256KB!",
+                "status": "fail"
+              }
+            ],
+            "summary": "Because pooled threads never die, an uncleaned ThreadLocalMap.Entry both leaks heap memory and bleeds User A's identity into User B's request."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Why CTX.set(null) and InheritableThreadLocal fail in thread pools",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "The problem: see what breaks without Why CTX.set under real concurrency or scale.",
+          "explanation": "Two common fixes still leak or bleed: **Calling `CTX.set(null)`**: Clears the value reference, but leaves the `Entry` slot allocated inside `ThreadLocalMap`. **Using `InheritableThreadLocal` with `ExecutorService`**: Values are copied only when a thread is *created*, not when a pooled worker picks up a `CompletableFuture`, causing async tasks to see stale or missing contexts.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Deterministic finally remove() & Java 21 ScopedValue",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Eliminate both memory leaks and cross-request bleed with three rules: **Filter-Level `try/finally` `CTX.remove()`**: Wrap the outermost `OncePerRequestFilter` in `try { CTX.set(...); chain.doFilter(...); } finally { CTX.remove(); }` so exceptions never bypass cleanup.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "state-machine",
+            "eyebrow": "Deterministic Lifecycle",
+            "title": "Scoped Binding & Guaranteed Cleanup on Pooled Threads",
+            "states": [
+              {
+                "id": "clean",
+                "label": "UNBOUND",
+                "sublabel": "Thread idle in pool",
+                "tone": "green"
+              },
+              {
+                "id": "bound",
+                "label": "BOUND (try)",
+                "sublabel": "RequestContext active",
+                "tone": "blue"
+              },
+              {
+                "id": "cleared",
+                "label": "REMOVED (finally)",
+                "sublabel": "CTX.remove() on exit",
+                "tone": "green"
+              }
+            ],
+            "transitions": [
+              {
+                "from": "clean",
+                "to": "bound",
+                "label": "CTX.set(reqCtx)"
+              },
+              {
+                "from": "bound",
+                "to": "cleared",
+                "label": "return OR exception"
+              }
+            ],
+            "summary": "Binding in a top-level filter and calling CTX.remove() in finally guarantees zero retained entries between pooled requests."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Always clear `ThreadLocal`s in a deterministic `finally` filter/interceptor, avoid storing large buffers or classloader-bound objects in `ThreadLocal`, and migrate to Java 21+ `ScopedValue` where possible."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** In a Spring Boot / Tomcat service with 200 long-lived worker threads, `ThreadLocalMap.Entry` holds a `WeakReference` to the `ThreadLocal` key, **but a strong reference to the value** (`RequestContext`, 256 KB).\n\n**Visual & Structural Flow:** Depicts Missing ThreadLocal.remove() Leaks Context Across Users (User A Req -> Tomcat Thread-17 -> ThreadLocalMap -> User B Req); Scoped Binding & Guaranteed Cleanup on Pooled Threads (UNBOUND -> BOUND (try) -> REMOVED (finally)).\n\n**Trade-Offs & Production:** Two common fixes still leak or bleed: **Calling `CTX.set(null)`**: Clears the value reference, but leaves the `Entry` slot allocated inside `ThreadLocalMap`. Safe thread-scoped context management is critical whenever request metadata crosses framework boundaries: **Multi-Tenant Auth & RBAC Filters**: Prevents tenant IDs or JWT claims from bleeding between requests.\n\n**Failure Modes & Application:** Safe thread-scoped context management is critical whenever request metadata crosses framework boundaries: **Multi-Tenant Auth & RBAC Filters**: Prevents tenant IDs or JWT claims from bleeding between requests.",
+      "spark": {
+        "summary": "`ThreadLocal` keys are `WeakReference`s, but their values are strongly referenced inside `ThreadLocalMap.Entry` for as long as the pooled worker thread lives—leaking megabytes of request/tenant state and causing cross-request data corruption.",
+        "keyTakeaway": "Always clear `ThreadLocal`s in a deterministic `finally` filter/interceptor, avoid storing large buffers or classloader-bound objects in `ThreadLocal`, and migrate to Java 21+ `ScopedValue` where possible."
+      }
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** `ThreadLocal` keys are `WeakReference`s, but their values are strongly referenced inside `ThreadLocalMap.Entry` for as long as the pooled worker thread lives—leaking megabytes of request/tenant state and causing cross-request data corruption.\n\n**Production Trade-Offs:** Two common fixes still leak or bleed: **Calling `CTX.set(null)`**: Clears the value reference, but leaves the `Entry` slot allocated inside `ThreadLocalMap`.\n\n**Failure Modes & Edge Cases:** Safe thread-scoped context management is critical whenever request metadata crosses framework boundaries: **Multi-Tenant Auth & RBAC Filters**: Prevents tenant IDs or JWT claims from bleeding between requests.\n\n**Principal Takeaway:** Always clear `ThreadLocal`s in a deterministic `finally` filter/interceptor, avoid storing large buffers or classloader-bound objects in `ThreadLocal`, and migrate to Java 21+ `ScopedValue` where possible.",
+      "spark": {
+        "summary": "`ThreadLocal` keys are `WeakReference`s, but their values are strongly referenced inside `ThreadLocalMap.Entry` for as long as the pooled worker thread lives—leaking megabytes of request/tenant state and causing cross-request data corruption.",
+        "keyTakeaway": "Always clear `ThreadLocal`s in a deterministic `finally` filter/interceptor, avoid storing large buffers or classloader-bound objects in `ThreadLocal`, and migrate to Java 21+ `ScopedValue` where possible."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why ThreadLocal values outlive HTTP requests in worker pools",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why ThreadLocal values outlive HTTP requests in worker pools works from first principles.",
+          "explanation": "In a Spring Boot / Tomcat service with 200 long-lived worker threads, `ThreadLocalMap.Entry` holds a `WeakReference` to the `ThreadLocal` key, **but a strong reference to the value** (`RequestContext`, 256 KB). Because `private static final ThreadLocal<RequestContext> CTX` is never garbage-collected and pooled worker threads never terminate, every unremoved `RequestContext` stays pinned as a GC root.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Heap exhaustion and cross-tenant data bleed on recycled threads",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without Heap exhaustion and cross-tenant data bleed on recycled threads under real concurrency or scale.",
+          "explanation": "Forgetting `CTX.remove()` across 200 pooled threads causes two production failures:\n\n1. **Old-Gen Heap Exhaustion**: Over 48 hours, retained 256 KB payloads push Old Gen to 92%, spiking GC pauses to `1.8 s` before crashing with `OutOfMemoryError`.\n2. **Cross-Request Security Bleed**: If an auth filter throws early or an unauthenticated route skips `CTX.set()`, the recycled thread still holds User A's `RequestContext` when serving User B.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Recycled Worker Thread Leak",
+            "title": "Missing ThreadLocal.remove() Leaks Context Across Users",
+            "actors": [
+              {
+                "id": "ua",
+                "label": "User A Req"
+              },
+              {
+                "id": "pool",
+                "label": "Tomcat Thread-17"
+              },
+              {
+                "id": "map",
+                "label": "ThreadLocalMap"
+              },
+              {
+                "id": "ub",
+                "label": "User B Req"
+              }
+            ],
+            "events": [
+              {
+                "from": "ua",
+                "to": "pool",
+                "label": "CTX.set(UserA_256KB)",
+                "status": "ok"
+              },
+              {
+                "from": "pool",
+                "to": "map",
+                "label": "Strong ref stored in Entry",
+                "status": "warn"
+              },
+              {
+                "from": "pool",
+                "to": "ua",
+                "label": "Exception skips remove()",
+                "status": "fail"
+              },
+              {
+                "from": "ub",
+                "to": "pool",
+                "label": "Thread-17 recycled for User B",
+                "status": "warn"
+              },
+              {
+                "from": "map",
+                "to": "ub",
+                "label": "Reads stale UserA_256KB!",
+                "status": "fail"
+              }
+            ],
+            "summary": "Because pooled threads never die, an uncleaned ThreadLocalMap.Entry both leaks heap memory and bleeds User A's identity into User B's request."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Why CTX.set(null) and InheritableThreadLocal fail in thread pools",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "The problem: see what breaks without Why CTX.set under real concurrency or scale.",
+          "explanation": "Two common fixes still leak or bleed:\n\n- **Calling `CTX.set(null)`**: Clears the value reference, but leaves the `Entry` slot allocated inside `ThreadLocalMap`.\n- **Using `InheritableThreadLocal` with `ExecutorService`**: Values are copied only when a thread is *created*, not when a pooled worker picks up a `CompletableFuture`, causing async tasks to see stale or missing contexts.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Deterministic finally remove() & Java 21 ScopedValue",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Eliminate both memory leaks and cross-request bleed with three rules:\n\n- **Filter-Level `try/finally` `CTX.remove()`**: Wrap the outermost `OncePerRequestFilter` in `try { CTX.set(...); chain.doFilter(...); } finally { CTX.remove(); }` so exceptions never bypass cleanup.\n- **Explicit Async Context Decorator**: Wrap `CompletableFuture` / `@Async` tasks with a `TaskDecorator` that snapshots the caller's `RequestContext`, binds it on the worker thread, and calls `remove()` in `finally`.\n- **Java 21+ `ScopedValue`**: Prefer immutable `ScopedValue.where(CTX, val).run(...)`, which automatically unbinds on scope exit and propagates safely across `StructuredTaskScope`.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "state-machine",
+            "eyebrow": "Deterministic Lifecycle",
+            "title": "Scoped Binding & Guaranteed Cleanup on Pooled Threads",
+            "states": [
+              {
+                "id": "clean",
+                "label": "UNBOUND",
+                "sublabel": "Thread idle in pool",
+                "tone": "green"
+              },
+              {
+                "id": "bound",
+                "label": "BOUND (try)",
+                "sublabel": "RequestContext active",
+                "tone": "blue"
+              },
+              {
+                "id": "cleared",
+                "label": "REMOVED (finally)",
+                "sublabel": "CTX.remove() on exit",
+                "tone": "green"
+              }
+            ],
+            "transitions": [
+              {
+                "from": "clean",
+                "to": "bound",
+                "label": "CTX.set(reqCtx)"
+              },
+              {
+                "from": "bound",
+                "to": "cleared",
+                "label": "return OR exception"
+              }
+            ],
+            "summary": "Binding in a top-level filter and calling CTX.remove() in finally guarantees zero retained entries between pooled requests."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where context isolation matters in production backends",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Safe thread-scoped context management is critical whenever request metadata crosses framework boundaries:\n\n- **Multi-Tenant Auth & RBAC Filters**: Prevents tenant IDs or JWT claims from bleeding between requests.\n- **MDC Structured Logging & OpenTelemetry**: Ensures `trace_id` and `span_id` are cleared on thread return and propagated across async executors.\n- **Database Routing & Read-Your-Own-Writes**: Safely scopes sticky-primary hints to a single request.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Always clear `ThreadLocal`s in a deterministic `finally` filter/interceptor, avoid storing large buffers or classloader-bound objects in `ThreadLocal`, and migrate to Java 21+ `ScopedValue` where possible."
+    }
+  }
+}

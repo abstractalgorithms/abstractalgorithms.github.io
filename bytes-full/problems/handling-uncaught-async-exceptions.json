@@ -1,0 +1,594 @@
+{
+  "id": "problem-handling-uncaught-async-exceptions",
+  "slug": "handling-uncaught-async-exceptions",
+  "title": "Catching Silenced Exceptions in Async Executors",
+  "problemType": "system-design",
+  "difficulty": "medium",
+  "prompt": "A billing reconciliation service runs two async patterns: (1) `executor.submit(() -> processInvoice(id))` fire-and-forget tasks, and (2) `scheduler.scheduleAtFixedRate(this::syncExchangeRates, 0, 1, TimeUnit.MINUTES)`. Last week, `syncExchangeRates()` threw a `NullPointerException` on a malformed partner field. Not only was zero error logged to stderr or Sentry, but `ScheduledExecutorService` silently cancelled all future executions of `syncExchangeRates()`, leaving exchange rates stale for 36 hours. Similarly, `submit()` tasks are dropping failed invoices silently because callers discard the returned `Future`. Design a fail-loud exception-handling framework across all async executors.",
+  "spark": {
+    "summary": "Exceptions thrown inside `executor.submit()`, `ScheduledExecutorService.scheduleAtFixedRate()`, and unawaited `CompletableFuture`s are captured silently inside `FutureTask`—halting periodic jobs permanently and hiding production failures with zero logs.",
+    "keyTakeaway": "Attach a global `UncaughtExceptionHandler`, override `ThreadPoolExecutor.afterExecute()` to unwrap `Future` failures, wrap periodic `ScheduledExecutorService` tasks in `try/catch (Throwable)`, and observe every `CompletableFuture`.",
+    "byteSummary": "**Core Mechanics:** In a billing reconciliation service using `executor.submit(() -> processInvoice(id))` and `scheduler.scheduleAtFixedRate(this::syncExchangeRates, 0, 1, TimeUnit.MINUTES)`, an unhandled `NullPointerException` inside.\n\n**Visual & Structural Flow:** Depicts Silent FutureTask Trap vs. afterExecute() Unwrapping (Caller -> Executor Pool -> FutureTask -> Alert / Gauge); Task Completion & Error Escalation Paths (TASK RUN -> AFTER_EXECUTE -> ALERT & GAUGE).\n\n**Trade-Offs & Production:** Setting only `Thread.setUncaughtExceptionHandler` fails for `executor.submit()` and `scheduleAtFixedRate()` because `FutureTask.run()` catches all `Throwable`s internally and. Enforce fail-loud observability centrally at the pool and scheduler boundary: **Override `afterExecute(Runnable r, Throwable t)`**: When `t == null && r instanceof Future<?> f &&.\n\n**Failure Modes & Application:** Centralized async exception observation is essential across concurrent backend systems: **Scheduled Reconciliation & Billing Jobs**: Dead-man's-switch gauges alert if `syncExchangeRates` stops succeeding, even if a scheduler fails silently."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why Silenced Async Exceptions Matter",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": "In a billing reconciliation service using `executor.submit(() -> processInvoice(id))` and `scheduler.scheduleAtFixedRate(this::syncExchangeRates, 0, 1, TimeUnit.MINUTES)`, an unhandled `NullPointerException` inside `syncExchangeRates()` produced **zero logs** in stderr/Sentry and silently cancelled all future periodic runs—leaving exchange rates stale for **36 hours**.\n\n**Constraints:**\n- Cannot rely on every developer calling `.get()` or `.exceptionally()` at every call site.\n- Must handle both `Runnable` (`execute`) and `FutureTask` (`submit`) in `ThreadPoolExecutor`.\n- Must never swallow `InterruptedException` or `VirtualMachineError` (`OutOfMemoryError`).",
+      "purpose": "The mechanism: understand how Why Silenced Async Exceptions Matter works from first principles."
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "Real-World Impact of Swallowed Executor Failures",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "Silent async failures create invisible data corruption:\n\n1. **Permanent Scheduler Cancellation**: `ScheduledExecutorService` catches `Throwable` inside `ScheduledFutureTask` and suppresses all subsequent periodic ticks.\n2. **Dropped Fire-and-Forget Work**: `executor.submit()` wraps exceptions inside a `FutureTask`; if callers discard the `Future`, `Thread.UncaughtExceptionHandler` is never invoked.\n3. **Broken Observability**: Metrics and alerts never fire, so stale state persists for days until business reconciliation fails.",
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Async Exception Capture",
+        "title": "Silent FutureTask Trap vs. afterExecute() Unwrapping",
+        "actors": [
+          {
+            "id": "caller",
+            "label": "Caller"
+          },
+          {
+            "id": "pool",
+            "label": "Executor Pool"
+          },
+          {
+            "id": "task",
+            "label": "FutureTask"
+          },
+          {
+            "id": "obs",
+            "label": "Alert / Gauge"
+          }
+        ],
+        "events": [
+          {
+            "from": "caller",
+            "to": "pool",
+            "label": "submit(processInvoice) (Future ignored)",
+            "status": "warn"
+          },
+          {
+            "from": "pool",
+            "to": "task",
+            "label": "NPE thrown -> stored in FutureTask",
+            "status": "fail"
+          },
+          {
+            "from": "task",
+            "to": "obs",
+            "label": "Naive: 0 logs, scheduler stops!",
+            "status": "fail"
+          },
+          {
+            "from": "pool",
+            "to": "task",
+            "label": "Override afterExecute(): future.get()",
+            "status": "ok"
+          },
+          {
+            "from": "pool",
+            "to": "obs",
+            "label": "Emit stack trace + metric + rethrow Error",
+            "status": "ok"
+          }
+        ],
+        "summary": "Overriding ThreadPoolExecutor.afterExecute() unwraps trapped FutureTask exceptions even when callers ignore the returned Future."
+      },
+      "purpose": "The problem: see what breaks without Real-World Impact of Swallowed Executor Failures under real concurrency or scale."
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Naive Solution (and Why It Breaks)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "Setting only `Thread.setUncaughtExceptionHandler` fails for `executor.submit()` and `scheduleAtFixedRate()` because `FutureTask.run()` catches all `Throwable`s internally and stores them in `outcome` without letting them escape to the thread's uncaught handler. Conversely, catching `Throwable` without rethrowing `Error`s (like `OutOfMemoryError`) or restoring `Thread.currentThread().interrupt()` on `InterruptedException` masks fatal JVM states.",
+      "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale."
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise Solution: ObservingThreadPoolExecutor & Safe Periodic Wrappers",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": "Enforce fail-loud observability centrally at the pool and scheduler boundary:\n\n- **Override `afterExecute(Runnable r, Throwable t)`**: When `t == null && r instanceof Future<?> f && f.isDone()`, call `f.get()` inside `try/catch` to unwrap `ExecutionException.getCause()` (ignoring `CancellationException` and restoring interrupt status on `InterruptedException`).\n- **Guard Periodic Tasks**: Wrap `ScheduledExecutorService` runnables in `try/catch (RuntimeException)` so transient partner errors log + increment `async_task_exceptions_total` without cancelling future ticks, while updating a dead-man's-switch `lastSuccessGauge` only on clean completion.\n- **CompletableFuture Observation**: Provide a central `observe(op, cf)` helper using `whenComplete`.",
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "Executor Exception Lifecycle",
+        "title": "Task Completion & Error Escalation Paths",
+        "states": [
+          {
+            "id": "run",
+            "label": "TASK RUN",
+            "sublabel": "execute / submit / tick",
+            "tone": "blue"
+          },
+          {
+            "id": "after",
+            "label": "AFTER_EXECUTE",
+            "sublabel": "unwrap Future.get()",
+            "tone": "amber"
+          },
+          {
+            "id": "report",
+            "label": "ALERT & GAUGE",
+            "sublabel": "log + metric + rethrow Error",
+            "tone": "red"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "run",
+            "to": "after",
+            "label": "completes or throws"
+          },
+          {
+            "from": "after",
+            "to": "report",
+            "label": "ExecutionException / t != null"
+          }
+        ],
+        "summary": "Centralized afterExecute() inspection guarantees zero silent failures across both execute() and submit()."
+      },
+      "markdownContent": "```java\nimport java.util.concurrent.*;\n\npublic class ObservingThreadPoolExecutor extends ThreadPoolExecutor {\n    private final String poolName;\n\n    public ObservingThreadPoolExecutor(String poolName, int core, int max, BlockingQueue<Runnable> q) {\n        super(core, max, 60L, TimeUnit.SECONDS, q, r -> {\n            Thread t = new Thread(r, poolName + \"-worker\");\n            t.setUncaughtExceptionHandler((th, ex) -> report(poolName, ex));\n            return t;\n        });\n        this.poolName = poolName;\n    }\n\n    @Override\n    protected void afterExecute(Runnable r, Throwable t) {\n        super.afterExecute(r, t);\n        if (t == null && r instanceof Future<?> future && future.isDone() && !future.isCancelled()) {\n            try {\n                future.get();\n            } catch (CancellationException ignored) {\n                // Normal cancellation\n            } catch (ExecutionException ee) {\n                t = ee.getCause();\n            } catch (InterruptedException ie) {\n                Thread.currentThread().interrupt();\n            }\n        }\n        if (t != null) {\n            report(poolName, t);\n        }\n    }\n\n    public static Runnable safePeriodic(String jobName, Runnable task) {\n        return () -> {\n            try {\n                task.run();\n            } catch (Exception ex) {\n                report(jobName, ex); // Keep scheduler alive for next tick\n            }\n        };\n    }\n\n    private static void report(String source, Throwable t) {\n        // Log with traceId + increment async_task_exceptions_total{pool=source}\n        System.err.println(\"[ASYNC_ERROR] source=\" + source + \" msg=\" + t);\n        t.printStackTrace(System.err);\n    }\n}\n\n// Helper for CompletableFuture that guarantees observation without forcing boilerplate\npublic static <T> CompletableFuture<T> observe(String op, CompletableFuture<T> cf) {\n    return cf.whenComplete((res, ex) -> {\n        if (ex != null) report(op, ex);\n    });\n}\n\n// Dead-man's-switch staleness gauge updated only on clean completion\ntask.run();\nlastSuccessGauge.set(Instant.now().getEpochSecond());\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where Fail-Loud Async Execution Applies in System Design",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": "Centralized async exception observation is essential across concurrent backend systems:\n\n- **Scheduled Reconciliation & Billing Jobs**: Dead-man's-switch gauges alert if `syncExchangeRates` stops succeeding, even if a scheduler fails silently.\n- **Event-Driven Worker Pools & Python `asyncio`**: Attaching `add_done_callback` to `concurrent.futures.Future` or `asyncio.Task` prevents silent background drops.\n- **Observability & Golden Signals**: Propagating MDC `traceId` into worker threads ties background failures directly to ingress requests.",
+      "supportingConcepts": [
+        {
+          "slug": "error-handling-result-types",
+          "title": "Concept: Error Handling & Result Types",
+          "kind": "concept"
+        },
+        {
+          "slug": "thread-pool-design",
+          "title": "Concept: Thread Pool Design",
+          "kind": "concept"
+        },
+        {
+          "slug": "observability-golden-signals",
+          "title": "Concept: Observability Golden Signals",
+          "kind": "concept"
+        },
+        {
+          "slug": "design-ai-agent-task-orchestrator-lld",
+          "title": "System Design: AI Agent Task Orchestrator",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why does `Thread.UncaughtExceptionHandler` fail to catch exceptions thrown inside `executor.submit(runnable)`?",
+      "options": [
+        {
+          "id": "a",
+          "text": "`FutureTask.run()` catches all `Throwable`s and stores them inside the `Future` outcome rather than letting them escape to the worker thread",
+          "correct": true,
+          "feedback": "Correct: you must call `Future.get()` in `afterExecute()` or attach a completion callback to observe the exception."
+        },
+        {
+          "id": "b",
+          "text": "Worker threads in a `ThreadPoolExecutor` ignore `UncaughtExceptionHandler` by JVM specification",
+          "correct": false,
+          "feedback": "`execute()` does invoke `UncaughtExceptionHandler` if an uncaught exception escapes `run()`."
+        },
+        {
+          "id": "c",
+          "text": "`submit()` converts all checked and unchecked exceptions into `InterruptedException`",
+          "correct": false,
+          "feedback": "`submit()` wraps the original exception in `ExecutionException`."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why does `Thread.UncaughtExceptionHandler` fail to catch exceptions thrown inside `executor.submit(runnable)`?",
+        "options": [
+          {
+            "id": "a",
+            "text": "`FutureTask.run()` catches all `Throwable`s and stores them inside the `Future` outcome rather than letting them escape to the worker thread",
+            "correct": true,
+            "feedback": "Correct: you must call `Future.get()` in `afterExecute()` or attach a completion callback to observe the exception."
+          },
+          {
+            "id": "b",
+            "text": "Worker threads in a `ThreadPoolExecutor` ignore `UncaughtExceptionHandler` by JVM specification",
+            "correct": false,
+            "feedback": "`execute()` does invoke `UncaughtExceptionHandler` if an uncaught exception escapes `run()`."
+          },
+          {
+            "id": "c",
+            "text": "`submit()` converts all checked and unchecked exceptions into `InterruptedException`",
+            "correct": false,
+            "feedback": "`submit()` wraps the original exception in `ExecutionException`."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why Silenced Async Exceptions Matter', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "b",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "c",
+            "text": "In a billing reconciliation service using executor.submit(() -> processInvoice(id)) and scheduler.scheduleAtFixedRate(this::syncExchangeRates, 0, 1, TimeUnit.MINUTES), an…",
+            "correct": true,
+            "feedback": "Correct: In a billing reconciliation service using executor.submit(() -> processInvoice(id)) and scheduler.scheduleAtFixedRate(this::syncExchangeRates, 0, 1, TimeUnit.MINUTES), an…"
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Real-World Impact of Swallowed Executor Failures', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "b",
+            "text": "Silent async failures create invisible data corruption: 1.",
+            "correct": true,
+            "feedback": "Correct: Silent async failures create invisible data corruption: 1."
+          },
+          {
+            "id": "c",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** In a billing reconciliation service using `executor.submit(() -> processInvoice(id))` and `scheduler.scheduleAtFixedRate(this::syncExchangeRates, 0, 1, TimeUnit.MINUTES)`, an unhandled `NullPointerException` inside.\n\n**How It Flows:** Think of Catching Silenced Exceptions in Async Executors as a clear step-by-step chain: Caller -> Executor Pool -> FutureTask -> Alert / Gauge -> TASK RUN.\n\n**Why Beginners Should Care:** Attach a global `UncaughtExceptionHandler`, override `ThreadPoolExecutor.afterExecute()` to unwrap `Future` failures, wrap periodic `ScheduledExecutorService` tasks in `try/catch.",
+      "spark": {
+        "summary": "In a billing reconciliation service using `executor.submit(() -> processInvoice(id))` and `scheduler.scheduleAtFixedRate(this::syncExchangeRates, 0, 1, TimeUnit.MINUTES)`, an unhandled `NullPointerException` inside.",
+        "keyTakeaway": "Attach a global `UncaughtExceptionHandler`, override `ThreadPoolExecutor.afterExecute()` to unwrap `Future` failures, wrap periodic `ScheduledExecutorService` tasks in `try/catch."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why Silenced Async Exceptions Matter",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why Silenced Async Exceptions Matter works from first principles.",
+          "explanation": "In a billing reconciliation service using `executor.submit(() -> processInvoice(id))` and `scheduler.scheduleAtFixedRate(this::syncExchangeRates, 0, 1, TimeUnit.MINUTES)`, an unhandled `NullPointerException` inside `syncExchangeRates()` produced **zero logs** in stderr/Sentry and silently cancelled all future periodic runs—leaving exchange rates stale for **36 hours**.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Real-World Impact of Swallowed Executor Failures",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without Real-World Impact of Swallowed Executor Failures under real concurrency or scale.",
+          "explanation": "Silent async failures create invisible data corruption: 1. **Permanent Scheduler Cancellation**: `ScheduledExecutorService` catches `Throwable` inside `ScheduledFutureTask` and suppresses all subsequent periodic ticks. 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Async Exception Capture",
+            "title": "Silent FutureTask Trap vs. afterExecute() Unwrapping",
+            "actors": [
+              {
+                "id": "caller",
+                "label": "Caller"
+              },
+              {
+                "id": "pool",
+                "label": "Executor Pool"
+              },
+              {
+                "id": "task",
+                "label": "FutureTask"
+              },
+              {
+                "id": "obs",
+                "label": "Alert / Gauge"
+              }
+            ],
+            "events": [
+              {
+                "from": "caller",
+                "to": "pool",
+                "label": "submit(processInvoice) (Future ignored)",
+                "status": "warn"
+              },
+              {
+                "from": "pool",
+                "to": "task",
+                "label": "NPE thrown -> stored in FutureTask",
+                "status": "fail"
+              },
+              {
+                "from": "task",
+                "to": "obs",
+                "label": "Naive: 0 logs, scheduler stops!",
+                "status": "fail"
+              },
+              {
+                "from": "pool",
+                "to": "task",
+                "label": "Override afterExecute(): future.get()",
+                "status": "ok"
+              },
+              {
+                "from": "pool",
+                "to": "obs",
+                "label": "Emit stack trace + metric + rethrow Error",
+                "status": "ok"
+              }
+            ],
+            "summary": "Overriding ThreadPoolExecutor.afterExecute() unwraps trapped FutureTask exceptions even when callers ignore the returned Future."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive Solution (and Why It Breaks)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+          "explanation": "Setting only `Thread.setUncaughtExceptionHandler` fails for `executor.submit()` and `scheduleAtFixedRate()` because `FutureTask.run()` catches all `Throwable`s internally and stores them in `outcome` without letting them escape to the thread's uncaught handler.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise Solution: ObservingThreadPoolExecutor & Safe Periodic Wrappers",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Enforce fail-loud observability centrally at the pool and scheduler boundary: **Override `afterExecute(Runnable r, Throwable t)`**: When `t == null && r instanceof Future<?> f && f.isDone()`, call `f.get()` inside `try/catch` to unwrap `ExecutionException.getCause()` (ignoring `CancellationException` and restoring interrupt status on `InterruptedException`).",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "state-machine",
+            "eyebrow": "Executor Exception Lifecycle",
+            "title": "Task Completion & Error Escalation Paths",
+            "states": [
+              {
+                "id": "run",
+                "label": "TASK RUN",
+                "sublabel": "execute / submit / tick",
+                "tone": "blue"
+              },
+              {
+                "id": "after",
+                "label": "AFTER_EXECUTE",
+                "sublabel": "unwrap Future.get()",
+                "tone": "amber"
+              },
+              {
+                "id": "report",
+                "label": "ALERT & GAUGE",
+                "sublabel": "log + metric + rethrow Error",
+                "tone": "red"
+              }
+            ],
+            "transitions": [
+              {
+                "from": "run",
+                "to": "after",
+                "label": "completes or throws"
+              },
+              {
+                "from": "after",
+                "to": "report",
+                "label": "ExecutionException / t != null"
+              }
+            ],
+            "summary": "Centralized afterExecute() inspection guarantees zero silent failures across both execute() and submit()."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Attach a global `UncaughtExceptionHandler`, override `ThreadPoolExecutor.afterExecute()` to unwrap `Future` failures, wrap periodic `ScheduledExecutorService` tasks in `try/catch."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** In a billing reconciliation service using `executor.submit(() -> processInvoice(id))` and `scheduler.scheduleAtFixedRate(this::syncExchangeRates, 0, 1, TimeUnit.MINUTES)`, an unhandled `NullPointerException` inside.\n\n**Visual & Structural Flow:** Depicts Silent FutureTask Trap vs. afterExecute() Unwrapping (Caller -> Executor Pool -> FutureTask -> Alert / Gauge); Task Completion & Error Escalation Paths (TASK RUN -> AFTER_EXECUTE -> ALERT & GAUGE).\n\n**Trade-Offs & Production:** Setting only `Thread.setUncaughtExceptionHandler` fails for `executor.submit()` and `scheduleAtFixedRate()` because `FutureTask.run()` catches all `Throwable`s internally and. Enforce fail-loud observability centrally at the pool and scheduler boundary: **Override `afterExecute(Runnable r, Throwable t)`**: When `t == null && r instanceof Future<?> f &&.\n\n**Failure Modes & Application:** Centralized async exception observation is essential across concurrent backend systems: **Scheduled Reconciliation & Billing Jobs**: Dead-man's-switch gauges alert if `syncExchangeRates` stops succeeding, even if a scheduler fails silently.",
+      "spark": {
+        "summary": "Exceptions thrown inside `executor.submit()`, `ScheduledExecutorService.scheduleAtFixedRate()`, and unawaited `CompletableFuture`s are captured silently inside `FutureTask`—halting periodic jobs permanently and hiding production failures with zero logs.",
+        "keyTakeaway": "Attach a global `UncaughtExceptionHandler`, override `ThreadPoolExecutor.afterExecute()` to unwrap `Future` failures, wrap periodic `ScheduledExecutorService` tasks in `try/catch (Throwable)`, and observe every `CompletableFuture`."
+      }
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** Exceptions thrown inside `executor.submit()`, `ScheduledExecutorService.scheduleAtFixedRate()`, and unawaited `CompletableFuture`s are captured silently inside `FutureTask`—halting periodic jobs permanently and hiding production failures with zero logs.\n\n**Production Trade-Offs:** Setting only `Thread.setUncaughtExceptionHandler` fails for `executor.submit()` and `scheduleAtFixedRate()` because `FutureTask.run()` catches all `Throwable`s internally and stores them in `outcome` without letting.\n\n**Failure Modes & Edge Cases:** Centralized async exception observation is essential across concurrent backend systems: **Scheduled Reconciliation & Billing Jobs**: Dead-man's-switch gauges alert if `syncExchangeRates` stops succeeding, even if a scheduler fails silently.\n\n**Principal Takeaway:** Attach a global `UncaughtExceptionHandler`, override `ThreadPoolExecutor.afterExecute()` to unwrap `Future` failures, wrap periodic `ScheduledExecutorService` tasks in `try/catch (Throwable)`, and observe every `CompletableFuture`.",
+      "spark": {
+        "summary": "Exceptions thrown inside `executor.submit()`, `ScheduledExecutorService.scheduleAtFixedRate()`, and unawaited `CompletableFuture`s are captured silently inside `FutureTask`—halting periodic jobs permanently and hiding production failures with zero logs.",
+        "keyTakeaway": "Attach a global `UncaughtExceptionHandler`, override `ThreadPoolExecutor.afterExecute()` to unwrap `Future` failures, wrap periodic `ScheduledExecutorService` tasks in `try/catch (Throwable)`, and observe every `CompletableFuture`."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why Silenced Async Exceptions Matter",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why Silenced Async Exceptions Matter works from first principles.",
+          "explanation": "In a billing reconciliation service using `executor.submit(() -> processInvoice(id))` and `scheduler.scheduleAtFixedRate(this::syncExchangeRates, 0, 1, TimeUnit.MINUTES)`, an unhandled `NullPointerException` inside `syncExchangeRates()` produced **zero logs** in stderr/Sentry and silently cancelled all future periodic runs—leaving exchange rates stale for **36 hours**.\n\n**Constraints:**\n- Cannot rely on every developer calling `.get()` or `.exceptionally()` at every call site.\n- Must handle both `Runnable` (`execute`) and `FutureTask` (`submit`) in `ThreadPoolExecutor`.\n- Must never swallow `InterruptedException` or `VirtualMachineError` (`OutOfMemoryError`).",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Real-World Impact of Swallowed Executor Failures",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without Real-World Impact of Swallowed Executor Failures under real concurrency or scale.",
+          "explanation": "Silent async failures create invisible data corruption:\n\n1. **Permanent Scheduler Cancellation**: `ScheduledExecutorService` catches `Throwable` inside `ScheduledFutureTask` and suppresses all subsequent periodic ticks.\n2. **Dropped Fire-and-Forget Work**: `executor.submit()` wraps exceptions inside a `FutureTask`; if callers discard the `Future`, `Thread.UncaughtExceptionHandler` is never invoked.\n3. **Broken Observability**: Metrics and alerts never fire, so stale state persists for days until business reconciliation fails.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Async Exception Capture",
+            "title": "Silent FutureTask Trap vs. afterExecute() Unwrapping",
+            "actors": [
+              {
+                "id": "caller",
+                "label": "Caller"
+              },
+              {
+                "id": "pool",
+                "label": "Executor Pool"
+              },
+              {
+                "id": "task",
+                "label": "FutureTask"
+              },
+              {
+                "id": "obs",
+                "label": "Alert / Gauge"
+              }
+            ],
+            "events": [
+              {
+                "from": "caller",
+                "to": "pool",
+                "label": "submit(processInvoice) (Future ignored)",
+                "status": "warn"
+              },
+              {
+                "from": "pool",
+                "to": "task",
+                "label": "NPE thrown -> stored in FutureTask",
+                "status": "fail"
+              },
+              {
+                "from": "task",
+                "to": "obs",
+                "label": "Naive: 0 logs, scheduler stops!",
+                "status": "fail"
+              },
+              {
+                "from": "pool",
+                "to": "task",
+                "label": "Override afterExecute(): future.get()",
+                "status": "ok"
+              },
+              {
+                "from": "pool",
+                "to": "obs",
+                "label": "Emit stack trace + metric + rethrow Error",
+                "status": "ok"
+              }
+            ],
+            "summary": "Overriding ThreadPoolExecutor.afterExecute() unwraps trapped FutureTask exceptions even when callers ignore the returned Future."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive Solution (and Why It Breaks)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+          "explanation": "Setting only `Thread.setUncaughtExceptionHandler` fails for `executor.submit()` and `scheduleAtFixedRate()` because `FutureTask.run()` catches all `Throwable`s internally and stores them in `outcome` without letting them escape to the thread's uncaught handler. Conversely, catching `Throwable` without rethrowing `Error`s (like `OutOfMemoryError`) or restoring `Thread.currentThread().interrupt()` on `InterruptedException` masks fatal JVM states.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise Solution: ObservingThreadPoolExecutor & Safe Periodic Wrappers",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Enforce fail-loud observability centrally at the pool and scheduler boundary:\n\n- **Override `afterExecute(Runnable r, Throwable t)`**: When `t == null && r instanceof Future<?> f && f.isDone()`, call `f.get()` inside `try/catch` to unwrap `ExecutionException.getCause()` (ignoring `CancellationException` and restoring interrupt status on `InterruptedException`).\n- **Guard Periodic Tasks**: Wrap `ScheduledExecutorService` runnables in `try/catch (RuntimeException)` so transient partner errors log + increment `async_task_exceptions_total` without cancelling future ticks, while updating a dead-man's-switch `lastSuccessGauge` only on clean completion.\n- **CompletableFuture Observation**: Provide a central `observe(op, cf)` helper using `whenComplete`.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "state-machine",
+            "eyebrow": "Executor Exception Lifecycle",
+            "title": "Task Completion & Error Escalation Paths",
+            "states": [
+              {
+                "id": "run",
+                "label": "TASK RUN",
+                "sublabel": "execute / submit / tick",
+                "tone": "blue"
+              },
+              {
+                "id": "after",
+                "label": "AFTER_EXECUTE",
+                "sublabel": "unwrap Future.get()",
+                "tone": "amber"
+              },
+              {
+                "id": "report",
+                "label": "ALERT & GAUGE",
+                "sublabel": "log + metric + rethrow Error",
+                "tone": "red"
+              }
+            ],
+            "transitions": [
+              {
+                "from": "run",
+                "to": "after",
+                "label": "completes or throws"
+              },
+              {
+                "from": "after",
+                "to": "report",
+                "label": "ExecutionException / t != null"
+              }
+            ],
+            "summary": "Centralized afterExecute() inspection guarantees zero silent failures across both execute() and submit()."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where Fail-Loud Async Execution Applies in System Design",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Centralized async exception observation is essential across concurrent backend systems:\n\n- **Scheduled Reconciliation & Billing Jobs**: Dead-man's-switch gauges alert if `syncExchangeRates` stops succeeding, even if a scheduler fails silently.\n- **Event-Driven Worker Pools & Python `asyncio`**: Attaching `add_done_callback` to `concurrent.futures.Future` or `asyncio.Task` prevents silent background drops.\n- **Observability & Golden Signals**: Propagating MDC `traceId` into worker threads ties background failures directly to ingress requests.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Attach a global `UncaughtExceptionHandler`, override `ThreadPoolExecutor.afterExecute()` to unwrap `Future` failures, wrap periodic `ScheduledExecutorService` tasks in `try/catch (Throwable)`, and observe every `CompletableFuture`."
+    }
+  }
+}

@@ -1,0 +1,562 @@
+{
+  "id": "concept-adaptive-concurrency-limiting",
+  "slug": "adaptive-concurrency-limiting",
+  "name": "Adaptive Concurrency Limiting (Little's Law & Gradient2)",
+  "domain": "Distributed Systems & Reliability",
+  "tagline": "Dynamically size in-flight request limits from RTT_min / RTT_sample gradients so services shed excess load before queues collapse.",
+  "purpose": "Master how TCP Vegas and Netflix Gradient2 adaptive concurrency limiters use Little's Law to protect backends from latency cascades without brittle static RPS thresholds.",
+  "spark": {
+    "summary": "Adaptive concurrency limiting continuously measures baseline latency (RTT_min) against observed latency (RTT_sample) to adjust the maximum allowed in-flight requests dynamically, shedding excess traffic with fast HTTP 503/429 before queues saturate.",
+    "keyTakeaway": "Static RPS limits fail when request cost or downstream capacity shifts; concurrency (L = lambda * W) is the true bottleneck, so dynamically bounding in-flight requests via RTT gradients prevents queueing collapse.",
+    "byteSummary": "**Core Mechanics:** By Little's Law (`L = lambda * W`), a service's in-flight concurrency (`L`) grows linearly with arrival rate (`lambda`) and latency (`W`). When downstream slows down, static RPS limits still admit too much work, filling queues until `504` timeouts cascade. Adaptive limiters (Vegas / Gradient2) dynamically shrink or grow `max_inflight`.\n\n**Visual & Structural Flow:** Contrasts a Static Limit (requests pile into a clogged queue, `RTT` spikes, `504 Cascade`) against an Adaptive Limiter (`Baseline RTT_min` + `Sample RTT` -> `Gradient = RTT_min / RTT_sample` -> dynamic `In-Flight Window` -> `Backend Pool` or `Fast 503 Shed`).\n\n**Trade-Offs & Production:** Unlike fixed thread pools or global token buckets, adaptive concurrency requires zero manual capacity tuning across hardware changes, though `RTT_min` must be periodically decayed/re-sampled so baseline drift does not lock the limiter too low.\n\n**Failure Modes & Application:** Pair adaptive concurrency with priority-aware load shedding and `Retry-After` jitter so critical health checks and idempotent retries are not starved during brownouts."
+  },
+  "learningJourney": [
+    {
+      "id": "01-what-it-is",
+      "eyebrow": "STAGE 01 · THE MECHANISM",
+      "title": "What is Adaptive Concurrency Limiting",
+      "level": "L4 · FUNDAMENTALS",
+      "purpose": "The mechanism: understand why bounding in-flight concurrency using RTT gradients beats static RPS limits.",
+      "explanation": "Static rate limits cap requests per second (RPS), assuming every request costs the same CPU and downstream latency never changes. In reality, when a database slows from `5 ms` to `100 ms`, the same `1,000 RPS` jumps from `5` concurrent requests to `100` concurrent requests (`L = lambda * W`, **Little's Law**), exhausting thread pools and connection pools.\n\nAn **adaptive concurrency limiter** measures **RTT_min** (the lowest observed round-trip time under healthy unloaded operation) and compares it to **RTT_sample** (current p50/p90 latency). Using `gradient = RTT_min / RTT_sample`, it shrinks `max_inflight` when queueing begins (`gradient < 1`) and probes upward slowly when latency stays near baseline.",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Feedback Control Loop",
+        "title": "Gradient2 Adaptive Concurrency Control Loop",
+        "nodes": [
+          {
+            "label": "Incoming Request",
+            "role": "Check inflight < limit"
+          },
+          {
+            "label": "In-Flight Gate",
+            "role": "Fast 503 if full"
+          },
+          {
+            "label": "Backend Pool",
+            "role": "Measure RTT_sample"
+          },
+          {
+            "label": "Gradient Updater",
+            "role": "RTT_min / RTT_sample"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Little's Law Bound",
+            "detail": "Caps active in-flight work L rather than arrival rate lambda."
+          },
+          {
+            "label": "Queue Detection",
+            "detail": "Rising RTT_sample drops gradient below 1.0, shrinking max_inflight."
+          },
+          {
+            "label": "Fast Fail",
+            "detail": "Excess requests fail in <1ms with 503 instead of waiting 30s to time out."
+          }
+        ],
+        "summary": "Caption: Adaptive limiters treat rising RTT as early queue formation and shrink max_inflight before timeouts cascade."
+      }
+    },
+    {
+      "id": "02-why-we-need-it",
+      "eyebrow": "STAGE 02 · THE PROBLEM",
+      "title": "Why Static Limits Fail Under Downstream Slowdowns",
+      "level": "L4 · FUNDAMENTALS",
+      "purpose": "The problem: trace how a modest downstream slowdown turns a fixed-RPS service into a 504 timeout storm.",
+      "explanation": "Suppose a service handles `2,000 RPS` at `10 ms` (`20` concurrent requests) and is protected by a static `2,500 RPS` limit. If a downstream cache miss or GC pause raises latency to `250 ms`, `2,000 RPS * 0.25s = 500` concurrent requests—exceeding a 100-thread pool, filling the socket accept queue, and triggering client retries that multiply load (`metastable failure`).",
+      "ideas": [
+        {
+          "title": "Queueing Delay Signal",
+          "description": "Latency rises before CPU hits 100% or errors spike, making RTT_sample an early leading indicator."
+        },
+        {
+          "title": "Metastable Retry Amplification",
+          "description": "Slow timeouts cause clients to retry, turning a transient 2-second hiccup into a 20-minute outage."
+        }
+      ]
+    },
+    {
+      "id": "03-where-it-is-used",
+      "eyebrow": "STAGE 03 · WHERE IT IS USED",
+      "title": "Where Adaptive Concurrency Belongs (and Where It Doesn't)",
+      "level": "L5 · APPLIED DESIGN",
+      "purpose": "Scope boundary: apply adaptive concurrency at RPC/gateway boundaries while keeping per-tenant fairness separate.",
+      "explanation": "Use adaptive concurrency limiters at **Envoy / API Gateway upstreams, microservice RPC clients, and database-facing workers**. Do **not** rely on a single global concurrency limiter to enforce per-tenant quotas—pair it with a per-tenant token bucket so one noisy tenant cannot consume the entire adaptive window."
+    },
+    {
+      "id": "04-how-it-is-managed",
+      "eyebrow": "STAGE 04 · HOW IT IS MANAGED",
+      "title": "Gradient2 Tuning, RTT_min Decay & Safe Fallback",
+      "level": "L5 · APPLIED DESIGN",
+      "purpose": "Operational control: tune smoothing windows, prevent RTT_min staleness, and handle rejections cleanly.",
+      "explanation": "Production Gradient2 limiters smooth `RTT_sample` with an **EWMA (Exponentially Weighted Moving Average)**, ignore tiny noise via a tolerance factor (`tolerance = 1.5`), and periodically decay/reset `RTT_min` (e.g., every 5 minutes) so a temporary fast path does not permanently under-estimate baseline latency. Always set a hard floor (`min_limit >= 4`) so health checks and recovery probes can still pass.",
+      "markdownContent": "```python\nimport time\nfrom threading import Lock\n\nclass Gradient2Limiter:\n    def __init__(self, initial=32, min_limit=4, max_limit=512, smoothing=0.2, tolerance=1.5):\n        self.limit = float(initial)\n        self.min_limit = min_limit\n        self.max_limit = max_limit\n        self.smoothing = smoothing\n        self.tolerance = tolerance\n        self.inflight = 0\n        self.rtt_min = None\n        self.rtt_ewma = None\n        self._lock = Lock()\n\n    def try_acquire(self) -> bool:\n        with self._lock:\n            if self.inflight >= int(self.limit):\n                return False\n            self.inflight += 1\n            return True\n\n    def release(self, rtt_ms: float, failed: bool = False) -> None:\n        with self._lock:\n            self.inflight = max(0, self.inflight - 1)\n            if rtt_ms <= 0:\n                return\n            self.rtt_min = rtt_ms if self.rtt_min is None else min(self.rtt_min, rtt_ms)\n            self.rtt_ewma = rtt_ms if self.rtt_ewma is None else (\n                self.smoothing * rtt_ms + (1.0 - self.smoothing) * self.rtt_ewma\n            )\n            if failed:\n                self.limit = max(self.min_limit, self.limit * 0.9)\n                return\n            gradient = min(1.0, (self.rtt_min * self.tolerance) / self.rtt_ewma)\n            queue_allowance = max(1.0, self.limit ** 0.5)\n            new_limit = self.limit * gradient + queue_allowance * (1.0 if gradient >= 1.0 else 0.0)\n            self.limit = max(self.min_limit, min(self.max_limit, new_limit))\n```"
+    },
+    {
+      "id": "05-alternatives",
+      "eyebrow": "STAGE 05 · THE TRADE-OFF",
+      "title": "Static Thread Pools vs. Token Buckets vs. Adaptive Gradient2",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "purpose": "The trade-off: compare static caps, token buckets, and adaptive concurrency limiters.",
+      "explanation": "Static thread pools block callers rather than failing fast; RPS token buckets ignore downstream latency changes; adaptive Gradient2 adjusts automatically to real-time capacity.",
+      "comparison": [
+        {
+          "choice": "Static RPS Rate Limiter",
+          "benefits": [
+            "Simple and predictable for billing/API quotas."
+          ],
+          "costs": [
+            "Blind to downstream slowdowns; still admits excess load during latency spikes."
+          ]
+        },
+        {
+          "choice": "Adaptive Gradient2 Limiter",
+          "benefits": [
+            "Self-tunes to changing hardware and request mix; fails fast on queue growth."
+          ],
+          "costs": [
+            "Requires periodic RTT_min reset and per-tenant isolation so noisy neighbors don't starve others."
+          ]
+        }
+      ]
+    },
+    {
+      "id": "06-production-architecture",
+      "eyebrow": "STAGE 06 · PRODUCTION ARCHITECTURE",
+      "title": "Envoy Adaptive Concurrency & Priority Load Shedding",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "purpose": "Production architecture: combine Envoy adaptive concurrency with priority tiers and retry budgets.",
+      "explanation": "In Envoy/Netflix-style gateways, each upstream cluster runs an independent Gradient2 concurrency filter. When `inflight >= limit`, low-priority background traffic is shed first (`HTTP 503` with `Retry-After` jitter) while checkout/health requests keep reserved headroom.",
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "Limiter Window States",
+        "title": "Adaptive Window Scaling State Machine",
+        "states": [
+          {
+            "id": "probe",
+            "label": "PROBING UP",
+            "sublabel": "RTT <= 1.5*RTT_min",
+            "tone": "green"
+          },
+          {
+            "id": "steady",
+            "label": "STEADY",
+            "sublabel": "Gradient ~ 1.0",
+            "tone": "blue"
+          },
+          {
+            "id": "shed",
+            "label": "SHEDDING",
+            "sublabel": "Queueing -> shrink",
+            "tone": "amber"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "probe",
+            "to": "steady",
+            "label": "Window saturated"
+          },
+          {
+            "from": "steady",
+            "to": "shed",
+            "label": "RTT_ewma spikes"
+          },
+          {
+            "from": "shed",
+            "to": "probe",
+            "label": "RTT recovers"
+          }
+        ],
+        "summary": "Caption: The limiter probes upward while latency stays near RTT_min and sheds excess concurrency immediately when RTT climbs."
+      }
+    },
+    {
+      "id": "07-problems-and-further-reading",
+      "eyebrow": "STAGE 07 · APPLIED PROBLEMS",
+      "title": "Problems Solved by Adaptive Concurrency Limiting",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "purpose": "Applied problems: connect adaptive concurrency to thread-pool sizing and priority load shedding.",
+      "explanation": "Explore how Little's Law, priority load shedding, and retry budgets work together in production resilience.",
+      "supportingConcepts": [
+        {
+          "slug": "littles-law-thread-pool-sizing",
+          "title": "Problem: Sizing Thread Pools with Little's Law",
+          "kind": "problem"
+        },
+        {
+          "slug": "priority-aware-load-shedding",
+          "title": "Problem: Priority-Aware Load Shedding Under Overload",
+          "kind": "problem"
+        },
+        {
+          "slug": "rate-limiting",
+          "title": "Concept: Rate Limiting Algorithms",
+          "kind": "concept"
+        }
+      ]
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "question": "A service normally handles 1,000 RPS at 10 ms latency. A downstream DB slowdown raises latency to 200 ms. By Little's Law, what happens to in-flight concurrency if a static 1,200 RPS limit stays active?",
+        "options": [
+          {
+            "id": "a",
+            "text": "In-flight concurrency jumps from 10 to 200 requests, saturating thread/connection pools and triggering timeouts",
+            "correct": true,
+            "feedback": "Correct: L = lambda * W = 1,000 * 0.2s = 200 concurrent requests—20x higher than normal—causing queueing collapse even though RPS is below 1,200."
+          },
+          {
+            "id": "b",
+            "text": "In-flight concurrency drops because fewer requests finish per second",
+            "correct": false,
+            "feedback": "Incorrect: slower processing keeps each request in-flight 20x longer, multiplying concurrency."
+          },
+          {
+            "id": "c",
+            "text": "The static RPS limiter automatically shrinks concurrency to 10",
+            "correct": false,
+            "feedback": "Incorrect: an RPS limiter only counts arrivals per second, not active in-flight work."
+          }
+        ]
+      },
+      {
+        "question": "Why does Gradient2 periodically decay or reset its tracked RTT_min baseline?",
+        "options": [
+          {
+            "id": "a",
+            "text": "To prevent a one-time abnormally fast cache hit or low-load sample from permanently keeping max_inflight too low",
+            "correct": true,
+            "feedback": "Correct: if workload mix or baseline network latency shifts slightly upward, a stale ultra-low RTT_min causes constant false queue detection."
+          },
+          {
+            "id": "b",
+            "text": "To disable load shedding during peak traffic",
+            "correct": false,
+            "feedback": "Incorrect: load shedding remains active; resetting RTT_min simply keeps the baseline realistic."
+          },
+          {
+            "id": "c",
+            "text": "To bypass thread synchronization in the limiter",
+            "correct": false,
+            "feedback": "Incorrect: RTT_min decay is for baseline calibration, not lock avoidance."
+          }
+        ]
+      },
+      {
+        "question": "What happens if an adaptive concurrency limiter has min_limit = 0?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Under a brief latency spike, the limit can drop to 0 and block all recovery/probe traffic permanently",
+            "correct": true,
+            "feedback": "Correct: without a positive floor (e.g., min_limit >= 4), zero requests can enter to record new healthy RTT samples."
+          },
+          {
+            "id": "b",
+            "text": "Throughput doubles because zero requests are queued",
+            "correct": false,
+            "feedback": "Incorrect: a limit of 0 rejects 100% of traffic."
+          },
+          {
+            "id": "c",
+            "text": "Client retries automatically stop",
+            "correct": false,
+            "feedback": "Incorrect: rejecting 100% of traffic without a floor causes complete outage."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** Adaptive concurrency limiting continuously measures baseline latency (RTT_min) against observed latency (RTT_sample) to adjust the maximum allowed in-flight requests dynamically, shedding excess traffic with fast HTTP 503/429 before queues saturate.\n\n**Key Takeaway:** Static RPS limits fail when request cost or downstream capacity shifts; concurrency (L = lambda * W) is the true bottleneck, so dynamically bounding in-flight requests via RTT gradients prevents queueing collapse.",
+      "spark": {
+        "summary": "Adaptive concurrency limiting continuously measures baseline latency (RTT_min) against observed latency (RTT_sample) to adjust the maximum allowed in-flight requests dynamically, shedding excess traffic with fast HTTP 503/429 before queues saturate.",
+        "keyTakeaway": "Static RPS limits fail when request cost or downstream capacity shifts; concurrency (L = lambda * W) is the true bottleneck, so dynamically bounding in-flight requests via RTT gradients prevents queueing collapse.",
+        "byteSummary": "**Core Mechanics:** By Little's Law (`L = lambda * W`), a service's in-flight concurrency (`L`) grows linearly with arrival rate (`lambda`) and latency (`W`). When downstream slows down, static RPS limits still admit too much work, filling queues until `504` timeouts cascade. Adaptive limiters (Vegas / Gradient2) dynamically shrink or grow `max_inflight`.\n\n**Visual & Structural Flow:** Contrasts a Static Limit (requests pile into a clogged queue, `RTT` spikes, `504 Cascade`) against an Adaptive Limiter (`Baseline RTT_min` + `Sample RTT` -> `Gradient = RTT_min / RTT_sample` -> dynamic `In-Flight Window` -> `Backend Pool` or `Fast 503 Shed`).\n\n**Trade-Offs & Production:** Unlike fixed thread pools or global token buckets, adaptive concurrency requires zero manual capacity tuning across hardware changes, though `RTT_min` must be periodically decayed/re-sampled so baseline drift does not lock the limiter too low.\n\n**Failure Modes & Application:** Pair adaptive concurrency with priority-aware load shedding and `Retry-After` jitter so critical health checks and idempotent retries are not starved during brownouts."
+      },
+      "learningJourney": [
+        {
+          "id": "01-what-it-is",
+          "eyebrow": "STAGE 01 · THE MECHANISM",
+          "title": "What is Adaptive Concurrency Limiting",
+          "level": "L4 · FUNDAMENTALS",
+          "purpose": "The mechanism: understand why bounding in-flight concurrency using RTT gradients beats static RPS limits.",
+          "explanation": "Static rate limits cap requests per second (RPS), assuming every request costs the same CPU and downstream latency never changes. In reality, when a database slows from `5 ms` to `100 ms`, the same `1,000 RPS` jumps from `5` concurrent requests to `100` concurrent requests (`L = lambda * W`, **Little's Law**), exhausting thread pools and connection pools.\n\nAn **adaptive concurrency limiter** measures **RTT_min** (the lowest observed round-trip time under healthy unloaded operation) and compares it to **RTT_sample** (current p50/p90 latency). Using `gradient = RTT_min / RTT_sample`, it shrinks `max_inflight` when queueing begins (`gradient < 1`) and probes upward slowly when latency stays near baseline.",
+          "sectionDiagram": {
+            "kind": "pipeline",
+            "eyebrow": "Feedback Control Loop",
+            "title": "Gradient2 Adaptive Concurrency Control Loop",
+            "nodes": [
+              {
+                "label": "Incoming Request",
+                "role": "Check inflight < limit"
+              },
+              {
+                "label": "In-Flight Gate",
+                "role": "Fast 503 if full"
+              },
+              {
+                "label": "Backend Pool",
+                "role": "Measure RTT_sample"
+              },
+              {
+                "label": "Gradient Updater",
+                "role": "RTT_min / RTT_sample"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Little's Law Bound",
+                "detail": "Caps active in-flight work L rather than arrival rate lambda."
+              },
+              {
+                "label": "Queue Detection",
+                "detail": "Rising RTT_sample drops gradient below 1.0, shrinking max_inflight."
+              },
+              {
+                "label": "Fast Fail",
+                "detail": "Excess requests fail in <1ms with 503 instead of waiting 30s to time out."
+              }
+            ],
+            "summary": "Caption: Adaptive limiters treat rising RTT as early queue formation and shrink max_inflight before timeouts cascade."
+          }
+        },
+        {
+          "id": "02-why-we-need-it",
+          "eyebrow": "STAGE 02 · THE PROBLEM",
+          "title": "Why Static Limits Fail Under Downstream Slowdowns",
+          "level": "L4 · FUNDAMENTALS",
+          "purpose": "The problem: trace how a modest downstream slowdown turns a fixed-RPS service into a 504 timeout storm.",
+          "explanation": "Suppose a service handles `2,000 RPS` at `10 ms` (`20` concurrent requests) and is protected by a static `2,500 RPS` limit. If a downstream cache miss or GC pause raises latency to `250 ms`, `2,000 RPS * 0.25s = 500` concurrent requests—exceeding a 100-thread pool, filling the socket accept queue, and triggering client retries that multiply load (`metastable failure`).",
+          "ideas": [
+            {
+              "title": "Queueing Delay Signal",
+              "description": "Latency rises before CPU hits 100% or errors spike, making RTT_sample an early leading indicator."
+            },
+            {
+              "title": "Metastable Retry Amplification",
+              "description": "Slow timeouts cause clients to retry, turning a transient 2-second hiccup into a 20-minute outage."
+            }
+          ]
+        },
+        {
+          "id": "03-where-it-is-used",
+          "eyebrow": "STAGE 03 · WHERE IT IS USED",
+          "title": "Where Adaptive Concurrency Belongs (and Where It Doesn't)",
+          "level": "L5 · APPLIED DESIGN",
+          "purpose": "Scope boundary: apply adaptive concurrency at RPC/gateway boundaries while keeping per-tenant fairness separate.",
+          "explanation": "Use adaptive concurrency limiters at **Envoy / API Gateway upstreams, microservice RPC clients, and database-facing workers**. Do **not** rely on a single global concurrency limiter to enforce per-tenant quotas—pair it with a per-tenant token bucket so one noisy tenant cannot consume the entire adaptive window."
+        }
+      ],
+      "finalSummary": "Static RPS limits fail when request cost or downstream capacity shifts; concurrency (L = lambda * W) is the true bottleneck, so dynamically bounding in-flight requests via RTT gradients prevents queueing collapse."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** By Little's Law (`L = lambda * W`), a service's in-flight concurrency (`L`) grows linearly with arrival rate (`lambda`) and latency (`W`). When downstream slows down, static RPS limits still admit too much work, filling queues until `504` timeouts cascade. Adaptive limiters (Vegas / Gradient2) dynamically shrink or grow `max_inflight`.\n\n**Visual & Structural Flow:** Contrasts a Static Limit (requests pile into a clogged queue, `RTT` spikes, `504 Cascade`) against an Adaptive Limiter (`Baseline RTT_min` + `Sample RTT` -> `Gradient = RTT_min / RTT_sample` -> dynamic `In-Flight Window` -> `Backend Pool` or `Fast 503 Shed`).\n\n**Trade-Offs & Production:** Unlike fixed thread pools or global token buckets, adaptive concurrency requires zero manual capacity tuning across hardware changes, though `RTT_min` must be periodically decayed/re-sampled so baseline drift does not lock the limiter too low.\n\n**Failure Modes & Application:** Pair adaptive concurrency with priority-aware load shedding and `Retry-After` jitter so critical health checks and idempotent retries are not starved during brownouts.",
+      "spark": {
+        "summary": "Adaptive concurrency limiting continuously measures baseline latency (RTT_min) against observed latency (RTT_sample) to adjust the maximum allowed in-flight requests dynamically, shedding excess traffic with fast HTTP 503/429 before queues saturate.",
+        "keyTakeaway": "Static RPS limits fail when request cost or downstream capacity shifts; concurrency (L = lambda * W) is the true bottleneck, so dynamically bounding in-flight requests via RTT gradients prevents queueing collapse.",
+        "byteSummary": "**Core Mechanics:** By Little's Law (`L = lambda * W`), a service's in-flight concurrency (`L`) grows linearly with arrival rate (`lambda`) and latency (`W`). When downstream slows down, static RPS limits still admit too much work, filling queues until `504` timeouts cascade. Adaptive limiters (Vegas / Gradient2) dynamically shrink or grow `max_inflight`.\n\n**Visual & Structural Flow:** Contrasts a Static Limit (requests pile into a clogged queue, `RTT` spikes, `504 Cascade`) against an Adaptive Limiter (`Baseline RTT_min` + `Sample RTT` -> `Gradient = RTT_min / RTT_sample` -> dynamic `In-Flight Window` -> `Backend Pool` or `Fast 503 Shed`).\n\n**Trade-Offs & Production:** Unlike fixed thread pools or global token buckets, adaptive concurrency requires zero manual capacity tuning across hardware changes, though `RTT_min` must be periodically decayed/re-sampled so baseline drift does not lock the limiter too low.\n\n**Failure Modes & Application:** Pair adaptive concurrency with priority-aware load shedding and `Retry-After` jitter so critical health checks and idempotent retries are not starved during brownouts."
+      }
+    },
+    "advanced": {
+      "byteSummary": "**Core Mechanics:** By Little's Law (`L = lambda * W`), a service's in-flight concurrency (`L`) grows linearly with arrival rate (`lambda`) and latency (`W`). When downstream slows down, static RPS limits still admit too much work, filling queues until `504` timeouts cascade. Adaptive limiters (Vegas / Gradient2) dynamically shrink or grow `max_inflight`.\n\n**Visual & Structural Flow:** Contrasts a Static Limit (requests pile into a clogged queue, `RTT` spikes, `504 Cascade`) against an Adaptive Limiter (`Baseline RTT_min` + `Sample RTT` -> `Gradient = RTT_min / RTT_sample` -> dynamic `In-Flight Window` -> `Backend Pool` or `Fast 503 Shed`).\n\n**Trade-Offs & Production:** Unlike fixed thread pools or global token buckets, adaptive concurrency requires zero manual capacity tuning across hardware changes, though `RTT_min` must be periodically decayed/re-sampled so baseline drift does not lock the limiter too low.\n\n**Failure Modes & Application:** Pair adaptive concurrency with priority-aware load shedding and `Retry-After` jitter so critical health checks and idempotent retries are not starved during brownouts.",
+      "spark": {
+        "summary": "Adaptive concurrency limiting continuously measures baseline latency (RTT_min) against observed latency (RTT_sample) to adjust the maximum allowed in-flight requests dynamically, shedding excess traffic with fast HTTP 503/429 before queues saturate.",
+        "keyTakeaway": "Static RPS limits fail when request cost or downstream capacity shifts; concurrency (L = lambda * W) is the true bottleneck, so dynamically bounding in-flight requests via RTT gradients prevents queueing collapse.",
+        "byteSummary": "**Core Mechanics:** By Little's Law (`L = lambda * W`), a service's in-flight concurrency (`L`) grows linearly with arrival rate (`lambda`) and latency (`W`). When downstream slows down, static RPS limits still admit too much work, filling queues until `504` timeouts cascade. Adaptive limiters (Vegas / Gradient2) dynamically shrink or grow `max_inflight`.\n\n**Visual & Structural Flow:** Contrasts a Static Limit (requests pile into a clogged queue, `RTT` spikes, `504 Cascade`) against an Adaptive Limiter (`Baseline RTT_min` + `Sample RTT` -> `Gradient = RTT_min / RTT_sample` -> dynamic `In-Flight Window` -> `Backend Pool` or `Fast 503 Shed`).\n\n**Trade-Offs & Production:** Unlike fixed thread pools or global token buckets, adaptive concurrency requires zero manual capacity tuning across hardware changes, though `RTT_min` must be periodically decayed/re-sampled so baseline drift does not lock the limiter too low.\n\n**Failure Modes & Application:** Pair adaptive concurrency with priority-aware load shedding and `Retry-After` jitter so critical health checks and idempotent retries are not starved during brownouts."
+      },
+      "learningJourney": [
+        {
+          "id": "01-what-it-is",
+          "eyebrow": "STAGE 01 · THE MECHANISM",
+          "title": "What is Adaptive Concurrency Limiting",
+          "level": "L4 · FUNDAMENTALS",
+          "purpose": "The mechanism: understand why bounding in-flight concurrency using RTT gradients beats static RPS limits.",
+          "explanation": "Static rate limits cap requests per second (RPS), assuming every request costs the same CPU and downstream latency never changes. In reality, when a database slows from `5 ms` to `100 ms`, the same `1,000 RPS` jumps from `5` concurrent requests to `100` concurrent requests (`L = lambda * W`, **Little's Law**), exhausting thread pools and connection pools.\n\nAn **adaptive concurrency limiter** measures **RTT_min** (the lowest observed round-trip time under healthy unloaded operation) and compares it to **RTT_sample** (current p50/p90 latency). Using `gradient = RTT_min / RTT_sample`, it shrinks `max_inflight` when queueing begins (`gradient < 1`) and probes upward slowly when latency stays near baseline.",
+          "sectionDiagram": {
+            "kind": "pipeline",
+            "eyebrow": "Feedback Control Loop",
+            "title": "Gradient2 Adaptive Concurrency Control Loop",
+            "nodes": [
+              {
+                "label": "Incoming Request",
+                "role": "Check inflight < limit"
+              },
+              {
+                "label": "In-Flight Gate",
+                "role": "Fast 503 if full"
+              },
+              {
+                "label": "Backend Pool",
+                "role": "Measure RTT_sample"
+              },
+              {
+                "label": "Gradient Updater",
+                "role": "RTT_min / RTT_sample"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Little's Law Bound",
+                "detail": "Caps active in-flight work L rather than arrival rate lambda."
+              },
+              {
+                "label": "Queue Detection",
+                "detail": "Rising RTT_sample drops gradient below 1.0, shrinking max_inflight."
+              },
+              {
+                "label": "Fast Fail",
+                "detail": "Excess requests fail in <1ms with 503 instead of waiting 30s to time out."
+              }
+            ],
+            "summary": "Caption: Adaptive limiters treat rising RTT as early queue formation and shrink max_inflight before timeouts cascade."
+          }
+        },
+        {
+          "id": "02-why-we-need-it",
+          "eyebrow": "STAGE 02 · THE PROBLEM",
+          "title": "Why Static Limits Fail Under Downstream Slowdowns",
+          "level": "L4 · FUNDAMENTALS",
+          "purpose": "The problem: trace how a modest downstream slowdown turns a fixed-RPS service into a 504 timeout storm.",
+          "explanation": "Suppose a service handles `2,000 RPS` at `10 ms` (`20` concurrent requests) and is protected by a static `2,500 RPS` limit. If a downstream cache miss or GC pause raises latency to `250 ms`, `2,000 RPS * 0.25s = 500` concurrent requests—exceeding a 100-thread pool, filling the socket accept queue, and triggering client retries that multiply load (`metastable failure`).",
+          "ideas": [
+            {
+              "title": "Queueing Delay Signal",
+              "description": "Latency rises before CPU hits 100% or errors spike, making RTT_sample an early leading indicator."
+            },
+            {
+              "title": "Metastable Retry Amplification",
+              "description": "Slow timeouts cause clients to retry, turning a transient 2-second hiccup into a 20-minute outage."
+            }
+          ]
+        },
+        {
+          "id": "03-where-it-is-used",
+          "eyebrow": "STAGE 03 · WHERE IT IS USED",
+          "title": "Where Adaptive Concurrency Belongs (and Where It Doesn't)",
+          "level": "L5 · APPLIED DESIGN",
+          "purpose": "Scope boundary: apply adaptive concurrency at RPC/gateway boundaries while keeping per-tenant fairness separate.",
+          "explanation": "Use adaptive concurrency limiters at **Envoy / API Gateway upstreams, microservice RPC clients, and database-facing workers**. Do **not** rely on a single global concurrency limiter to enforce per-tenant quotas—pair it with a per-tenant token bucket so one noisy tenant cannot consume the entire adaptive window."
+        },
+        {
+          "id": "04-how-it-is-managed",
+          "eyebrow": "STAGE 04 · HOW IT IS MANAGED",
+          "title": "Gradient2 Tuning, RTT_min Decay & Safe Fallback",
+          "level": "L5 · APPLIED DESIGN",
+          "purpose": "Operational control: tune smoothing windows, prevent RTT_min staleness, and handle rejections cleanly.",
+          "explanation": "Production Gradient2 limiters smooth `RTT_sample` with an **EWMA (Exponentially Weighted Moving Average)**, ignore tiny noise via a tolerance factor (`tolerance = 1.5`), and periodically decay/reset `RTT_min` (e.g., every 5 minutes) so a temporary fast path does not permanently under-estimate baseline latency. Always set a hard floor (`min_limit >= 4`) so health checks and recovery probes can still pass.",
+          "markdownContent": "```python\nimport time\nfrom threading import Lock\n\nclass Gradient2Limiter:\n    def __init__(self, initial=32, min_limit=4, max_limit=512, smoothing=0.2, tolerance=1.5):\n        self.limit = float(initial)\n        self.min_limit = min_limit\n        self.max_limit = max_limit\n        self.smoothing = smoothing\n        self.tolerance = tolerance\n        self.inflight = 0\n        self.rtt_min = None\n        self.rtt_ewma = None\n        self._lock = Lock()\n\n    def try_acquire(self) -> bool:\n        with self._lock:\n            if self.inflight >= int(self.limit):\n                return False\n            self.inflight += 1\n            return True\n\n    def release(self, rtt_ms: float, failed: bool = False) -> None:\n        with self._lock:\n            self.inflight = max(0, self.inflight - 1)\n            if rtt_ms <= 0:\n                return\n            self.rtt_min = rtt_ms if self.rtt_min is None else min(self.rtt_min, rtt_ms)\n            self.rtt_ewma = rtt_ms if self.rtt_ewma is None else (\n                self.smoothing * rtt_ms + (1.0 - self.smoothing) * self.rtt_ewma\n            )\n            if failed:\n                self.limit = max(self.min_limit, self.limit * 0.9)\n                return\n            gradient = min(1.0, (self.rtt_min * self.tolerance) / self.rtt_ewma)\n            queue_allowance = max(1.0, self.limit ** 0.5)\n            new_limit = self.limit * gradient + queue_allowance * (1.0 if gradient >= 1.0 else 0.0)\n            self.limit = max(self.min_limit, min(self.max_limit, new_limit))\n```"
+        },
+        {
+          "id": "05-alternatives",
+          "eyebrow": "STAGE 05 · THE TRADE-OFF",
+          "title": "Static Thread Pools vs. Token Buckets vs. Adaptive Gradient2",
+          "level": "L6 · SCALE & TRADE-OFFS",
+          "purpose": "The trade-off: compare static caps, token buckets, and adaptive concurrency limiters.",
+          "explanation": "Static thread pools block callers rather than failing fast; RPS token buckets ignore downstream latency changes; adaptive Gradient2 adjusts automatically to real-time capacity.",
+          "comparison": [
+            {
+              "choice": "Static RPS Rate Limiter",
+              "benefits": [
+                "Simple and predictable for billing/API quotas."
+              ],
+              "costs": [
+                "Blind to downstream slowdowns; still admits excess load during latency spikes."
+              ]
+            },
+            {
+              "choice": "Adaptive Gradient2 Limiter",
+              "benefits": [
+                "Self-tunes to changing hardware and request mix; fails fast on queue growth."
+              ],
+              "costs": [
+                "Requires periodic RTT_min reset and per-tenant isolation so noisy neighbors don't starve others."
+              ]
+            }
+          ]
+        },
+        {
+          "id": "06-production-architecture",
+          "eyebrow": "STAGE 06 · PRODUCTION ARCHITECTURE",
+          "title": "Envoy Adaptive Concurrency & Priority Load Shedding",
+          "level": "L7 · STAFF / PRINCIPAL",
+          "purpose": "Production architecture: combine Envoy adaptive concurrency with priority tiers and retry budgets.",
+          "explanation": "In Envoy/Netflix-style gateways, each upstream cluster runs an independent Gradient2 concurrency filter. When `inflight >= limit`, low-priority background traffic is shed first (`HTTP 503` with `Retry-After` jitter) while checkout/health requests keep reserved headroom.",
+          "sectionDiagram": {
+            "kind": "state-machine",
+            "eyebrow": "Limiter Window States",
+            "title": "Adaptive Window Scaling State Machine",
+            "states": [
+              {
+                "id": "probe",
+                "label": "PROBING UP",
+                "sublabel": "RTT <= 1.5*RTT_min",
+                "tone": "green"
+              },
+              {
+                "id": "steady",
+                "label": "STEADY",
+                "sublabel": "Gradient ~ 1.0",
+                "tone": "blue"
+              },
+              {
+                "id": "shed",
+                "label": "SHEDDING",
+                "sublabel": "Queueing -> shrink",
+                "tone": "amber"
+              }
+            ],
+            "transitions": [
+              {
+                "from": "probe",
+                "to": "steady",
+                "label": "Window saturated"
+              },
+              {
+                "from": "steady",
+                "to": "shed",
+                "label": "RTT_ewma spikes"
+              },
+              {
+                "from": "shed",
+                "to": "probe",
+                "label": "RTT recovers"
+              }
+            ],
+            "summary": "Caption: The limiter probes upward while latency stays near RTT_min and sheds excess concurrency immediately when RTT climbs."
+          }
+        },
+        {
+          "id": "07-problems-and-further-reading",
+          "eyebrow": "STAGE 07 · APPLIED PROBLEMS",
+          "title": "Problems Solved by Adaptive Concurrency Limiting",
+          "level": "L7 · STAFF / PRINCIPAL",
+          "purpose": "Applied problems: connect adaptive concurrency to thread-pool sizing and priority load shedding.",
+          "explanation": "Explore how Little's Law, priority load shedding, and retry budgets work together in production resilience.",
+          "supportingConcepts": [
+            {
+              "slug": "littles-law-thread-pool-sizing",
+              "title": "Problem: Sizing Thread Pools with Little's Law",
+              "kind": "problem"
+            },
+            {
+              "slug": "priority-aware-load-shedding",
+              "title": "Problem: Priority-Aware Load Shedding Under Overload",
+              "kind": "problem"
+            },
+            {
+              "slug": "rate-limiting",
+              "title": "Concept: Rate Limiting Algorithms",
+              "kind": "concept"
+            }
+          ]
+        }
+      ],
+      "finalSummary": "Static RPS limits fail when request cost or downstream capacity shifts; concurrency (L = lambda * W) is the true bottleneck, so dynamically bounding in-flight requests via RTT gradients prevents queueing collapse."
+    }
+  }
+}

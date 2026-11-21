@@ -1,0 +1,542 @@
+{
+  "id": "problem-fixing-kafka-hot-partition-skew",
+  "slug": "fixing-kafka-hot-partition-skew",
+  "title": "Fixing Kafka Hot-Partition Skew",
+  "problemType": "system-design",
+  "difficulty": "medium",
+  "prompt": "A multi-tenant analytics pipeline produces 25,000 events/sec into a 32-partition Kafka topic keyed by tenant_id. One enterprise tenant ('acme-corp') generates 68% of all traffic (17,000 events/sec, ~17 MB/s). Because Murmur2(tenant_id) % 32 deterministically maps 'acme-corp' to partition 14, partition 14 receives 17,000 msg/s while the other 31 partitions average 258 msg/s each. Consumer pod #14 is 100% CPU-saturated with 4.5M lag, broker #3 disk I/O is pinned at 98%, and the other 31 consumer threads sit at 3% CPU. Redesign the partitioning and consumer aggregation strategy to balance load across partitions without breaking per-tenant analytics.",
+  "spark": {
+    "summary": "When whale tenant acme-corp (68% of 25k events/sec) pins partition 14 at 17,000 msg/s while 31 partitions sit idle, adaptive key salting (acme-corp#0..15) + two-stage tumbling aggregation balances all 32 partitions under 2x cluster average.",
+    "keyTakeaway": "Salt only hot/whale tenant keys (or composite tenant_id#user_id) across K partitions to balance broker and consumer load, and use two-stage aggregation to preserve exact 1-minute tenant rollups.",
+    "byteSummary": "**Core Mechanics:** In a `32-partition` Kafka topic (`25,000 events/sec` total, `~781 msg/s` average) keyed by `tenant_id`, one whale tenant (`acme-corp`) sends `17,000 events/sec` (`68%` of traffic).\n\n**Visual & Structural Flow:** Depicts Spreading acme-corp (17k/s) Across 16 Salted Partitions (Part 0..7 -> Part 8..15 -> Part 16..23 -> Part 24..31 -> acme#0); Salted Partition Parallelism -> Partial Window -> Exact Tenant Sum (Producer -> 32 Partitions -> Stage 1 (32x) -> Stage 2 Agg).\n\n**Trade-Offs & Production:** Two common reactions fail: **Adding More Partitions (`32 -> 128`)**: `Murmur2('acme-corp') % 128` still maps 100% of `acme-corp` to **one** partition. Production Kafka pipelines balance load without losing ordering or accuracy: **Dynamic Whale Config (No Topic Recreation)**: Maintain a lightweight hot-tenant map (`acme-corp ->.\n\n**Failure Modes & Application:** Adaptive salting + hierarchical aggregation solves skew in any partitioned streaming system: **Multi-Tenant Analytics (Kafka / Flink)**: Preventing enterprise whale tenants from starving shared consumer groups."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why Kafka partition skew creates consumer lag despite 32 partitions",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": "In a `32-partition` Kafka topic (`25,000 events/sec` total, `~781 msg/s` average) keyed by `tenant_id`, one whale tenant (`acme-corp`) sends `17,000 events/sec` (`68%` of traffic). Because `Murmur2('acme-corp') % 32 == 14`, **partition 14 and consumer #14** absorb `17,000 msg/s`—nearly `8×` a single consumer thread's `2,200 events/sec` ceiling—building a `4.5M`-message lag while the other 31 consumers sit at 3% CPU.",
+      "purpose": "The mechanism: understand how Why Kafka partition skew creates consumer lag despite 32 partitions works from first principles."
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "What happens when one key saturates a broker leader and consumer thread",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "Hot-partition skew breaks both Kafka brokers and stream processors:\n\n1. **Consumer Thread Ceiling**: Kafka assigns each partition to at most **one** consumer thread in a group; 31 idle threads cannot help partition 14.\n2. **Broker Disk Saturation**: Broker #3 (leader for partition 14) hits 98% disk I/O.\n3. **Broken Window Watermarks**: 4.5M lag delays `acme-corp`'s 1-minute analytics by 30+ minutes.",
+      "sectionDiagram": {
+        "kind": "ring",
+        "eyebrow": "Adaptive Key Salting",
+        "title": "Spreading acme-corp (17k/s) Across 16 Salted Partitions",
+        "nodes": [
+          "Part 0..7",
+          "Part 8..15",
+          "Part 16..23",
+          "Part 24..31"
+        ],
+        "vnodes": [
+          "acme#0",
+          "acme#1",
+          "acme#2",
+          "acme#3",
+          "acme#4",
+          "acme#5",
+          "acme#6",
+          "acme#7"
+        ],
+        "ringLabel": "Murmur2(tenant#salt)",
+        "ringSub": "<1,560 msg/s max",
+        "sampleKey": "acme#3",
+        "summary": "Salting acme-corp across K=16 buckets (or hashing tenant_id#user_id) caps every partition below ~1,500 msg/s."
+      },
+      "purpose": "The problem: see what breaks without What happens when one key saturates a broker leader and consumer thread under real concurrency or scale."
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Naive solution (and why adding partitions or round-robin fails)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "Two common reactions fail:\n\n- **Adding More Partitions (`32 -> 128`)**: `Murmur2('acme-corp') % 128` still maps 100% of `acme-corp` to **one** partition.\n- **Unkeyed Round-Robin**: Breaks per-`user_id` ordering and forces an expensive full-topic repartition before 1-minute `tenant_id` windowing.",
+      "purpose": "The problem: see what breaks without Naive solution under real concurrency or scale."
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise solution: Dynamic Whale Salting + Two-Stage Aggregation",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": "Production Kafka pipelines balance load without losing ordering or accuracy:\n\n- **Dynamic Whale Config (No Topic Recreation)**: Maintain a lightweight hot-tenant map (`acme-corp -> K=16`, normal tenants `K=1`) pushed via config/Redis. Producers compute `key = f'{tenant_id}#{hash(user_id) % K}'`—preserving strict per-`user_id` ordering while spreading `acme-corp` across `16` partitions (`~1,062 msg/s` each, well under the `2,200 msg/s` thread limit).\n- **Two-Stage Tumbling Window**: Stage 1 (32 workers) computes partial 1-minute aggregates keyed by `(tenant_id, salt, window_end)` and emits compact partial records (`32` rows/min/tenant); Stage 2 sums partials by `(tenant_id, window_end)`.\n- **Zero-Loss Migration**: Deploy Stage 2 / dual-key consumers first, then flip producer salting.",
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Two-Stage Windowed Rollup",
+        "title": "Salted Partition Parallelism -> Partial Window -> Exact Tenant Sum",
+        "actors": [
+          {
+            "id": "prod",
+            "label": "Producer"
+          },
+          {
+            "id": "k",
+            "label": "32 Partitions"
+          },
+          {
+            "id": "s1",
+            "label": "Stage 1 (32x)"
+          },
+          {
+            "id": "s2",
+            "label": "Stage 2 Agg"
+          }
+        ],
+        "events": [
+          {
+            "from": "prod",
+            "to": "k",
+            "label": "Key = acme-corp#(hash(user)%16)",
+            "status": "ok"
+          },
+          {
+            "from": "k",
+            "to": "s1",
+            "label": "~1,062 msg/s per partition (<2.2k cap)",
+            "status": "ok"
+          },
+          {
+            "from": "s1",
+            "to": "s2",
+            "label": "Emit 16 partial 1-min counts",
+            "status": "ok"
+          },
+          {
+            "from": "s2",
+            "to": "s2",
+            "label": "Merge by (tenant_id, window) -> exact!",
+            "status": "ok"
+          }
+        ],
+        "summary": "Hashing user_id into K=16 buckets preserves per-user ordering while two-stage aggregation delivers exact per-tenant windows."
+      },
+      "markdownContent": "```python\nimport hashlib\n\nWHALE_SALTS = {\"acme-corp\": 16}  # dynamically updated without topic recreation\n\ndef partition_key(tenant_id: str, user_id: str | None) -> str:\n    k = WHALE_SALTS.get(tenant_id, 1)\n    if k <= 1:\n        return tenant_id\n    if user_id:\n        bucket = int(hashlib.md5(user_id.encode()).hexdigest(), 16) % k\n    else:\n        bucket = hash(tenant_id) % k\n    return f\"{tenant_id}#{bucket}\"\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where Key Salting & Two-Stage Aggregation apply in System Design",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": "Adaptive salting + hierarchical aggregation solves skew in any partitioned streaming system:\n\n- **Multi-Tenant Analytics (Kafka / Flink)**: Preventing enterprise whale tenants from starving shared consumer groups.\n- **Real-Time Metrics & Billing**: Computing exact per-customer 1-minute rollups across salted partitions.\n- **IoT & Clickstream Pipelines**: Preserving per-device/per-user ordering while scaling across 32–256 partitions.",
+      "supportingConcepts": [
+        {
+          "slug": "message-queues",
+          "title": "Concept: Kafka & Message Queues",
+          "kind": "concept"
+        },
+        {
+          "slug": "database-sharding",
+          "title": "Concept: Sharding & Partitioning",
+          "kind": "concept"
+        },
+        {
+          "slug": "stream-watermarks-late-data",
+          "title": "Concept: Stream Watermarks & Late Data",
+          "kind": "concept"
+        },
+        {
+          "slug": "dynamodb-write-sharding-hot-partitions",
+          "title": "Problem: DynamoDB Write Sharding",
+          "kind": "problem"
+        },
+        {
+          "slug": "fix-spark-skew-shuffle-oom-production",
+          "title": "Problem: Fix Spark Shuffle Skew",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "How can you salt a whale tenant's Kafka key across 16 partitions while still preserving per-user_id ordering and exact 1-minute tenant aggregations?",
+      "options": [
+        {
+          "id": "a",
+          "text": "Compute salt = hash(user_id) % 16 as the key suffix and use a two-stage aggregation (partial sums per salt, then final sum per tenant_id)",
+          "correct": true,
+          "feedback": "Correct: deterministic user_id salting keeps each user's events on one partition, and two-stage aggregation merges the 16 partials accurately."
+        },
+        {
+          "id": "b",
+          "text": "Use random round-robin partitioning with no key",
+          "correct": false,
+          "feedback": "Random partitioning breaks per-user_id ordering."
+        },
+        {
+          "id": "c",
+          "text": "Increase the topic from 32 to 128 partitions without changing the key",
+          "correct": false,
+          "feedback": "All acme-corp events still hash to a single partition."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "How can you salt a whale tenant's Kafka key across 16 partitions while still preserving per-user_id ordering and exact 1-minute tenant aggregations?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Compute salt = hash(user_id) % 16 as the key suffix and use a two-stage aggregation (partial sums per salt, then final sum per tenant_id)",
+            "correct": true,
+            "feedback": "Correct: deterministic user_id salting keeps each user's events on one partition, and two-stage aggregation merges the 16 partials accurately."
+          },
+          {
+            "id": "b",
+            "text": "Use random round-robin partitioning with no key",
+            "correct": false,
+            "feedback": "Random partitioning breaks per-user_id ordering."
+          },
+          {
+            "id": "c",
+            "text": "Increase the topic from 32 to 128 partitions without changing the key",
+            "correct": false,
+            "feedback": "All acme-corp events still hash to a single partition."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why Kafka partition skew creates consumer lag despite 32 partitions', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "In a 32-partition Kafka topic (25,000 events/sec total, ~781 msg/s average) keyed by tenant_id, one whale tenant (acme-corp) sends 17,000 events/sec (68% of traffic).",
+            "correct": true,
+            "feedback": "Correct: In a 32-partition Kafka topic (25,000 events/sec total, ~781 msg/s average) keyed by tenant_id, one whale tenant (acme-corp) sends 17,000 events/sec (68% of traffic)."
+          },
+          {
+            "id": "b",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "c",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'What happens when one key saturates a broker leader and consumer thread', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "b",
+            "text": "Hot-partition skew breaks both Kafka brokers and stream processors: 1.",
+            "correct": true,
+            "feedback": "Correct: Hot-partition skew breaks both Kafka brokers and stream processors: 1."
+          },
+          {
+            "id": "c",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** In a `32-partition` Kafka topic (`25,000 events/sec` total, `~781 msg/s` average) keyed by `tenant_id`, one whale tenant (`acme-corp`) sends `17,000 events/sec` (`68%` of traffic).\n\n**How It Flows:** Think of Fixing Kafka Hot-Partition Skew as a clear step-by-step chain: Part 0..7 -> Part 8..15 -> Part 16..23 -> Part 24..31 -> Producer.\n\n**Why Beginners Should Care:** Salt only hot/whale tenant keys (or composite tenant_id#user_id) across K partitions to balance broker and consumer load, and use two-stage aggregation to preserve exact 1-minute tenant rollups.",
+      "spark": {
+        "summary": "In a `32-partition` Kafka topic (`25,000 events/sec` total, `~781 msg/s` average) keyed by `tenant_id`, one whale tenant (`acme-corp`) sends `17,000 events/sec` (`68%` of traffic).",
+        "keyTakeaway": "Salt only hot/whale tenant keys (or composite tenant_id#user_id) across K partitions to balance broker and consumer load, and use two-stage aggregation to preserve exact 1-minute tenant rollups."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why Kafka partition skew creates consumer lag despite 32 partitions",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why Kafka partition skew creates consumer lag despite 32 partitions works from first principles.",
+          "explanation": "In a `32-partition` Kafka topic (`25,000 events/sec` total, `~781 msg/s` average) keyed by `tenant_id`, one whale tenant (`acme-corp`) sends `17,000 events/sec` (`68%` of traffic). Because `Murmur2('acme-corp') % 32 == 14`, **partition 14 and consumer #14** absorb `17,000 msg/s`—nearly `8×` a single consumer thread's `2,200 events/sec` ceiling—building a `4.5M`-message lag while the other 31 consumers sit at 3% CPU.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "What happens when one key saturates a broker leader and consumer thread",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without What happens when one key saturates a broker leader and consumer thread under real concurrency or scale.",
+          "explanation": "Hot-partition skew breaks both Kafka brokers and stream processors: 1. **Consumer Thread Ceiling**: Kafka assigns each partition to at most **one** consumer thread in a group; 31 idle threads cannot help partition 14. 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "ring",
+            "eyebrow": "Adaptive Key Salting",
+            "title": "Spreading acme-corp (17k/s) Across 16 Salted Partitions",
+            "nodes": [
+              "Part 0..7",
+              "Part 8..15",
+              "Part 16..23",
+              "Part 24..31"
+            ],
+            "vnodes": [
+              "acme#0",
+              "acme#1",
+              "acme#2",
+              "acme#3",
+              "acme#4",
+              "acme#5",
+              "acme#6",
+              "acme#7"
+            ],
+            "ringLabel": "Murmur2(tenant#salt)",
+            "ringSub": "<1,560 msg/s max",
+            "sampleKey": "acme#3",
+            "summary": "Salting acme-corp across K=16 buckets (or hashing tenant_id#user_id) caps every partition below ~1,500 msg/s."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive solution (and why adding partitions or round-robin fails)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "The problem: see what breaks without Naive solution under real concurrency or scale.",
+          "explanation": "Two common reactions fail: **Adding More Partitions (`32 -> 128`)**: `Murmur2('acme-corp') % 128` still maps 100% of `acme-corp` to **one** partition. **Unkeyed Round-Robin**: Breaks per-`user_id` ordering and forces an expensive full-topic repartition before 1-minute `tenant_id` windowing.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Dynamic Whale Salting + Two-Stage Aggregation",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Production Kafka pipelines balance load without losing ordering or accuracy: **Dynamic Whale Config (No Topic Recreation)**: Maintain a lightweight hot-tenant map (`acme-corp -> K=16`, normal tenants `K=1`) pushed via config/Redis.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Two-Stage Windowed Rollup",
+            "title": "Salted Partition Parallelism -> Partial Window -> Exact Tenant Sum",
+            "actors": [
+              {
+                "id": "prod",
+                "label": "Producer"
+              },
+              {
+                "id": "k",
+                "label": "32 Partitions"
+              },
+              {
+                "id": "s1",
+                "label": "Stage 1 (32x)"
+              },
+              {
+                "id": "s2",
+                "label": "Stage 2 Agg"
+              }
+            ],
+            "events": [
+              {
+                "from": "prod",
+                "to": "k",
+                "label": "Key = acme-corp#(hash(user)%16)",
+                "status": "ok"
+              },
+              {
+                "from": "k",
+                "to": "s1",
+                "label": "~1,062 msg/s per partition (<2.2k cap)",
+                "status": "ok"
+              },
+              {
+                "from": "s1",
+                "to": "s2",
+                "label": "Emit 16 partial 1-min counts",
+                "status": "ok"
+              },
+              {
+                "from": "s2",
+                "to": "s2",
+                "label": "Merge by (tenant_id, window) -> exact!",
+                "status": "ok"
+              }
+            ],
+            "summary": "Hashing user_id into K=16 buckets preserves per-user ordering while two-stage aggregation delivers exact per-tenant windows."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Salt only hot/whale tenant keys (or composite tenant_id#user_id) across K partitions to balance broker and consumer load, and use two-stage aggregation to preserve exact 1-minute tenant rollups."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** In a `32-partition` Kafka topic (`25,000 events/sec` total, `~781 msg/s` average) keyed by `tenant_id`, one whale tenant (`acme-corp`) sends `17,000 events/sec` (`68%` of traffic).\n\n**Visual & Structural Flow:** Depicts Spreading acme-corp (17k/s) Across 16 Salted Partitions (Part 0..7 -> Part 8..15 -> Part 16..23 -> Part 24..31 -> acme#0); Salted Partition Parallelism -> Partial Window -> Exact Tenant Sum (Producer -> 32 Partitions -> Stage 1 (32x) -> Stage 2 Agg).\n\n**Trade-Offs & Production:** Two common reactions fail: **Adding More Partitions (`32 -> 128`)**: `Murmur2('acme-corp') % 128` still maps 100% of `acme-corp` to **one** partition. Production Kafka pipelines balance load without losing ordering or accuracy: **Dynamic Whale Config (No Topic Recreation)**: Maintain a lightweight hot-tenant map (`acme-corp ->.\n\n**Failure Modes & Application:** Adaptive salting + hierarchical aggregation solves skew in any partitioned streaming system: **Multi-Tenant Analytics (Kafka / Flink)**: Preventing enterprise whale tenants from starving shared consumer groups.",
+      "spark": {
+        "summary": "When whale tenant acme-corp (68% of 25k events/sec) pins partition 14 at 17,000 msg/s while 31 partitions sit idle, adaptive key salting (acme-corp#0..15) + two-stage tumbling aggregation balances all 32 partitions under 2x cluster average.",
+        "keyTakeaway": "Salt only hot/whale tenant keys (or composite tenant_id#user_id) across K partitions to balance broker and consumer load, and use two-stage aggregation to preserve exact 1-minute tenant rollups."
+      }
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** When whale tenant acme-corp (68% of 25k events/sec) pins partition 14 at 17,000 msg/s while 31 partitions sit idle, adaptive key salting (acme-corp#0..15) + two-stage tumbling aggregation balances all 32 partitions under 2x cluster average.\n\n**Production Trade-Offs:** Two common reactions fail: **Adding More Partitions (`32 -> 128`)**: `Murmur2('acme-corp') % 128` still maps 100% of `acme-corp` to **one** partition.\n\n**Failure Modes & Edge Cases:** Adaptive salting + hierarchical aggregation solves skew in any partitioned streaming system: **Multi-Tenant Analytics (Kafka / Flink)**: Preventing enterprise whale tenants from starving shared consumer groups.\n\n**Principal Takeaway:** Salt only hot/whale tenant keys (or composite tenant_id#user_id) across K partitions to balance broker and consumer load, and use two-stage aggregation to preserve exact 1-minute tenant rollups.",
+      "spark": {
+        "summary": "When whale tenant acme-corp (68% of 25k events/sec) pins partition 14 at 17,000 msg/s while 31 partitions sit idle, adaptive key salting (acme-corp#0..15) + two-stage tumbling aggregation balances all 32 partitions under 2x cluster average.",
+        "keyTakeaway": "Salt only hot/whale tenant keys (or composite tenant_id#user_id) across K partitions to balance broker and consumer load, and use two-stage aggregation to preserve exact 1-minute tenant rollups."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why Kafka partition skew creates consumer lag despite 32 partitions",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why Kafka partition skew creates consumer lag despite 32 partitions works from first principles.",
+          "explanation": "In a `32-partition` Kafka topic (`25,000 events/sec` total, `~781 msg/s` average) keyed by `tenant_id`, one whale tenant (`acme-corp`) sends `17,000 events/sec` (`68%` of traffic). Because `Murmur2('acme-corp') % 32 == 14`, **partition 14 and consumer #14** absorb `17,000 msg/s`—nearly `8×` a single consumer thread's `2,200 events/sec` ceiling—building a `4.5M`-message lag while the other 31 consumers sit at 3% CPU.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "What happens when one key saturates a broker leader and consumer thread",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without What happens when one key saturates a broker leader and consumer thread under real concurrency or scale.",
+          "explanation": "Hot-partition skew breaks both Kafka brokers and stream processors:\n\n1. **Consumer Thread Ceiling**: Kafka assigns each partition to at most **one** consumer thread in a group; 31 idle threads cannot help partition 14.\n2. **Broker Disk Saturation**: Broker #3 (leader for partition 14) hits 98% disk I/O.\n3. **Broken Window Watermarks**: 4.5M lag delays `acme-corp`'s 1-minute analytics by 30+ minutes.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "ring",
+            "eyebrow": "Adaptive Key Salting",
+            "title": "Spreading acme-corp (17k/s) Across 16 Salted Partitions",
+            "nodes": [
+              "Part 0..7",
+              "Part 8..15",
+              "Part 16..23",
+              "Part 24..31"
+            ],
+            "vnodes": [
+              "acme#0",
+              "acme#1",
+              "acme#2",
+              "acme#3",
+              "acme#4",
+              "acme#5",
+              "acme#6",
+              "acme#7"
+            ],
+            "ringLabel": "Murmur2(tenant#salt)",
+            "ringSub": "<1,560 msg/s max",
+            "sampleKey": "acme#3",
+            "summary": "Salting acme-corp across K=16 buckets (or hashing tenant_id#user_id) caps every partition below ~1,500 msg/s."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive solution (and why adding partitions or round-robin fails)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "The problem: see what breaks without Naive solution under real concurrency or scale.",
+          "explanation": "Two common reactions fail:\n\n- **Adding More Partitions (`32 -> 128`)**: `Murmur2('acme-corp') % 128` still maps 100% of `acme-corp` to **one** partition.\n- **Unkeyed Round-Robin**: Breaks per-`user_id` ordering and forces an expensive full-topic repartition before 1-minute `tenant_id` windowing.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Dynamic Whale Salting + Two-Stage Aggregation",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Production Kafka pipelines balance load without losing ordering or accuracy:\n\n- **Dynamic Whale Config (No Topic Recreation)**: Maintain a lightweight hot-tenant map (`acme-corp -> K=16`, normal tenants `K=1`) pushed via config/Redis. Producers compute `key = f'{tenant_id}#{hash(user_id) % K}'`—preserving strict per-`user_id` ordering while spreading `acme-corp` across `16` partitions (`~1,062 msg/s` each, well under the `2,200 msg/s` thread limit).\n- **Two-Stage Tumbling Window**: Stage 1 (32 workers) computes partial 1-minute aggregates keyed by `(tenant_id, salt, window_end)` and emits compact partial records (`32` rows/min/tenant); Stage 2 sums partials by `(tenant_id, window_end)`.\n- **Zero-Loss Migration**: Deploy Stage 2 / dual-key consumers first, then flip producer salting.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Two-Stage Windowed Rollup",
+            "title": "Salted Partition Parallelism -> Partial Window -> Exact Tenant Sum",
+            "actors": [
+              {
+                "id": "prod",
+                "label": "Producer"
+              },
+              {
+                "id": "k",
+                "label": "32 Partitions"
+              },
+              {
+                "id": "s1",
+                "label": "Stage 1 (32x)"
+              },
+              {
+                "id": "s2",
+                "label": "Stage 2 Agg"
+              }
+            ],
+            "events": [
+              {
+                "from": "prod",
+                "to": "k",
+                "label": "Key = acme-corp#(hash(user)%16)",
+                "status": "ok"
+              },
+              {
+                "from": "k",
+                "to": "s1",
+                "label": "~1,062 msg/s per partition (<2.2k cap)",
+                "status": "ok"
+              },
+              {
+                "from": "s1",
+                "to": "s2",
+                "label": "Emit 16 partial 1-min counts",
+                "status": "ok"
+              },
+              {
+                "from": "s2",
+                "to": "s2",
+                "label": "Merge by (tenant_id, window) -> exact!",
+                "status": "ok"
+              }
+            ],
+            "summary": "Hashing user_id into K=16 buckets preserves per-user ordering while two-stage aggregation delivers exact per-tenant windows."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where Key Salting & Two-Stage Aggregation apply in System Design",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Adaptive salting + hierarchical aggregation solves skew in any partitioned streaming system:\n\n- **Multi-Tenant Analytics (Kafka / Flink)**: Preventing enterprise whale tenants from starving shared consumer groups.\n- **Real-Time Metrics & Billing**: Computing exact per-customer 1-minute rollups across salted partitions.\n- **IoT & Clickstream Pipelines**: Preserving per-device/per-user ordering while scaling across 32–256 partitions.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Salt only hot/whale tenant keys (or composite tenant_id#user_id) across K partitions to balance broker and consumer load, and use two-stage aggregation to preserve exact 1-minute tenant rollups."
+    }
+  }
+}

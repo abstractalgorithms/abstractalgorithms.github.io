@@ -1,0 +1,540 @@
+{
+  "id": "problem-design-high-concurrency-cache",
+  "slug": "design-high-concurrency-cache",
+  "title": "Design a High-Concurrency LRU & W-TinyLFU Cache",
+  "problemType": "system-design",
+  "difficulty": "medium",
+  "prompt": "Design an in-process thread-safe cache for a 64-core API server holding 10M entries (~8 GB, ~800 B/entry) at 1,200,000 `get()`/sec (95% reads, 5% writes) and < 50 us p99 latency. A single-lock `HashMap + DoublyLinkedList` collapses to 140K ops/sec because `get()` mutates the list. Add scan resistance and bounded TTL.",
+  "spark": {
+    "summary": "A classic `HashMap + DoublyLinkedList` LRU serializes every read behind a global write lock, collapsing 64-core throughput from 1.2M ops/sec to 140K ops/sec.",
+    "keyTakeaway": "Eliminate read-path lock contention via 128-way lock striping or Caffeine-style read ring buffers (or SIEVE 1-bit `visited` flags), and pair with W-TinyLFU (1% window + 4-bit Count-Min Sketch) for scan resistance.",
+    "byteSummary": "**Core Mechanics:** Every textbook teaches `HashMap + DoublyLinkedList` for `O(1)` LRU.\n\n**Visual & Structural Flow:** Depicts 1% Admission Window -> 4-bit Count-Min Sketch -> Segmented Main (128 Striped Shards -> Read Ring Buffer -> W-TinyLFU (CMS) -> Timing Wheel TTL); Lock-Free Read Buffer Drain & W-TinyLFU Admission Filter (64 Reader Cores -> Striped Read Buffer -> 4-bit CMS Filter -> Main SLRU (99%)).\n\n**Trade-Offs & Production:** A `ReentrantReadWriteLock` still requires an exclusive write lock on `get()` to mutate the LRU list. Scale to `1.2M+ ops/sec` within `8 GB` (`~880 MB` metadata + `7.12 GB` payload): **Zero-Contention Read Path**: Partition into `128` shards (`78,125` entries and `9,375` ops/s per.\n\n**Failure Modes & Application:** Caffeine (Java) and Ristretto/Otter (Go) implement this exact architecture: **L1 In-Process Caches**: Sits in front of Redis/DB in high-QPS API servers to serve `95%` hot reads in `< 50 us`."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why classic LRU fails on 64-core servers",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": "Every textbook teaches `HashMap + DoublyLinkedList` for `O(1)` LRU. On a 64-core server handling `1,200,000 get()/sec` (`95%` reads), `get()` is *not* read-only: it must unlink the node and move it to the MRU head—forcing a global write lock that caps throughput at `~140,000 ops/sec` (`>85%` CPU spent spinning).",
+      "purpose": "The mechanism: understand how Why classic LRU fails on 64-core servers works from first principles."
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "Mutex convoying, one-hit scan pollution, and expired-key leaks",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "Three bottlenecks destroy in-process cache performance:\n\n1. **Global Write-Lock Contention**: 64 threads serialize on one mutex (`140k` vs `1.2M` ops/sec).\n2. **One-Hit Scan Pollution**: A batch job scanning `10M` cold keys flushes the entire hot working set out of a pure LRU.\n3. **Lazy-TTL Memory Leak**: Keys that expire without being read again occupy the `8 GB` budget unless swept.",
+      "sectionDiagram": {
+        "kind": "cache-tier",
+        "eyebrow": "W-TinyLFU + Striped Cache",
+        "title": "1% Admission Window -> 4-bit Count-Min Sketch -> Segmented Main",
+        "nodes": [
+          {
+            "label": "128 Striped Shards",
+            "role": "9.4k ops/s/shard (<50us)"
+          },
+          {
+            "label": "Read Ring Buffer",
+            "role": "Lossy batch promote (no lock)"
+          },
+          {
+            "label": "W-TinyLFU (CMS)",
+            "role": "Blocks 1-hit scan pollution"
+          },
+          {
+            "label": "Timing Wheel TTL",
+            "role": "O(1) active expiry sweep"
+          }
+        ],
+        "edges": [
+          {
+            "label": "freq(cand) > freq(victim)"
+          },
+          {
+            "label": "periodic CMS halving"
+          }
+        ],
+        "summary": "Striped read ring buffers remove read-path locks while W-TinyLFU protects hot entries from sequential scans."
+      },
+      "purpose": "The problem: see what breaks without Mutex convoying, one-hit scan pollution, and expired-key leaks under real concurrency or scale."
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Naive `RWLock` and un-aged frequency counters",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "A `ReentrantReadWriteLock` still requires an exclusive write lock on `get()` to mutate the LRU list. Meanwhile, a naive LFU without periodic counter halving lets historically hot keys permanently block newly hot keys.",
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise solution: Lock Striping / SIEVE + W-TinyLFU + Timing Wheel",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": "Scale to `1.2M+ ops/sec` within `8 GB` (`~880 MB` metadata + `7.12 GB` payload):\n\n- **Zero-Contention Read Path**: Partition into `128` shards (`78,125` entries and `9,375` ops/s per shard) + a Caffeine-style striped **read ring buffer** (drains promotions asynchronously under `tryLock`) or **SIEVE** (`if (!node.visited) node.visited = true;` avoids even dirtying the cache line on hot reads!).\n- **Scan Resistance (W-TinyLFU)**: Admit new keys into a `1%` Window LRU; on eviction, a **4-bit Count-Min Sketch** (periodically halved) admits the candidate to Main SLRU only if its frequency beats the Main victim.\n- **Active TTL**: Hierarchical timing wheel sweeps expired entries in `O(1)`.",
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Deferred Promotion & Eviction",
+        "title": "Lock-Free Read Buffer Drain & W-TinyLFU Admission Filter",
+        "actors": [
+          {
+            "id": "reader",
+            "label": "64 Reader Cores"
+          },
+          {
+            "id": "rb",
+            "label": "Striped Read Buffer"
+          },
+          {
+            "id": "cms",
+            "label": "4-bit CMS Filter"
+          },
+          {
+            "id": "slru",
+            "label": "Main SLRU (99%)"
+          }
+        ],
+        "events": [
+          {
+            "from": "reader",
+            "to": "rb",
+            "label": "get(k): ConcurrentHashMap + append ring",
+            "status": "ok"
+          },
+          {
+            "from": "rb",
+            "to": "slru",
+            "label": "tryLock() drains batch -> promote/evict",
+            "status": "ok"
+          },
+          {
+            "from": "cms",
+            "to": "slru",
+            "label": "One-hit scan (freq=1 < victim=12) -> reject",
+            "status": "warn"
+          }
+        ],
+        "summary": "Readers never wait on list locks; a single tryLock drain updates LRU order and filters one-hit scans via CMS."
+      },
+      "markdownContent": "```java\n// SIEVE / Deferred-Read Pattern: avoid write-locking on hot reads\npublic V get(K key) {\n    Node<K, V> node = map.get(key); // ConcurrentHashMap lock-free read\n    if (node == null || node.isExpired(clock.millis())) return null;\n    if (!node.visited) {\n        node.visited = true; // Avoids cache-line bouncing on hot keys\n    }\n    readBuffer.offer(node);  // Lossy ring buffer drained asynchronously\n    return node.value;\n}\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where high-concurrency W-TinyLFU caches are used",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": "Caffeine (Java) and Ristretto/Otter (Go) implement this exact architecture:\n\n- **L1 In-Process Caches**: Sits in front of Redis/DB in high-QPS API servers to serve `95%` hot reads in `< 50 us`.\n- **Database & Storage Block Caches**: RocksDB/CockroachDB Pebble use segmented/clock-pro caches to resist large range-scan pollution.",
+      "supportingConcepts": [
+        {
+          "slug": "caching",
+          "title": "Concept: Caching Strategies",
+          "kind": "concept"
+        },
+        {
+          "slug": "lock-free-atomics",
+          "title": "Concept: Lock-Free Atomics",
+          "kind": "concept"
+        },
+        {
+          "slug": "hash-tables-and-bloom-filters",
+          "title": "Concept: Hash Tables & Bloom Filters",
+          "kind": "concept"
+        },
+        {
+          "slug": "design-lru-cache-lld",
+          "title": "System Design: Thread-Safe LRU Cache (LLD)",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why does Caffeine use a lossy read ring buffer and W-TinyLFU instead of a global-lock LRU?",
+      "options": [
+        {
+          "id": "a",
+          "text": "The lossy ring buffer batches LRU promotions off the hot read path without blocking readers, while W-TinyLFU's Count-Min Sketch prevents one-hit scans from evicting hot keys",
+          "correct": true,
+          "feedback": "Correct: decoupling list mutation from `get()` removes mutex contention, and W-TinyLFU adds scan resistance."
+        },
+        {
+          "id": "b",
+          "text": "Because `ConcurrentHashMap.get()` cannot store keys larger than 64 bytes",
+          "correct": false,
+          "feedback": "`ConcurrentHashMap` has no 64-byte key limit; the bottleneck in classic LRU is mutating the doubly linked list on every read."
+        },
+        {
+          "id": "c",
+          "text": "W-TinyLFU eliminates the need for TTL expiration on cached entries",
+          "correct": false,
+          "feedback": "W-TinyLFU handles eviction policy; TTL expiration still requires a timing wheel or periodic sweep."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why does Caffeine use a lossy read ring buffer and W-TinyLFU instead of a global-lock LRU?",
+        "options": [
+          {
+            "id": "a",
+            "text": "The lossy ring buffer batches LRU promotions off the hot read path without blocking readers, while W-TinyLFU's Count-Min Sketch prevents one-hit scans from evicting hot keys",
+            "correct": true,
+            "feedback": "Correct: decoupling list mutation from `get()` removes mutex contention, and W-TinyLFU adds scan resistance."
+          },
+          {
+            "id": "b",
+            "text": "Because `ConcurrentHashMap.get()` cannot store keys larger than 64 bytes",
+            "correct": false,
+            "feedback": "`ConcurrentHashMap` has no 64-byte key limit; the bottleneck in classic LRU is mutating the doubly linked list on every read."
+          },
+          {
+            "id": "c",
+            "text": "W-TinyLFU eliminates the need for TTL expiration on cached entries",
+            "correct": false,
+            "feedback": "W-TinyLFU handles eviction policy; TTL expiration still requires a timing wheel or periodic sweep."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why classic LRU fails on 64-core servers', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "b",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "c",
+            "text": "Every textbook teaches HashMap + DoublyLinkedList for O(1) LRU.",
+            "correct": true,
+            "feedback": "Correct: Every textbook teaches HashMap + DoublyLinkedList for O(1) LRU."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Mutex convoying, one-hit scan pollution, and expired-key leaks', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "b",
+            "text": "Three bottlenecks destroy in-process cache performance: 1.",
+            "correct": true,
+            "feedback": "Correct: Three bottlenecks destroy in-process cache performance: 1."
+          },
+          {
+            "id": "c",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** Every textbook teaches `HashMap + DoublyLinkedList` for `O(1)` LRU.\n\n**How It Flows:** Think of Design a High-Concurrency LRU & W-TinyLFU Cache as a clear step-by-step chain: 128 Striped Shards -> Read Ring Buffer -> W-TinyLFU (CMS) -> Timing Wheel TTL -> 64 Reader Cores.\n\n**Why Beginners Should Care:** Eliminate read-path lock contention via 128-way lock striping or Caffeine-style read ring buffers (or SIEVE 1-bit `visited` flags), and pair with W-TinyLFU (1% window + 4-bit Count-Min Sketch) for scan resistance.",
+      "spark": {
+        "summary": "Every textbook teaches `HashMap + DoublyLinkedList` for `O(1)` LRU.",
+        "keyTakeaway": "Eliminate read-path lock contention via 128-way lock striping or Caffeine-style read ring buffers (or SIEVE 1-bit `visited` flags), and pair with W-TinyLFU (1% window + 4-bit Count-Min Sketch) for scan resistance."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why classic LRU fails on 64-core servers",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why classic LRU fails on 64-core servers works from first principles.",
+          "explanation": "Every textbook teaches `HashMap + DoublyLinkedList` for `O(1)` LRU. On a 64-core server handling `1,200,000 get()/sec` (`95%` reads), `get()` is *not* read-only: it must unlink the node and move it to the MRU head—forcing a global write lock that caps throughput at `~140,000 ops/sec` (`>85%` CPU spent spinning).",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Mutex convoying, one-hit scan pollution, and expired-key leaks",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without Mutex convoying, one-hit scan pollution, and expired-key leaks under real concurrency or scale.",
+          "explanation": "Three bottlenecks destroy in-process cache performance: 1. **Global Write-Lock Contention**: 64 threads serialize on one mutex (`140k` vs `1.2M` ops/sec). 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "W-TinyLFU + Striped Cache",
+            "title": "1% Admission Window -> 4-bit Count-Min Sketch -> Segmented Main",
+            "nodes": [
+              {
+                "label": "128 Striped Shards",
+                "role": "9.4k ops/s/shard (<50us)"
+              },
+              {
+                "label": "Read Ring Buffer",
+                "role": "Lossy batch promote (no lock)"
+              },
+              {
+                "label": "W-TinyLFU (CMS)",
+                "role": "Blocks 1-hit scan pollution"
+              },
+              {
+                "label": "Timing Wheel TTL",
+                "role": "O(1) active expiry sweep"
+              }
+            ],
+            "edges": [
+              {
+                "label": "freq(cand) > freq(victim)"
+              },
+              {
+                "label": "periodic CMS halving"
+              }
+            ],
+            "summary": "Striped read ring buffers remove read-path locks while W-TinyLFU protects hot entries from sequential scans."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive `RWLock` and un-aged frequency counters",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "A `ReentrantReadWriteLock` still requires an exclusive write lock on `get()` to mutate the LRU list. Meanwhile, a naive LFU without periodic counter halving lets historically hot keys permanently block newly hot keys.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Lock Striping / SIEVE + W-TinyLFU + Timing Wheel",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Scale to `1.2M+ ops/sec` within `8 GB` (`~880 MB` metadata + `7.12 GB` payload): **Zero-Contention Read Path**: Partition into `128` shards (`78,125` entries and `9,375` ops/s per shard) + a Caffeine-style striped **read ring buffer** (drains promotions asynchronously under `tryLock`) or **SIEVE** (`if (!node.visited) node.visited = true;` avoids even dirtying the cache line on hot reads!).",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Deferred Promotion & Eviction",
+            "title": "Lock-Free Read Buffer Drain & W-TinyLFU Admission Filter",
+            "actors": [
+              {
+                "id": "reader",
+                "label": "64 Reader Cores"
+              },
+              {
+                "id": "rb",
+                "label": "Striped Read Buffer"
+              },
+              {
+                "id": "cms",
+                "label": "4-bit CMS Filter"
+              },
+              {
+                "id": "slru",
+                "label": "Main SLRU (99%)"
+              }
+            ],
+            "events": [
+              {
+                "from": "reader",
+                "to": "rb",
+                "label": "get(k): ConcurrentHashMap + append ring",
+                "status": "ok"
+              },
+              {
+                "from": "rb",
+                "to": "slru",
+                "label": "tryLock() drains batch -> promote/evict",
+                "status": "ok"
+              },
+              {
+                "from": "cms",
+                "to": "slru",
+                "label": "One-hit scan (freq=1 < victim=12) -> reject",
+                "status": "warn"
+              }
+            ],
+            "summary": "Readers never wait on list locks; a single tryLock drain updates LRU order and filters one-hit scans via CMS."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Eliminate read-path lock contention via 128-way lock striping or Caffeine-style read ring buffers (or SIEVE 1-bit `visited` flags), and pair with W-TinyLFU (1% window + 4-bit Count-Min Sketch) for scan resistance."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** Every textbook teaches `HashMap + DoublyLinkedList` for `O(1)` LRU.\n\n**Visual & Structural Flow:** Depicts 1% Admission Window -> 4-bit Count-Min Sketch -> Segmented Main (128 Striped Shards -> Read Ring Buffer -> W-TinyLFU (CMS) -> Timing Wheel TTL); Lock-Free Read Buffer Drain & W-TinyLFU Admission Filter (64 Reader Cores -> Striped Read Buffer -> 4-bit CMS Filter -> Main SLRU (99%)).\n\n**Trade-Offs & Production:** A `ReentrantReadWriteLock` still requires an exclusive write lock on `get()` to mutate the LRU list. Scale to `1.2M+ ops/sec` within `8 GB` (`~880 MB` metadata + `7.12 GB` payload): **Zero-Contention Read Path**: Partition into `128` shards (`78,125` entries and `9,375` ops/s per.\n\n**Failure Modes & Application:** Caffeine (Java) and Ristretto/Otter (Go) implement this exact architecture: **L1 In-Process Caches**: Sits in front of Redis/DB in high-QPS API servers to serve `95%` hot reads in `< 50 us`.",
+      "spark": {
+        "summary": "A classic `HashMap + DoublyLinkedList` LRU serializes every read behind a global write lock, collapsing 64-core throughput from 1.2M ops/sec to 140K ops/sec.",
+        "keyTakeaway": "Eliminate read-path lock contention via 128-way lock striping or Caffeine-style read ring buffers (or SIEVE 1-bit `visited` flags), and pair with W-TinyLFU (1% window + 4-bit Count-Min Sketch) for scan resistance."
+      }
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** A classic `HashMap + DoublyLinkedList` LRU serializes every read behind a global write lock, collapsing 64-core throughput from 1.2M ops/sec to 140K ops/sec.\n\n**Production Trade-Offs:** A `ReentrantReadWriteLock` still requires an exclusive write lock on `get()` to mutate the LRU list. Meanwhile, a naive LFU without periodic counter halving lets historically hot keys permanently block newly hot keys.\n\n**Failure Modes & Edge Cases:** Caffeine (Java) and Ristretto/Otter (Go) implement this exact architecture: **L1 In-Process Caches**: Sits in front of Redis/DB in high-QPS API servers to serve `95%` hot reads in `< 50 us`.\n\n**Principal Takeaway:** Eliminate read-path lock contention via 128-way lock striping or Caffeine-style read ring buffers (or SIEVE 1-bit `visited` flags), and pair with W-TinyLFU (1% window + 4-bit Count-Min Sketch) for scan resistance.",
+      "spark": {
+        "summary": "A classic `HashMap + DoublyLinkedList` LRU serializes every read behind a global write lock, collapsing 64-core throughput from 1.2M ops/sec to 140K ops/sec.",
+        "keyTakeaway": "Eliminate read-path lock contention via 128-way lock striping or Caffeine-style read ring buffers (or SIEVE 1-bit `visited` flags), and pair with W-TinyLFU (1% window + 4-bit Count-Min Sketch) for scan resistance."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why classic LRU fails on 64-core servers",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why classic LRU fails on 64-core servers works from first principles.",
+          "explanation": "Every textbook teaches `HashMap + DoublyLinkedList` for `O(1)` LRU. On a 64-core server handling `1,200,000 get()/sec` (`95%` reads), `get()` is *not* read-only: it must unlink the node and move it to the MRU head—forcing a global write lock that caps throughput at `~140,000 ops/sec` (`>85%` CPU spent spinning).",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Mutex convoying, one-hit scan pollution, and expired-key leaks",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without Mutex convoying, one-hit scan pollution, and expired-key leaks under real concurrency or scale.",
+          "explanation": "Three bottlenecks destroy in-process cache performance:\n\n1. **Global Write-Lock Contention**: 64 threads serialize on one mutex (`140k` vs `1.2M` ops/sec).\n2. **One-Hit Scan Pollution**: A batch job scanning `10M` cold keys flushes the entire hot working set out of a pure LRU.\n3. **Lazy-TTL Memory Leak**: Keys that expire without being read again occupy the `8 GB` budget unless swept.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "W-TinyLFU + Striped Cache",
+            "title": "1% Admission Window -> 4-bit Count-Min Sketch -> Segmented Main",
+            "nodes": [
+              {
+                "label": "128 Striped Shards",
+                "role": "9.4k ops/s/shard (<50us)"
+              },
+              {
+                "label": "Read Ring Buffer",
+                "role": "Lossy batch promote (no lock)"
+              },
+              {
+                "label": "W-TinyLFU (CMS)",
+                "role": "Blocks 1-hit scan pollution"
+              },
+              {
+                "label": "Timing Wheel TTL",
+                "role": "O(1) active expiry sweep"
+              }
+            ],
+            "edges": [
+              {
+                "label": "freq(cand) > freq(victim)"
+              },
+              {
+                "label": "periodic CMS halving"
+              }
+            ],
+            "summary": "Striped read ring buffers remove read-path locks while W-TinyLFU protects hot entries from sequential scans."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive `RWLock` and un-aged frequency counters",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "A `ReentrantReadWriteLock` still requires an exclusive write lock on `get()` to mutate the LRU list. Meanwhile, a naive LFU without periodic counter halving lets historically hot keys permanently block newly hot keys.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Lock Striping / SIEVE + W-TinyLFU + Timing Wheel",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Scale to `1.2M+ ops/sec` within `8 GB` (`~880 MB` metadata + `7.12 GB` payload):\n\n- **Zero-Contention Read Path**: Partition into `128` shards (`78,125` entries and `9,375` ops/s per shard) + a Caffeine-style striped **read ring buffer** (drains promotions asynchronously under `tryLock`) or **SIEVE** (`if (!node.visited) node.visited = true;` avoids even dirtying the cache line on hot reads!).\n- **Scan Resistance (W-TinyLFU)**: Admit new keys into a `1%` Window LRU; on eviction, a **4-bit Count-Min Sketch** (periodically halved) admits the candidate to Main SLRU only if its frequency beats the Main victim.\n- **Active TTL**: Hierarchical timing wheel sweeps expired entries in `O(1)`.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Deferred Promotion & Eviction",
+            "title": "Lock-Free Read Buffer Drain & W-TinyLFU Admission Filter",
+            "actors": [
+              {
+                "id": "reader",
+                "label": "64 Reader Cores"
+              },
+              {
+                "id": "rb",
+                "label": "Striped Read Buffer"
+              },
+              {
+                "id": "cms",
+                "label": "4-bit CMS Filter"
+              },
+              {
+                "id": "slru",
+                "label": "Main SLRU (99%)"
+              }
+            ],
+            "events": [
+              {
+                "from": "reader",
+                "to": "rb",
+                "label": "get(k): ConcurrentHashMap + append ring",
+                "status": "ok"
+              },
+              {
+                "from": "rb",
+                "to": "slru",
+                "label": "tryLock() drains batch -> promote/evict",
+                "status": "ok"
+              },
+              {
+                "from": "cms",
+                "to": "slru",
+                "label": "One-hit scan (freq=1 < victim=12) -> reject",
+                "status": "warn"
+              }
+            ],
+            "summary": "Readers never wait on list locks; a single tryLock drain updates LRU order and filters one-hit scans via CMS."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where high-concurrency W-TinyLFU caches are used",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Caffeine (Java) and Ristretto/Otter (Go) implement this exact architecture:\n\n- **L1 In-Process Caches**: Sits in front of Redis/DB in high-QPS API servers to serve `95%` hot reads in `< 50 us`.\n- **Database & Storage Block Caches**: RocksDB/CockroachDB Pebble use segmented/clock-pro caches to resist large range-scan pollution.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Eliminate read-path lock contention via 128-way lock striping or Caffeine-style read ring buffers (or SIEVE 1-bit `visited` flags), and pair with W-TinyLFU (1% window + 4-bit Count-Min Sketch) for scan resistance."
+    }
+  }
+}

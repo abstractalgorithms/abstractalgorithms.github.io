@@ -1,0 +1,576 @@
+{
+  "id": "problem-fixing-coordinated-omission-load-tests",
+  "slug": "fixing-coordinated-omission-load-tests",
+  "title": "Fixing Coordinated Omission in Load Tests",
+  "problemType": "production-debugging",
+  "difficulty": "medium",
+  "prompt": "Your payment gateway SLA requires p99.9 latency below 120 ms at 5,000 RPS. A closed-loop benchmark with 100 worker threads reports p99.9 = 45 ms, yet production alerts fire on 2.4-second timeouts during 800 ms JVM safepoint pauses. Design and implement an open-loop load harness with Coordinated Omission correction that accurately captures queueing delay during server stalls.",
+  "spark": {
+    "summary": "Closed-loop load generators pause sending while waiting for slow responses, hiding 800 ms JVM safepoint stalls (reporting 45 ms p99.9 instead of 2,400 ms); an open-loop pacer with HdrHistogram expected-interval backfill captures true queueing delay.",
+    "keyTakeaway": "Always benchmark latency SLAs with an open-loop fixed-rate scheduler that measures from intended scheduled start time and backfills omitted intervals during server stalls.",
+    "byteSummary": "**Core Mechanics:** A closed-loop benchmark with `100` worker threads reports `p99.9 = 45 ms` at `5,000 RPS`, yet production alerts fire on `2.4-second` timeouts during `800 ms` JVM safepoint pauses.\n\n**Visual & Structural Flow:** Depicts 800ms Server Stall: Closed-Loop Hides Queueing vs. Open-Loop Measures It (Open-Loop Pacer -> Async Client (2k) -> Payment GW); NanoTime Pacer -> Bounded Async Pool -> HdrHistogram Dual Recording (NanoTime Pacer -> Virtual Queue -> Async HTTP Pool -> HdrHistogram).\n\n**Trade-Offs & Production:** Increasing closed-loop threads from `100` to `2,000` still stalls once all threads are waiting on a long GC pause, and exhausts client-side ephemeral ports or CPU. Accurate tail-latency benchmarking (`wrk2`, `k6` constant-arrival-rate, `HdrHistogram`) uses four rules: **Open-Loop Arrival Schedule**: Schedule requests at fixed `200 µs`.\n\n**Failure Modes & Application:** Coordinated-omission-free testing is mandatory before signing off on strict p99.9 SLAs: **Payment & Trading Gateways**: Validating `< 120 ms` p99.9 under realistic JVM/Go GC pauses."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why Coordinated Omission invalidates closed-loop benchmarks",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": "A closed-loop benchmark with `100` worker threads reports `p99.9 = 45 ms` at `5,000 RPS`, yet production alerts fire on `2.4-second` timeouts during `800 ms` JVM safepoint pauses. Because each closed-loop thread waits for a response before sending its next request, **all 100 threads stop sending during the 800 ms pause**—omitting the `4,000` requests that *would* have arrived at `5,000 RPS` and queued behind the stall.",
+      "purpose": "The mechanism: understand how Why Coordinated Omission invalidates closed-loop benchmarks works from first principles."
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "What happens when load generators coordinate with server stalls",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "Coordinated Omission distorts tail percentiles in two ways:\n\n1. **Zero Queueing Visibility**: Measuring only `actual_send -> response` ignores the time requests wait in the arrival queue during a pause.\n2. **False SLA Confidence**: Only `100` in-flight requests record the `800 ms` stall instead of `4,000` arrivals, making `p99.9` look artificially clean.",
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Closed-Loop vs. Open-Loop Pacer",
+        "title": "800ms Server Stall: Closed-Loop Hides Queueing vs. Open-Loop Measures It",
+        "actors": [
+          {
+            "id": "pacer",
+            "label": "Open-Loop Pacer"
+          },
+          {
+            "id": "pool",
+            "label": "Async Client (2k)"
+          },
+          {
+            "id": "srv",
+            "label": "Payment GW"
+          }
+        ],
+        "events": [
+          {
+            "from": "pacer",
+            "to": "pool",
+            "label": "Schedule every 200us (5,000 RPS)",
+            "status": "ok"
+          },
+          {
+            "from": "srv",
+            "to": "srv",
+            "label": "800ms JVM safepoint pause!",
+            "status": "fail"
+          },
+          {
+            "from": "pacer",
+            "to": "pool",
+            "label": "4,000 virtual arrivals queue up",
+            "status": "warn"
+          },
+          {
+            "from": "pool",
+            "to": "pacer",
+            "label": "Record (now - intended_start) + backfill",
+            "status": "ok"
+          }
+        ],
+        "summary": "Recording response_time = now - intended_start_ns captures the full queueing + service delay during stalls."
+      },
+      "purpose": "The problem: see what breaks without What happens when load generators coordinate with server stalls under real concurrency or scale."
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Naive solution (and why adding more closed-loop threads doesn't fix it)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "Increasing closed-loop threads from `100` to `2,000` still stalls once all threads are waiting on a long GC pause, and exhausts client-side ephemeral ports or CPU.",
+      "purpose": "The problem: see what breaks without Naive solution under real concurrency or scale."
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise solution: Open-Loop Pacer + HdrHistogram Backfill + Monotonic Clock",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": "Accurate tail-latency benchmarking (`wrk2`, `k6` constant-arrival-rate, `HdrHistogram`) uses four rules:\n\n- **Open-Loop Arrival Schedule**: Schedule requests at fixed `200 µs` intervals (`5,000 RPS`) using `System.nanoTime()` (monotonic, immune to NTP).\n- **Service vs. Response Time**: Track both `service_time = end - actual_send` and `response_time = end - intended_start`.\n- **HdrHistogram Backfill**: Call `recordValueWithExpectedInterval(latencyNs, expectedIntervalNs)` (which linearly backfills `latency - k * interval` for omitted samples) inside bounded memory (`< 512 MB` heap) for `10M+` samples.\n- **Bounded Socket Pool**: Cap physical sockets at `2,048` while accounting for queued virtual arrivals.",
+      "sectionDiagram": {
+        "kind": "cache-tier",
+        "eyebrow": "Low-Overhead Open-Loop Harness",
+        "title": "NanoTime Pacer -> Bounded Async Pool -> HdrHistogram Dual Recording",
+        "nodes": [
+          {
+            "label": "NanoTime Pacer",
+            "role": "Fixed 200us ticks"
+          },
+          {
+            "label": "Virtual Queue",
+            "role": "Tracks intended_ts"
+          },
+          {
+            "label": "Async HTTP Pool",
+            "role": "<=2,048 sockets"
+          },
+          {
+            "label": "HdrHistogram",
+            "role": "Uncorrected + CO"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Monotonic Clock",
+            "detail": "System.nanoTime() avoids wall-clock NTP jumps."
+          },
+          {
+            "label": "Dual Metrics",
+            "detail": "Emits both service-time and CO-corrected response-time percentiles."
+          },
+          {
+            "label": "Constant Memory",
+            "detail": "HdrHistogram tracks 10M+ samples in < 10 MB RAM with zero GC pressure."
+          },
+          {
+            "label": "Socket Cap",
+            "detail": "2,048 async keep-alive sockets prevent client EADDRNOTAVAIL."
+          }
+        ],
+        "summary": "Open-loop pacing with HdrHistogram backfill exposes the true 2.4s p99.9 tail latency from a single < 5% CPU generator."
+      },
+      "markdownContent": "```java\n// Open-loop pacer + HdrHistogram Coordinated Omission correction\nfinal long intervalNs = 1_000_000_000L / 5_000; // 200,000 ns = 5,000 RPS\nlong intendedStartNs = System.nanoTime();\n\nwhile (running) {\n    long now = System.nanoTime();\n    if (now < intendedStartNs) {\n        LockSupport.parkNanos(intendedStartNs - now);\n        continue;\n    }\n    final long scheduledNs = intendedStartNs;\n    intendedStartNs += intervalNs;\n\n    asyncClient.sendAsync(req).whenComplete((resp, err) -> {\n        long responseTimeNs = System.nanoTime() - scheduledNs;\n        correctedHist.recordValueWithExpectedInterval(responseTimeNs, intervalNs);\n    });\n}\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where Open-Loop Benchmarking applies in System Design",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": "Coordinated-omission-free testing is mandatory before signing off on strict p99.9 SLAs:\n\n- **Payment & Trading Gateways**: Validating `< 120 ms` p99.9 under realistic JVM/Go GC pauses.\n- **API Gateway & Load Balancer Tuning**: Verifying queue-drop and backpressure behavior during bursts.\n- **Database & Cache Benchmarks**: Measuring true tail latency under checkpointing or compaction stalls.",
+      "supportingConcepts": [
+        {
+          "slug": "load-soak-spike-testing",
+          "title": "Concept: Load, Soak & Spike Testing",
+          "kind": "concept"
+        },
+        {
+          "slug": "observability-golden-signals",
+          "title": "Concept: Observability Golden Signals",
+          "kind": "concept"
+        },
+        {
+          "slug": "jvm-internals-and-garbage-collection",
+          "title": "Concept: JVM Internals & GC",
+          "kind": "concept"
+        },
+        {
+          "slug": "fixing-kubernetes-cfs-cpu-throttling",
+          "title": "Problem: Fixing K8s CFS CPU Throttling",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why does a closed-loop benchmark under-report p99.9 latency during an 800 ms server GC pause?",
+      "options": [
+        {
+          "id": "a",
+          "text": "Because worker threads wait for responses before sending new requests, omitting the thousands of arrivals that would have queued during the stall",
+          "correct": true,
+          "feedback": "Correct: this is Coordinated Omission—the load generator slows down to match the stalled server."
+        },
+        {
+          "id": "b",
+          "text": "Because System.nanoTime() pauses during garbage collection",
+          "correct": false,
+          "feedback": "System.nanoTime() continues advancing; the bias comes from closed-loop request scheduling."
+        },
+        {
+          "id": "c",
+          "text": "Because HdrHistogram discards samples above 100 ms",
+          "correct": false,
+          "feedback": "HdrHistogram records all values; closed-loop generators simply never send them during stalls."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why does a closed-loop benchmark under-report p99.9 latency during an 800 ms server GC pause?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Because worker threads wait for responses before sending new requests, omitting the thousands of arrivals that would have queued during the stall",
+            "correct": true,
+            "feedback": "Correct: this is Coordinated Omission—the load generator slows down to match the stalled server."
+          },
+          {
+            "id": "b",
+            "text": "Because System.nanoTime() pauses during garbage collection",
+            "correct": false,
+            "feedback": "System.nanoTime() continues advancing; the bias comes from closed-loop request scheduling."
+          },
+          {
+            "id": "c",
+            "text": "Because HdrHistogram discards samples above 100 ms",
+            "correct": false,
+            "feedback": "HdrHistogram records all values; closed-loop generators simply never send them during stalls."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why Coordinated Omission invalidates closed-loop benchmarks', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "A closed-loop benchmark with 100 worker threads reports p99.9 = 45 ms at 5,000 RPS, yet production alerts fire on 2.4-second timeouts during 800 ms JVM safepoint pauses.",
+            "correct": true,
+            "feedback": "Correct: A closed-loop benchmark with 100 worker threads reports p99.9 = 45 ms at 5,000 RPS, yet production alerts fire on 2.4-second timeouts during 800 ms JVM safepoint pauses."
+          },
+          {
+            "id": "b",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "c",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'What happens when load generators coordinate with server stalls', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "b",
+            "text": "Coordinated Omission distorts tail percentiles in two ways: 1.",
+            "correct": true,
+            "feedback": "Correct: Coordinated Omission distorts tail percentiles in two ways: 1."
+          },
+          {
+            "id": "c",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** A closed-loop benchmark with `100` worker threads reports `p99.9 = 45 ms` at `5,000 RPS`, yet production alerts fire on `2.4-second` timeouts during `800 ms` JVM safepoint pauses.\n\n**How It Flows:** Think of Fixing Coordinated Omission in Load Tests as a clear step-by-step chain: Open-Loop Pacer -> Async Client (2k) -> Payment GW -> NanoTime Pacer -> Virtual Queue.\n\n**Why Beginners Should Care:** Always benchmark latency SLAs with an open-loop fixed-rate scheduler that measures from intended scheduled start time and backfills omitted intervals during server stalls.",
+      "spark": {
+        "summary": "A closed-loop benchmark with `100` worker threads reports `p99.9 = 45 ms` at `5,000 RPS`, yet production alerts fire on `2.4-second` timeouts during `800 ms` JVM safepoint pauses.",
+        "keyTakeaway": "Always benchmark latency SLAs with an open-loop fixed-rate scheduler that measures from intended scheduled start time and backfills omitted intervals during server stalls."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why Coordinated Omission invalidates closed-loop benchmarks",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why Coordinated Omission invalidates closed-loop benchmarks works from first principles.",
+          "explanation": "A closed-loop benchmark with `100` worker threads reports `p99.9 = 45 ms` at `5,000 RPS`, yet production alerts fire on `2.4-second` timeouts during `800 ms` JVM safepoint pauses.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "What happens when load generators coordinate with server stalls",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without What happens when load generators coordinate with server stalls under real concurrency or scale.",
+          "explanation": "Coordinated Omission distorts tail percentiles in two ways: 1. **Zero Queueing Visibility**: Measuring only `actual_send -> response` ignores the time requests wait in the arrival queue during a pause. 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Closed-Loop vs. Open-Loop Pacer",
+            "title": "800ms Server Stall: Closed-Loop Hides Queueing vs. Open-Loop Measures It",
+            "actors": [
+              {
+                "id": "pacer",
+                "label": "Open-Loop Pacer"
+              },
+              {
+                "id": "pool",
+                "label": "Async Client (2k)"
+              },
+              {
+                "id": "srv",
+                "label": "Payment GW"
+              }
+            ],
+            "events": [
+              {
+                "from": "pacer",
+                "to": "pool",
+                "label": "Schedule every 200us (5,000 RPS)",
+                "status": "ok"
+              },
+              {
+                "from": "srv",
+                "to": "srv",
+                "label": "800ms JVM safepoint pause!",
+                "status": "fail"
+              },
+              {
+                "from": "pacer",
+                "to": "pool",
+                "label": "4,000 virtual arrivals queue up",
+                "status": "warn"
+              },
+              {
+                "from": "pool",
+                "to": "pacer",
+                "label": "Record (now - intended_start) + backfill",
+                "status": "ok"
+              }
+            ],
+            "summary": "Recording response_time = now - intended_start_ns captures the full queueing + service delay during stalls."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive solution (and why adding more closed-loop threads doesn't fix it)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "The problem: see what breaks without Naive solution under real concurrency or scale.",
+          "explanation": "Increasing closed-loop threads from `100` to `2,000` still stalls once all threads are waiting on a long GC pause, and exhausts client-side ephemeral ports or CPU.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Open-Loop Pacer + HdrHistogram Backfill + Monotonic Clock",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Accurate tail-latency benchmarking (`wrk2`, `k6` constant-arrival-rate, `HdrHistogram`) uses four rules: **Open-Loop Arrival Schedule**: Schedule requests at fixed `200 µs` intervals (`5,000 RPS`) using `System.nanoTime()` (monotonic, immune to NTP). **Service vs. Response Time**: Track both `service_time = end - actual_send` and `response_time = end - intended_start`.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Low-Overhead Open-Loop Harness",
+            "title": "NanoTime Pacer -> Bounded Async Pool -> HdrHistogram Dual Recording",
+            "nodes": [
+              {
+                "label": "NanoTime Pacer",
+                "role": "Fixed 200us ticks"
+              },
+              {
+                "label": "Virtual Queue",
+                "role": "Tracks intended_ts"
+              },
+              {
+                "label": "Async HTTP Pool",
+                "role": "<=2,048 sockets"
+              },
+              {
+                "label": "HdrHistogram",
+                "role": "Uncorrected + CO"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Monotonic Clock",
+                "detail": "System.nanoTime() avoids wall-clock NTP jumps."
+              },
+              {
+                "label": "Dual Metrics",
+                "detail": "Emits both service-time and CO-corrected response-time percentiles."
+              },
+              {
+                "label": "Constant Memory",
+                "detail": "HdrHistogram tracks 10M+ samples in < 10 MB RAM with zero GC pressure."
+              },
+              {
+                "label": "Socket Cap",
+                "detail": "2,048 async keep-alive sockets prevent client EADDRNOTAVAIL."
+              }
+            ],
+            "summary": "Open-loop pacing with HdrHistogram backfill exposes the true 2.4s p99.9 tail latency from a single < 5% CPU generator."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Always benchmark latency SLAs with an open-loop fixed-rate scheduler that measures from intended scheduled start time and backfills omitted intervals during server stalls."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** A closed-loop benchmark with `100` worker threads reports `p99.9 = 45 ms` at `5,000 RPS`, yet production alerts fire on `2.4-second` timeouts during `800 ms` JVM safepoint pauses.\n\n**Visual & Structural Flow:** Depicts 800ms Server Stall: Closed-Loop Hides Queueing vs. Open-Loop Measures It (Open-Loop Pacer -> Async Client (2k) -> Payment GW); NanoTime Pacer -> Bounded Async Pool -> HdrHistogram Dual Recording (NanoTime Pacer -> Virtual Queue -> Async HTTP Pool -> HdrHistogram).\n\n**Trade-Offs & Production:** Increasing closed-loop threads from `100` to `2,000` still stalls once all threads are waiting on a long GC pause, and exhausts client-side ephemeral ports or CPU. Accurate tail-latency benchmarking (`wrk2`, `k6` constant-arrival-rate, `HdrHistogram`) uses four rules: **Open-Loop Arrival Schedule**: Schedule requests at fixed `200 µs`.\n\n**Failure Modes & Application:** Coordinated-omission-free testing is mandatory before signing off on strict p99.9 SLAs: **Payment & Trading Gateways**: Validating `< 120 ms` p99.9 under realistic JVM/Go GC pauses.",
+      "spark": {
+        "summary": "Closed-loop load generators pause sending while waiting for slow responses, hiding 800 ms JVM safepoint stalls (reporting 45 ms p99.9 instead of 2,400 ms); an open-loop pacer with HdrHistogram expected-interval backfill captures true queueing delay.",
+        "keyTakeaway": "Always benchmark latency SLAs with an open-loop fixed-rate scheduler that measures from intended scheduled start time and backfills omitted intervals during server stalls."
+      }
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** Closed-loop load generators pause sending while waiting for slow responses, hiding 800 ms JVM safepoint stalls (reporting 45 ms p99.9 instead of 2,400 ms); an open-loop pacer with HdrHistogram expected-interval backfill captures true queueing delay.\n\n**Production Trade-Offs:** Increasing closed-loop threads from `100` to `2,000` still stalls once all threads are waiting on a long GC pause, and exhausts client-side ephemeral ports or CPU.\n\n**Failure Modes & Edge Cases:** Coordinated-omission-free testing is mandatory before signing off on strict p99.9 SLAs: **Payment & Trading Gateways**: Validating `< 120 ms` p99.9 under realistic JVM/Go GC pauses.\n\n**Principal Takeaway:** Always benchmark latency SLAs with an open-loop fixed-rate scheduler that measures from intended scheduled start time and backfills omitted intervals during server stalls.",
+      "spark": {
+        "summary": "Closed-loop load generators pause sending while waiting for slow responses, hiding 800 ms JVM safepoint stalls (reporting 45 ms p99.9 instead of 2,400 ms); an open-loop pacer with HdrHistogram expected-interval backfill captures true queueing delay.",
+        "keyTakeaway": "Always benchmark latency SLAs with an open-loop fixed-rate scheduler that measures from intended scheduled start time and backfills omitted intervals during server stalls."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why Coordinated Omission invalidates closed-loop benchmarks",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why Coordinated Omission invalidates closed-loop benchmarks works from first principles.",
+          "explanation": "A closed-loop benchmark with `100` worker threads reports `p99.9 = 45 ms` at `5,000 RPS`, yet production alerts fire on `2.4-second` timeouts during `800 ms` JVM safepoint pauses. Because each closed-loop thread waits for a response before sending its next request, **all 100 threads stop sending during the 800 ms pause**—omitting the `4,000` requests that *would* have arrived at `5,000 RPS` and queued behind the stall.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "What happens when load generators coordinate with server stalls",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without What happens when load generators coordinate with server stalls under real concurrency or scale.",
+          "explanation": "Coordinated Omission distorts tail percentiles in two ways:\n\n1. **Zero Queueing Visibility**: Measuring only `actual_send -> response` ignores the time requests wait in the arrival queue during a pause.\n2. **False SLA Confidence**: Only `100` in-flight requests record the `800 ms` stall instead of `4,000` arrivals, making `p99.9` look artificially clean.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Closed-Loop vs. Open-Loop Pacer",
+            "title": "800ms Server Stall: Closed-Loop Hides Queueing vs. Open-Loop Measures It",
+            "actors": [
+              {
+                "id": "pacer",
+                "label": "Open-Loop Pacer"
+              },
+              {
+                "id": "pool",
+                "label": "Async Client (2k)"
+              },
+              {
+                "id": "srv",
+                "label": "Payment GW"
+              }
+            ],
+            "events": [
+              {
+                "from": "pacer",
+                "to": "pool",
+                "label": "Schedule every 200us (5,000 RPS)",
+                "status": "ok"
+              },
+              {
+                "from": "srv",
+                "to": "srv",
+                "label": "800ms JVM safepoint pause!",
+                "status": "fail"
+              },
+              {
+                "from": "pacer",
+                "to": "pool",
+                "label": "4,000 virtual arrivals queue up",
+                "status": "warn"
+              },
+              {
+                "from": "pool",
+                "to": "pacer",
+                "label": "Record (now - intended_start) + backfill",
+                "status": "ok"
+              }
+            ],
+            "summary": "Recording response_time = now - intended_start_ns captures the full queueing + service delay during stalls."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive solution (and why adding more closed-loop threads doesn't fix it)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "The problem: see what breaks without Naive solution under real concurrency or scale.",
+          "explanation": "Increasing closed-loop threads from `100` to `2,000` still stalls once all threads are waiting on a long GC pause, and exhausts client-side ephemeral ports or CPU.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Open-Loop Pacer + HdrHistogram Backfill + Monotonic Clock",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Accurate tail-latency benchmarking (`wrk2`, `k6` constant-arrival-rate, `HdrHistogram`) uses four rules:\n\n- **Open-Loop Arrival Schedule**: Schedule requests at fixed `200 µs` intervals (`5,000 RPS`) using `System.nanoTime()` (monotonic, immune to NTP).\n- **Service vs. Response Time**: Track both `service_time = end - actual_send` and `response_time = end - intended_start`.\n- **HdrHistogram Backfill**: Call `recordValueWithExpectedInterval(latencyNs, expectedIntervalNs)` (which linearly backfills `latency - k * interval` for omitted samples) inside bounded memory (`< 512 MB` heap) for `10M+` samples.\n- **Bounded Socket Pool**: Cap physical sockets at `2,048` while accounting for queued virtual arrivals.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Low-Overhead Open-Loop Harness",
+            "title": "NanoTime Pacer -> Bounded Async Pool -> HdrHistogram Dual Recording",
+            "nodes": [
+              {
+                "label": "NanoTime Pacer",
+                "role": "Fixed 200us ticks"
+              },
+              {
+                "label": "Virtual Queue",
+                "role": "Tracks intended_ts"
+              },
+              {
+                "label": "Async HTTP Pool",
+                "role": "<=2,048 sockets"
+              },
+              {
+                "label": "HdrHistogram",
+                "role": "Uncorrected + CO"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Monotonic Clock",
+                "detail": "System.nanoTime() avoids wall-clock NTP jumps."
+              },
+              {
+                "label": "Dual Metrics",
+                "detail": "Emits both service-time and CO-corrected response-time percentiles."
+              },
+              {
+                "label": "Constant Memory",
+                "detail": "HdrHistogram tracks 10M+ samples in < 10 MB RAM with zero GC pressure."
+              },
+              {
+                "label": "Socket Cap",
+                "detail": "2,048 async keep-alive sockets prevent client EADDRNOTAVAIL."
+              }
+            ],
+            "summary": "Open-loop pacing with HdrHistogram backfill exposes the true 2.4s p99.9 tail latency from a single < 5% CPU generator."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where Open-Loop Benchmarking applies in System Design",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Coordinated-omission-free testing is mandatory before signing off on strict p99.9 SLAs:\n\n- **Payment & Trading Gateways**: Validating `< 120 ms` p99.9 under realistic JVM/Go GC pauses.\n- **API Gateway & Load Balancer Tuning**: Verifying queue-drop and backpressure behavior during bursts.\n- **Database & Cache Benchmarks**: Measuring true tail latency under checkpointing or compaction stalls.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Always benchmark latency SLAs with an open-loop fixed-rate scheduler that measures from intended scheduled start time and backfills omitted intervals during server stalls."
+    }
+  }
+}

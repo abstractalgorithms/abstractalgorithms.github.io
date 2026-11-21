@@ -1,0 +1,719 @@
+{
+  "id": "concept-python-concurrency-nogil",
+  "slug": "python-concurrency-nogil",
+  "name": "Python GIL-Free Concurrency, Asyncio & Coroutines",
+  "domain": "Distributed Concurrency & Multithreading",
+  "tagline": "True multi-core shared-memory Python parallelism in CPython 3.13t+ (PEP 703) using Biased Reference Counting and per-object critical sections.",
+  "purpose": "Build a progressive mental model of free-threaded Python (PEP 703)—from why the GIL existed to Biased Reference Counting, C-extension `Py_MOD_GIL_NOT_USED` traps, and thread-safe state.",
+  "spark": {
+    "summary": "Free-threaded Python (PEP 703, CPython 3.13t+) removes the Global Interpreter Lock so multiple threads execute Python bytecode simultaneously across CPU cores within a single shared memory space.",
+    "keyTakeaway": "CPU-bound Python threads can now scale across cores without multiprocessing pickle overhead, provided C-extensions declare Py_MOD_GIL_NOT_USED and shared mutable state is synchronized.",
+    "byteSummary": "**Core Mechanics:** CPython's Global Interpreter Lock (GIL) existed because `Py_INCREF`/`Py_DECREF` reference counting was not thread-safe.\n\n**Visual & Structural Flow:** Depicts Free-Threaded CPython Import & GIL Fallback States (GIL DISABLED -> CRITICAL SECTION -> GIL RE-ENABLED); 8-Core Free-Threaded Workers Over Shared 2 GB Rule Graph (ThreadPool (8) -> threading.local() -> 2 GB Rule Graph -> mimalloc + BRC).\n\n**Trade-Offs & Production:** Choose the Python concurrency model based on CPU vs. An 8-core service runs `ThreadPoolExecutor(max_workers=8)` on `python3.13t` over a shared 2 GB read-only rule graph, asserting `not sys._is_gil_enabled()` at boot and aggregating.\n\n**Failure Modes & Application:** Explore bypassing the GIL for CPU workloads, false sharing, and asyncio."
+  },
+  "learningJourney": [
+    {
+      "id": "01-what-it-is",
+      "eyebrow": "STAGE 01 · WHAT IT IS",
+      "title": "What is Free-Threaded Python (PEP 703)",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": "CPython's Global Interpreter Lock (GIL) existed because `Py_INCREF`/`Py_DECREF` reference counting was not thread-safe. **PEP 703** (`python3.13t`+) removes the GIL by introducing **Biased Reference Counting (BRC)**, `mimalloc` per-thread heaps, immortal objects (PEP 683 for `None`/`True`/small ints), and per-object **critical sections** for `list`/`dict`/`set`.\n\nMultiple OS threads can now execute Python bytecode simultaneously across CPU cores inside one shared heap.",
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "GIL Runtime State",
+        "title": "Free-Threaded CPython Import & GIL Fallback States",
+        "states": [
+          {
+            "id": "nogil",
+            "label": "GIL DISABLED",
+            "sublabel": "python3.13t multi-core",
+            "tone": "green"
+          },
+          {
+            "id": "crit",
+            "label": "CRITICAL SECTION",
+            "sublabel": "Per-object dict/list lock",
+            "tone": "blue"
+          },
+          {
+            "id": "fallback",
+            "label": "GIL RE-ENABLED",
+            "sublabel": "Legacy .so without flag",
+            "tone": "red"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "nogil",
+            "to": "crit",
+            "label": "Mutate shared dict/list"
+          },
+          {
+            "from": "crit",
+            "to": "nogil",
+            "label": "Release per-object lock"
+          },
+          {
+            "from": "nogil",
+            "to": "fallback",
+            "label": "Import unported C-extension"
+          }
+        ],
+        "summary": "Importing a single C-extension without Py_MOD_GIL_NOT_USED silently re-enables the GIL at runtime."
+      },
+      "purpose": "The mechanism: understand how Free-Threaded Python (PEP 703) works from first principles."
+    },
+    {
+      "id": "02-why-we-need-it",
+      "eyebrow": "STAGE 02 · WHY WE NEED IT",
+      "title": "Why we need No-GIL (and why Compound Races Now Surface)",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": "Previously, CPU-bound Python required `multiprocessing`, duplicating multi-gigabyte model weights or rule graphs across N processes and serializing payloads over IPC pipes. Under `python3.13t`, shared-memory threads eliminate that duplication—but code like `counter += 1` or `d[k] = d.get(k, 0) + 1`, which accidentally relied on GIL bytecode-switch atomicity, now exhibits real **lost-update data races**.",
+      "ideas": [
+        {
+          "title": "Assert `not sys._is_gil_enabled()` at Startup",
+          "description": "Run CI with `PYTHON_GIL=0` and check `sys._is_gil_enabled() is False` in startup health probes so legacy wheels never silently serialize your cluster."
+        },
+        {
+          "title": "Avoid False Sharing on Shared Counters",
+          "description": "Accumulate metrics in `threading.local()` and merge periodically instead of bouncing cache lines on one global counter."
+        }
+      ],
+      "purpose": "The problem: see what breaks without No-GIL under real concurrency or scale."
+    },
+    {
+      "id": "03-where-it-is-used",
+      "eyebrow": "STAGE 03 · WHERE IT IS USED",
+      "title": "Where Free-Threaded Python shines (and where Asyncio/GIL win)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "Free-threaded Python fills the CPU + shared-memory gap between `asyncio` (high-concurrency I/O) and `multiprocessing` (process isolation).",
+      "comparison": [
+        {
+          "choice": "Good Candidate: CPU-Bound Parsing & Shared 4+ GB In-Memory Graphs",
+          "benefits": [
+            "Zero-copy shared heap across 8–64 threads with no pickle serialization overhead."
+          ],
+          "costs": [
+            "Incurs ~5–10% single-thread overhead in 3.13t from biased refcounting."
+          ]
+        },
+        {
+          "choice": "Avoid: 10,000+ Open Network Sockets",
+          "benefits": [
+            "Use `asyncio` for massive I/O concurrency instead of spawning 5,000 OS threads (~8 MB stack each)."
+          ],
+          "costs": [
+            "OS thread scheduling and stack virtual memory waste RAM on idle sockets."
+          ]
+        },
+        {
+          "choice": "Avoid: Legacy Unported C-Extension Stacks",
+          "benefits": [
+            "Keep `multiprocessing` until all critical `.so` wheels declare `Py_MOD_GIL_NOT_USED`."
+          ],
+          "costs": [
+            "One unported extension forces GIL fallback."
+          ]
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    },
+    {
+      "id": "04-how-it-is-managed",
+      "eyebrow": "STAGE 04 · HOW IT IS MANAGED",
+      "title": "How Thread-Safe Shared State & Startup Verification are managed",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "Verify GIL status after imports, guard compound read-modify-write invariants with `threading.Lock` or `queue.Queue`, and pool long-lived objects to minimize stop-the-world cyclic GC pauses.",
+      "markdownContent": "```python\nimport sys, threading\nfrom concurrent.futures import ThreadPoolExecutor\n\n# 1. Fail loudly in startup probe if any imported wheel re-enabled the GIL\nif hasattr(sys, \"_is_gil_enabled\") and sys._is_gil_enabled():\n    raise RuntimeError(\"GIL was re-enabled by an incompatible C extension\")\n\n_lock = threading.Lock()\nshared_counts: dict[str, int] = {}\n\ndef score_chunk(items: list[str]) -> None:\n    local_counts: dict[str, int] = {}\n    for item in items:\n        local_counts[item] = local_counts.get(item, 0) + 1\n    with _lock:  # Merge once per chunk to avoid lock contention & false sharing\n        for k, v in local_counts.items():\n            shared_counts[k] = shared_counts.get(k, 0) + v\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-alternatives",
+      "eyebrow": "STAGE 05 · ALTERNATIVES",
+      "title": "Alternatives: Standard GIL Threads vs. Free-Threaded 3.13t vs. Multiprocessing",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": "Choose the Python concurrency model based on CPU vs. I/O profile and memory sharing needs.",
+      "comparison": [
+        {
+          "choice": "Free-Threaded CPython (`python3.13t+`)",
+          "benefits": [
+            "Multi-core CPU scaling with zero-copy shared heap."
+          ],
+          "costs": [
+            "~5–10% single-thread overhead; requires explicit locking on compound mutations."
+          ]
+        },
+        {
+          "choice": "Multiprocessing (`ProcessPoolExecutor`)",
+          "benefits": [
+            "Strong process isolation and works with any legacy C extension."
+          ],
+          "costs": [
+            "Duplicates N copies of large memory structures and pays pickle IPC cost."
+          ]
+        },
+        {
+          "choice": "asyncio (Single-Threaded Event Loop)",
+          "benefits": [
+            "Lowest memory per task (~KB) for 10k+ I/O connections."
+          ],
+          "costs": [
+            "Single core only for Python CPU execution."
+          ]
+        }
+      ],
+      "purpose": "The trade-off: compare competing approaches across latency, consistency, and operational cost."
+    },
+    {
+      "id": "06-production-architecture",
+      "eyebrow": "STAGE 06 · PRODUCTION ARCHITECTURE",
+      "title": "Production example: 8-Core In-Memory Rule Scoring Service",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": "An 8-core service runs `ThreadPoolExecutor(max_workers=8)` on `python3.13t` over a shared 2 GB read-only rule graph, asserting `not sys._is_gil_enabled()` at boot and aggregating per-thread metrics locally before periodic merges.",
+      "sectionDiagram": {
+        "kind": "cache-tier",
+        "eyebrow": "Shared-Heap Multi-Core",
+        "title": "8-Core Free-Threaded Workers Over Shared 2 GB Rule Graph",
+        "nodes": [
+          {
+            "id": "req",
+            "label": "ThreadPool (8)",
+            "role": "True CPU parallel"
+          },
+          {
+            "id": "loc",
+            "label": "threading.local()",
+            "role": "Zero-contention agg"
+          },
+          {
+            "id": "heap",
+            "label": "2 GB Rule Graph",
+            "role": "Zero-copy read-only"
+          },
+          {
+            "id": "gc",
+            "label": "mimalloc + BRC",
+            "role": "Per-thread heaps"
+          }
+        ],
+        "edges": [
+          {
+            "label": "parallel read"
+          },
+          {
+            "label": "periodic lock merge"
+          }
+        ],
+        "cards": [
+          {
+            "label": "1. Zero-Copy Read",
+            "detail": "All 8 threads traverse the 2 GB rule graph concurrently without 8x RAM duplication."
+          },
+          {
+            "label": "2. Thread-Local Tally",
+            "detail": "Workers accumulate counts locally to eliminate L1/L2 cache-line false sharing."
+          },
+          {
+            "label": "3. Startup Guard",
+            "detail": "CI runs with PYTHON_GIL=0 and startup asserts sys._is_gil_enabled() is False."
+          }
+        ],
+        "summary": "Shared-memory threads unlock 8x CPU throughput on 1x RAM footprint when C extensions and locks are audited."
+      },
+      "purpose": "Production architecture: see how the components compose end to end under real load."
+    },
+    {
+      "id": "07-problems-and-further-reading",
+      "eyebrow": "STAGE 07 · PROBLEMS SOLVED & FURTHER DEEP DIVE",
+      "title": "Problems solved by No-GIL Python & Related Concurrency Concepts",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": "Explore bypassing the GIL for CPU workloads, false sharing, and asyncio.",
+      "supportingConcepts": [
+        {
+          "slug": "bypassing-python-gil-cpu-workloads",
+          "title": "Problem: Bypassing Python GIL for CPU Workloads",
+          "kind": "problem"
+        },
+        {
+          "slug": "eliminating-cpu-cache-false-sharing",
+          "title": "Problem: Eliminating CPU Cache False Sharing",
+          "kind": "problem"
+        },
+        {
+          "slug": "python-asyncio-event-loops-coroutines",
+          "title": "Concept: Python Asyncio Event Loops",
+          "kind": "concept"
+        },
+        {
+          "slug": "thread-pool-design",
+          "title": "Concept: Thread Pool Design",
+          "kind": "concept"
+        }
+      ],
+      "purpose": "Applied problems: connect these internals to concrete system design and debugging scenarios."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "In free-threaded CPython (`python3.13t` with GIL disabled), what happens if you import a legacy C-extension that has NOT declared `Py_MOD_GIL_NOT_USED`?",
+      "options": [
+        {
+          "id": "a",
+          "text": "CPython automatically re-enables the GIL at runtime with a warning, silently eliminating multi-core Python scaling",
+          "correct": true,
+          "feedback": "Correct: assert `not sys._is_gil_enabled()` in startup probes and test with `PYTHON_GIL=0` in CI."
+        },
+        {
+          "id": "b",
+          "text": "The Python interpreter immediately segfaults on import",
+          "correct": false,
+          "feedback": "CPython falls back to re-enabling the GIL safely unless `PYTHON_GIL=0` forces it off."
+        },
+        {
+          "id": "c",
+          "text": "CPython automatically transpiles the C-extension to pure Python",
+          "correct": false,
+          "feedback": "No transpilation occurs; it falls back to GIL mode."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "In free-threaded CPython (`python3.13t` with GIL disabled), what happens if you import a legacy C-extension that has NOT declared `Py_MOD_GIL_NOT_USED`?",
+        "options": [
+          {
+            "id": "a",
+            "text": "CPython automatically re-enables the GIL at runtime with a warning, silently eliminating multi-core Python scaling",
+            "correct": true,
+            "feedback": "Correct: assert `not sys._is_gil_enabled()` in startup probes and test with `PYTHON_GIL=0` in CI."
+          },
+          {
+            "id": "b",
+            "text": "The Python interpreter immediately segfaults on import",
+            "correct": false,
+            "feedback": "CPython falls back to re-enabling the GIL safely unless `PYTHON_GIL=0` forces it off."
+          },
+          {
+            "id": "c",
+            "text": "CPython automatically transpiles the C-extension to pure Python",
+            "correct": false,
+            "feedback": "No transpilation occurs; it falls back to GIL mode."
+          }
+        ]
+      },
+      {
+        "question": "What is the main benefit—and corresponding operational trade-off—of using Good Candidate: CPU-Bound Parsing & Shared 4+ GB In-Memory Graphs in Python GIL-Free Concurrency, Asyncio & Coroutines?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Relying solely on Legacy Unported C-Extension Stacks avoids all operational and latency trade-offs",
+            "correct": false,
+            "feedback": "Incorrect: every production option in Python GIL-Free Concurrency, Asyncio & Coroutines carries concrete latency, consistency, or operational costs."
+          },
+          {
+            "id": "b",
+            "text": "Advantage: Zero-copy shared heap across 8–64 threads with no pickle serialization overhead. Cost: Incurs ~5–10% single-thread overhead in 3.13t from biased refcounting.",
+            "correct": true,
+            "feedback": "Correct: Good Candidate: CPU-Bound Parsing & Shared 4+ GB In-Memory Graphs delivers zero-copy shared heap across 8–64 threads with no pickle serialization overhead. while requiring you to manage incurs ~5–10% single-thread overhead in 3.13t from biased refcounting."
+          },
+          {
+            "id": "c",
+            "text": "Advantage: Use asyncio for massive I/O concurrency instead of spawning 5,000 OS threads (~8 MB stack each). It has zero operational or latency overhead compared to Avoid: 10,000+ Open Network Sockets.",
+            "correct": false,
+            "feedback": "Not quite: that describes Avoid: 10,000+ Open Network Sockets, whereas Good Candidate: CPU-Bound Parsing & Shared 4+ GB In-Memory Graphs specifically trades off: Incurs ~5–10% single-thread overhead in 3.13t from biased refcounting."
+          }
+        ]
+      },
+      {
+        "question": "Why is Avoid False Sharing on Shared Counters critical when operating Python GIL-Free Concurrency, Asyncio & Coroutines in production?",
+        "options": [
+          {
+            "id": "a",
+            "text": "It replaces the need for observability, timeouts, or capacity planning across Python GIL-Free Concurrency, Asyncio & Coroutines.",
+            "correct": false,
+            "feedback": "Incorrect: 'Avoid False Sharing on Shared Counters' works alongside proper bounds, monitoring, and failure isolation."
+          },
+          {
+            "id": "b",
+            "text": "Accumulate metrics in threading.local() and merge periodically instead of bouncing cache lines on one global counter.",
+            "correct": true,
+            "feedback": "Correct: Accumulate metrics in threading.local() and merge periodically instead of bouncing cache lines on one global counter."
+          },
+          {
+            "id": "c",
+            "text": "It only applies during local unit testing and can be disabled in production to save memory.",
+            "correct": false,
+            "feedback": "Incorrect: 'Avoid False Sharing on Shared Counters' directly governs production reliability and correctness under real traffic."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** CPython's Global Interpreter Lock (GIL) existed because `Py_INCREF`/`Py_DECREF` reference counting was not thread-safe.\n\n**How It Flows:** Think of Python GIL-Free Concurrency, Asyncio & Coroutines as a clear step-by-step chain: GIL DISABLED -> CRITICAL SECTION -> GIL RE-ENABLED -> ThreadPool (8) -> threading.local().\n\n**Why Beginners Should Care:** CPU-bound Python threads can now scale across cores without multiprocessing pickle overhead, provided C-extensions declare Py_MOD_GIL_NOT_USED and shared mutable state is synchronized.",
+      "spark": {
+        "summary": "CPython's Global Interpreter Lock (GIL) existed because `Py_INCREF`/`Py_DECREF` reference counting was not thread-safe.",
+        "keyTakeaway": "CPU-bound Python threads can now scale across cores without multiprocessing pickle overhead, provided C-extensions declare Py_MOD_GIL_NOT_USED and shared mutable state is synchronized."
+      },
+      "learningJourney": [
+        {
+          "id": "01-what-it-is",
+          "title": "What is Free-Threaded Python (PEP 703)",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Free-Threaded Python (PEP 703) works from first principles.",
+          "explanation": "CPython's Global Interpreter Lock (GIL) existed because `Py_INCREF`/`Py_DECREF` reference counting was not thread-safe. **PEP 703** (`python3.13t`+) removes the GIL by introducing **Biased Reference Counting (BRC)**, `mimalloc` per-thread heaps, immortal objects (PEP 683 for `None`/`True`/small ints), and per-object **critical sections** for `list`/`dict`/`set`.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "state-machine",
+            "eyebrow": "GIL Runtime State",
+            "title": "Free-Threaded CPython Import & GIL Fallback States",
+            "states": [
+              {
+                "id": "nogil",
+                "label": "GIL DISABLED",
+                "sublabel": "python3.13t multi-core",
+                "tone": "green"
+              },
+              {
+                "id": "crit",
+                "label": "CRITICAL SECTION",
+                "sublabel": "Per-object dict/list lock",
+                "tone": "blue"
+              },
+              {
+                "id": "fallback",
+                "label": "GIL RE-ENABLED",
+                "sublabel": "Legacy .so without flag",
+                "tone": "red"
+              }
+            ],
+            "transitions": [
+              {
+                "from": "nogil",
+                "to": "crit",
+                "label": "Mutate shared dict/list"
+              },
+              {
+                "from": "crit",
+                "to": "nogil",
+                "label": "Release per-object lock"
+              },
+              {
+                "from": "nogil",
+                "to": "fallback",
+                "label": "Import unported C-extension"
+              }
+            ],
+            "summary": "Importing a single C-extension without Py_MOD_GIL_NOT_USED silently re-enables the GIL at runtime."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-why-we-need-it",
+          "title": "Why we need No-GIL (and why Compound Races Now Surface)",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without No-GIL under real concurrency or scale.",
+          "explanation": "Previously, CPU-bound Python required `multiprocessing`, duplicating multi-gigabyte model weights or rule graphs across N processes and serializing payloads over IPC pipes. Under `python3.13t`, shared-memory threads eliminate that duplication—but code like `counter += 1` or `d[k] = d.get(k, 0) + 1`, which accidentally relied on GIL bytecode-switch atomicity, now exhibits real **lost-update data races**.",
+          "ideas": [
+            {
+              "title": "Assert `not sys._is_gil_enabled()` at Startup",
+              "description": "Run CI with `PYTHON_GIL=0` and check `sys._is_gil_enabled() is False` in startup health probes so legacy wheels never silently serialize your cluster."
+            },
+            {
+              "title": "Avoid False Sharing on Shared Counters",
+              "description": "Accumulate metrics in `threading.local()` and merge periodically instead of bouncing cache lines on one global counter."
+            }
+          ],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-where-it-is-used",
+          "title": "Where Free-Threaded Python shines (and where Asyncio/GIL win)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Free-threaded Python fills the CPU + shared-memory gap between `asyncio` (high-concurrency I/O) and `multiprocessing` (process isolation).",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "06-production-architecture",
+          "title": "Production example: 8-Core In-Memory Rule Scoring Service",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Production architecture: see how the components compose end to end under real load.",
+          "explanation": "An 8-core service runs `ThreadPoolExecutor(max_workers=8)` on `python3.13t` over a shared 2 GB read-only rule graph, asserting `not sys._is_gil_enabled()` at boot and aggregating per-thread metrics locally before periodic merges.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Shared-Heap Multi-Core",
+            "title": "8-Core Free-Threaded Workers Over Shared 2 GB Rule Graph",
+            "nodes": [
+              {
+                "id": "req",
+                "label": "ThreadPool (8)",
+                "role": "True CPU parallel"
+              },
+              {
+                "id": "loc",
+                "label": "threading.local()",
+                "role": "Zero-contention agg"
+              },
+              {
+                "id": "heap",
+                "label": "2 GB Rule Graph",
+                "role": "Zero-copy read-only"
+              },
+              {
+                "id": "gc",
+                "label": "mimalloc + BRC",
+                "role": "Per-thread heaps"
+              }
+            ],
+            "edges": [
+              {
+                "label": "parallel read"
+              },
+              {
+                "label": "periodic lock merge"
+              }
+            ],
+            "cards": [
+              {
+                "label": "1. Zero-Copy Read",
+                "detail": "All 8 threads traverse the 2 GB rule graph concurrently without 8x RAM duplication."
+              },
+              {
+                "label": "2. Thread-Local Tally",
+                "detail": "Workers accumulate counts locally to eliminate L1/L2 cache-line false sharing."
+              },
+              {
+                "label": "3. Startup Guard",
+                "detail": "CI runs with PYTHON_GIL=0 and startup asserts sys._is_gil_enabled() is False."
+              }
+            ],
+            "summary": "Shared-memory threads unlock 8x CPU throughput on 1x RAM footprint when C extensions and locks are audited."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "CPU-bound Python threads can now scale across cores without multiprocessing pickle overhead, provided C-extensions declare Py_MOD_GIL_NOT_USED and shared mutable state is synchronized."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** CPython's Global Interpreter Lock (GIL) existed because `Py_INCREF`/`Py_DECREF` reference counting was not thread-safe.\n\n**Visual & Structural Flow:** Depicts Free-Threaded CPython Import & GIL Fallback States (GIL DISABLED -> CRITICAL SECTION -> GIL RE-ENABLED); 8-Core Free-Threaded Workers Over Shared 2 GB Rule Graph (ThreadPool (8) -> threading.local() -> 2 GB Rule Graph -> mimalloc + BRC).\n\n**Trade-Offs & Production:** Choose the Python concurrency model based on CPU vs. An 8-core service runs `ThreadPoolExecutor(max_workers=8)` on `python3.13t` over a shared 2 GB read-only rule graph, asserting `not sys._is_gil_enabled()` at boot and aggregating.\n\n**Failure Modes & Application:** Explore bypassing the GIL for CPU workloads, false sharing, and asyncio.",
+      "spark": {
+        "summary": "Free-threaded Python (PEP 703, CPython 3.13t+) removes the Global Interpreter Lock so multiple threads execute Python bytecode simultaneously across CPU cores within a single shared memory space.",
+        "keyTakeaway": "CPU-bound Python threads can now scale across cores without multiprocessing pickle overhead, provided C-extensions declare Py_MOD_GIL_NOT_USED and shared mutable state is synchronized."
+      }
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** Free-threaded Python (PEP 703, CPython 3.13t+) removes the Global Interpreter Lock so multiple threads execute Python bytecode simultaneously across CPU cores within a single shared memory space.\n\n**Production Trade-Offs:** Verify GIL status after imports, guard compound read-modify-write invariants with `threading.Lock` or `queue.Queue`, and pool long-lived objects to minimize stop-the-world cyclic GC pauses.\n\n**Failure Modes & Edge Cases:** Explore bypassing the GIL for CPU workloads, false sharing, and asyncio.\n\n**Principal Takeaway:** CPU-bound Python threads can now scale across cores without multiprocessing pickle overhead, provided C-extensions declare Py_MOD_GIL_NOT_USED and shared mutable state is synchronized.",
+      "spark": {
+        "summary": "Free-threaded Python (PEP 703, CPython 3.13t+) removes the Global Interpreter Lock so multiple threads execute Python bytecode simultaneously across CPU cores within a single shared memory space.",
+        "keyTakeaway": "CPU-bound Python threads can now scale across cores without multiprocessing pickle overhead, provided C-extensions declare Py_MOD_GIL_NOT_USED and shared mutable state is synchronized."
+      },
+      "learningJourney": [
+        {
+          "id": "01-what-it-is",
+          "title": "What is Free-Threaded Python (PEP 703)",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Free-Threaded Python (PEP 703) works from first principles.",
+          "explanation": "CPython's Global Interpreter Lock (GIL) existed because `Py_INCREF`/`Py_DECREF` reference counting was not thread-safe. **PEP 703** (`python3.13t`+) removes the GIL by introducing **Biased Reference Counting (BRC)**, `mimalloc` per-thread heaps, immortal objects (PEP 683 for `None`/`True`/small ints), and per-object **critical sections** for `list`/`dict`/`set`.\n\nMultiple OS threads can now execute Python bytecode simultaneously across CPU cores inside one shared heap.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "state-machine",
+            "eyebrow": "GIL Runtime State",
+            "title": "Free-Threaded CPython Import & GIL Fallback States",
+            "states": [
+              {
+                "id": "nogil",
+                "label": "GIL DISABLED",
+                "sublabel": "python3.13t multi-core",
+                "tone": "green"
+              },
+              {
+                "id": "crit",
+                "label": "CRITICAL SECTION",
+                "sublabel": "Per-object dict/list lock",
+                "tone": "blue"
+              },
+              {
+                "id": "fallback",
+                "label": "GIL RE-ENABLED",
+                "sublabel": "Legacy .so without flag",
+                "tone": "red"
+              }
+            ],
+            "transitions": [
+              {
+                "from": "nogil",
+                "to": "crit",
+                "label": "Mutate shared dict/list"
+              },
+              {
+                "from": "crit",
+                "to": "nogil",
+                "label": "Release per-object lock"
+              },
+              {
+                "from": "nogil",
+                "to": "fallback",
+                "label": "Import unported C-extension"
+              }
+            ],
+            "summary": "Importing a single C-extension without Py_MOD_GIL_NOT_USED silently re-enables the GIL at runtime."
+          },
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-why-we-need-it",
+          "title": "Why we need No-GIL (and why Compound Races Now Surface)",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without No-GIL under real concurrency or scale.",
+          "explanation": "Previously, CPU-bound Python required `multiprocessing`, duplicating multi-gigabyte model weights or rule graphs across N processes and serializing payloads over IPC pipes. Under `python3.13t`, shared-memory threads eliminate that duplication—but code like `counter += 1` or `d[k] = d.get(k, 0) + 1`, which accidentally relied on GIL bytecode-switch atomicity, now exhibits real **lost-update data races**.",
+          "caveats": null,
+          "ideas": [
+            {
+              "title": "Assert `not sys._is_gil_enabled()` at Startup",
+              "description": "Run CI with `PYTHON_GIL=0` and check `sys._is_gil_enabled() is False` in startup health probes so legacy wheels never silently serialize your cluster."
+            },
+            {
+              "title": "Avoid False Sharing on Shared Counters",
+              "description": "Accumulate metrics in `threading.local()` and merge periodically instead of bouncing cache lines on one global counter."
+            }
+          ],
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "03-where-it-is-used",
+          "title": "Where Free-Threaded Python shines (and where Asyncio/GIL win)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Free-threaded Python fills the CPU + shared-memory gap between `asyncio` (high-concurrency I/O) and `multiprocessing` (process isolation).",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-how-it-is-managed",
+          "title": "How Thread-Safe Shared State & Startup Verification are managed",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Verify GIL status after imports, guard compound read-modify-write invariants with `threading.Lock` or `queue.Queue`, and pool long-lived objects to minimize stop-the-world cyclic GC pauses.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "05-alternatives",
+          "title": "Alternatives: Standard GIL Threads vs. Free-Threaded 3.13t vs. Multiprocessing",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "The trade-off: compare competing approaches across latency, consistency, and operational cost.",
+          "explanation": "Choose the Python concurrency model based on CPU vs. I/O profile and memory sharing needs.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "06-production-architecture",
+          "title": "Production example: 8-Core In-Memory Rule Scoring Service",
+          "eyebrow": "Advanced Path · Stage 06",
+          "purpose": "Production architecture: see how the components compose end to end under real load.",
+          "explanation": "An 8-core service runs `ThreadPoolExecutor(max_workers=8)` on `python3.13t` over a shared 2 GB read-only rule graph, asserting `not sys._is_gil_enabled()` at boot and aggregating per-thread metrics locally before periodic merges.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Shared-Heap Multi-Core",
+            "title": "8-Core Free-Threaded Workers Over Shared 2 GB Rule Graph",
+            "nodes": [
+              {
+                "id": "req",
+                "label": "ThreadPool (8)",
+                "role": "True CPU parallel"
+              },
+              {
+                "id": "loc",
+                "label": "threading.local()",
+                "role": "Zero-contention agg"
+              },
+              {
+                "id": "heap",
+                "label": "2 GB Rule Graph",
+                "role": "Zero-copy read-only"
+              },
+              {
+                "id": "gc",
+                "label": "mimalloc + BRC",
+                "role": "Per-thread heaps"
+              }
+            ],
+            "edges": [
+              {
+                "label": "parallel read"
+              },
+              {
+                "label": "periodic lock merge"
+              }
+            ],
+            "cards": [
+              {
+                "label": "1. Zero-Copy Read",
+                "detail": "All 8 threads traverse the 2 GB rule graph concurrently without 8x RAM duplication."
+              },
+              {
+                "label": "2. Thread-Local Tally",
+                "detail": "Workers accumulate counts locally to eliminate L1/L2 cache-line false sharing."
+              },
+              {
+                "label": "3. Startup Guard",
+                "detail": "CI runs with PYTHON_GIL=0 and startup asserts sys._is_gil_enabled() is False."
+              }
+            ],
+            "summary": "Shared-memory threads unlock 8x CPU throughput on 1x RAM footprint when C extensions and locks are audited."
+          },
+          "level": "L7 · STAFF / PRINCIPAL"
+        },
+        {
+          "id": "07-problems-and-further-reading",
+          "title": "Problems solved by No-GIL Python & Related Concurrency Concepts",
+          "eyebrow": "Advanced Path · Stage 07",
+          "purpose": "Applied problems: connect these internals to concrete system design and debugging scenarios.",
+          "explanation": "Explore bypassing the GIL for CPU workloads, false sharing, and asyncio.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "CPU-bound Python threads can now scale across cores without multiprocessing pickle overhead, provided C-extensions declare Py_MOD_GIL_NOT_USED and shared mutable state is synchronized."
+    }
+  }
+}

@@ -1,0 +1,707 @@
+{
+  "id": "concept-mysql-replication-topologies",
+  "slug": "mysql-replication-topologies",
+  "name": "MySQL Replication Topologies",
+  "domain": "Databases & Storage Engines",
+  "tagline": "Scaling MySQL reads and failover via GTID row-based binlogs across asynchronous, semi-synchronous, and Group Replication topologies.",
+  "purpose": "Compare async, semi-sync (AFTER_SYNC), and Paxos-based Group Replication while preventing replication lag and split-brain dual-primary writes.",
+  "spark": {
+    "summary": "MySQL replication copies binary log (binlog) events from a primary server to one or more replicas to scale reads, isolate analytics, and survive node or availability-zone failures.",
+    "keyTakeaway": "Enable GTIDs and ROW-based binlogging as your baseline, use semi-synchronous (`AFTER_SYNC`) or Group Replication to prevent lost commits on failover, and enforce `super_read_only=ON` on replicas to stop split-brain.",
+    "byteSummary": "**Core Mechanics:** **MySQL replication** streams committed **binary log (binlog)** events from a primary server to replica relay logs so replicas can replay mutations for read scaling, backups, and high availability.\n\n**Visual & Structural Flow:** Depicts MySQL Primary Binlog -> Replica Relay Log -> InnoDB Commit (App Write -> Primary Binlog -> Replica Relay Log -> InnoDB Storage); 3-Node MySQL Group Replication (Paxos Single-Primary) (Primary (RW) -> Replica 1 (RO) -> Replica 2 (RO)).\n\n**Trade-Offs & Production:** Trade commit RTT against RPO and built-in Paxos failover. Enable GTIDs, `ROW` format, `WRITESET` parallel workers, and `super_read_only`.\n\n**Failure Modes & Application:** Explore InnoDB gap-lock deadlocks, read-your-own-writes routing, and online DDL."
+  },
+  "learningJourney": [
+    {
+      "id": "01-what-it-is",
+      "eyebrow": "STAGE 01 · WHAT IT IS",
+      "title": "What is MySQL Replication",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": "**MySQL replication** streams committed **binary log (binlog)** events from a primary server to replica relay logs so replicas can replay mutations for read scaling, backups, and high availability.\n\nModern production MySQL mandates two baseline settings: **`gtid_mode=ON`** (tracking transactions by `UUID:sequence` rather than brittle binlog file/offset positions) and **`binlog_format=ROW`** (eliminating non-deterministic `UUID()` / `NOW()` replay bugs).",
+      "sectionDiagram": {
+        "kind": "wal-mvcc",
+        "eyebrow": "Semi-Sync AFTER_SYNC",
+        "title": "MySQL Primary Binlog -> Replica Relay Log -> InnoDB Commit",
+        "nodes": [
+          {
+            "id": "cli",
+            "label": "App Write",
+            "role": "COMMIT Tx"
+          },
+          {
+            "id": "pri",
+            "label": "Primary Binlog",
+            "role": "Wait >=1 Relay ACK"
+          },
+          {
+            "id": "rep",
+            "label": "Replica Relay Log",
+            "role": "WRITESET Parallel"
+          },
+          {
+            "id": "inno",
+            "label": "InnoDB Storage",
+            "role": "Durable Commit"
+          }
+        ],
+        "cards": [
+          {
+            "label": "1. AFTER_SYNC Safety",
+            "detail": "Primary waits for at least one replica relay-log ACK before committing to InnoDB—preventing phantom reads and lost commits."
+          },
+          {
+            "label": "2. GTID Tracking",
+            "detail": "Global Transaction IDs allow any replica to re-point to a new primary cleanly without manual log-position math."
+          },
+          {
+            "label": "3. WRITESET Parallelism",
+            "detail": "LOGICAL_CLOCK + WRITESET lets replicas apply non-conflicting transactions in parallel."
+          }
+        ],
+        "summary": "GTIDs + ROW binlogs + WRITESET parallel workers form the foundation of modern MySQL HA."
+      },
+      "purpose": "The mechanism: understand how MySQL Replication works from first principles."
+    },
+    {
+      "id": "02-why-we-need-it",
+      "eyebrow": "STAGE 02 · WHY WE NEED IT",
+      "title": "Why Replication Lag and Dual-Primary Split-Brain happen",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": "Two failure modes plague MySQL clusters:\n- **Replication Lag**: single-threaded DDL (`ALTER TABLE`) or unindexed batch `DELETE`s serialize on replicas, spiking `Seconds_Behind_Source` to minutes and serving stale read-after-write data.\n- **Split-Brain Dual-Primary Writes**: after a network partition promotes a replica, stale app pods keep writing to the old primary, diverging GTID histories.",
+      "ideas": [
+        {
+          "title": "super_read_only=ON Everywhere",
+          "description": "Set `super_read_only=ON` on all replicas by default and revoke VIPs/security-group ingress on the old primary before unsetting `read_only`."
+        },
+        {
+          "title": "GTID Read-Your-Own-Writes",
+          "description": "Route critical post-write reads to the primary, or call `WAIT_FOR_EXECUTED_GTID_SET()` on the replica."
+        }
+      ],
+      "purpose": "The problem: see what breaks without Why Replication Lag and Dual-Primary Split-Brain happen under real concurrency or scale."
+    },
+    {
+      "id": "03-where-it-is-used",
+      "eyebrow": "STAGE 03 · WHERE IT IS USED",
+      "title": "Where MySQL Replication fits (and when to Shard)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "Replication scales reads horizontally; it cannot scale writes beyond a single primary.",
+      "comparison": [
+        {
+          "choice": "Good Candidate: Read-Heavy (>5:1) & Online Backups",
+          "benefits": [
+            "Offloads dashboards, `gh-ost` schema migrations, and snapshots from the primary."
+          ],
+          "costs": [
+            "Asynchronous replicas lag under heavy write bursts."
+          ]
+        },
+        {
+          "choice": "Avoid: Single-Table Writes > 20k–30k/sec",
+          "benefits": [
+            "Shard horizontally (Vitess / Citus) when write IOPS saturates one primary."
+          ],
+          "costs": [
+            "Every replica must replay 100% of primary writes."
+          ]
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    },
+    {
+      "id": "04-how-it-is-managed",
+      "eyebrow": "STAGE 04 · HOW IT IS MANAGED",
+      "title": "Production my.cnf Baseline for GTID + Parallel Replicas",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "Enable GTIDs, `ROW` format, `WRITESET` parallel workers, and `super_read_only`.",
+      "markdownContent": "```ini\n[mysqld]\ngtid_mode = ON\nenforce_gtid_consistency = ON\nbinlog_format = ROW\nbinlog_row_image = MINIMAL\nreplica_parallel_type = LOGICAL_CLOCK\nreplica_parallel_workers = 8\nbinlog_transaction_dependency_tracking = WRITESET\nsuper_read_only = ON  # Keep ON for all replicas until Orchestrator promotes\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-alternatives",
+      "eyebrow": "STAGE 05 · ALTERNATIVES",
+      "title": "Alternatives: Async vs. Semi-Sync (AFTER_SYNC) vs. Group Replication",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": "Trade commit RTT against RPO and built-in Paxos failover.",
+      "comparison": [
+        {
+          "choice": "Asynchronous Replication",
+          "benefits": [
+            "~0.3 ms local commit latency independent of replica network RTT."
+          ],
+          "costs": [
+            "RPO > 0: unshipped commits are lost if the primary disk dies."
+          ]
+        },
+        {
+          "choice": "Semi-Sync (AFTER_SYNC)",
+          "benefits": [
+            "Zero lost commits on single-node crash; no phantom reads before replica relay ACK."
+          ],
+          "costs": [
+            "Adds 1 cross-AZ network RTT (~0.5–2 ms) to every commit."
+          ]
+        },
+        {
+          "choice": "MySQL Group Replication (Single-Primary)",
+          "benefits": [
+            "Built-in Paxos membership, automatic primary election, and split-brain fencing."
+          ],
+          "costs": [
+            "XCom consensus RTT + certification overhead; 150 MB transaction size limit."
+          ]
+        }
+      ],
+      "purpose": "The trade-off: compare competing approaches across latency, consistency, and operational cost."
+    },
+    {
+      "id": "06-production-architecture",
+      "eyebrow": "STAGE 06 · PRODUCTION ARCHITECTURE",
+      "title": "3-Node Semi-Sync / Group Replication + ProxySQL Fencing",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": "Production MySQL clusters pair **ProxySQL** (splitting writes to Primary and reads to low-lag Replicas) with **Orchestrator** or **MySQL InnoDB Cluster (Group Replication)**, automatically fencing unreachable primaries before promoting a replica.",
+      "sectionDiagram": {
+        "kind": "quorum-cluster",
+        "eyebrow": "InnoDB Cluster",
+        "title": "3-Node MySQL Group Replication (Paxos Single-Primary)",
+        "nodes": [
+          {
+            "id": "pri",
+            "label": "Primary (RW)",
+            "role": "Paxos Proposer + GTID"
+          },
+          {
+            "id": "r1",
+            "label": "Replica 1 (RO)",
+            "role": "super_read_only=ON"
+          },
+          {
+            "id": "r2",
+            "label": "Replica 2 (RO)",
+            "role": "super_read_only=ON"
+          }
+        ],
+        "edges": [
+          {
+            "label": "XCom Paxos Quorum"
+          },
+          {
+            "label": "Certify & Apply"
+          }
+        ],
+        "cards": [
+          {
+            "label": "1. Automatic Quorum",
+            "detail": "3 nodes across 3 AZs tolerate 1 AZ loss without external Zookeeper/Orchestrator."
+          },
+          {
+            "label": "2. Chunked Mutations",
+            "detail": "Chunk large DELETE/UPDATEs to 1,000 rows and use gh-ost for DDL to keep lag <1s."
+          },
+          {
+            "label": "3. ProxySQL Routing",
+            "detail": "Shun replicas automatically if Seconds_Behind_Source exceeds threshold."
+          }
+        ],
+        "summary": "Group Replication provides built-in consensus fencing, while ProxySQL shields apps from lagged replicas."
+      },
+      "purpose": "Production architecture: see how the components compose end to end under real load."
+    },
+    {
+      "id": "07-problems-and-further-reading",
+      "eyebrow": "STAGE 07 · PROBLEMS SOLVED & FURTHER DEEP DIVE",
+      "title": "Related Database Problems & Concepts",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": "Explore InnoDB gap-lock deadlocks, read-your-own-writes routing, and online DDL.",
+      "supportingConcepts": [
+        {
+          "slug": "mysql-innodb-gap-lock-deadlocks",
+          "title": "Problem: MySQL InnoDB Gap-Lock Deadlocks",
+          "kind": "problem"
+        },
+        {
+          "slug": "read-your-own-writes-consistency-patterns",
+          "title": "Problem: Read-Your-Own-Writes Consistency",
+          "kind": "problem"
+        },
+        {
+          "slug": "online-ddl-large-table-migrations",
+          "title": "Problem: Online DDL Large Table Migrations",
+          "kind": "problem"
+        },
+        {
+          "slug": "consistency-replication",
+          "title": "Concept: Consistency & Replication",
+          "kind": "concept"
+        },
+        {
+          "slug": "database-sharding",
+          "title": "Concept: Database Sharding",
+          "kind": "concept"
+        },
+        {
+          "slug": "point-in-time-recovery",
+          "title": "Concept: Point-in-Time Recovery (PITR)",
+          "kind": "concept"
+        },
+        {
+          "slug": "split-brain-prevention",
+          "title": "Concept: Split-Brain Prevention",
+          "kind": "concept"
+        }
+      ],
+      "purpose": "Applied problems: connect these internals to concrete system design and debugging scenarios."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why does modern MySQL replication require `binlog_format=ROW` and `gtid_mode=ON`?",
+      "options": [
+        {
+          "id": "a",
+          "text": "ROW format eliminates non-deterministic SQL replay bugs (like UUID()/NOW()) and GTIDs let replicas re-point cleanly without fragile file/offset math",
+          "correct": true,
+          "feedback": "Correct: ROW + GTID prevents silent data drift and makes automated failover reliable."
+        },
+        {
+          "id": "b",
+          "text": "ROW format disables binary logging on replicas",
+          "correct": false,
+          "feedback": "Replicas still log binlogs if log_replica_updates is enabled."
+        },
+        {
+          "id": "c",
+          "text": "GTIDs allow replicas to accept writes without split-brain",
+          "correct": false,
+          "feedback": "Replicas should keep super_read_only=ON to prevent split-brain."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why does modern MySQL replication require `binlog_format=ROW` and `gtid_mode=ON`?",
+        "options": [
+          {
+            "id": "a",
+            "text": "ROW format eliminates non-deterministic SQL replay bugs (like UUID()/NOW()) and GTIDs let replicas re-point cleanly without fragile file/offset math",
+            "correct": true,
+            "feedback": "Correct: ROW + GTID prevents silent data drift and makes automated failover reliable."
+          },
+          {
+            "id": "b",
+            "text": "ROW format disables binary logging on replicas",
+            "correct": false,
+            "feedback": "Replicas still log binlogs if log_replica_updates is enabled."
+          },
+          {
+            "id": "c",
+            "text": "GTIDs allow replicas to accept writes without split-brain",
+            "correct": false,
+            "feedback": "Replicas should keep super_read_only=ON to prevent split-brain."
+          }
+        ]
+      },
+      {
+        "question": "What is the main benefit—and corresponding operational trade-off—of using Good Candidate: Read-Heavy (>5:1) & Online Backups in MySQL Replication Topologies?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Ignoring asynchronous replicas lag under heavy write bursts. removes the need for any trade-off evaluation",
+            "correct": false,
+            "feedback": "Incorrect: every production option in MySQL Replication Topologies carries concrete latency, consistency, or operational costs."
+          },
+          {
+            "id": "b",
+            "text": "Advantage: Offloads dashboards, gh-ost schema migrations, and snapshots from the primary. Cost: Asynchronous replicas lag under heavy write bursts.",
+            "correct": true,
+            "feedback": "Correct: Good Candidate: Read-Heavy (>5:1) & Online Backups delivers offloads dashboards, gh-ost schema migrations, and snapshots from the primary. while requiring you to manage asynchronous replicas lag under heavy write bursts."
+          },
+          {
+            "id": "c",
+            "text": "Advantage: Shard horizontally (Vitess / Citus) when write IOPS saturates one primary. It has zero operational or latency overhead compared to Avoid: Single-Table Writes > 20k–30k/sec.",
+            "correct": false,
+            "feedback": "Not quite: that describes Avoid: Single-Table Writes > 20k–30k/sec, whereas Good Candidate: Read-Heavy (>5:1) & Online Backups specifically trades off: Asynchronous replicas lag under heavy write bursts."
+          }
+        ]
+      },
+      {
+        "question": "Why is GTID Read-Your-Own-Writes critical when operating MySQL Replication Topologies in production?",
+        "options": [
+          {
+            "id": "a",
+            "text": "It only applies during local unit testing and can be disabled in production to save memory.",
+            "correct": false,
+            "feedback": "Incorrect: 'GTID Read-Your-Own-Writes' directly governs production reliability and correctness under real traffic."
+          },
+          {
+            "id": "b",
+            "text": "It replaces the need for observability, timeouts, or capacity planning across MySQL Replication Topologies.",
+            "correct": false,
+            "feedback": "Incorrect: 'GTID Read-Your-Own-Writes' works alongside proper bounds, monitoring, and failure isolation."
+          },
+          {
+            "id": "c",
+            "text": "Route critical post-write reads to the primary, or call WAIT_FOR_EXECUTED_GTID_SET() on the replica.",
+            "correct": true,
+            "feedback": "Correct: Route critical post-write reads to the primary, or call WAIT_FOR_EXECUTED_GTID_SET() on the replica."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** **MySQL replication** streams committed **binary log (binlog)** events from a primary server to replica relay logs so replicas can replay mutations for read scaling, backups, and high availability.\n\n**How It Flows:** Think of MySQL Replication Topologies as a clear step-by-step chain: App Write -> Primary Binlog -> Replica Relay Log -> InnoDB Storage -> Primary (RW).\n\n**Why Beginners Should Care:** Enable GTIDs and ROW-based binlogging as your baseline, use semi-synchronous (`AFTER_SYNC`) or Group Replication to prevent lost commits on failover, and enforce `super_read_only=ON` on replicas to stop split-brain.",
+      "spark": {
+        "summary": "**MySQL replication** streams committed **binary log (binlog)** events from a primary server to replica relay logs so replicas can replay mutations for read scaling, backups, and high availability.",
+        "keyTakeaway": "Enable GTIDs and ROW-based binlogging as your baseline, use semi-synchronous (`AFTER_SYNC`) or Group Replication to prevent lost commits on failover, and enforce `super_read_only=ON` on replicas to stop split-brain."
+      },
+      "learningJourney": [
+        {
+          "id": "01-what-it-is",
+          "title": "What is MySQL Replication",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how MySQL Replication works from first principles.",
+          "explanation": "**MySQL replication** streams committed **binary log (binlog)** events from a primary server to replica relay logs so replicas can replay mutations for read scaling, backups, and high availability.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "wal-mvcc",
+            "eyebrow": "Semi-Sync AFTER_SYNC",
+            "title": "MySQL Primary Binlog -> Replica Relay Log -> InnoDB Commit",
+            "nodes": [
+              {
+                "id": "cli",
+                "label": "App Write",
+                "role": "COMMIT Tx"
+              },
+              {
+                "id": "pri",
+                "label": "Primary Binlog",
+                "role": "Wait >=1 Relay ACK"
+              },
+              {
+                "id": "rep",
+                "label": "Replica Relay Log",
+                "role": "WRITESET Parallel"
+              },
+              {
+                "id": "inno",
+                "label": "InnoDB Storage",
+                "role": "Durable Commit"
+              }
+            ],
+            "cards": [
+              {
+                "label": "1. AFTER_SYNC Safety",
+                "detail": "Primary waits for at least one replica relay-log ACK before committing to InnoDB—preventing phantom reads and lost commits."
+              },
+              {
+                "label": "2. GTID Tracking",
+                "detail": "Global Transaction IDs allow any replica to re-point to a new primary cleanly without manual log-position math."
+              },
+              {
+                "label": "3. WRITESET Parallelism",
+                "detail": "LOGICAL_CLOCK + WRITESET lets replicas apply non-conflicting transactions in parallel."
+              }
+            ],
+            "summary": "GTIDs + ROW binlogs + WRITESET parallel workers form the foundation of modern MySQL HA."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-why-we-need-it",
+          "title": "Why Replication Lag and Dual-Primary Split-Brain happen",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without Why Replication Lag and Dual-Primary Split-Brain happen under real concurrency or scale.",
+          "explanation": "Two failure modes plague MySQL clusters: **Replication Lag**: single-threaded DDL (`ALTER TABLE`) or unindexed batch `DELETE`s serialize on replicas, spiking `Seconds_Behind_Source` to minutes and serving stale read-after-write data. **Split-Brain Dual-Primary Writes**: after a network partition promotes a replica, stale app pods keep writing to the old primary, diverging GTID histories.",
+          "ideas": [
+            {
+              "title": "super_read_only=ON Everywhere",
+              "description": "Set `super_read_only=ON` on all replicas by default and revoke VIPs/security-group ingress on the old primary before unsetting `read_only`."
+            },
+            {
+              "title": "GTID Read-Your-Own-Writes",
+              "description": "Route critical post-write reads to the primary, or call `WAIT_FOR_EXECUTED_GTID_SET()` on the replica."
+            }
+          ],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-where-it-is-used",
+          "title": "Where MySQL Replication fits (and when to Shard)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Replication scales reads horizontally; it cannot scale writes beyond a single primary.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "06-production-architecture",
+          "title": "3-Node Semi-Sync / Group Replication + ProxySQL Fencing",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Production architecture: see how the components compose end to end under real load.",
+          "explanation": "Production MySQL clusters pair **ProxySQL** (splitting writes to Primary and reads to low-lag Replicas) with **Orchestrator** or **MySQL InnoDB Cluster (Group Replication)**, automatically fencing unreachable primaries before promoting a replica.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "quorum-cluster",
+            "eyebrow": "InnoDB Cluster",
+            "title": "3-Node MySQL Group Replication (Paxos Single-Primary)",
+            "nodes": [
+              {
+                "id": "pri",
+                "label": "Primary (RW)",
+                "role": "Paxos Proposer + GTID"
+              },
+              {
+                "id": "r1",
+                "label": "Replica 1 (RO)",
+                "role": "super_read_only=ON"
+              },
+              {
+                "id": "r2",
+                "label": "Replica 2 (RO)",
+                "role": "super_read_only=ON"
+              }
+            ],
+            "edges": [
+              {
+                "label": "XCom Paxos Quorum"
+              },
+              {
+                "label": "Certify & Apply"
+              }
+            ],
+            "cards": [
+              {
+                "label": "1. Automatic Quorum",
+                "detail": "3 nodes across 3 AZs tolerate 1 AZ loss without external Zookeeper/Orchestrator."
+              },
+              {
+                "label": "2. Chunked Mutations",
+                "detail": "Chunk large DELETE/UPDATEs to 1,000 rows and use gh-ost for DDL to keep lag <1s."
+              },
+              {
+                "label": "3. ProxySQL Routing",
+                "detail": "Shun replicas automatically if Seconds_Behind_Source exceeds threshold."
+              }
+            ],
+            "summary": "Group Replication provides built-in consensus fencing, while ProxySQL shields apps from lagged replicas."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Enable GTIDs and ROW-based binlogging as your baseline, use semi-synchronous (`AFTER_SYNC`) or Group Replication to prevent lost commits on failover, and enforce `super_read_only=ON` on replicas to stop split-brain."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** **MySQL replication** streams committed **binary log (binlog)** events from a primary server to replica relay logs so replicas can replay mutations for read scaling, backups, and high availability.\n\n**Visual & Structural Flow:** Depicts MySQL Primary Binlog -> Replica Relay Log -> InnoDB Commit (App Write -> Primary Binlog -> Replica Relay Log -> InnoDB Storage); 3-Node MySQL Group Replication (Paxos Single-Primary) (Primary (RW) -> Replica 1 (RO) -> Replica 2 (RO)).\n\n**Trade-Offs & Production:** Trade commit RTT against RPO and built-in Paxos failover. Enable GTIDs, `ROW` format, `WRITESET` parallel workers, and `super_read_only`.\n\n**Failure Modes & Application:** Explore InnoDB gap-lock deadlocks, read-your-own-writes routing, and online DDL.",
+      "spark": {
+        "summary": "MySQL replication copies binary log (binlog) events from a primary server to one or more replicas to scale reads, isolate analytics, and survive node or availability-zone failures.",
+        "keyTakeaway": "Enable GTIDs and ROW-based binlogging as your baseline, use semi-synchronous (`AFTER_SYNC`) or Group Replication to prevent lost commits on failover, and enforce `super_read_only=ON` on replicas to stop split-brain."
+      }
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** MySQL replication copies binary log (binlog) events from a primary server to one or more replicas to scale reads, isolate analytics, and survive node or availability-zone failures.\n\n**Production Trade-Offs:** Enable GTIDs, `ROW` format, `WRITESET` parallel workers, and `super_read_only`.\n\n**Failure Modes & Edge Cases:** Explore InnoDB gap-lock deadlocks, read-your-own-writes routing, and online DDL.\n\n**Principal Takeaway:** Enable GTIDs and ROW-based binlogging as your baseline, use semi-synchronous (`AFTER_SYNC`) or Group Replication to prevent lost commits on failover, and enforce `super_read_only=ON` on replicas to stop split-brain.",
+      "spark": {
+        "summary": "MySQL replication copies binary log (binlog) events from a primary server to one or more replicas to scale reads, isolate analytics, and survive node or availability-zone failures.",
+        "keyTakeaway": "Enable GTIDs and ROW-based binlogging as your baseline, use semi-synchronous (`AFTER_SYNC`) or Group Replication to prevent lost commits on failover, and enforce `super_read_only=ON` on replicas to stop split-brain."
+      },
+      "learningJourney": [
+        {
+          "id": "01-what-it-is",
+          "title": "What is MySQL Replication",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how MySQL Replication works from first principles.",
+          "explanation": "**MySQL replication** streams committed **binary log (binlog)** events from a primary server to replica relay logs so replicas can replay mutations for read scaling, backups, and high availability.\n\nModern production MySQL mandates two baseline settings: **`gtid_mode=ON`** (tracking transactions by `UUID:sequence` rather than brittle binlog file/offset positions) and **`binlog_format=ROW`** (eliminating non-deterministic `UUID()` / `NOW()` replay bugs).",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "wal-mvcc",
+            "eyebrow": "Semi-Sync AFTER_SYNC",
+            "title": "MySQL Primary Binlog -> Replica Relay Log -> InnoDB Commit",
+            "nodes": [
+              {
+                "id": "cli",
+                "label": "App Write",
+                "role": "COMMIT Tx"
+              },
+              {
+                "id": "pri",
+                "label": "Primary Binlog",
+                "role": "Wait >=1 Relay ACK"
+              },
+              {
+                "id": "rep",
+                "label": "Replica Relay Log",
+                "role": "WRITESET Parallel"
+              },
+              {
+                "id": "inno",
+                "label": "InnoDB Storage",
+                "role": "Durable Commit"
+              }
+            ],
+            "cards": [
+              {
+                "label": "1. AFTER_SYNC Safety",
+                "detail": "Primary waits for at least one replica relay-log ACK before committing to InnoDB—preventing phantom reads and lost commits."
+              },
+              {
+                "label": "2. GTID Tracking",
+                "detail": "Global Transaction IDs allow any replica to re-point to a new primary cleanly without manual log-position math."
+              },
+              {
+                "label": "3. WRITESET Parallelism",
+                "detail": "LOGICAL_CLOCK + WRITESET lets replicas apply non-conflicting transactions in parallel."
+              }
+            ],
+            "summary": "GTIDs + ROW binlogs + WRITESET parallel workers form the foundation of modern MySQL HA."
+          },
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-why-we-need-it",
+          "title": "Why Replication Lag and Dual-Primary Split-Brain happen",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without Why Replication Lag and Dual-Primary Split-Brain happen under real concurrency or scale.",
+          "explanation": "Two failure modes plague MySQL clusters:\n- **Replication Lag**: single-threaded DDL (`ALTER TABLE`) or unindexed batch `DELETE`s serialize on replicas, spiking `Seconds_Behind_Source` to minutes and serving stale read-after-write data.\n- **Split-Brain Dual-Primary Writes**: after a network partition promotes a replica, stale app pods keep writing to the old primary, diverging GTID histories.",
+          "caveats": null,
+          "ideas": [
+            {
+              "title": "super_read_only=ON Everywhere",
+              "description": "Set `super_read_only=ON` on all replicas by default and revoke VIPs/security-group ingress on the old primary before unsetting `read_only`."
+            },
+            {
+              "title": "GTID Read-Your-Own-Writes",
+              "description": "Route critical post-write reads to the primary, or call `WAIT_FOR_EXECUTED_GTID_SET()` on the replica."
+            }
+          ],
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "03-where-it-is-used",
+          "title": "Where MySQL Replication fits (and when to Shard)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Replication scales reads horizontally; it cannot scale writes beyond a single primary.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-how-it-is-managed",
+          "title": "Production my.cnf Baseline for GTID + Parallel Replicas",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Enable GTIDs, `ROW` format, `WRITESET` parallel workers, and `super_read_only`.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "05-alternatives",
+          "title": "Alternatives: Async vs. Semi-Sync (AFTER_SYNC) vs. Group Replication",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "The trade-off: compare competing approaches across latency, consistency, and operational cost.",
+          "explanation": "Trade commit RTT against RPO and built-in Paxos failover.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "06-production-architecture",
+          "title": "3-Node Semi-Sync / Group Replication + ProxySQL Fencing",
+          "eyebrow": "Advanced Path · Stage 06",
+          "purpose": "Production architecture: see how the components compose end to end under real load.",
+          "explanation": "Production MySQL clusters pair **ProxySQL** (splitting writes to Primary and reads to low-lag Replicas) with **Orchestrator** or **MySQL InnoDB Cluster (Group Replication)**, automatically fencing unreachable primaries before promoting a replica.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "quorum-cluster",
+            "eyebrow": "InnoDB Cluster",
+            "title": "3-Node MySQL Group Replication (Paxos Single-Primary)",
+            "nodes": [
+              {
+                "id": "pri",
+                "label": "Primary (RW)",
+                "role": "Paxos Proposer + GTID"
+              },
+              {
+                "id": "r1",
+                "label": "Replica 1 (RO)",
+                "role": "super_read_only=ON"
+              },
+              {
+                "id": "r2",
+                "label": "Replica 2 (RO)",
+                "role": "super_read_only=ON"
+              }
+            ],
+            "edges": [
+              {
+                "label": "XCom Paxos Quorum"
+              },
+              {
+                "label": "Certify & Apply"
+              }
+            ],
+            "cards": [
+              {
+                "label": "1. Automatic Quorum",
+                "detail": "3 nodes across 3 AZs tolerate 1 AZ loss without external Zookeeper/Orchestrator."
+              },
+              {
+                "label": "2. Chunked Mutations",
+                "detail": "Chunk large DELETE/UPDATEs to 1,000 rows and use gh-ost for DDL to keep lag <1s."
+              },
+              {
+                "label": "3. ProxySQL Routing",
+                "detail": "Shun replicas automatically if Seconds_Behind_Source exceeds threshold."
+              }
+            ],
+            "summary": "Group Replication provides built-in consensus fencing, while ProxySQL shields apps from lagged replicas."
+          },
+          "level": "L7 · STAFF / PRINCIPAL"
+        },
+        {
+          "id": "07-problems-and-further-reading",
+          "title": "Related Database Problems & Concepts",
+          "eyebrow": "Advanced Path · Stage 07",
+          "purpose": "Applied problems: connect these internals to concrete system design and debugging scenarios.",
+          "explanation": "Explore InnoDB gap-lock deadlocks, read-your-own-writes routing, and online DDL.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Enable GTIDs and ROW-based binlogging as your baseline, use semi-synchronous (`AFTER_SYNC`) or Group Replication to prevent lost commits on failover, and enforce `super_read_only=ON` on replicas to stop split-brain."
+    }
+  }
+}

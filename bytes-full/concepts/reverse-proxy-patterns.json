@@ -1,0 +1,736 @@
+{
+  "id": "concept-reverse-proxy-patterns",
+  "slug": "reverse-proxy-patterns",
+  "name": "Reverse Proxy Patterns & Edge Load Balancing",
+  "domain": "Networking & Protocols",
+  "tagline": "Terminating client TLS, buffering slowloris connections, and multiplexing traffic over persistent upstream pools via P2C and outlier detection.",
+  "purpose": "Build a progressive mental model of reverse proxy patterns—from L4 vs. L7 termination and keep-alive timeout alignment to P2C load balancing, circuit breaking, and outlier ejection.",
+  "spark": {
+    "summary": "A reverse proxy terminates client connections at the network edge, enforces TLS 1.3, rate limits, and auth, and multiplexes requests over persistent upstream pools to backend services using algorithms like Power of Two Choices (P2C) or consistent hashing.",
+    "keyTakeaway": "Terminate TLS and untrusted client behavior at the proxy boundary so backend services only process normalized, connection-pooled traffic within strict timeout and circuit-breaker budgets.",
+    "byteSummary": "**Core Mechanics:** A **reverse proxy** (Envoy, NGINX, HAProxy) sits in front of origin servers and acts as a single L7 termination boundary.\n\n**Visual & Structural Flow:** Depicts L7 Reverse Proxy TLS Offload & Per-Cluster Upstream Pools (Public Clients -> Envoy / NGINX Edge -> Isolated Pools -> 50 Microservices); Envoy P2C Routing & Passive Pod Ejection Flow (Client -> Envoy Edge -> Pod 1 (Sick) -> Pod 2 (Healthy)).\n\n**Trade-Offs & Production:** Select the proxy layer based on dynamic control-plane needs, gRPC/HTTP2 support, and throughput. An Envoy edge tier handles 50,000 RPS across 50 microservices: terminating TLS 1.3 with session tickets, enforcing per-tenant token-bucket limits, routing via P2C across isolated.\n\n**Failure Modes & Application:** Explore NGINX 502 buffer tuning, HTTP keep-alive alignment, and gRPC HTTP/2 load balancing."
+  },
+  "learningJourney": [
+    {
+      "id": "01-what-it-is",
+      "eyebrow": "STAGE 01 · WHAT IT IS",
+      "title": "What is a Reverse Proxy",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": "A **reverse proxy** (Envoy, NGINX, HAProxy) sits in front of origin servers and acts as a single L7 termination boundary. It terminates client TCP/TLS 1.3, buffers slow client bodies (blocking slowloris attacks), enforces auth/rate limits, and multiplexes normalized HTTP/2 or gRPC requests over **persistent upstream connection pools**.\n\nUnlike an L4 TCP load balancer, an L7 reverse proxy inspects HTTP headers/paths, runs **Power-of-Two-Choices (P2C)** or **consistent hashing**, and performs passive **outlier detection** to eject failing pods.",
+      "sectionDiagram": {
+        "kind": "cache-tier",
+        "eyebrow": "Edge Multiplexing Tier",
+        "title": "L7 Reverse Proxy TLS Offload & Per-Cluster Upstream Pools",
+        "nodes": [
+          {
+            "id": "cli",
+            "label": "Public Clients",
+            "role": "TLS 1.3 + HTTP/3"
+          },
+          {
+            "id": "pxy",
+            "label": "Envoy / NGINX Edge",
+            "role": "Auth + P2C + Outliers"
+          },
+          {
+            "id": "pool",
+            "label": "Isolated Pools",
+            "role": "Per-service max_conns"
+          },
+          {
+            "id": "svc",
+            "label": "50 Microservices",
+            "role": "Normalized HTTP/2"
+          }
+        ],
+        "edges": [
+          {
+            "label": "Terminate TLS + buffer"
+          },
+          {
+            "label": "Persistent keep-alive"
+          }
+        ],
+        "cards": [
+          {
+            "label": "1. TLS & Slowloris Shield",
+            "detail": "Proxy absorbs untrusted WAN jitter and TLS handshakes so origin workers never stall on slow sockets."
+          },
+          {
+            "label": "2. Per-Service Pools",
+            "detail": "Isolating connection pools per upstream cluster prevents one slow service from starving all others."
+          },
+          {
+            "label": "3. Outlier Ejection",
+            "detail": "Consecutive 5xx responses trip passive circuit breakers and eject sick pods for a cooldown window."
+          }
+        ],
+        "summary": "Edge reverse proxies turn chaotic public internet connections into bounded, pooled internal RPCs."
+      },
+      "purpose": "The mechanism: understand how a Reverse Proxy works from first principles."
+    },
+    {
+      "id": "02-why-we-need-it",
+      "eyebrow": "STAGE 02 · WHY WE NEED IT",
+      "title": "Why we need Reverse Proxies (Keep-Alive Races & Global Pools)",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": "Exposing application servers directly to the internet forces every service to manage TLS certificates, connection floods, and HTTP/1.1 head-of-line blocking. Even with a proxy, two subtle bugs cause production 502s: (1) **Keep-Alive Timeout Race**: if the upstream app's idle timeout (e.g., 60s) is *shorter* than the proxy's pool timeout (65s), the proxy writes onto a socket the backend just closed, returning `502 Bad Gateway`; (2) **Shared Unbounded Pools** let one noisy microservice exhaust all proxy workers.",
+      "ideas": [
+        {
+          "title": "Keep Upstream Idle Timeout > Proxy Pool Timeout",
+          "description": "Always configure the backend server's keep-alive idle timeout (e.g., 65s) strictly higher than the proxy's upstream idle timeout (e.g., 55s)."
+        },
+        {
+          "title": "Use Consistent Hashing for Stateful/Cache Backends",
+          "description": "Route by `x-tenant-id` or key hash to preserve L1 cache locality on stateful pods, while using P2C for stateless APIs."
+        }
+      ],
+      "purpose": "The problem: see what breaks without Reverse Proxies under real concurrency or scale."
+    },
+    {
+      "id": "03-where-it-is-used",
+      "eyebrow": "STAGE 03 · WHERE IT IS USED",
+      "title": "Where Reverse Proxies fit (and where L4 Pass-Through wins)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "Use L7 reverse proxies for HTTP/gRPC routing, TLS offload, and canary traffic splitting; use L4 DSR/Maglev when zero TLS decryption or raw packet throughput is needed.",
+      "comparison": [
+        {
+          "choice": "Good Candidate: Multi-Tenant HTTP/gRPC Edge Gateways",
+          "benefits": [
+            "Provides weighted canary routing, gRPC HTTP/2 load balancing, header auth, and outlier detection."
+          ],
+          "costs": [
+            "Adds ~0.5–3 ms L7 parsing overhead and requires proxy buffer/timeout tuning."
+          ]
+        },
+        {
+          "choice": "Avoid: Ultra-High-Bandwidth Media Streaming / Raw TCP",
+          "benefits": [
+            "Use L4 DSR (Direct Server Return) / IPVS so video/file egress bypasses the proxy completely."
+          ],
+          "costs": [
+            "Proxying 100 Gbps of video through L7 user-space buffers wastes CPU and NIC bandwidth."
+          ]
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    },
+    {
+      "id": "04-how-it-is-managed",
+      "eyebrow": "STAGE 04 · HOW IT IS MANAGED",
+      "title": "How Envoy Circuit Breakers, Outlier Detection & Pools are configured",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": "Configure per-cluster `circuit_breakers` (`max_connections`, `max_pending_requests`), passive `outlier_detection` (`consecutive_5xx`), and strict `timeout` budgets smaller than client timeouts.",
+      "markdownContent": "```yaml\n# Envoy upstream cluster with isolated pool, circuit breaker & outlier detection\nname: payments_service\nlb_policy: LEAST_REQUEST  # Power-of-Two-Choices (choice_count=2)\ncommon_http_protocol_options:\n  idle_timeout: 55s       # Strictly < backend keep-alive (65s)\ncircuit_breakers:\n  thresholds:\n    - max_connections: 256\n      max_pending_requests: 128\n      max_retries: 3\noutlier_detection:\n  consecutive_5xx: 5\n  interval: 10s\n  base_ejection_time: 30s\n  max_ejection_percent: 50\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-alternatives",
+      "eyebrow": "STAGE 05 · ALTERNATIVES",
+      "title": "Alternatives: Envoy vs. NGINX vs. L4 Load Balancer",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": "Select the proxy layer based on dynamic control-plane needs, gRPC/HTTP2 support, and throughput.",
+      "comparison": [
+        {
+          "choice": "Envoy Proxy",
+          "benefits": [
+            "Dynamic xDS config without reloads, native gRPC HTTP/2 L7 balancing, P2C, and rich outlier detection."
+          ],
+          "costs": [
+            "Higher memory footprint and steeper xDS configuration complexity than static NGINX."
+          ]
+        },
+        {
+          "choice": "NGINX / OpenResty",
+          "benefits": [
+            "Battle-tested static file/cache serving, tiny RAM footprint, and Lua extensibility."
+          ],
+          "costs": [
+            "Config reloads spawn new worker processes; dynamic service discovery is less native than Envoy xDS."
+          ]
+        },
+        {
+          "choice": "L4 Load Balancer (NLB / IPVS)",
+          "benefits": [
+            "Line-rate kernel/NIC forwarding with zero TLS termination overhead."
+          ],
+          "costs": [
+            "Cannot balance individual gRPC/HTTP2 multiplexed streams across new pods."
+          ]
+        }
+      ],
+      "purpose": "The trade-off: compare competing approaches across latency, consistency, and operational cost."
+    },
+    {
+      "id": "06-production-architecture",
+      "eyebrow": "STAGE 06 · PRODUCTION ARCHITECTURE",
+      "title": "Production example: 50k RPS Multi-Tenant Edge Tier",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": "An Envoy edge tier handles 50,000 RPS across 50 microservices: terminating TLS 1.3 with session tickets, enforcing per-tenant token-bucket limits, routing via P2C across isolated per-service connection pools, and ejecting 5xx pods via outlier detection (<3 ms p99 overhead).",
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Outlier Detection & Pool Guard",
+        "title": "Envoy P2C Routing & Passive Pod Ejection Flow",
+        "actors": [
+          {
+            "id": "cli",
+            "label": "Client"
+          },
+          {
+            "id": "env",
+            "label": "Envoy Edge"
+          },
+          {
+            "id": "p1",
+            "label": "Pod 1 (Sick)"
+          },
+          {
+            "id": "p2",
+            "label": "Pod 2 (Healthy)"
+          }
+        ],
+        "events": [
+          {
+            "from": "cli",
+            "to": "env",
+            "label": "TLS 1.3 + HTTP/2 request",
+            "status": "ok"
+          },
+          {
+            "from": "env",
+            "to": "p1",
+            "label": "P2C picks Pod 1 -> 5x 500s",
+            "status": "fail"
+          },
+          {
+            "from": "env",
+            "to": "p1",
+            "label": "Outlier detection ejects Pod 1 (30s)",
+            "status": "warn"
+          },
+          {
+            "from": "env",
+            "to": "p2",
+            "label": "Route 100% to healthy Pod 2",
+            "status": "ok"
+          }
+        ],
+        "summary": "Passive outlier detection removes degraded backends in seconds without waiting for slow active health-check intervals."
+      },
+      "purpose": "Production architecture: see how the components compose end to end under real load."
+    },
+    {
+      "id": "07-problems-and-further-reading",
+      "eyebrow": "STAGE 07 · PROBLEMS SOLVED & FURTHER DEEP DIVE",
+      "title": "Problems solved by Reverse Proxies & Related Networking Concepts",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": "Explore NGINX 502 buffer tuning, HTTP keep-alive alignment, and gRPC HTTP/2 load balancing.",
+      "supportingConcepts": [
+        {
+          "slug": "http-keep-alive-timeout-alignment",
+          "title": "Problem: HTTP Keep-Alive Timeout Alignment",
+          "kind": "problem"
+        },
+        {
+          "slug": "tuning-nginx-proxy-buffers-502",
+          "title": "Problem: Tuning NGINX Proxy Buffers & 502 Errors",
+          "kind": "problem"
+        },
+        {
+          "slug": "grpc-http2-l7-load-balancing",
+          "title": "Problem: gRPC HTTP/2 L7 Load Balancing",
+          "kind": "problem"
+        },
+        {
+          "slug": "load-balancing",
+          "title": "Concept: Load Balancing",
+          "kind": "concept"
+        },
+        {
+          "slug": "api-gateway",
+          "title": "Concept: API Gateway",
+          "kind": "concept"
+        }
+      ],
+      "purpose": "Applied problems: connect these internals to concrete system design and debugging scenarios."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why does an upstream backend keep-alive timeout (e.g., 60s) that is *shorter* than the reverse proxy's connection-pool idle timeout (e.g., 65s) cause intermittent `502 Bad Gateway` errors?",
+      "options": [
+        {
+          "id": "a",
+          "text": "The backend closes an idle TCP connection at 60s while the proxy still considers it open and writes a new request onto the closed socket",
+          "correct": true,
+          "feedback": "Correct: always set the backend's keep-alive idle timeout strictly greater than the reverse proxy's pool idle timeout."
+        },
+        {
+          "id": "b",
+          "text": "Because TLS 1.3 session tickets expire every 60 seconds",
+          "correct": false,
+          "feedback": "TLS session tickets have much longer lifetimes and do not cause mid-pool 502s."
+        },
+        {
+          "id": "c",
+          "text": "Because P2C load balancing requires 65-second health checks",
+          "correct": false,
+          "feedback": "The 502 comes from the TCP close race between proxy and backend."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why does an upstream backend keep-alive timeout (e.g., 60s) that is *shorter* than the reverse proxy's connection-pool idle timeout (e.g., 65s) cause intermittent `502 Bad Gateway` errors?",
+        "options": [
+          {
+            "id": "a",
+            "text": "The backend closes an idle TCP connection at 60s while the proxy still considers it open and writes a new request onto the closed socket",
+            "correct": true,
+            "feedback": "Correct: always set the backend's keep-alive idle timeout strictly greater than the reverse proxy's pool idle timeout."
+          },
+          {
+            "id": "b",
+            "text": "Because TLS 1.3 session tickets expire every 60 seconds",
+            "correct": false,
+            "feedback": "TLS session tickets have much longer lifetimes and do not cause mid-pool 502s."
+          },
+          {
+            "id": "c",
+            "text": "Because P2C load balancing requires 65-second health checks",
+            "correct": false,
+            "feedback": "The 502 comes from the TCP close race between proxy and backend."
+          }
+        ]
+      },
+      {
+        "question": "What is the main benefit—and corresponding operational trade-off—of using Good Candidate: Multi-Tenant HTTP/gRPC Edge Gateways in Reverse Proxy Patterns & Edge Load Balancing?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Advantage: Provides weighted canary routing, gRPC HTTP/2 load balancing, header auth, and outlier detection. Cost: Adds ~0.5–3 ms L7 parsing overhead and requires proxy buffer/timeout tuning.",
+            "correct": true,
+            "feedback": "Correct: Good Candidate: Multi-Tenant HTTP/gRPC Edge Gateways delivers provides weighted canary routing, gRPC HTTP/2 load balancing, header auth, and outlier detection. while requiring you to manage adds ~0.5–3 ms L7 parsing overhead and requires proxy buffer/timeout tuning."
+          },
+          {
+            "id": "b",
+            "text": "Advantage: Use L4 DSR (Direct Server Return) / IPVS so video/file egress bypasses the proxy completely. It has zero operational or latency overhead compared to Avoid: Ultra-High-Bandwidth Media Streaming / Raw TCP.",
+            "correct": false,
+            "feedback": "Not quite: that describes Avoid: Ultra-High-Bandwidth Media Streaming / Raw TCP, whereas Good Candidate: Multi-Tenant HTTP/gRPC Edge Gateways specifically trades off: Adds ~0.5–3 ms L7 parsing overhead and requires proxy buffer/timeout tuning."
+          },
+          {
+            "id": "c",
+            "text": "Ignoring adds ~0.5–3 ms l7 parsing overhead and requires proxy buffer/timeout tuning. removes the need for any trade-off evaluation",
+            "correct": false,
+            "feedback": "Incorrect: every production option in Reverse Proxy Patterns & Edge Load Balancing carries concrete latency, consistency, or operational costs."
+          }
+        ]
+      },
+      {
+        "question": "Why is Use Consistent Hashing for Stateful/Cache Backends critical when operating Reverse Proxy Patterns & Edge Load Balancing in production?",
+        "options": [
+          {
+            "id": "a",
+            "text": "It only applies during local unit testing and can be disabled in production to save memory.",
+            "correct": false,
+            "feedback": "Incorrect: 'Use Consistent Hashing for Stateful/Cache Backends' directly governs production reliability and correctness under real traffic."
+          },
+          {
+            "id": "b",
+            "text": "It replaces the need for observability, timeouts, or capacity planning across Reverse Proxy Patterns & Edge Load Balancing.",
+            "correct": false,
+            "feedback": "Incorrect: 'Use Consistent Hashing for Stateful/Cache Backends' works alongside proper bounds, monitoring, and failure isolation."
+          },
+          {
+            "id": "c",
+            "text": "Route by x-tenant-id or key hash to preserve L1 cache locality on stateful pods, while using P2C for stateless APIs.",
+            "correct": true,
+            "feedback": "Correct: Route by x-tenant-id or key hash to preserve L1 cache locality on stateful pods, while using P2C for stateless APIs."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** A **reverse proxy** (Envoy, NGINX, HAProxy) sits in front of origin servers and acts as a single L7 termination boundary.\n\n**How It Flows:** Think of Reverse Proxy Patterns & Edge Load Balancing as a clear step-by-step chain: Public Clients -> Envoy / NGINX Edge -> Isolated Pools -> 50 Microservices -> Client.\n\n**Why Beginners Should Care:** Terminate TLS and untrusted client behavior at the proxy boundary so backend services only process normalized, connection-pooled traffic within strict timeout and circuit-breaker budgets.",
+      "spark": {
+        "summary": "A **reverse proxy** (Envoy, NGINX, HAProxy) sits in front of origin servers and acts as a single L7 termination boundary.",
+        "keyTakeaway": "Terminate TLS and untrusted client behavior at the proxy boundary so backend services only process normalized, connection-pooled traffic within strict timeout and circuit-breaker budgets."
+      },
+      "learningJourney": [
+        {
+          "id": "01-what-it-is",
+          "title": "What is a Reverse Proxy",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how a Reverse Proxy works from first principles.",
+          "explanation": "A **reverse proxy** (Envoy, NGINX, HAProxy) sits in front of origin servers and acts as a single L7 termination boundary. It terminates client TCP/TLS 1.3, buffers slow client bodies (blocking slowloris attacks), enforces auth/rate limits, and multiplexes normalized HTTP/2 or gRPC requests over **persistent upstream connection pools**.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Edge Multiplexing Tier",
+            "title": "L7 Reverse Proxy TLS Offload & Per-Cluster Upstream Pools",
+            "nodes": [
+              {
+                "id": "cli",
+                "label": "Public Clients",
+                "role": "TLS 1.3 + HTTP/3"
+              },
+              {
+                "id": "pxy",
+                "label": "Envoy / NGINX Edge",
+                "role": "Auth + P2C + Outliers"
+              },
+              {
+                "id": "pool",
+                "label": "Isolated Pools",
+                "role": "Per-service max_conns"
+              },
+              {
+                "id": "svc",
+                "label": "50 Microservices",
+                "role": "Normalized HTTP/2"
+              }
+            ],
+            "edges": [
+              {
+                "label": "Terminate TLS + buffer"
+              },
+              {
+                "label": "Persistent keep-alive"
+              }
+            ],
+            "cards": [
+              {
+                "label": "1. TLS & Slowloris Shield",
+                "detail": "Proxy absorbs untrusted WAN jitter and TLS handshakes so origin workers never stall on slow sockets."
+              },
+              {
+                "label": "2. Per-Service Pools",
+                "detail": "Isolating connection pools per upstream cluster prevents one slow service from starving all others."
+              },
+              {
+                "label": "3. Outlier Ejection",
+                "detail": "Consecutive 5xx responses trip passive circuit breakers and eject sick pods for a cooldown window."
+              }
+            ],
+            "summary": "Edge reverse proxies turn chaotic public internet connections into bounded, pooled internal RPCs."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-why-we-need-it",
+          "title": "Why we need Reverse Proxies (Keep-Alive Races & Global Pools)",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without Reverse Proxies under real concurrency or scale.",
+          "explanation": "Exposing application servers directly to the internet forces every service to manage TLS certificates, connection floods, and HTTP/1.1 head-of-line blocking.",
+          "ideas": [
+            {
+              "title": "Keep Upstream Idle Timeout > Proxy Pool Timeout",
+              "description": "Always configure the backend server's keep-alive idle timeout (e.g., 65s) strictly higher than the proxy's upstream idle timeout (e.g., 55s)."
+            },
+            {
+              "title": "Use Consistent Hashing for Stateful/Cache Backends",
+              "description": "Route by `x-tenant-id` or key hash to preserve L1 cache locality on stateful pods, while using P2C for stateless APIs."
+            }
+          ],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-where-it-is-used",
+          "title": "Where Reverse Proxies fit (and where L4 Pass-Through wins)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Use L7 reverse proxies for HTTP/gRPC routing, TLS offload, and canary traffic splitting; use L4 DSR/Maglev when zero TLS decryption or raw packet throughput is needed.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "06-production-architecture",
+          "title": "Production example: 50k RPS Multi-Tenant Edge Tier",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Production architecture: see how the components compose end to end under real load.",
+          "explanation": "An Envoy edge tier handles 50,000 RPS across 50 microservices: terminating TLS 1.3 with session tickets, enforcing per-tenant token-bucket limits, routing via P2C across isolated per-service connection pools, and ejecting 5xx pods via outlier detection (<3 ms p99 overhead).",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Outlier Detection & Pool Guard",
+            "title": "Envoy P2C Routing & Passive Pod Ejection Flow",
+            "actors": [
+              {
+                "id": "cli",
+                "label": "Client"
+              },
+              {
+                "id": "env",
+                "label": "Envoy Edge"
+              },
+              {
+                "id": "p1",
+                "label": "Pod 1 (Sick)"
+              },
+              {
+                "id": "p2",
+                "label": "Pod 2 (Healthy)"
+              }
+            ],
+            "events": [
+              {
+                "from": "cli",
+                "to": "env",
+                "label": "TLS 1.3 + HTTP/2 request",
+                "status": "ok"
+              },
+              {
+                "from": "env",
+                "to": "p1",
+                "label": "P2C picks Pod 1 -> 5x 500s",
+                "status": "fail"
+              },
+              {
+                "from": "env",
+                "to": "p1",
+                "label": "Outlier detection ejects Pod 1 (30s)",
+                "status": "warn"
+              },
+              {
+                "from": "env",
+                "to": "p2",
+                "label": "Route 100% to healthy Pod 2",
+                "status": "ok"
+              }
+            ],
+            "summary": "Passive outlier detection removes degraded backends in seconds without waiting for slow active health-check intervals."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Terminate TLS and untrusted client behavior at the proxy boundary so backend services only process normalized, connection-pooled traffic within strict timeout and circuit-breaker budgets."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** A **reverse proxy** (Envoy, NGINX, HAProxy) sits in front of origin servers and acts as a single L7 termination boundary.\n\n**Visual & Structural Flow:** Depicts L7 Reverse Proxy TLS Offload & Per-Cluster Upstream Pools (Public Clients -> Envoy / NGINX Edge -> Isolated Pools -> 50 Microservices); Envoy P2C Routing & Passive Pod Ejection Flow (Client -> Envoy Edge -> Pod 1 (Sick) -> Pod 2 (Healthy)).\n\n**Trade-Offs & Production:** Select the proxy layer based on dynamic control-plane needs, gRPC/HTTP2 support, and throughput. An Envoy edge tier handles 50,000 RPS across 50 microservices: terminating TLS 1.3 with session tickets, enforcing per-tenant token-bucket limits, routing via P2C across isolated.\n\n**Failure Modes & Application:** Explore NGINX 502 buffer tuning, HTTP keep-alive alignment, and gRPC HTTP/2 load balancing.",
+      "spark": {
+        "summary": "A reverse proxy terminates client connections at the network edge, enforces TLS 1.3, rate limits, and auth, and multiplexes requests over persistent upstream pools to backend services using algorithms like Power of Two Choices (P2C) or consistent hashing.",
+        "keyTakeaway": "Terminate TLS and untrusted client behavior at the proxy boundary so backend services only process normalized, connection-pooled traffic within strict timeout and circuit-breaker budgets."
+      }
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** A reverse proxy terminates client connections at the network edge, enforces TLS 1.3, rate limits, and auth, and multiplexes requests over persistent upstream pools to backend services using algorithms like Power of Two Choices (P2C) or consistent hashing.\n\n**Production Trade-Offs:** Configure per-cluster `circuit_breakers` (`max_connections`, `max_pending_requests`), passive `outlier_detection` (`consecutive_5xx`), and strict `timeout` budgets smaller than client timeouts.\n\n**Failure Modes & Edge Cases:** Explore NGINX 502 buffer tuning, HTTP keep-alive alignment, and gRPC HTTP/2 load balancing.\n\n**Principal Takeaway:** Terminate TLS and untrusted client behavior at the proxy boundary so backend services only process normalized, connection-pooled traffic within strict timeout and circuit-breaker budgets.",
+      "spark": {
+        "summary": "A reverse proxy terminates client connections at the network edge, enforces TLS 1.3, rate limits, and auth, and multiplexes requests over persistent upstream pools to backend services using algorithms like Power of Two Choices (P2C) or consistent hashing.",
+        "keyTakeaway": "Terminate TLS and untrusted client behavior at the proxy boundary so backend services only process normalized, connection-pooled traffic within strict timeout and circuit-breaker budgets."
+      },
+      "learningJourney": [
+        {
+          "id": "01-what-it-is",
+          "title": "What is a Reverse Proxy",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how a Reverse Proxy works from first principles.",
+          "explanation": "A **reverse proxy** (Envoy, NGINX, HAProxy) sits in front of origin servers and acts as a single L7 termination boundary. It terminates client TCP/TLS 1.3, buffers slow client bodies (blocking slowloris attacks), enforces auth/rate limits, and multiplexes normalized HTTP/2 or gRPC requests over **persistent upstream connection pools**.\n\nUnlike an L4 TCP load balancer, an L7 reverse proxy inspects HTTP headers/paths, runs **Power-of-Two-Choices (P2C)** or **consistent hashing**, and performs passive **outlier detection** to eject failing pods.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Edge Multiplexing Tier",
+            "title": "L7 Reverse Proxy TLS Offload & Per-Cluster Upstream Pools",
+            "nodes": [
+              {
+                "id": "cli",
+                "label": "Public Clients",
+                "role": "TLS 1.3 + HTTP/3"
+              },
+              {
+                "id": "pxy",
+                "label": "Envoy / NGINX Edge",
+                "role": "Auth + P2C + Outliers"
+              },
+              {
+                "id": "pool",
+                "label": "Isolated Pools",
+                "role": "Per-service max_conns"
+              },
+              {
+                "id": "svc",
+                "label": "50 Microservices",
+                "role": "Normalized HTTP/2"
+              }
+            ],
+            "edges": [
+              {
+                "label": "Terminate TLS + buffer"
+              },
+              {
+                "label": "Persistent keep-alive"
+              }
+            ],
+            "cards": [
+              {
+                "label": "1. TLS & Slowloris Shield",
+                "detail": "Proxy absorbs untrusted WAN jitter and TLS handshakes so origin workers never stall on slow sockets."
+              },
+              {
+                "label": "2. Per-Service Pools",
+                "detail": "Isolating connection pools per upstream cluster prevents one slow service from starving all others."
+              },
+              {
+                "label": "3. Outlier Ejection",
+                "detail": "Consecutive 5xx responses trip passive circuit breakers and eject sick pods for a cooldown window."
+              }
+            ],
+            "summary": "Edge reverse proxies turn chaotic public internet connections into bounded, pooled internal RPCs."
+          },
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-why-we-need-it",
+          "title": "Why we need Reverse Proxies (Keep-Alive Races & Global Pools)",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without Reverse Proxies under real concurrency or scale.",
+          "explanation": "Exposing application servers directly to the internet forces every service to manage TLS certificates, connection floods, and HTTP/1.1 head-of-line blocking. Even with a proxy, two subtle bugs cause production 502s: (1) **Keep-Alive Timeout Race**: if the upstream app's idle timeout (e.g., 60s) is *shorter* than the proxy's pool timeout (65s), the proxy writes onto a socket the backend just closed, returning `502 Bad Gateway`; (2) **Shared Unbounded Pools** let one noisy microservice exhaust all proxy workers.",
+          "caveats": null,
+          "ideas": [
+            {
+              "title": "Keep Upstream Idle Timeout > Proxy Pool Timeout",
+              "description": "Always configure the backend server's keep-alive idle timeout (e.g., 65s) strictly higher than the proxy's upstream idle timeout (e.g., 55s)."
+            },
+            {
+              "title": "Use Consistent Hashing for Stateful/Cache Backends",
+              "description": "Route by `x-tenant-id` or key hash to preserve L1 cache locality on stateful pods, while using P2C for stateless APIs."
+            }
+          ],
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "03-where-it-is-used",
+          "title": "Where Reverse Proxies fit (and where L4 Pass-Through wins)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Use L7 reverse proxies for HTTP/gRPC routing, TLS offload, and canary traffic splitting; use L4 DSR/Maglev when zero TLS decryption or raw packet throughput is needed.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-how-it-is-managed",
+          "title": "How Envoy Circuit Breakers, Outlier Detection & Pools are configured",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Configure per-cluster `circuit_breakers` (`max_connections`, `max_pending_requests`), passive `outlier_detection` (`consecutive_5xx`), and strict `timeout` budgets smaller than client timeouts.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "05-alternatives",
+          "title": "Alternatives: Envoy vs. NGINX vs. L4 Load Balancer",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "The trade-off: compare competing approaches across latency, consistency, and operational cost.",
+          "explanation": "Select the proxy layer based on dynamic control-plane needs, gRPC/HTTP2 support, and throughput.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "06-production-architecture",
+          "title": "Production example: 50k RPS Multi-Tenant Edge Tier",
+          "eyebrow": "Advanced Path · Stage 06",
+          "purpose": "Production architecture: see how the components compose end to end under real load.",
+          "explanation": "An Envoy edge tier handles 50,000 RPS across 50 microservices: terminating TLS 1.3 with session tickets, enforcing per-tenant token-bucket limits, routing via P2C across isolated per-service connection pools, and ejecting 5xx pods via outlier detection (<3 ms p99 overhead).",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Outlier Detection & Pool Guard",
+            "title": "Envoy P2C Routing & Passive Pod Ejection Flow",
+            "actors": [
+              {
+                "id": "cli",
+                "label": "Client"
+              },
+              {
+                "id": "env",
+                "label": "Envoy Edge"
+              },
+              {
+                "id": "p1",
+                "label": "Pod 1 (Sick)"
+              },
+              {
+                "id": "p2",
+                "label": "Pod 2 (Healthy)"
+              }
+            ],
+            "events": [
+              {
+                "from": "cli",
+                "to": "env",
+                "label": "TLS 1.3 + HTTP/2 request",
+                "status": "ok"
+              },
+              {
+                "from": "env",
+                "to": "p1",
+                "label": "P2C picks Pod 1 -> 5x 500s",
+                "status": "fail"
+              },
+              {
+                "from": "env",
+                "to": "p1",
+                "label": "Outlier detection ejects Pod 1 (30s)",
+                "status": "warn"
+              },
+              {
+                "from": "env",
+                "to": "p2",
+                "label": "Route 100% to healthy Pod 2",
+                "status": "ok"
+              }
+            ],
+            "summary": "Passive outlier detection removes degraded backends in seconds without waiting for slow active health-check intervals."
+          },
+          "level": "L7 · STAFF / PRINCIPAL"
+        },
+        {
+          "id": "07-problems-and-further-reading",
+          "title": "Problems solved by Reverse Proxies & Related Networking Concepts",
+          "eyebrow": "Advanced Path · Stage 07",
+          "purpose": "Applied problems: connect these internals to concrete system design and debugging scenarios.",
+          "explanation": "Explore NGINX 502 buffer tuning, HTTP keep-alive alignment, and gRPC HTTP/2 load balancing.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Terminate TLS and untrusted client behavior at the proxy boundary so backend services only process normalized, connection-pooled traffic within strict timeout and circuit-breaker budgets."
+    }
+  }
+}
