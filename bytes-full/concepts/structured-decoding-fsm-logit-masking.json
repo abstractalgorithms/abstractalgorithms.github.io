@@ -1,0 +1,603 @@
+{
+  "id": "structured-decoding-fsm-logit-masking",
+  "slug": "structured-decoding-fsm-logit-masking",
+  "title": "Structured Decoding with Finite-State Machine Logit Masking",
+  "domain": "ai-machine-learning-systems",
+  "spark": {
+    "summary": "Compiling JSON Schemas or regexes into deterministic finite-state machines (DFAs) and pre-indexed vocabulary bitmasks lets LLM servers mask invalid token logits to -inf before Softmax in < 50 microseconds, guaranteeing 100% schema-valid output in a single pass.",
+    "keyTakeaway": "Prompt-only JSON generation fails ~18% of the time and wastes up to 3x GPU decode FLOPs on retries; precompiled FSM vocabulary bitmasks enforce structural validity deterministically at token-sampling time.",
+    "byteSummary": "Production AI agents and tool-calling pipelines require 100% schema-valid JSON at 10,000+ requests per second. Relying on prompt engineering plus json.loads() retry loops suffers roughly 18% structural parse failures on complex nested schemas, wasting up to 3x GPU decode FLOPs and inflating tail latency.\n\nConstrained decoding solves this by compiling a JSON Schema into a regular expression or context-free grammar (CFG), determinizing it into a Finite-State Machine (FSM), and pre-indexing every state against the model's 128K+ token vocabulary into a compact bitmask table.\n\nDuring autoregressive decoding, each active sequence tracks its current FSM state q_i. Before Softmax sampling, a fused GPU kernel applies the bitmask for q_i to the raw logit vector—setting invalid token logits to -inf so their probability becomes zero—and advances the FSM state upon sampling.\n\nAdvanced engines like XGrammar and Outlines further eliminate per-token overhead via CPU-GPU overlapped bitmask lookup, compressed vocabulary tries for multi-byte BPE tokens, and token jump-forward (coalescing) that skips deterministic boilerplate tokens such as `{\"id\": ` in a single step."
+  },
+  "learningJourney": [
+    {
+      "level": "foundation",
+      "title": "Stage 1: Why Prompt-and-Retry Fails at 10K+ req/sec",
+      "purpose": "Quantify the reliability and GPU FLOP waste of unconstrained JSON prompting compared to logit-level grammar enforcement.",
+      "explanation": "Unconstrained LLMs treat JSON syntax as soft statistical preferences, leading to trailing commas, unescaped quotes, or truncated braces under temperature > 0. At an 18% parse-failure rate, retrying failed generations consumes up to 3x GPU KV-cache and decode FLOPs while breaking strict SLA budgets.",
+      "codeExample": "import json\n\ndef parse_with_bounded_retry(raw_outputs: list[str]) -> dict:\n    for attempt, payload in enumerate(raw_outputs, start=1):\n        try:\n            return json.loads(payload)\n        except json.JSONDecodeError:\n            if attempt == len(raw_outputs):\n                raise ValueError(f'All {attempt} unconstrained JSON attempts failed')\n    raise ValueError('Empty output stream')\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "FOUNDATION · UNCONSTRAINED FAILURE MODE",
+        "title": "Prompt-and-Retry Loop vs. Single-Pass Deterministic Validity",
+        "nodes": [
+          {
+            "id": "prompt",
+            "label": "JSON Prompt + Temp > 0",
+            "sub": "Soft statistical syntax",
+            "role": "Unconstrained LLM"
+          },
+          {
+            "id": "parse",
+            "label": "json.loads() Validator",
+            "sub": "~18% syntax/schema failure",
+            "role": "Post-Hoc Check"
+          },
+          {
+            "id": "retry",
+            "label": "Retry Loop (Up to 3x)",
+            "sub": "3x GPU decode FLOP waste",
+            "role": "Latency Spike"
+          },
+          {
+            "id": "fsm",
+            "label": "FSM Logit Masking",
+            "sub": "100% valid in 1 pass",
+            "role": "Zero-Retry Path"
+          }
+        ],
+        "edges": [
+          {
+            "from": "prompt",
+            "to": "parse",
+            "label": "Emit full response"
+          },
+          {
+            "from": "parse",
+            "to": "retry",
+            "label": "On JSONDecodeError"
+          },
+          {
+            "from": "prompt",
+            "to": "fsm",
+            "label": "Enforce per-token mask"
+          }
+        ],
+        "cards": [
+          {
+            "label": "3x Compute Amplification",
+            "detail": "Discarding a 500-token generation on a single missing brace wastes the entire prefill + decode budget."
+          },
+          {
+            "label": "First-Pass Guarantee",
+            "detail": "Logit masking prevents invalid syntax tokens from ever being sampled, eliminating schema retries."
+          }
+        ],
+        "summary": "Post-hoc json.loads() retries waste up to 3x GPU compute on ~18% failure rates, whereas logit masking guarantees valid output in one pass.",
+        "caption": "Unconstrained prompting incurs ~18% parse failures and 3x GPU retries, while FSM logit masking guarantees single-pass validity."
+      },
+      "id": "stage-1-stage-1-why-prompt-and-retry-fails-at-10k-req-se"
+    },
+    {
+      "level": "foundation",
+      "title": "Stage 2: Compiling JSON Schema & Regex into a DFA",
+      "purpose": "Trace how a JSON Schema is lowered into a regular expression or CFG and determinized into a Finite-State Machine.",
+      "explanation": "A JSON Schema defines field names, types, enums, and nesting constraints. An offline compiler translates the schema into a regex (or pushdown CFG for recursive objects), converts it to an NFA via Thompson's construction, and applies subset construction + Hopcroft minimization to produce a compact Deterministic Finite Automaton (DFA) with states q_0...q_k.",
+      "codeExample": "from typing import Dict, Set\n\ndef step_dfa(transitions: Dict[tuple[int, str], int], state: int, ch: str) -> int:\n    key = (state, ch)\n    if key not in transitions:\n        raise ValueError(f'Invalid character {ch!r} from DFA state {state}')\n    return transitions[key]\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "FOUNDATION · GRAMMAR COMPILATION",
+        "title": "Lowering JSON Schema to a Minimized Deterministic Finite Automaton",
+        "nodes": [
+          {
+            "id": "schema",
+            "label": "JSON Schema / Pydantic",
+            "sub": "Types, enums, required keys",
+            "role": "Schema Spec"
+          },
+          {
+            "id": "regex",
+            "label": "Regex / CFG Lowering",
+            "sub": "Grammar AST rules",
+            "role": "Parser IR"
+          },
+          {
+            "id": "nfa",
+            "label": "Thompson NFA + Subset",
+            "sub": "Determinize transitions",
+            "role": "Automaton Builder"
+          },
+          {
+            "id": "dfa",
+            "label": "Minimized DFA (q0..qK)",
+            "sub": "O(1) char-level transition",
+            "role": "Runtime FSM"
+          }
+        ],
+        "edges": [
+          {
+            "from": "schema",
+            "to": "regex",
+            "label": "Lower to grammar"
+          },
+          {
+            "from": "regex",
+            "to": "nfa",
+            "label": "Construct NFA"
+          },
+          {
+            "from": "nfa",
+            "to": "dfa",
+            "label": "Determinize & minimize"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Amortized Compilation",
+            "detail": "Compiled DFAs are cached by schema hash in shared RAM so repeated API calls skip compilation."
+          },
+          {
+            "label": "Deterministic Transitions",
+            "detail": "Each character or token maps deterministically from state q_i to exactly one next state q_j."
+          }
+        ],
+        "summary": "JSON Schemas compile through regex/CFG lowering and subset construction into a minimized DFA cached by schema hash.",
+        "caption": "JSON Schema compiles via regex/CFG and NFA determinization into a minimized DFA for O(1) state transitions."
+      },
+      "id": "stage-2-stage-2-compiling-json-schema-regex-into-a-dfa"
+    },
+    {
+      "level": "intermediate",
+      "title": "Stage 3: BPE Vocabulary Indexing & Precomputed Bitmask Tables",
+      "purpose": "Bridge character-level DFA transitions with multi-character BPE tokens using precomputed vocabulary bitmasks.",
+      "explanation": "LLMs operate over subword BPE vocabularies (V = 128,256+ tokens) where a single token like `\": \"` or `123,` spans multiple DFA transitions. During compilation, the engine walks every token in the vocabulary trie from each DFA state q_i to record which token IDs remain valid, packing them into a compact bitmask array of ceil(V / 32) uint32 words per state.",
+      "codeExample": "import numpy as np\n\ndef build_state_bitmask(valid_token_ids: list[int], vocab_size: int = 128256) -> np.ndarray:\n    if vocab_size <= 0:\n        raise ValueError('vocab_size must be positive')\n    num_words = (vocab_size + 31) // 32\n    mask = np.zeros(num_words, dtype=np.uint32)\n    for tid in valid_token_ids:\n        if 0 <= tid < vocab_size:\n            mask[tid >> 5] |= np.uint32(1 << (tid & 31))\n    return mask\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "INTERMEDIATE · VOCABULARY BITMASKS",
+        "title": "Mapping 128K BPE Tokens onto DFA States as 16 KB Bitmasks",
+        "nodes": [
+          {
+            "id": "trie",
+            "label": "Compressed BPE Vocab Trie",
+            "sub": "V = 128,256 subword tokens",
+            "role": "Tokenizer Index"
+          },
+          {
+            "id": "walk",
+            "label": "State-Trie Walker",
+            "sub": "Simulate multi-char tokens",
+            "role": "Validity Solver"
+          },
+          {
+            "id": "table",
+            "label": "Token Bitmask Table",
+            "sub": "16 KB/state (uint32[4008])",
+            "role": "O(1) Mask Store"
+          },
+          {
+            "id": "next",
+            "label": "Next-State Lookup",
+            "sub": "(q_i, token_id) -> q_j",
+            "role": "Transition Table"
+          }
+        ],
+        "edges": [
+          {
+            "from": "trie",
+            "to": "walk",
+            "label": "Traverse shared prefixes"
+          },
+          {
+            "from": "walk",
+            "to": "table",
+            "label": "Pack allowed token bits"
+          },
+          {
+            "from": "walk",
+            "to": "next",
+            "label": "Record target DFA state"
+          }
+        ],
+        "cards": [
+          {
+            "label": "16 KB Per State",
+            "detail": "A 128K-token vocabulary packs into just 4,008 uint32 words (16 KB) per DFA state."
+          },
+          {
+            "label": "Trie Prefix Sharing",
+            "detail": "Walking a compressed BPE trie avoids re-evaluating shared token prefixes, cutting compile time by 10x."
+          }
+        ],
+        "summary": "Precomputing a 16 KB uint32 bitmask per DFA state over the BPE trie turns runtime token validation into an O(1) table lookup.",
+        "caption": "Walking the compressed 128K BPE trie from each DFA state produces 16 KB uint32 bitmasks and next-state transitions."
+      },
+      "id": "stage-3-stage-3-bpe-vocabulary-indexing-precomputed-bitm"
+    },
+    {
+      "level": "intermediate",
+      "title": "Stage 4: Element-Wise Logit Masking & Fused Softmax Kernels",
+      "purpose": "Apply vocabulary bitmasks to raw GPU logits in < 50 microseconds before Softmax sampling.",
+      "explanation": "At each decode step, the engine fetches the 16 KB bitmask for sequence i's current FSM state and applies it to the [B, V] raw logit tensor on GPU. Any token whose bit is 0 has its logit overwritten with -inf before Softmax, ensuring zero probability mass without disturbing relative probabilities among valid tokens.",
+      "codeExample": "import numpy as np\n\ndef apply_logit_bitmask(logits: np.ndarray, bitmask: np.ndarray) -> np.ndarray:\n    if logits.ndim != 1:\n        raise ValueError('Expected 1D logit vector')\n    masked = logits.copy()\n    for tid in range(logits.shape[0]):\n        if not ((bitmask[tid >> 5] >> (tid & 31)) & 1):\n            masked[tid] = -np.inf\n    return masked\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "INTERMEDIATE · GPU MASKING KERNEL",
+        "title": "Fused Bitmask + Softmax Kernel Under 50 Microseconds",
+        "nodes": [
+          {
+            "id": "logits",
+            "label": "Raw LLM Logits [B, 128K]",
+            "sub": "FP16/BF16 LM-Head output",
+            "role": "Decoder Output"
+          },
+          {
+            "id": "mask",
+            "label": "Bitmask Tensor [B, 4008]",
+            "sub": "Async H2D pinned copy",
+            "role": "Constraint Mask"
+          },
+          {
+            "id": "kernel",
+            "label": "Fused Mask + Softmax",
+            "sub": "0-bit -> -inf (< 50 us)",
+            "role": "CUDA Kernel"
+          },
+          {
+            "id": "sample",
+            "label": "Top-P / Greedy Sampler",
+            "sub": "Guaranteed valid token_id",
+            "role": "Token Emitter"
+          }
+        ],
+        "edges": [
+          {
+            "from": "logits",
+            "to": "kernel",
+            "label": "Stream LM-Head logits"
+          },
+          {
+            "from": "mask",
+            "to": "kernel",
+            "label": "Broadcast uint32 bits"
+          },
+          {
+            "from": "kernel",
+            "to": "sample",
+            "label": "Sample valid distribution"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Distribution Preservation",
+            "detail": "Masking invalid tokens to -inf before Softmax preserves exact relative odds among all schema-valid tokens."
+          },
+          {
+            "label": "Sub-50 us Overhead",
+            "detail": "Fusing bit-unpacking with Softmax avoids an extra global HBM round-trip on the 128K logit tensor."
+          }
+        ],
+        "summary": "A fused CUDA kernel unpacks the uint32 bitmask and sets invalid logits to -inf before Softmax in under 50 microseconds.",
+        "caption": "Raw [B, 128K] logits and [B, 4008] bitmasks feed a fused CUDA Mask+Softmax kernel before sampling."
+      },
+      "id": "stage-4-stage-4-element-wise-logit-masking-fused-softmax"
+    },
+    {
+      "level": "intermediate",
+      "title": "Stage 5: CPU-GPU Overlap in Continuous Batching Loops",
+      "purpose": "Hide FSM state transitions and bitmask H2D transfers behind GPU Transformer forward passes.",
+      "explanation": "If the CPU advances FSM states and copies bitmasks synchronously between decode steps, the GPU stalls waiting on PCIe transfers. Continuous batching engines overlap CPU FSM stepping and pinned-memory async H2D bitmask copies for step t+1 while the GPU executes Transformer layers for step t.",
+      "codeExample": "def overlap_step_budget(gpu_forward_ms: float, cpu_fsm_us: float, h2d_copy_us: float) -> float:\n    if gpu_forward_ms <= 0:\n        raise ValueError('GPU forward pass must be positive')\n    hidden_overhead_ms = (cpu_fsm_us + h2d_copy_us) / 1000.0\n    return max(0.0, hidden_overhead_ms - gpu_forward_ms)\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "INTERMEDIATE · ASYNC PIPELINING",
+        "title": "Hiding FSM Transitions & H2D Copies Behind GPU Forward Passes",
+        "nodes": [
+          {
+            "id": "gpu",
+            "label": "GPU Transformer Layers",
+            "sub": "Step t forward (~12 ms)",
+            "role": "Compute Stream"
+          },
+          {
+            "id": "cpu",
+            "label": "CPU FSM State Advance",
+            "sub": "O(1) lookup (< 20 us)",
+            "role": "Host Thread"
+          },
+          {
+            "id": "dma",
+            "label": "Pinned Async H2D Copy",
+            "sub": "16 KB/seq via cudaMemcpyAsync",
+            "role": "DMA Stream"
+          },
+          {
+            "id": "sync",
+            "label": "CUDA Event Sync",
+            "sub": "Zero GPU bubble at LM-Head",
+            "role": "Barrier"
+          }
+        ],
+        "edges": [
+          {
+            "from": "gpu",
+            "to": "sync",
+            "label": "Finish hidden states"
+          },
+          {
+            "from": "cpu",
+            "to": "dma",
+            "label": "Stage next bitmask"
+          },
+          {
+            "from": "dma",
+            "to": "sync",
+            "label": "Overlap with Transformer"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Zero Bubble Overhead",
+            "detail": "20 us of CPU FSM work and 16 KB DMA fit completely inside a 10-20 ms Transformer decode step."
+          },
+          {
+            "label": "Pinned Memory Pool",
+            "detail": "Pre-allocated pinned host buffers prevent page-fault stalls during cudaMemcpyAsync."
+          }
+        ],
+        "summary": "Overlapping host FSM transitions and async pinned H2D bitmask copies with GPU Transformer layers eliminates decode bubbles.",
+        "caption": "CPU FSM state advance and async H2D bitmask staging execute concurrently with the GPU Transformer forward pass."
+      },
+      "id": "stage-5-stage-5-cpu-gpu-overlap-in-continuous-batching-l"
+    },
+    {
+      "level": "advanced",
+      "title": "Stage 6: Token Jump-Forward (Coalescing) for Boilerplate Keys",
+      "purpose": "Skip deterministic multi-token JSON boilerplate in zero forward passes using single-branch DFA chains.",
+      "explanation": "Whenever the FSM enters a state with only one valid outgoing string—such as `\",\"status\":\"` or fixed enum prefixes—the LLM has zero entropy and would waste 3 to 6 forward passes generating known tokens. Jump-forward decoding detects single-path DFA chains, appends those tokens directly into the KV-cache prefill/chunked-prefill batch, and advances the FSM to the next branching state.",
+      "codeExample": "def extract_jump_forward_tokens(single_edge_map: dict[int, tuple[int, int]], start_state: int, max_jump: int = 16) -> tuple[list[int], int]:\n    tokens = []\n    cur = start_state\n    while cur in single_edge_map and len(tokens) < max_jump:\n        tid, nxt = single_edge_map[cur]\n        tokens.append(tid)\n        cur = nxt\n    return tokens, cur\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "ADVANCED · TOKEN COALESCING",
+        "title": "Skipping Deterministic JSON Keys via DFA Jump-Forward Decoding",
+        "nodes": [
+          {
+            "id": "det",
+            "label": "Single-Choice DFA Chain",
+            "sub": "e.g. \",\\\"status\\\":\\\"\"",
+            "role": "Zero-Entropy Path"
+          },
+          {
+            "id": "emit",
+            "label": "Direct Token Injection",
+            "sub": "Bypass LM-Head & Softmax",
+            "role": "Jump-Forward"
+          },
+          {
+            "id": "kv",
+            "label": "Chunked KV-Cache Prefill",
+            "sub": "Batch-compute KV states",
+            "role": "Fast Catch-Up"
+          },
+          {
+            "id": "branch",
+            "label": "Next Branching State",
+            "sub": "Resume constrained sampling",
+            "role": "Value Generation"
+          }
+        ],
+        "edges": [
+          {
+            "from": "det",
+            "to": "emit",
+            "label": "Detect out-degree == 1"
+          },
+          {
+            "from": "emit",
+            "to": "kv",
+            "label": "Inject 4-6 tokens at once"
+          },
+          {
+            "from": "kv",
+            "to": "branch",
+            "label": "Resume at value slot"
+          }
+        ],
+        "cards": [
+          {
+            "label": "2x-3x Decode Speedup",
+            "detail": "Schema-heavy JSON payloads with fixed keys cut autoregressive decode steps by up to 60%."
+          },
+          {
+            "label": "Exact Logit Equivalence",
+            "detail": "When out-degree is 1, only one token sequence has non-zero probability, so jumping preserves exact distribution."
+          }
+        ],
+        "summary": "Jump-forward decoding injects deterministic single-path JSON keys directly into chunked KV prefill, cutting decode steps by up to 60%.",
+        "caption": "Single-choice DFA chains bypass autoregressive sampling and inject deterministic key tokens into chunked KV prefill."
+      },
+      "id": "stage-6-stage-6-token-jump-forward-coalescing-for-boiler"
+    },
+    {
+      "level": "advanced",
+      "title": "Stage 7: Context-Free Grammars (CFG) & Adaptive Bitmask Caching",
+      "purpose": "Support arbitrarily nested recursive JSON objects using pushdown stack automata and adaptive mask splitting.",
+      "explanation": "Pure DFAs cannot express unbounded recursive nesting such as trees or nested comments without state explosion. Engines like XGrammar split vocabulary tokens into context-independent tokens (evaluated once per pushdown CFG state and cached) and context-dependent tokens (evaluated dynamically over the active stack), bounding per-step CPU latency to < 40 microseconds even for arbitrary CFGs.",
+      "codeExample": "def classify_cfg_token(is_stack_sensitive: bool, cached_mask_hit: bool) -> str:\n    if not is_stack_sensitive and cached_mask_hit:\n        return 'O(1)_CACHED_BITMASK'\n    if not is_stack_sensitive:\n        return 'POPULATE_STATIC_MASK'\n    return 'DYNAMIC_STACK_EVAL'\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "ADVANCED · PUSHDOWN CFG",
+        "title": "Splitting Context-Independent & Stack-Dependent Tokens in XGrammar",
+        "nodes": [
+          {
+            "id": "pda",
+            "label": "Pushdown Stack Automaton",
+            "sub": "Arbitrary nested JSON/SQL",
+            "role": "CFG Engine"
+          },
+          {
+            "id": "indep",
+            "label": "Context-Independent Mask",
+            "sub": "99% vocab cached per rule",
+            "role": "Static Cache"
+          },
+          {
+            "id": "dep",
+            "label": "Context-Dependent Tokens",
+            "sub": "<1% vocab checked on stack",
+            "role": "Dynamic Eval"
+          },
+          {
+            "id": "merge",
+            "label": "OR-Merged Final Bitmask",
+            "sub": "< 40 us per decode step",
+            "role": "Runtime Mask"
+          }
+        ],
+        "edges": [
+          {
+            "from": "pda",
+            "to": "indep",
+            "label": "Lookup cached rule mask"
+          },
+          {
+            "from": "pda",
+            "to": "dep",
+            "label": "Evaluate stack-top tokens"
+          },
+          {
+            "from": "indep",
+            "to": "merge",
+            "label": "Bitwise OR into mask"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Unbounded Nesting",
+            "detail": "Pushdown automata handle recursive schemas and DSLs without exponential DFA state blowup."
+          },
+          {
+            "label": "< 1% Dynamic Checks",
+            "detail": "Pre-caching context-independent tokens leaves only a tiny fraction of tokens needing stack inspection."
+          }
+        ],
+        "summary": "Adaptive bitmask caching splits pushdown CFG tokens into 99% static cached masks and < 1% stack-checked tokens for < 40 us steps.",
+        "caption": "Pushdown CFG evaluation merges cached context-independent masks with < 1% dynamic stack-dependent token checks."
+      },
+      "id": "stage-7-stage-7-context-free-grammars-cfg-adaptive-bitma"
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-fsm-1",
+        "question": "Why does FSM logit masking set invalid token logits to -inf BEFORE Softmax rather than filtering tokens after Softmax?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Because setting logits to -inf before Softmax guarantees zero probability for invalid tokens while preserving exact relative probabilities among valid tokens.",
+            "correct": true,
+            "feedback": "Correct. Softmax renormalizes exp(logit) over all remaining valid tokens automatically."
+          },
+          {
+            "id": "b",
+            "text": "Because Softmax cannot run on FP16 tensors without -inf inputs.",
+            "correct": false,
+            "feedback": "Incorrect. Standard Softmax runs on any finite FP16 logit tensor."
+          },
+          {
+            "id": "c",
+            "text": "Because post-Softmax filtering would require recompiling the JSON Schema.",
+            "correct": false,
+            "feedback": "Incorrect. Post-Softmax filtering would require manual renormalization and still risk zero-sum edge cases."
+          },
+          {
+            "id": "d",
+            "text": "Because -inf logits automatically trigger token jump-forward coalescing.",
+            "correct": false,
+            "feedback": "Incorrect. Jump-forward coalescing is triggered by single-path DFA states, not -inf values."
+          }
+        ],
+        "explanation": "Masking invalid logits to -inf prior to Softmax zeroes their probability mass and renormalizes the remaining valid distribution in one fused pass."
+      },
+      {
+        "id": "kc-fsm-2",
+        "question": "How much memory does a single DFA state's vocabulary bitmask require for a 128,256-token BPE vocabulary?",
+        "options": [
+          {
+            "id": "a",
+            "text": "512 KB (4 bytes per token)",
+            "correct": false,
+            "feedback": "Incorrect. That would be an FP32 array, not a 1-bit-per-token bitmask."
+          },
+          {
+            "id": "b",
+            "text": "~16 KB (4,008 uint32 words, 1 bit per token)",
+            "correct": true,
+            "feedback": "Correct. 128,256 bits / 8 bits per byte = 16,032 bytes (~16 KB)."
+          },
+          {
+            "id": "c",
+            "text": "128 MB (1 KB per token)",
+            "correct": false,
+            "feedback": "Incorrect. Each token only needs 1 bit in the bitmask."
+          },
+          {
+            "id": "d",
+            "text": "64 bytes (PQ64 codebook)",
+            "correct": false,
+            "feedback": "Incorrect. PQ64 is for vector similarity, not vocabulary bitmasks."
+          }
+        ],
+        "explanation": "Packing 1 bit per vocabulary token into uint32 words stores 128,256 token permissions in ~16 KB per state."
+      },
+      {
+        "id": "kc-fsm-3",
+        "question": "When is Token Jump-Forward (Coalescing) safe to apply during constrained JSON decoding?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Whenever the user sets temperature = 2.0.",
+            "correct": false,
+            "feedback": "Incorrect. Temperature does not make multi-choice states deterministic."
+          },
+          {
+            "id": "b",
+            "text": "Whenever the current DFA state has out-degree 1 (a single deterministic token chain like `\",\"status\":\"`).",
+            "correct": true,
+            "feedback": "Correct. When only one valid continuation exists, injecting those tokens directly into chunked KV prefill is mathematically identical to sampling."
+          },
+          {
+            "id": "c",
+            "text": "Whenever the previous request failed json.loads().",
+            "correct": false,
+            "feedback": "Incorrect. Constrained decoding prevents json.loads() failures altogether."
+          },
+          {
+            "id": "d",
+            "text": "Only after the entire JSON object has finished generating.",
+            "correct": false,
+            "feedback": "Incorrect. Jump-forward runs mid-generation whenever deterministic boilerplate keys appear."
+          }
+        ],
+        "explanation": "Jump-forward coalescing is exact whenever the FSM enters a deterministic single-branch chain where only one token sequence has non-zero probability."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Constrained decoding uses a state machine like a spell-checker at every word step, blocking any token that would break JSON syntax before the AI picks it.",
+      "keyTakeaway": "Blocking invalid tokens before sampling guarantees 100% valid JSON on the first try without expensive retries.",
+      "byteSummary": "Normally, an LLM might forget a closing brace or quote when asked for JSON, forcing your server to retry the whole request. Constrained decoding builds a rulebook (a Finite-State Machine) from your JSON Schema.\n\nBefore the model picks each next token, invalid tokens are blocked, so the output is guaranteed to be valid JSON in a single pass."
+    },
+    "intermediate": {
+      "summary": "Compile JSON Schemas into DFAs, precompute 16 KB uint32 vocabulary bitmasks over the BPE trie, and overlap H2D mask copies with Transformer forward passes.",
+      "keyTakeaway": "Precomputing per-state BPE bitmasks and overlapping CPU FSM transitions with GPU compute keeps overhead under 50 microseconds per step.",
+      "byteSummary": "A schema compiler lowers JSON Schema into a minimized DFA and walks the 128K BPE vocabulary trie to build 16 KB uint32 bitmasks per state.\n\nDuring continuous batching, host threads advance FSM states and stage bitmasks via pinned cudaMemcpyAsync concurrently with GPU Transformer layers, then run a fused Mask+Softmax kernel."
+    },
+    "advanced": {
+      "summary": "High-throughput engines combine XGrammar pushdown CFG adaptive bitmask caching, fused CUDA Mask+Softmax kernels (< 50 us), and DFA jump-forward coalescing.",
+      "keyTakeaway": "Adaptive CFG bitmask splitting (< 1% dynamic stack checks) and single-path jump-forward prefill cut schema-heavy decode steps by up to 60%.",
+      "byteSummary": "For arbitrary recursive schemas, pushdown CFG engines split the 128K vocabulary into ~99% context-independent tokens (cached as static bitmasks per rule) and < 1% stack-sensitive tokens evaluated dynamically in < 40 us.\n\nPairing this with deterministic DFA jump-forward coalescing injects fixed JSON keys directly into chunked KV prefill, eliminating up to 60% of autoregressive decode steps."
+    }
+  }
+}

@@ -1,0 +1,781 @@
+{
+  "id": "graphql-n-plus-one",
+  "slug": "graphql-n-plus-one",
+  "title": "Solving GraphQL N+1 Queries with DataLoader",
+  "problemType": "architecture",
+  "difficulty": "medium",
+  "prompt": "A mobile app release adds a `seller { rating }` field to the Order History screen, issuing `orders(first: 50) { id items { qty product { id title seller { id name rating } } } }`. Your Apollo/Java GraphQL Gateway resolves each field independently: 1 query for 50 orders -> 50 queries for items -> 200 queries for products -> 200 gRPC calls for sellers = **451 backend calls per HTTP request**. At just 60 mobile RPS, backend traffic surges to **27,060 QPS**, saturating PostgreSQL and `Seller-Service` and causing 503s. Redesign the GraphQL execution layer to bound backend queries and protect against arbitrary nested queries.",
+  "spark": {
+    "summary": "A single nested GraphQL query (`orders(first: 50) { items { product { seller { rating } } } }`) triggers 1 + 50 + 200 + 200 = 451 sequential DB/gRPC calls per HTTP request, saturating PostgreSQL at just 60 RPS.",
+    "keyTakeaway": "If latency budgets leave no room for synchronous retries, always pair request-scoped `DataLoader` batching (collapsing N+1 into `WHERE id IN (...)`) with GraphQL query depth/complexity limits and persisted query allowlists.",
+    "byteSummary": "**Core Mechanics:** GraphQL lets mobile clients compose arbitrary nested selections like `orders(first: 50) { items { product { seller { rating } } } }`.\n\n**Visual & Structural Flow:** Depicts 451 Sequential Calls Collapsed to 4 Batched Tier Calls (Mobile Client -> GraphQL + DataLoader -> Postgres (Orders/Items) -> Seller gRPC); Complexity Gate -> Per-Tick DataLoader -> Batched Backends (Complexity & Depth Gate -> Request DataLoaders -> Postgres (ANY($1)) -> Seller-Service BatchGetSellers(ids)).\n\n**Trade-Offs & Production:** Three common mistakes break naive DataLoader rollouts: **Singleton / Shared DataLoader**: Sharing a `DataLoader` across requests leaks User A's cached data to User B and serves stale mutations. Reduce 451 calls to `<= 4` batched calls while blocking abusive queries: **Request-Scoped `DataLoader` per Tier**: Instantiate `OrderItemsLoader`, `ProductLoader`, and.\n\n**Failure Modes & Application:** Request-scoped batching and complexity governance are mandatory in modern BFFs: **GraphQL Federation & Subgraphs**: Prevents subgraph N+1 fanout across microservices."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why nested GraphQL queries explode into 451 backend calls per request",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "Think of **Why nested GraphQL queries explode into 451 backend calls per request** as the intuition layer for Solving GraphQL N+1 Queries with DataLoader: The mechanism: understand how Why nested GraphQL queries explode into 451 backend calls per request works from first principles.",
+        "core": "GraphQL lets mobile clients compose arbitrary nested selections like `orders(first: 50) { items { product { seller { rating } } } }`. When each field resolver executes independently, 1 HTTP request fans out into `1` query for 50 orders + `50` queries for items + `200` queries for products + `200` gRPC calls for sellers = **451 sequential round-trips**, saturating PostgreSQL at just 60 RPS.",
+        "deepDive": "Under heavy load or partial failure, why nested graphql queries explode into 451 backend calls per request becomes a critical lever for predictable latency and correctness. A single nested GraphQL query (`orders(first: 50) { items { product { seller { rating } } } }`) triggers 1 + 50 + 200 + 200 = 451 sequential DB/gRPC calls per HTTP request, saturating PostgreSQL at just 60 RPS."
+      },
+      "purpose": "The mechanism: understand how Why nested GraphQL queries explode into 451 backend calls per request works from first principles."
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "Database connection exhaustion and unbounded recursive query DoS",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Without batching and query governance, one mobile release triggers two failures:",
+        "core": "1. **110x Backend QPS Amplification**: `60 RPS` of mobile screen loads generates `27,060` DB/gRPC calls/sec.\n2. **Cyclic Query DoS**: Malicious or accidental cyclic queries (`order -> items -> product -> seller -> orders -> ...`) exhaust gateway CPU and DB pools.",
+        "deepDive": "In production deployments of Solving GraphQL N+1 Queries with DataLoader, watch how database connection exhaustion and unbounded recursive query dos interacts with tail latency, retry amplification, and partial failures. A single nested GraphQL query (`orders(first: 50) { items { product { seller { rating } } } }`) triggers 1 + 50 + 200 + 200 = 451 sequential DB/gRPC calls per HTTP request, saturating PostgreSQL at just 60 RPS."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "N+1 Fanout vs. DataLoader",
+        "title": "451 Sequential Calls Collapsed to 4 Batched Tier Calls",
+        "actors": [
+          {
+            "id": "mob",
+            "label": "Mobile Client"
+          },
+          {
+            "id": "gql",
+            "label": "GraphQL + DataLoader"
+          },
+          {
+            "id": "pg",
+            "label": "Postgres (Orders/Items)"
+          },
+          {
+            "id": "sel",
+            "label": "Seller gRPC"
+          }
+        ],
+        "events": [
+          {
+            "from": "mob",
+            "to": "gql",
+            "label": "orders(first:50){items{product{seller}}}",
+            "status": "ok"
+          },
+          {
+            "from": "gql",
+            "to": "pg",
+            "label": "Naive: 1 + 50 + 200 queries!",
+            "status": "fail"
+          },
+          {
+            "from": "gql",
+            "to": "sel",
+            "label": "Naive: 200 sequential gRPC!",
+            "status": "fail"
+          },
+          {
+            "from": "gql",
+            "to": "pg",
+            "label": "DataLoader: 3x WHERE id IN (...)",
+            "status": "ok"
+          },
+          {
+            "from": "gql",
+            "to": "sel",
+            "label": "DataLoader: 1x BatchGetSellers(ids)",
+            "status": "ok"
+          }
+        ],
+        "summary": "DataLoader collects keys per execution tick and dispatches 1 batched query per entity tier (4 total instead of 451)."
+      },
+      "purpose": "The problem: see what breaks without Database connection exhaustion and unbounded recursive query DoS under real concurrency or scale.",
+      "decisionFramework": {
+        "problem": "How to implement Solving GraphQL N+1 Queries with DataLoader without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "If latency budgets leave no room for synchronous retries, always pair request-scoped `DataLoader` batching (collapsing N+1 into `WHERE id IN (...)`) with GraphQL query depth/complexity limits and persisted query allowlists.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Solving GraphQL N+1 Queries with DataLoader experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Why singleton DataLoaders and un-chunked IN() clauses break",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Three common mistakes break naive DataLoader rollouts:",
+        "core": "- **Singleton / Shared DataLoader**: Sharing a `DataLoader` across requests leaks User A's cached data to User B and serves stale mutations.\n- **Partial Coverage**: Adding a `SellerDataLoader` while forgetting `OrderItemsDataLoader` still leaves a `51x` N+1 at tier 2.\n- **Unbounded `maxBatchSize`**: Passing `> 65,535` bind parameters in a single PostgreSQL `IN (...)` fails; chunk batches (e.g., `maxBatchSize=500`).",
+        "deepDive": "In production deployments of Solving GraphQL N+1 Queries with DataLoader, watch how why singleton dataloaders and un-chunked in() clauses break interacts with tail latency, retry amplification, and partial failures. A single nested GraphQL query (`orders(first: 50) { items { product { seller { rating } } } }`) triggers 1 + 50 + 200 + 200 = 451 sequential DB/gRPC calls per HTTP request, saturating PostgreSQL at just 60 RPS."
+      },
+      "purpose": "The problem: see what breaks without Why singleton DataLoaders and un-chunked IN under real concurrency or scale.",
+      "sectionDiagram": {
+        "kind": "behavior-transition",
+        "eyebrow": "Design Trade-Off",
+        "title": "Why singleton DataLoaders and un-chunked IN() clauses break",
+        "before": {
+          "label": "Unbounded Coupling",
+          "metrics": [
+            "No backpressure on spikes",
+            "Implicit shared state",
+            "Cascading tail latency"
+          ]
+        },
+        "after": {
+          "label": "Bounded & Observable",
+          "metrics": [
+            "Explicit capacity budgets",
+            "Isolated failure domains",
+            "Predictable p99 latency"
+          ]
+        }
+      }
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise solution: Request-Scoped DataLoader + Complexity Limits",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": {
+        "foundation": "Reduce 451 calls to `<= 4` batched calls while blocking abusive queries:",
+        "core": "- **Request-Scoped `DataLoader` per Tier**: Instantiate `OrderItemsLoader`, `ProductLoader`, and `SellerDataLoader` per HTTP request so in-request deduplication never bleeds across users. Use `WHERE id = ANY($1)` (Postgres) and `BatchGetSellers(ids)` (gRPC) with `maxBatchSize=500`.\n- **Query Complexity & Depth Limits**: Reject queries with depth `> 6` or complexity score `> 1,000` (where list arguments like `first: 50` multiply child cost) *before* execution.\n- **Persisted Query Allowlists (APQ)**: In production, accept only SHA-256 registered query hashes from mobile clients.",
+        "deepDive": "In production deployments of Solving GraphQL N+1 Queries with DataLoader, watch how enterprise solution: request-scoped dataloader + complexity limits interacts with tail latency, retry amplification, and partial failures. A single nested GraphQL query (`orders(first: 50) { items { product { seller { rating } } } }`) triggers 1 + 50 + 200 + 200 = 451 sequential DB/gRPC calls per HTTP request, saturating PostgreSQL at just 60 RPS."
+      },
+      "sectionDiagram": {
+        "kind": "cache-tier",
+        "eyebrow": "Request-Scoped Batching",
+        "title": "Complexity Gate -> Per-Tick DataLoader -> Batched Backends",
+        "nodes": [
+          {
+            "label": "Complexity & Depth Gate",
+            "role": "Rejects depth>6 / cycles"
+          },
+          {
+            "label": "Request DataLoaders",
+            "role": "Dedups & batches per tick"
+          },
+          {
+            "label": "Postgres (ANY($1))",
+            "role": "3 batched SQL queries"
+          },
+          {
+            "label": "Seller-Service BatchGetSellers(ids)",
+            "role": "1 gRPC call (<=500/batch)"
+          }
+        ],
+        "cards": [
+          {
+            "label": "O(levels) = 4 Calls",
+            "detail": "Collapses 451 sequential queries into 1 call per hierarchy level (>110x QPS drop)."
+          },
+          {
+            "label": "Strict Request Scope",
+            "detail": "New DataLoaderRegistry per request prevents cross-user cache leaks."
+          },
+          {
+            "label": "List-Multiplier Costing",
+            "detail": "orders(first: 50) multiplies subtree cost by 50 before any DB query runs."
+          }
+        ],
+        "summary": "Per-request DataLoaders cut backend calls by >110x while complexity scoring blocks cyclic DoS queries."
+      },
+      "markdownContent": "```java\n@DgsDataLoader(name = \"sellers\")\npublic class SellerDataLoader implements MappedBatchLoader<String, SellerDto> {\n    @Override\n    public CompletionStage<Map<String, SellerDto>> load(Set<String> sellerIds) {\n        return CompletableFuture.supplyAsync(() -> sellerGrpcClient.batchGetSellers(sellerIds));\n    }\n}\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where DataLoader batching powers federated APIs",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Request-scoped batching and complexity governance are mandatory in modern BFFs:",
+        "core": "- **GraphQL Federation & Subgraphs**: Prevents subgraph N+1 fanout across microservices.\n- **BFF Aggregation Layers**: Batches product, pricing, and inventory lookups for mobile screens.\n- **ORM Lazy-Loading Prevention**: Replaces per-row lazy JPA/SQLAlchemy fetches with explicit batch loaders.",
+        "deepDive": "In production deployments of Solving GraphQL N+1 Queries with DataLoader, watch how where dataloader batching powers federated apis interacts with tail latency, retry amplification, and partial failures. A single nested GraphQL query (`orders(first: 50) { items { product { seller { rating } } } }`) triggers 1 + 50 + 200 + 200 = 451 sequential DB/gRPC calls per HTTP request, saturating PostgreSQL at just 60 RPS."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "graphql-federation",
+          "title": "Concept: GraphQL Federation",
+          "kind": "concept"
+        },
+        {
+          "slug": "edge-bff-bulkheads",
+          "title": "Concept: Resilient API Edge & BFF Bulkhead",
+          "kind": "concept"
+        },
+        {
+          "slug": "grpc-streaming-rpc",
+          "title": "Concept: gRPC & Streaming RPC",
+          "kind": "concept"
+        },
+        {
+          "slug": "design-rate-limiter",
+          "title": "System Design: Distributed Rate Limiter",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why MUST a GraphQL `DataLoader` instance be created per-request rather than shared as a global singleton?",
+      "options": [
+        {
+          "id": "a",
+          "text": "DataLoader caches resolved keys in memory; sharing it across requests leaks user data and serves stale state after mutations",
+          "correct": true,
+          "feedback": "Correct: DataLoader's built-in memoization map is designed strictly for single-request deduplication."
+        },
+        {
+          "id": "b",
+          "text": "Global DataLoaders cannot call gRPC BatchGet endpoints",
+          "correct": false,
+          "feedback": "The transport works either way, but cross-request caching causes security and staleness bugs."
+        },
+        {
+          "id": "c",
+          "text": "GraphQL depth limits only apply to singleton DataLoaders",
+          "correct": false,
+          "feedback": "Query depth/complexity validation runs at parse/validation time before resolvers."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why MUST a GraphQL `DataLoader` instance be created per-request rather than shared as a global singleton?",
+        "options": [
+          {
+            "id": "a",
+            "text": "DataLoader caches resolved keys in memory; sharing it across requests leaks user data and serves stale state after mutations",
+            "correct": true,
+            "feedback": "Correct: DataLoader's built-in memoization map is designed strictly for single-request deduplication."
+          },
+          {
+            "id": "b",
+            "text": "Global DataLoaders cannot call gRPC BatchGet endpoints",
+            "correct": false,
+            "feedback": "The transport works either way, but cross-request caching causes security and staleness bugs."
+          },
+          {
+            "id": "c",
+            "text": "GraphQL depth limits only apply to singleton DataLoaders",
+            "correct": false,
+            "feedback": "Query depth/complexity validation runs at parse/validation time before resolvers."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why nested GraphQL queries explode into 451 backend calls per request', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "b",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "c",
+            "text": "GraphQL lets mobile clients compose arbitrary nested selections like orders(first: 50) { items { product { seller { rating } } } }.",
+            "correct": true,
+            "feedback": "Correct: GraphQL lets mobile clients compose arbitrary nested selections like orders(first: 50) { items { product { seller { rating } } } }."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Database connection exhaustion and unbounded recursive query DoS', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Without batching and query governance, one mobile release triggers two failures: 1.",
+            "correct": true,
+            "feedback": "Correct: Without batching and query governance, one mobile release triggers two failures: 1."
+          },
+          {
+            "id": "b",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "c",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** GraphQL lets mobile clients compose arbitrary nested selections like `orders(first: 50) { items { product { seller { rating } } } }`.\n\n**How It Flows:** Think of Solving GraphQL N+1 Queries with DataLoader as a clear step-by-step chain: Mobile Client -> GraphQL + DataLoader -> Postgres (Orders/Items) -> Seller gRPC -> Complexity & Depth Gate.\n\n**Why Beginners Should Care:** Always pair request-scoped `DataLoader` batching (collapsing N+1 into `WHERE id IN (...)`) with GraphQL query depth/complexity limits and persisted query allowlists.",
+      "spark": {
+        "summary": "GraphQL lets mobile clients compose arbitrary nested selections like `orders(first: 50) { items { product { seller { rating } } } }`.",
+        "keyTakeaway": "Always pair request-scoped `DataLoader` batching (collapsing N+1 into `WHERE id IN (...)`) with GraphQL query depth/complexity limits and persisted query allowlists."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why nested GraphQL queries explode into 451 backend calls per request",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why nested GraphQL queries explode into 451 backend calls per request works from first principles.",
+          "explanation": "GraphQL lets mobile clients compose arbitrary nested selections like `orders(first: 50) { items { product { seller { rating } } } }`. When each field resolver executes independently, 1 HTTP request fans out into `1` query for 50 orders + `50` queries for items + `200` queries for products + `200` gRPC calls for sellers = **451 sequential round-trips**, saturating PostgreSQL at just 60 RPS.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Database connection exhaustion and unbounded recursive query DoS",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without Database connection exhaustion and unbounded recursive query DoS under real concurrency or scale.",
+          "explanation": "Without batching and query governance, one mobile release triggers two failures: 1. **110x Backend QPS Amplification**: `60 RPS` of mobile screen loads generates `27,060` DB/gRPC calls/sec. 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "N+1 Fanout vs. DataLoader",
+            "title": "451 Sequential Calls Collapsed to 4 Batched Tier Calls",
+            "actors": [
+              {
+                "id": "mob",
+                "label": "Mobile Client"
+              },
+              {
+                "id": "gql",
+                "label": "GraphQL + DataLoader"
+              },
+              {
+                "id": "pg",
+                "label": "Postgres (Orders/Items)"
+              },
+              {
+                "id": "sel",
+                "label": "Seller gRPC"
+              }
+            ],
+            "events": [
+              {
+                "from": "mob",
+                "to": "gql",
+                "label": "orders(first:50){items{product{seller}}}",
+                "status": "ok"
+              },
+              {
+                "from": "gql",
+                "to": "pg",
+                "label": "Naive: 1 + 50 + 200 queries!",
+                "status": "fail"
+              },
+              {
+                "from": "gql",
+                "to": "sel",
+                "label": "Naive: 200 sequential gRPC!",
+                "status": "fail"
+              },
+              {
+                "from": "gql",
+                "to": "pg",
+                "label": "DataLoader: 3x WHERE id IN (...)",
+                "status": "ok"
+              },
+              {
+                "from": "gql",
+                "to": "sel",
+                "label": "DataLoader: 1x BatchGetSellers(ids)",
+                "status": "ok"
+              }
+            ],
+            "summary": "DataLoader collects keys per execution tick and dispatches 1 batched query per entity tier (4 total instead of 451)."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Why singleton DataLoaders and un-chunked IN() clauses break",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "The problem: see what breaks without Why singleton DataLoaders and un-chunked IN under real concurrency or scale.",
+          "explanation": "Three common mistakes break naive DataLoader rollouts: **Singleton / Shared DataLoader**: Sharing a `DataLoader` across requests leaks User A's cached data to User B and serves stale mutations. **Partial Coverage**: Adding a `SellerDataLoader` while forgetting `OrderItemsDataLoader` still leaves a `51x` N+1 at tier 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Request-Scoped DataLoader + Complexity Limits",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Reduce 451 calls to `<= 4` batched calls while blocking abusive queries: **Request-Scoped `DataLoader` per Tier**: Instantiate `OrderItemsLoader`, `ProductLoader`, and `SellerDataLoader` per HTTP request so in-request deduplication never bleeds across users. Use `WHERE id = ANY($1)` (Postgres) and `BatchGetSellers(ids)` (gRPC) with `maxBatchSize=500`.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Request-Scoped Batching",
+            "title": "Complexity Gate -> Per-Tick DataLoader -> Batched Backends",
+            "nodes": [
+              {
+                "label": "Complexity & Depth Gate",
+                "role": "Rejects depth>6 / cycles"
+              },
+              {
+                "label": "Request DataLoaders",
+                "role": "Dedups & batches per tick"
+              },
+              {
+                "label": "Postgres (ANY($1))",
+                "role": "3 batched SQL queries"
+              },
+              {
+                "label": "Seller-Service BatchGetSellers(ids)",
+                "role": "1 gRPC call (<=500/batch)"
+              }
+            ],
+            "cards": [
+              {
+                "label": "O(levels) = 4 Calls",
+                "detail": "Collapses 451 sequential queries into 1 call per hierarchy level (>110x QPS drop)."
+              },
+              {
+                "label": "Strict Request Scope",
+                "detail": "New DataLoaderRegistry per request prevents cross-user cache leaks."
+              },
+              {
+                "label": "List-Multiplier Costing",
+                "detail": "orders(first: 50) multiplies subtree cost by 50 before any DB query runs."
+              }
+            ],
+            "summary": "Per-request DataLoaders cut backend calls by >110x while complexity scoring blocks cyclic DoS queries."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Always pair request-scoped `DataLoader` batching (collapsing N+1 into `WHERE id IN (...)`) with GraphQL query depth/complexity limits and persisted query allowlists.",
+      "summary": "A single nested GraphQL query (`orders(first: 50) { items { product { seller { rating } } } }`) triggers 1 + 50 + 200 + 200 = 451 sequential DB/gRPC calls per HTTP request, saturating PostgreSQL at just 60 RPS.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, always pair request-scoped `DataLoader` batching (collapsing N+1 into `WHERE id IN (...)`) with GraphQL query depth/complexity limits and persisted query allowlists."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** GraphQL lets mobile clients compose arbitrary nested selections like `orders(first: 50) { items { product { seller { rating } } } }`.\n\n**Visual & Structural Flow:** Depicts 451 Sequential Calls Collapsed to 4 Batched Tier Calls (Mobile Client -> GraphQL + DataLoader -> Postgres (Orders/Items) -> Seller gRPC); Complexity Gate -> Per-Tick DataLoader -> Batched Backends (Complexity & Depth Gate -> Request DataLoaders -> Postgres (ANY($1)) -> Seller-Service BatchGetSellers(ids)).\n\n**Trade-Offs & Production:** Three common mistakes break naive DataLoader rollouts: **Singleton / Shared DataLoader**: Sharing a `DataLoader` across requests leaks User A's cached data to User B and serves stale mutations. Reduce 451 calls to `<= 4` batched calls while blocking abusive queries: **Request-Scoped `DataLoader` per Tier**: Instantiate `OrderItemsLoader`, `ProductLoader`, and.\n\n**Failure Modes & Application:** Request-scoped batching and complexity governance are mandatory in modern BFFs: **GraphQL Federation & Subgraphs**: Prevents subgraph N+1 fanout across microservices.",
+      "spark": {
+        "summary": "A single nested GraphQL query (`orders(first: 50) { items { product { seller { rating } } } }`) triggers 1 + 50 + 200 + 200 = 451 sequential DB/gRPC calls per HTTP request, saturating PostgreSQL at just 60 RPS.",
+        "keyTakeaway": "Always pair request-scoped `DataLoader` batching (collapsing N+1 into `WHERE id IN (...)`) with GraphQL query depth/complexity limits and persisted query allowlists."
+      },
+      "summary": "A single nested GraphQL query (`orders(first: 50) { items { product { seller { rating } } } }`) triggers 1 + 50 + 200 + 200 = 451 sequential DB/gRPC calls per HTTP request, saturating PostgreSQL at just 60 RPS.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, always pair request-scoped `DataLoader` batching (collapsing N+1 into `WHERE id IN (...)`) with GraphQL query depth/complexity limits and persisted query allowlists."
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** A single nested GraphQL query (`orders(first: 50) { items { product { seller { rating } } } }`) triggers 1 + 50 + 200 + 200 = 451 sequential DB/gRPC calls per HTTP request, saturating PostgreSQL at just 60 RPS.\n\n**Production Trade-Offs:** Three common mistakes break naive DataLoader rollouts: **Singleton / Shared DataLoader**: Sharing a `DataLoader` across requests leaks User A's cached data to User B and serves stale mutations.\n\n**Failure Modes & Edge Cases:** Request-scoped batching and complexity governance are mandatory in modern BFFs: **GraphQL Federation & Subgraphs**: Prevents subgraph N+1 fanout across microservices.\n\n**Principal Takeaway:** Always pair request-scoped `DataLoader` batching (collapsing N+1 into `WHERE id IN (...)`) with GraphQL query depth/complexity limits and persisted query allowlists.",
+      "spark": {
+        "summary": "A single nested GraphQL query (`orders(first: 50) { items { product { seller { rating } } } }`) triggers 1 + 50 + 200 + 200 = 451 sequential DB/gRPC calls per HTTP request, saturating PostgreSQL at just 60 RPS.",
+        "keyTakeaway": "Always pair request-scoped `DataLoader` batching (collapsing N+1 into `WHERE id IN (...)`) with GraphQL query depth/complexity limits and persisted query allowlists."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why nested GraphQL queries explode into 451 backend calls per request",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why nested GraphQL queries explode into 451 backend calls per request works from first principles.",
+          "explanation": "GraphQL lets mobile clients compose arbitrary nested selections like `orders(first: 50) { items { product { seller { rating } } } }`. When each field resolver executes independently, 1 HTTP request fans out into `1` query for 50 orders + `50` queries for items + `200` queries for products + `200` gRPC calls for sellers = **451 sequential round-trips**, saturating PostgreSQL at just 60 RPS.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Database connection exhaustion and unbounded recursive query DoS",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without Database connection exhaustion and unbounded recursive query DoS under real concurrency or scale.",
+          "explanation": "Without batching and query governance, one mobile release triggers two failures:\n\n1. **110x Backend QPS Amplification**: `60 RPS` of mobile screen loads generates `27,060` DB/gRPC calls/sec.\n2. **Cyclic Query DoS**: Malicious or accidental cyclic queries (`order -> items -> product -> seller -> orders -> ...`) exhaust gateway CPU and DB pools.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "N+1 Fanout vs. DataLoader",
+            "title": "451 Sequential Calls Collapsed to 4 Batched Tier Calls",
+            "actors": [
+              {
+                "id": "mob",
+                "label": "Mobile Client"
+              },
+              {
+                "id": "gql",
+                "label": "GraphQL + DataLoader"
+              },
+              {
+                "id": "pg",
+                "label": "Postgres (Orders/Items)"
+              },
+              {
+                "id": "sel",
+                "label": "Seller gRPC"
+              }
+            ],
+            "events": [
+              {
+                "from": "mob",
+                "to": "gql",
+                "label": "orders(first:50){items{product{seller}}}",
+                "status": "ok"
+              },
+              {
+                "from": "gql",
+                "to": "pg",
+                "label": "Naive: 1 + 50 + 200 queries!",
+                "status": "fail"
+              },
+              {
+                "from": "gql",
+                "to": "sel",
+                "label": "Naive: 200 sequential gRPC!",
+                "status": "fail"
+              },
+              {
+                "from": "gql",
+                "to": "pg",
+                "label": "DataLoader: 3x WHERE id IN (...)",
+                "status": "ok"
+              },
+              {
+                "from": "gql",
+                "to": "sel",
+                "label": "DataLoader: 1x BatchGetSellers(ids)",
+                "status": "ok"
+              }
+            ],
+            "summary": "DataLoader collects keys per execution tick and dispatches 1 batched query per entity tier (4 total instead of 451)."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Why singleton DataLoaders and un-chunked IN() clauses break",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "The problem: see what breaks without Why singleton DataLoaders and un-chunked IN under real concurrency or scale.",
+          "explanation": "Three common mistakes break naive DataLoader rollouts:\n\n- **Singleton / Shared DataLoader**: Sharing a `DataLoader` across requests leaks User A's cached data to User B and serves stale mutations.\n- **Partial Coverage**: Adding a `SellerDataLoader` while forgetting `OrderItemsDataLoader` still leaves a `51x` N+1 at tier 2.\n- **Unbounded `maxBatchSize`**: Passing `> 65,535` bind parameters in a single PostgreSQL `IN (...)` fails; chunk batches (e.g., `maxBatchSize=500`).",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Request-Scoped DataLoader + Complexity Limits",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Reduce 451 calls to `<= 4` batched calls while blocking abusive queries:\n\n- **Request-Scoped `DataLoader` per Tier**: Instantiate `OrderItemsLoader`, `ProductLoader`, and `SellerDataLoader` per HTTP request so in-request deduplication never bleeds across users. Use `WHERE id = ANY($1)` (Postgres) and `BatchGetSellers(ids)` (gRPC) with `maxBatchSize=500`.\n- **Query Complexity & Depth Limits**: Reject queries with depth `> 6` or complexity score `> 1,000` (where list arguments like `first: 50` multiply child cost) *before* execution.\n- **Persisted Query Allowlists (APQ)**: In production, accept only SHA-256 registered query hashes from mobile clients.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Request-Scoped Batching",
+            "title": "Complexity Gate -> Per-Tick DataLoader -> Batched Backends",
+            "nodes": [
+              {
+                "label": "Complexity & Depth Gate",
+                "role": "Rejects depth>6 / cycles"
+              },
+              {
+                "label": "Request DataLoaders",
+                "role": "Dedups & batches per tick"
+              },
+              {
+                "label": "Postgres (ANY($1))",
+                "role": "3 batched SQL queries"
+              },
+              {
+                "label": "Seller-Service BatchGetSellers(ids)",
+                "role": "1 gRPC call (<=500/batch)"
+              }
+            ],
+            "cards": [
+              {
+                "label": "O(levels) = 4 Calls",
+                "detail": "Collapses 451 sequential queries into 1 call per hierarchy level (>110x QPS drop)."
+              },
+              {
+                "label": "Strict Request Scope",
+                "detail": "New DataLoaderRegistry per request prevents cross-user cache leaks."
+              },
+              {
+                "label": "List-Multiplier Costing",
+                "detail": "orders(first: 50) multiplies subtree cost by 50 before any DB query runs."
+              }
+            ],
+            "summary": "Per-request DataLoaders cut backend calls by >110x while complexity scoring blocks cyclic DoS queries."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where DataLoader batching powers federated APIs",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Request-scoped batching and complexity governance are mandatory in modern BFFs:\n\n- **GraphQL Federation & Subgraphs**: Prevents subgraph N+1 fanout across microservices.\n- **BFF Aggregation Layers**: Batches product, pricing, and inventory lookups for mobile screens.\n- **ORM Lazy-Loading Prevention**: Replaces per-row lazy JPA/SQLAlchemy fetches with explicit batch loaders.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Always pair request-scoped `DataLoader` batching (collapsing N+1 into `WHERE id IN (...)`) with GraphQL query depth/complexity limits and persisted query allowlists.",
+      "summary": "A single nested GraphQL query (`orders(first: 50) { items { product { seller { rating } } } }`) triggers 1 + 50 + 200 + 200 = 451 sequential DB/gRPC calls per HTTP request, saturating PostgreSQL at just 60 RPS.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, always pair request-scoped `DataLoader` batching (collapsing N+1 into `WHERE id IN (...)`) with GraphQL query depth/complexity limits and persisted query allowlists."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "simulation": {
+    "title": "Solving GraphQL N+1 Queries with DataLoader — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Input Workload"
+      },
+      {
+        "id": "entry",
+        "label": "Router / API",
+        "role": "Admission Control"
+      },
+      {
+        "id": "worker",
+        "label": "Processor",
+        "role": "Domain Logic"
+      },
+      {
+        "id": "store",
+        "label": "State Layer",
+        "role": "Durable Store"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "entry",
+        "label": "request"
+      },
+      {
+        "from": "entry",
+        "to": "worker",
+        "label": "dispatch"
+      },
+      {
+        "from": "worker",
+        "to": "store",
+        "label": "read/write"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why nested GraphQL queries explode into 451 backend calls per request",
+        "actionLabel": "request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "entry"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "request",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Caller sends work to Router / API (Why nested GraphQL queries explode into 451 backend calls per request)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Database connection exhaustion and unbounded recursive query DoS",
+        "actionLabel": "dispatch",
+        "status": "healthy",
+        "activeNodeIds": [
+          "entry",
+          "worker"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "dispatch",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Router / API coordinates with Processor while preserving the core invariant (Database connection exhaustion and unbounded recursive query DoS)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Why singleton DataLoaders and un-chunked IN() clauses break",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "worker",
+          "store"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, State Layer absorbs pressure without cascading (Why singleton DataLoaders and un-chunked IN() clauses break)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Where DataLoader batching powers federated APIs",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "entry",
+          "worker",
+          "store"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Where DataLoader batching powers federated APIs)."
+      }
+    ]
+  }
+}

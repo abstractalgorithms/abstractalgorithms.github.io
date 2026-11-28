@@ -1,0 +1,807 @@
+{
+  "id": "problem-bounded-task-queues-backpressure",
+  "slug": "bounded-task-queues-backpressure",
+  "title": "Bounding Task Queues to Prevent Heap OOM",
+  "problemType": "low-level-design",
+  "difficulty": "medium",
+  "prompt": "An ingestion service (15,000 events/sec, 8 KB payloads, `-Xmx2048m`) dispatches tasks into `Executors.newFixedThreadPool(16)` to write to Elasticsearch. During a 45-second ES GC pause (200 writes/sec), the hidden unbounded `LinkedBlockingQueue` buffers 675,000+ closures (5.4 GB) and crashes with `OutOfMemoryError`. Bound memory <= 64 MB and propagate backpressure.",
+  "spark": {
+    "summary": "`Executors.newFixedThreadPool()` defaults to an unbounded `LinkedBlockingQueue(Integer.MAX_VALUE)`, buffering millions of tasks during downstream stalls until the JVM crashes with `OutOfMemoryError`.",
+    "keyTakeaway": "When traffic spikes expose hidden coupling, replace JDK executor factories with an explicit `ThreadPoolExecutor` backed by a Little's-Law-sized `ArrayBlockingQueue`, and propagate backpressure via HTTP 429/503 or `KafkaConsumer.pause()`.",
+    "byteSummary": "**Core Mechanics:** Java's `Executors.newFixedThreadPool(16)` looks safe because it caps worker threads at 16, but its internal `LinkedBlockingQueue` defaults to `Integer.MAX_VALUE` (`2.14 billion` tasks).\n\n**Visual & Structural Flow:** Depicts 45s Elasticsearch Stall: Heap OOM vs. Bounded Shedding (HTTP / Kafka -> Executor Queue -> Elasticsearch (GC)); Bounded Queue High/Low Watermark Consumer Pause (CONSUMING -> PAUSED -> DRAINING).\n\n**Trade-Offs & Production:** Two naive workarounds break in production: **Blocking `queue.put()` on Kafka Consumer Thread**: If `put()` blocks longer than `max.poll.interval.ms` (`5 min`), the Kafka broker. Size the queue with **Little's Law (`L = λ × W`)** and propagate backpressure cleanly: **Queue Sizing (`2,048` slots = `16 MB`)**: At `15,000 events/s` and `250 ms` max acceptable.\n\n**Failure Modes & Application:** Bounded queues are mandatory at every asynchronous boundary: **Reactive Streams & Netty/gRPC**: Enforce explicit demand (`request(n)`) and high/low watermarks on write buffers."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why unbounded executor queues cause silent heap collapse",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "Think of **Why unbounded executor queues cause silent heap collapse** as the intuition layer for Bounding Task Queues to Prevent Heap OOM: The mechanism: understand how Why unbounded executor queues cause silent heap collapse works from first principles.",
+        "core": "Java's `Executors.newFixedThreadPool(16)` looks safe because it caps worker threads at 16, but its internal `LinkedBlockingQueue` defaults to `Integer.MAX_VALUE` (`2.14 billion` tasks). At `15,000 events/sec` of `8 KB` payloads, even a `45-second` downstream Elasticsearch GC pause queues `675,000` closures—demanding `5.4 GB` of heap on a `2 GB` container.",
+        "deepDive": "Under heavy load or partial failure, why unbounded executor queues cause silent heap collapse becomes a critical lever for predictable latency and correctness. `Executors.newFixedThreadPool()` defaults to an unbounded `LinkedBlockingQueue(Integer.MAX_VALUE)`, buffering millions of tasks during downstream stalls until the JVM crashes with `OutOfMemoryError`."
+      },
+      "purpose": "The mechanism: understand how Why unbounded executor queues cause silent heap collapse works from first principles.",
+      "sectionDiagram": {
+        "kind": "behavior-transition",
+        "eyebrow": "Stage 1 Trade-Off",
+        "title": "Why unbounded executor queues cause silent heap collapse",
+        "before": {
+          "label": "Naive Unbounded Path",
+          "metrics": [
+            "Unbounded retries",
+            "Tail latency spikes",
+            "Silent state drift"
+          ]
+        },
+        "after": {
+          "label": "Bounded Engineering Path",
+          "metrics": [
+            "Explicit budgets",
+            "Predictable p99",
+            "Verifiable invariants"
+          ]
+        }
+      }
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "GC thrash loops and dead `maximumPoolSize` config",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Unbounded queues create two severe production failures:",
+        "core": "1. **Old-Gen OOM Crash**: `5.4 GB` of queued `Runnable` closures fills the `2,048 MiB` heap; G1GC burns 99% CPU in Full GC before pods die with `OutOfMemoryError: Java heap space`.\n2. **Dead `maximumPoolSize`**: `ThreadPoolExecutor` only scales past `corePoolSize` *after* the queue is full—so an unbounded queue silently pins the pool at `corePoolSize` forever.",
+        "deepDive": "In production deployments of Bounding Task Queues to Prevent Heap OOM, watch how gc thrash loops and dead `maximumpoolsize` config interacts with tail latency, retry amplification, and partial failures. `Executors.newFixedThreadPool()` defaults to an unbounded `LinkedBlockingQueue(Integer.MAX_VALUE)`, buffering millions of tasks during downstream stalls until the JVM crashes with `OutOfMemoryError`."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Unbounded vs. Bounded Backpressure",
+        "title": "45s Elasticsearch Stall: Heap OOM vs. Bounded Shedding",
+        "actors": [
+          {
+            "id": "in",
+            "label": "HTTP / Kafka"
+          },
+          {
+            "id": "q",
+            "label": "Executor Queue"
+          },
+          {
+            "id": "es",
+            "label": "Elasticsearch (GC)"
+          }
+        ],
+        "events": [
+          {
+            "from": "in",
+            "to": "q",
+            "label": "Unbounded: 675k x 8KB = 5.4GB -> OOM",
+            "status": "fail"
+          },
+          {
+            "from": "in",
+            "to": "q",
+            "label": "Bounded ArrayBlockingQueue(2048) = 16MB",
+            "status": "ok"
+          },
+          {
+            "from": "q",
+            "to": "es",
+            "label": "ES stalls at 200/s -> queue fills in 136ms",
+            "status": "warn"
+          },
+          {
+            "from": "q",
+            "to": "in",
+            "label": "HTTP 429/503 or consumer.pause(partitions)",
+            "status": "ok"
+          }
+        ],
+        "summary": "Capping the queue at 2,048 slots (16 MB) surfaces backpressure in 136 ms instead of crashing the JVM at 45 s."
+      },
+      "purpose": "The problem: see what breaks without GC thrash loops and dead `maximumPoolSize` config under real concurrency or scale.",
+      "decisionFramework": {
+        "problem": "How to implement Bounding Task Queues to Prevent Heap OOM without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "When traffic spikes expose hidden coupling, replace JDK executor factories with an explicit `ThreadPoolExecutor` backed by a Little's-Law-sized `ArrayBlockingQueue`, and propagate backpressure via HTTP 429/503 or `KafkaConsumer.pause()`.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Bounding Task Queues to Prevent Heap OOM experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Naive fixes (and why blocking Kafka poll() triggers rebalance storms)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Two naive workarounds break in production:",
+        "core": "- **Blocking `queue.put()` on Kafka Consumer Thread**: If `put()` blocks longer than `max.poll.interval.ms` (`5 min`), the Kafka broker kicks the consumer out of the group, triggering endless rebalance storms.\n- **`DiscardPolicy` with Futures**: Silently drops `CompletableFuture` tasks without completing them, hanging callers forever.",
+        "deepDive": "In production deployments of Bounding Task Queues to Prevent Heap OOM, watch how naive fixes (and why blocking kafka poll() triggers rebalance storms) interacts with tail latency, retry amplification, and partial failures. `Executors.newFixedThreadPool()` defaults to an unbounded `LinkedBlockingQueue(Integer.MAX_VALUE)`, buffering millions of tasks during downstream stalls until the JVM crashes with `OutOfMemoryError`."
+      },
+      "purpose": "The problem: see what breaks without Naive fixes under real concurrency or scale.",
+      "sectionDiagram": {
+        "kind": "behavior-transition",
+        "eyebrow": "Stage 3 Trade-Off",
+        "title": "Naive fixes (and why blocking Kafka poll() triggers rebala...",
+        "before": {
+          "label": "Naive Unbounded Path",
+          "metrics": [
+            "Unbounded retries",
+            "Tail latency spikes",
+            "Silent state drift"
+          ]
+        },
+        "after": {
+          "label": "Bounded Engineering Path",
+          "metrics": [
+            "Explicit budgets",
+            "Predictable p99",
+            "Verifiable invariants"
+          ]
+        }
+      }
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise solution: Little's-Law Queue + Upstream Pause / Fast-Fail",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": {
+        "foundation": "Size the queue with **Little's Law (`L = λ × W`)** and propagate backpressure cleanly:",
+        "core": "- **Queue Sizing (`2,048` slots = `16 MB`)**: At `15,000 events/s` and `250 ms` max acceptable queue wait (`W = 0.25 s`), `L = 3,750` -> cap at `ArrayBlockingQueue(2048)` (`~16 MB` at `8 KB/event`, well under `64 MB`).\n- **HTTP Ingress**: Custom `RejectedExecutionHandler` fails fast with HTTP `429`/`503` + `Retry-After`.\n- **Kafka Ingress**: When `queue.offer(task, 50, MILLISECONDS)` returns `false`, call `consumer.pause(partitions)` while continuing lightweight `poll(0)` heartbeats; `consumer.resume()` once queue depth drops below 50%.",
+        "deepDive": "In production deployments of Bounding Task Queues to Prevent Heap OOM, watch how enterprise solution: little's-law queue + upstream pause / fast-fail interacts with tail latency, retry amplification, and partial failures. `Executors.newFixedThreadPool()` defaults to an unbounded `LinkedBlockingQueue(Integer.MAX_VALUE)`, buffering millions of tasks during downstream stalls until the JVM crashes with `OutOfMemoryError`."
+      },
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "Kafka Backpressure Loop",
+        "title": "Bounded Queue High/Low Watermark Consumer Pause",
+        "states": [
+          {
+            "id": "run",
+            "label": "CONSUMING",
+            "sublabel": "Queue < 80% (<16 MB)",
+            "tone": "green"
+          },
+          {
+            "id": "paused",
+            "label": "PAUSED",
+            "sublabel": "consumer.pause() + poll(0) heartbeats",
+            "tone": "amber"
+          },
+          {
+            "id": "drain",
+            "label": "DRAINING",
+            "sublabel": "SIGTERM graceful awaitTermination",
+            "tone": "blue"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "run",
+            "to": "paused",
+            "label": "queue full (offer false)"
+          },
+          {
+            "from": "paused",
+            "to": "run",
+            "label": "depth < 50% -> resume()"
+          },
+          {
+            "from": "run",
+            "to": "drain",
+            "label": "SIGTERM"
+          }
+        ],
+        "summary": "Pausing Kafka partitions while keeping poll(0) alive holds backlog safely on broker disks without rebalance storms."
+      },
+      "markdownContent": "```java\nint capacity = 2048; // ~16 MB for 8 KB payloads\nThreadPoolExecutor pool = new ThreadPoolExecutor(\n    16, 32, 60L, TimeUnit.SECONDS,\n    new ArrayBlockingQueue<>(capacity),\n    (runnable, executor) -> {\n        throw new RejectedExecutionException(\"Queue full: apply backpressure\");\n    }\n);\n\n// Kafka consumer loop: pause instead of blocking > max.poll.interval.ms\nif (!pool.getQueue().offer(task)) {\n    consumer.pause(consumer.assignment());\n}\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where bounded queues and backpressure are used",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Bounded queues are mandatory at every asynchronous boundary:",
+        "core": "- **Reactive Streams & Netty/gRPC**: Enforce explicit demand (`request(n)`) and high/low watermarks on write buffers.\n- **Kafka & Log Pipelines**: Pause partition consumption during downstream Elasticsearch/ClickHouse slowdowns so backlog stays on durable broker disks.",
+        "deepDive": "In production deployments of Bounding Task Queues to Prevent Heap OOM, watch how where bounded queues and backpressure are used interacts with tail latency, retry amplification, and partial failures. `Executors.newFixedThreadPool()` defaults to an unbounded `LinkedBlockingQueue(Integer.MAX_VALUE)`, buffering millions of tasks during downstream stalls until the JVM crashes with `OutOfMemoryError`."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "backpressure-flow-control",
+          "title": "Concept: Backpressure & Flow Control",
+          "kind": "concept"
+        },
+        {
+          "slug": "reactive-streams-backpressure",
+          "title": "Concept: Reactive Streams Backpressure",
+          "kind": "concept"
+        },
+        {
+          "slug": "thread-pool-design",
+          "title": "Concept: Thread Pool Design",
+          "kind": "concept"
+        },
+        {
+          "slug": "preventing-kafka-consumer-rebalance-storms",
+          "title": "System Design: Kafka Rebalance Storms",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+      "sectionDiagram": {
+        "kind": "behavior-transition",
+        "eyebrow": "Stage 5 Trade-Off",
+        "title": "Where bounded queues and backpressure are used",
+        "before": {
+          "label": "Naive Unbounded Path",
+          "metrics": [
+            "Unbounded retries",
+            "Tail latency spikes",
+            "Silent state drift"
+          ]
+        },
+        "after": {
+          "label": "Bounded Engineering Path",
+          "metrics": [
+            "Explicit budgets",
+            "Predictable p99",
+            "Verifiable invariants"
+          ]
+        }
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why should a Kafka consumer call `consumer.pause()` on a full bounded queue instead of blocking indefinitely in `queue.put()`?",
+      "options": [
+        {
+          "id": "a",
+          "text": "Blocking the consumer thread longer than `max.poll.interval.ms` triggers group eviction and rebalance storms, whereas `pause()` keeps `poll(0)` heartbeats alive",
+          "correct": true,
+          "feedback": "Correct: pausing lets the consumer stay in the group while Kafka brokers retain the unconsumed backlog on disk."
+        },
+        {
+          "id": "b",
+          "text": "`consumer.pause()` automatically increases `Xmx` heap size during Elasticsearch GC pauses",
+          "correct": false,
+          "feedback": "JVM heap size is fixed at startup; `pause()` prevents heap exhaustion by stopping new records from entering memory."
+        },
+        {
+          "id": "c",
+          "text": "`queue.put()` throws `OutOfMemoryError` immediately even when the queue has capacity",
+          "correct": false,
+          "feedback": "`queue.put()` blocks the caller thread; the OOM was caused by `Executors.newFixedThreadPool()` using an unbounded `LinkedBlockingQueue`."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why should a Kafka consumer call `consumer.pause()` on a full bounded queue instead of blocking indefinitely in `queue.put()`?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Blocking the consumer thread longer than `max.poll.interval.ms` triggers group eviction and rebalance storms, whereas `pause()` keeps `poll(0)` heartbeats alive",
+            "correct": true,
+            "feedback": "Correct: pausing lets the consumer stay in the group while Kafka brokers retain the unconsumed backlog on disk."
+          },
+          {
+            "id": "b",
+            "text": "`consumer.pause()` automatically increases `Xmx` heap size during Elasticsearch GC pauses",
+            "correct": false,
+            "feedback": "JVM heap size is fixed at startup; `pause()` prevents heap exhaustion by stopping new records from entering memory."
+          },
+          {
+            "id": "c",
+            "text": "`queue.put()` throws `OutOfMemoryError` immediately even when the queue has capacity",
+            "correct": false,
+            "feedback": "`queue.put()` blocks the caller thread; the OOM was caused by `Executors.newFixedThreadPool()` using an unbounded `LinkedBlockingQueue`."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why unbounded executor queues cause silent heap collapse', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "b",
+            "text": "Java's Executors.newFixedThreadPool(16) looks safe because it caps worker threads at 16, but its internal LinkedBlockingQueue defaults to Integer.MAX_VALUE (2.14 billion…",
+            "correct": true,
+            "feedback": "Correct: Java's Executors.newFixedThreadPool(16) looks safe because it caps worker threads at 16, but its internal LinkedBlockingQueue defaults to Integer.MAX_VALUE (2.14 billion…"
+          },
+          {
+            "id": "c",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'GC thrash loops and dead maximumPoolSize config', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "b",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "c",
+            "text": "Unbounded queues create two severe production failures: 1.",
+            "correct": true,
+            "feedback": "Correct: Unbounded queues create two severe production failures: 1."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** Java's `Executors.newFixedThreadPool(16)` looks safe because it caps worker threads at 16, but its internal `LinkedBlockingQueue` defaults to `Integer.MAX_VALUE` (`2.14 billion` tasks).\n\n**How It Flows:** Think of Bounding Task Queues to Prevent Heap OOM as a clear step-by-step chain: HTTP / Kafka -> Executor Queue -> Elasticsearch (GC) -> CONSUMING -> PAUSED.\n\n**Why Beginners Should Care:** Replace JDK executor factories with an explicit `ThreadPoolExecutor` backed by a Little's-Law-sized `ArrayBlockingQueue`, and propagate backpressure via HTTP 429/503 or `KafkaConsumer.pause()`.",
+      "spark": {
+        "summary": "Java's `Executors.newFixedThreadPool(16)` looks safe because it caps worker threads at 16, but its internal `LinkedBlockingQueue` defaults to `Integer.MAX_VALUE` (`2.14 billion` tasks).",
+        "keyTakeaway": "Replace JDK executor factories with an explicit `ThreadPoolExecutor` backed by a Little's-Law-sized `ArrayBlockingQueue`, and propagate backpressure via HTTP 429/503 or `KafkaConsumer.pause()`."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why unbounded executor queues cause silent heap collapse",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why unbounded executor queues cause silent heap collapse works from first principles.",
+          "explanation": "Java's `Executors.newFixedThreadPool(16)` looks safe because it caps worker threads at 16, but its internal `LinkedBlockingQueue` defaults to `Integer.MAX_VALUE` (`2.14 billion` tasks). At `15,000 events/sec` of `8 KB` payloads, even a `45-second` downstream Elasticsearch GC pause queues `675,000` closures—demanding `5.4 GB` of heap on a `2 GB` container.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "GC thrash loops and dead `maximumPoolSize` config",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without GC thrash loops and dead `maximumPoolSize` config under real concurrency or scale.",
+          "explanation": "Unbounded queues create two severe production failures: 1. **Old-Gen OOM Crash**: `5.4 GB` of queued `Runnable` closures fills the `2,048 MiB` heap; G1GC burns 99% CPU in Full GC before pods die with `OutOfMemoryError: Java heap space`. 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Unbounded vs. Bounded Backpressure",
+            "title": "45s Elasticsearch Stall: Heap OOM vs. Bounded Shedding",
+            "actors": [
+              {
+                "id": "in",
+                "label": "HTTP / Kafka"
+              },
+              {
+                "id": "q",
+                "label": "Executor Queue"
+              },
+              {
+                "id": "es",
+                "label": "Elasticsearch (GC)"
+              }
+            ],
+            "events": [
+              {
+                "from": "in",
+                "to": "q",
+                "label": "Unbounded: 675k x 8KB = 5.4GB -> OOM",
+                "status": "fail"
+              },
+              {
+                "from": "in",
+                "to": "q",
+                "label": "Bounded ArrayBlockingQueue(2048) = 16MB",
+                "status": "ok"
+              },
+              {
+                "from": "q",
+                "to": "es",
+                "label": "ES stalls at 200/s -> queue fills in 136ms",
+                "status": "warn"
+              },
+              {
+                "from": "q",
+                "to": "in",
+                "label": "HTTP 429/503 or consumer.pause(partitions)",
+                "status": "ok"
+              }
+            ],
+            "summary": "Capping the queue at 2,048 slots (16 MB) surfaces backpressure in 136 ms instead of crashing the JVM at 45 s."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive fixes (and why blocking Kafka poll() triggers rebalance storms)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "The problem: see what breaks without Naive fixes under real concurrency or scale.",
+          "explanation": "Two naive workarounds break in production: **Blocking `queue.put()` on Kafka Consumer Thread**: If `put()` blocks longer than `max.poll.interval.ms` (`5 min`), the Kafka broker kicks the consumer out of the group, triggering endless rebalance storms. **`DiscardPolicy` with Futures**: Silently drops `CompletableFuture` tasks without completing them, hanging callers forever.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Little's-Law Queue + Upstream Pause / Fast-Fail",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Size the queue with **Little's Law (`L = λ × W`)** and propagate backpressure cleanly: **Queue Sizing (`2,048` slots = `16 MB`)**: At `15,000 events/s` and `250 ms` max acceptable queue wait (`W = 0.25 s`), `L = 3,750` -> cap at `ArrayBlockingQueue(2048)` (`~16 MB` at `8 KB/event`, well under `64 MB`). **HTTP Ingress**: Custom `RejectedExecutionHandler` fails fast with HTTP `429`/`503` + `Retry-After`.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "state-machine",
+            "eyebrow": "Kafka Backpressure Loop",
+            "title": "Bounded Queue High/Low Watermark Consumer Pause",
+            "states": [
+              {
+                "id": "run",
+                "label": "CONSUMING",
+                "sublabel": "Queue < 80% (<16 MB)",
+                "tone": "green"
+              },
+              {
+                "id": "paused",
+                "label": "PAUSED",
+                "sublabel": "consumer.pause() + poll(0) heartbeats",
+                "tone": "amber"
+              },
+              {
+                "id": "drain",
+                "label": "DRAINING",
+                "sublabel": "SIGTERM graceful awaitTermination",
+                "tone": "blue"
+              }
+            ],
+            "transitions": [
+              {
+                "from": "run",
+                "to": "paused",
+                "label": "queue full (offer false)"
+              },
+              {
+                "from": "paused",
+                "to": "run",
+                "label": "depth < 50% -> resume()"
+              },
+              {
+                "from": "run",
+                "to": "drain",
+                "label": "SIGTERM"
+              }
+            ],
+            "summary": "Pausing Kafka partitions while keeping poll(0) alive holds backlog safely on broker disks without rebalance storms."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Replace JDK executor factories with an explicit `ThreadPoolExecutor` backed by a Little's-Law-sized `ArrayBlockingQueue`, and propagate backpressure via HTTP 429/503 or `KafkaConsumer.pause()`.",
+      "summary": "`Executors.newFixedThreadPool()` defaults to an unbounded `LinkedBlockingQueue(Integer.MAX_VALUE)`, buffering millions of tasks during downstream stalls until the JVM crashes with `OutOfMemoryError`.",
+      "keyTakeaway": "When traffic spikes expose hidden coupling, replace JDK executor factories with an explicit `ThreadPoolExecutor` backed by a Little's-Law-sized `ArrayBlockingQueue`, and propagate backpressure via HTTP 429/503 or `KafkaConsumer.pause()`."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** Java's `Executors.newFixedThreadPool(16)` looks safe because it caps worker threads at 16, but its internal `LinkedBlockingQueue` defaults to `Integer.MAX_VALUE` (`2.14 billion` tasks).\n\n**Visual & Structural Flow:** Depicts 45s Elasticsearch Stall: Heap OOM vs. Bounded Shedding (HTTP / Kafka -> Executor Queue -> Elasticsearch (GC)); Bounded Queue High/Low Watermark Consumer Pause (CONSUMING -> PAUSED -> DRAINING).\n\n**Trade-Offs & Production:** Two naive workarounds break in production: **Blocking `queue.put()` on Kafka Consumer Thread**: If `put()` blocks longer than `max.poll.interval.ms` (`5 min`), the Kafka broker. Size the queue with **Little's Law (`L = λ × W`)** and propagate backpressure cleanly: **Queue Sizing (`2,048` slots = `16 MB`)**: At `15,000 events/s` and `250 ms` max acceptable.\n\n**Failure Modes & Application:** Bounded queues are mandatory at every asynchronous boundary: **Reactive Streams & Netty/gRPC**: Enforce explicit demand (`request(n)`) and high/low watermarks on write buffers.",
+      "spark": {
+        "summary": "`Executors.newFixedThreadPool()` defaults to an unbounded `LinkedBlockingQueue(Integer.MAX_VALUE)`, buffering millions of tasks during downstream stalls until the JVM crashes with `OutOfMemoryError`.",
+        "keyTakeaway": "Replace JDK executor factories with an explicit `ThreadPoolExecutor` backed by a Little's-Law-sized `ArrayBlockingQueue`, and propagate backpressure via HTTP 429/503 or `KafkaConsumer.pause()`."
+      },
+      "summary": "`Executors.newFixedThreadPool()` defaults to an unbounded `LinkedBlockingQueue(Integer.MAX_VALUE)`, buffering millions of tasks during downstream stalls until the JVM crashes with `OutOfMemoryError`.",
+      "keyTakeaway": "When traffic spikes expose hidden coupling, replace JDK executor factories with an explicit `ThreadPoolExecutor` backed by a Little's-Law-sized `ArrayBlockingQueue`, and propagate backpressure via HTTP 429/503 or `KafkaConsumer.pause()`."
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** `Executors.newFixedThreadPool()` defaults to an unbounded `LinkedBlockingQueue(Integer.MAX_VALUE)`, buffering millions of tasks during downstream stalls until the JVM crashes with `OutOfMemoryError`.\n\n**Production Trade-Offs:** Two naive workarounds break in production: **Blocking `queue.put()` on Kafka Consumer Thread**: If `put()` blocks longer than `max.poll.interval.ms` (`5 min`), the Kafka broker kicks the consumer out of the group, triggering endless rebalance storms.\n\n**Failure Modes & Edge Cases:** Bounded queues are mandatory at every asynchronous boundary: **Reactive Streams & Netty/gRPC**: Enforce explicit demand (`request(n)`) and high/low watermarks on write buffers.\n\n**Principal Takeaway:** Replace JDK executor factories with an explicit `ThreadPoolExecutor` backed by a Little's-Law-sized `ArrayBlockingQueue`, and propagate backpressure via HTTP 429/503 or `KafkaConsumer.pause()`.",
+      "spark": {
+        "summary": "`Executors.newFixedThreadPool()` defaults to an unbounded `LinkedBlockingQueue(Integer.MAX_VALUE)`, buffering millions of tasks during downstream stalls until the JVM crashes with `OutOfMemoryError`.",
+        "keyTakeaway": "Replace JDK executor factories with an explicit `ThreadPoolExecutor` backed by a Little's-Law-sized `ArrayBlockingQueue`, and propagate backpressure via HTTP 429/503 or `KafkaConsumer.pause()`."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why unbounded executor queues cause silent heap collapse",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why unbounded executor queues cause silent heap collapse works from first principles.",
+          "explanation": "Java's `Executors.newFixedThreadPool(16)` looks safe because it caps worker threads at 16, but its internal `LinkedBlockingQueue` defaults to `Integer.MAX_VALUE` (`2.14 billion` tasks). At `15,000 events/sec` of `8 KB` payloads, even a `45-second` downstream Elasticsearch GC pause queues `675,000` closures—demanding `5.4 GB` of heap on a `2 GB` container.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "GC thrash loops and dead `maximumPoolSize` config",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without GC thrash loops and dead `maximumPoolSize` config under real concurrency or scale.",
+          "explanation": "Unbounded queues create two severe production failures:\n\n1. **Old-Gen OOM Crash**: `5.4 GB` of queued `Runnable` closures fills the `2,048 MiB` heap; G1GC burns 99% CPU in Full GC before pods die with `OutOfMemoryError: Java heap space`.\n2. **Dead `maximumPoolSize`**: `ThreadPoolExecutor` only scales past `corePoolSize` *after* the queue is full—so an unbounded queue silently pins the pool at `corePoolSize` forever.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Unbounded vs. Bounded Backpressure",
+            "title": "45s Elasticsearch Stall: Heap OOM vs. Bounded Shedding",
+            "actors": [
+              {
+                "id": "in",
+                "label": "HTTP / Kafka"
+              },
+              {
+                "id": "q",
+                "label": "Executor Queue"
+              },
+              {
+                "id": "es",
+                "label": "Elasticsearch (GC)"
+              }
+            ],
+            "events": [
+              {
+                "from": "in",
+                "to": "q",
+                "label": "Unbounded: 675k x 8KB = 5.4GB -> OOM",
+                "status": "fail"
+              },
+              {
+                "from": "in",
+                "to": "q",
+                "label": "Bounded ArrayBlockingQueue(2048) = 16MB",
+                "status": "ok"
+              },
+              {
+                "from": "q",
+                "to": "es",
+                "label": "ES stalls at 200/s -> queue fills in 136ms",
+                "status": "warn"
+              },
+              {
+                "from": "q",
+                "to": "in",
+                "label": "HTTP 429/503 or consumer.pause(partitions)",
+                "status": "ok"
+              }
+            ],
+            "summary": "Capping the queue at 2,048 slots (16 MB) surfaces backpressure in 136 ms instead of crashing the JVM at 45 s."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive fixes (and why blocking Kafka poll() triggers rebalance storms)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "The problem: see what breaks without Naive fixes under real concurrency or scale.",
+          "explanation": "Two naive workarounds break in production:\n\n- **Blocking `queue.put()` on Kafka Consumer Thread**: If `put()` blocks longer than `max.poll.interval.ms` (`5 min`), the Kafka broker kicks the consumer out of the group, triggering endless rebalance storms.\n- **`DiscardPolicy` with Futures**: Silently drops `CompletableFuture` tasks without completing them, hanging callers forever.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Little's-Law Queue + Upstream Pause / Fast-Fail",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Size the queue with **Little's Law (`L = λ × W`)** and propagate backpressure cleanly:\n\n- **Queue Sizing (`2,048` slots = `16 MB`)**: At `15,000 events/s` and `250 ms` max acceptable queue wait (`W = 0.25 s`), `L = 3,750` -> cap at `ArrayBlockingQueue(2048)` (`~16 MB` at `8 KB/event`, well under `64 MB`).\n- **HTTP Ingress**: Custom `RejectedExecutionHandler` fails fast with HTTP `429`/`503` + `Retry-After`.\n- **Kafka Ingress**: When `queue.offer(task, 50, MILLISECONDS)` returns `false`, call `consumer.pause(partitions)` while continuing lightweight `poll(0)` heartbeats; `consumer.resume()` once queue depth drops below 50%.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "state-machine",
+            "eyebrow": "Kafka Backpressure Loop",
+            "title": "Bounded Queue High/Low Watermark Consumer Pause",
+            "states": [
+              {
+                "id": "run",
+                "label": "CONSUMING",
+                "sublabel": "Queue < 80% (<16 MB)",
+                "tone": "green"
+              },
+              {
+                "id": "paused",
+                "label": "PAUSED",
+                "sublabel": "consumer.pause() + poll(0) heartbeats",
+                "tone": "amber"
+              },
+              {
+                "id": "drain",
+                "label": "DRAINING",
+                "sublabel": "SIGTERM graceful awaitTermination",
+                "tone": "blue"
+              }
+            ],
+            "transitions": [
+              {
+                "from": "run",
+                "to": "paused",
+                "label": "queue full (offer false)"
+              },
+              {
+                "from": "paused",
+                "to": "run",
+                "label": "depth < 50% -> resume()"
+              },
+              {
+                "from": "run",
+                "to": "drain",
+                "label": "SIGTERM"
+              }
+            ],
+            "summary": "Pausing Kafka partitions while keeping poll(0) alive holds backlog safely on broker disks without rebalance storms."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where bounded queues and backpressure are used",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Bounded queues are mandatory at every asynchronous boundary:\n\n- **Reactive Streams & Netty/gRPC**: Enforce explicit demand (`request(n)`) and high/low watermarks on write buffers.\n- **Kafka & Log Pipelines**: Pause partition consumption during downstream Elasticsearch/ClickHouse slowdowns so backlog stays on durable broker disks.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Replace JDK executor factories with an explicit `ThreadPoolExecutor` backed by a Little's-Law-sized `ArrayBlockingQueue`, and propagate backpressure via HTTP 429/503 or `KafkaConsumer.pause()`.",
+      "summary": "`Executors.newFixedThreadPool()` defaults to an unbounded `LinkedBlockingQueue(Integer.MAX_VALUE)`, buffering millions of tasks during downstream stalls until the JVM crashes with `OutOfMemoryError`.",
+      "keyTakeaway": "When traffic spikes expose hidden coupling, replace JDK executor factories with an explicit `ThreadPoolExecutor` backed by a Little's-Law-sized `ArrayBlockingQueue`, and propagate backpressure via HTTP 429/503 or `KafkaConsumer.pause()`."
+    }
+  },
+  "pedagogicalFramework": "CLASSE",
+  "simulation": {
+    "title": "Bounding Task Queues to Prevent Heap OOM — Interactive Execution Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Workload & Budget"
+      },
+      {
+        "id": "router",
+        "label": "Gateway / Router",
+        "role": "Admission & Dispatch"
+      },
+      {
+        "id": "engine",
+        "label": "Core Engine",
+        "role": "Primary Execution"
+      },
+      {
+        "id": "replica",
+        "label": "Replica / Fallback",
+        "role": "Durability & Recovery"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "router",
+        "label": "request"
+      },
+      {
+        "from": "router",
+        "to": "engine",
+        "label": "route"
+      },
+      {
+        "from": "engine",
+        "to": "replica",
+        "label": "sync / fallback"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why unbounded executor queues cause silent heap collapse",
+        "actionLabel": "Dispatch nominal request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "router"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "Ingress",
+          "p99_ms": 8,
+          "error_rate": "0.0%"
+        },
+        "explanation": "Caller sends work into the gateway with explicit timeout and concurrency bounds (Why unbounded executor queues cause silent heap collapse)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "GC thrash loops and dead `maximumPoolSize` config",
+        "actionLabel": "Execute core invariant",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "Core Path",
+          "p99_ms": 18,
+          "in_flight": 124
+        },
+        "explanation": "The core engine processes the hot path while keeping state transitions deterministic (GC thrash loops and dead `maximumPoolSize` config)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Naive fixes (and why blocking Kafka poll() triggers rebalanc",
+        "actionLabel": "Detect skew or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Degraded",
+          "p99_ms": 64,
+          "retries_capped": "true"
+        },
+        "explanation": "Under load or replica lag, bounded backoff and isolation prevent cascading saturation (Naive fixes (and why blocking Kafka poll() triggers rebalance storms))."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Where bounded queues and backpressure are used",
+        "actionLabel": "Converge & restore SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 11,
+          "drift": 0
+        },
+        "explanation": "State converges cleanly and telemetry confirms the system returned within its SLO envelope (Where bounded queues and backpressure are used)."
+      }
+    ]
+  }
+}

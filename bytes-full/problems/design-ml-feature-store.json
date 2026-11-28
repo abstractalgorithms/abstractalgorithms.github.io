@@ -1,0 +1,784 @@
+{
+  "version": 3,
+  "slug": "design-ml-feature-store",
+  "title": "Design an Enterprise ML Feature Store (100K QPS, <5ms p99)",
+  "domain": "ai-machine-learning",
+  "spark": {
+    "summary": "Design a multi-tenant Enterprise ML Feature Store supporting 100K+ online QPS at <5ms p99 latency, petabyte-scale point-in-time training dataset generation, and zero training-serving skew.",
+    "keyTakeaway": "To keep serving pipelines predictable under bursty prompts, <5ms p99), separate the hot Redis serving plane from the immutable Iceberg history plane, connected by a single declarative Flink/Spark registry.",
+    "byteSummary": "An enterprise ML organization with 50+ models needs a unified Feature Store that serves 100,000 feature-vector lookups per second under a 5ms p99 SLA while enabling data scientists to generate leak-free training datasets over 2 years of historical events.\n\nThe core architectural challenge is maintaining strict semantic parity between streaming online features (5-minute velocity counters) and batch offline training tables without duplicating business logic or causing tail-latency spikes during backfills.\n\nBy combining Kafka event ingestion, Flink RocksDB stateful aggregations, a Dual-Sink Materializer (Redis Cluster + Apache Iceberg), and a Git-versioned Feature Registry, the platform delivers sub-5ms online reads and deterministic ASOF training joins."
+  },
+  "learningJourney": [
+    {
+      "id": "stage-1",
+      "stageNumber": 1,
+      "level": "foundation",
+      "title": "Requirements & Capacity Envelope",
+      "purpose": "Quantify QPS, payload sizes, Redis RAM footprint, and offline storage growth.",
+      "explanation": {
+        "foundation": "At 100K QPS with 50 features per entity (~400 bytes Protobuf), online egress is 40 MB/s.",
+        "core": "Storing 100M active entities requires ~40 GB raw data (~120 GB with Redis Cluster overhead and replication), easily fitting in a 6-shard RAM cluster.",
+        "deepDive": "Offline Iceberg grows at ~5 TB/day."
+      },
+      "codeExample": "def estimate_redis_ram_gb(entities=100_000_000, bytes_per_entity=400, repl_factor=2):\n    raw_gb = (entities * bytes_per_entity) / (1024 ** 3)\n    return round(raw_gb * repl_factor * 1.35, 2)  # 35% allocator & dict overhead",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Capacity Math",
+        "title": "100K QPS Online & PB-Scale Offline Sizing",
+        "nodes": [
+          {
+            "id": "qps",
+            "label": "100K QPS Ingress",
+            "sub": "40 MB/s Protobuf egress",
+            "role": "Online throughput"
+          },
+          {
+            "id": "ram",
+            "label": "Redis 6-Shard Cluster",
+            "sub": "~100 GB RAM w/ 2x repl",
+            "role": "Hot state budget"
+          },
+          {
+            "id": "ice",
+            "label": "Iceberg S3 Lakehouse",
+            "sub": "5 TB/day Zstd Parquet",
+            "role": "Cold history"
+          },
+          {
+            "id": "sla",
+            "label": "5ms p99 Budget",
+            "sub": "1ms net + 2ms Redis + 2ms app",
+            "role": "Latency envelope"
+          }
+        ],
+        "edges": [
+          {
+            "from": "qps",
+            "to": "ram",
+            "label": "Hits 6-shard cluster"
+          },
+          {
+            "from": "ram",
+            "to": "sla",
+            "label": "Meets <5ms p99"
+          },
+          {
+            "from": "ice",
+            "to": "sla",
+            "label": "Isolates heavy scans"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Memory Budget",
+            "detail": "100M entities x 400B x 2x replication + 35% overhead = ~100 GB RAM."
+          },
+          {
+            "label": "Workload Isolation",
+            "detail": "Training scans never touch Redis; they read Zstd-compressed Iceberg."
+          }
+        ],
+        "summary": "Back-of-the-envelope sizing confirms 100M active entities fit in a modest 6-shard Redis Cluster.",
+        "caption": "Sizing online RAM separately from cold Iceberg storage prevents training jobs from starving inference."
+      }
+    },
+    {
+      "id": "stage-2",
+      "stageNumber": 2,
+      "level": "foundation",
+      "title": "High-Level Dual-Plane Architecture",
+      "purpose": "Connect Kafka streams and batch lakes to online Redis and offline Iceberg.",
+      "explanation": {
+        "foundation": "Think of **High-Level Dual-Plane Architecture** as the intuition layer for Design an Enterprise ML Feature Store (100K QPS, <5ms p99): Connect Kafka streams and batch lakes to online Redis and offline Iceberg.",
+        "core": "Kafka ingests real-time domain events while S3/GCS holds batch tables. Flink runs stateful sliding-window aggregations and writes to a Dual-Sink Materializer: Redis Cluster for real-time inference and Apache Iceberg for point-in-time historical storage.",
+        "deepDive": "Under heavy load or partial failure, high-level dual-plane architecture becomes a critical lever for predictable latency and correctness. End-to-end architecture for multi-tenant ML feature platforms covering adaptive backfill throttling, event-time watermarks, and automated PSI drift fallback."
+      },
+      "codeExample": "class FeatureMaterializer:\n    def publish(self, entity_id, vector, ts):\n        if not entity_id or ts <= 0:\n            raise ValueError('Invalid entity or timestamp')\n        self.redis_sink.upsert(entity_id, vector)\n        self.iceberg_sink.append(entity_id, vector, ts)",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "System Blueprint",
+        "title": "Dual-Plane Feature Store Architecture",
+        "nodes": [
+          {
+            "id": "src",
+            "label": "Kafka + S3 Data Lakes",
+            "sub": "Streams & batch tables",
+            "role": "Ingestion tier"
+          },
+          {
+            "id": "flk",
+            "label": "Flink Stateful Ingest",
+            "sub": "Sliding-window compute",
+            "role": "Unified processor"
+          },
+          {
+            "id": "mat",
+            "label": "Dual-Write Materializer",
+            "sub": "Redis + Iceberg sinks",
+            "role": "Parity bridge"
+          },
+          {
+            "id": "srv",
+            "label": "Inference & Training APIs",
+            "sub": "gRPC + Spark ASOF",
+            "role": "Consumption tier"
+          }
+        ],
+        "edges": [
+          {
+            "from": "src",
+            "to": "flk",
+            "label": "Feeds raw events"
+          },
+          {
+            "from": "flk",
+            "to": "mat",
+            "label": "Emits feature vectors"
+          },
+          {
+            "from": "mat",
+            "to": "srv",
+            "label": "Serves online & offline"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Single Compute Path",
+            "detail": "Flink Kappa-style processing handles both real-time and replay streams."
+          },
+          {
+            "label": "Typed Contracts",
+            "detail": "Protobuf schemas enforce strict type compatibility across producers and consumers."
+          }
+        ],
+        "summary": "A unified Flink materializer feeds both the low-latency Redis online plane and the Iceberg offline plane.",
+        "caption": "Dual-plane separation ensures sub-5ms online reads while preserving full historical auditability."
+      },
+      "decisionFramework": {
+        "problem": "How to implement Design an Enterprise ML Feature Store (100K QPS, <5ms p99) without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "To keep serving pipelines predictable under bursty prompts, <5ms p99), separate the hot Redis serving plane from the immutable Iceberg history plane, connected by a single declarative Flink/Spark registry.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Design an Enterprise ML Feature Store (100K QPS, <5ms p99) experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-3",
+      "stageNumber": 3,
+      "level": "intermediate",
+      "title": "Point-in-Time Training Set Generation",
+      "purpose": "Execute scalable ASOF joins across petabytes of Iceberg snapshots.",
+      "explanation": {
+        "foundation": "Think of **Point-in-Time Training Set Generation** as the intuition layer for Design an Enterprise ML Feature Store (100K QPS, <5ms p99): Execute scalable ASOF joins across petabytes of Iceberg snapshots.",
+        "core": "Naively joining 100M labels with 50B feature rows causes a massive shuffle. Partitioning both tables by entity_id hash bucket and event date, and performing a Spark sort-merge ASOF join with a bounded 30-day lookback window reduces shuffle I/O by 90%.",
+        "deepDive": "Under heavy load or partial failure, point-in-time training set generation becomes a critical lever for predictable latency and correctness. End-to-end architecture for multi-tenant ML feature platforms covering adaptive backfill throttling, event-time watermarks, and automated PSI drift fallback."
+      },
+      "codeExample": "def asof_join_partitioned(labels_df, features_df, lookback_days=30):\n    return labels_df.join(\n        features_df,\n        (labels_df.entity_id == features_df.entity_id) &\n        (features_df.ts <= labels_df.ts) &\n        (features_df.ts >= labels_df.ts - F.expr(f'INTERVAL {lookback_days} DAYS')),\n        how='left'\n    )",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Offline Engine",
+        "title": "Bucketed Sort-Merge ASOF Join in Spark",
+        "nodes": [
+          {
+            "id": "lbl",
+            "label": "Label Spine (100M)",
+            "sub": "Bucketed by entity_id",
+            "role": "Query driver"
+          },
+          {
+            "id": "ice",
+            "label": "Iceberg Partitions",
+            "sub": "30-day pruned scan",
+            "role": "Feature history"
+          },
+          {
+            "id": "smj",
+            "label": "Sort-Merge ASOF",
+            "sub": "Zero-shuffle co-located",
+            "role": "Temporal join"
+          },
+          {
+            "id": "out",
+            "label": "Training Parquet",
+            "sub": "Sharded TFRecord/Parquet",
+            "role": "Model input"
+          }
+        ],
+        "edges": [
+          {
+            "from": "lbl",
+            "to": "smj",
+            "label": "Streams sorted labels"
+          },
+          {
+            "from": "ice",
+            "to": "smj",
+            "label": "Prunes by date & bucket"
+          },
+          {
+            "from": "smj",
+            "to": "out",
+            "label": "Writes training shards"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Co-Located Bucketing",
+            "detail": "Matching Iceberg bucket counts on entity_id eliminates wide Spark shuffles."
+          },
+          {
+            "label": "Bounded Lookback",
+            "detail": "A 30-day TTL window prevents scanning years of cold partitions."
+          }
+        ],
+        "summary": "Bucketed Iceberg tables and bounded lookback windows make petabyte ASOF joins fast and cheap.",
+        "caption": "Co-partitioning labels and features by entity_id avoids expensive all-to-all shuffles."
+      }
+    },
+    {
+      "id": "stage-4",
+      "stageNumber": 4,
+      "level": "intermediate",
+      "title": "Online Serving, Caching & Circuit Breakers",
+      "purpose": "Guarantee <5ms p99 inference latency even during Redis node failovers.",
+      "explanation": {
+        "foundation": "Think of **Online Serving, Caching & Circuit Breakers** as the intuition layer for Design an Enterprise ML Feature Store (100K QPS, <5ms p99): Guarantee <5ms p99 inference latency even during Redis node failovers.",
+        "core": "The Real-Time Inference API batches multi-entity lookups into pipelined Redis MGETs with a strict 3.5ms socket timeout. A local Caffeine L1 cache absorbs hot-key spikes (e.g., viral merchants), and a circuit breaker falls back to default feature medians if Redis errors exceed 1%.",
+        "deepDive": "Under heavy load or partial failure, online serving, caching & circuit breakers becomes a critical lever for predictable latency and correctness. End-to-end architecture for multi-tenant ML feature platforms covering adaptive backfill throttling, event-time watermarks, and automated PSI drift fallback."
+      },
+      "codeExample": "def get_online_vector_safe(entity_id):\n    cached = l1_cache.get(entity_id)\n    if cached is not None:\n        return cached\n    try:\n        vec = redis_breaker.call(redis_client.get, f'fv:{entity_id}')\n        l1_cache.set(entity_id, vec, ttl=0.5)\n        return vec\n    except CircuitBreakerOpenError:\n        return FALLBACK_MEDIANS",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Low-Latency Serving",
+        "title": "Multi-Tier Online Serving with Circuit Breaker",
+        "nodes": [
+          {
+            "id": "api",
+            "label": "Inference gRPC Gateway",
+            "sub": "100K QPS fan-in",
+            "role": "Request router"
+          },
+          {
+            "id": "l1",
+            "label": "L1 In-Process Cache",
+            "sub": "500ms TTL hot-key shield",
+            "role": "Spike absorber"
+          },
+          {
+            "id": "rds",
+            "label": "Redis Cluster",
+            "sub": "Replica-read enabled",
+            "role": "Distributed KV"
+          },
+          {
+            "id": "cb",
+            "label": "Circuit Breaker",
+            "sub": "3.5ms timeout -> medians",
+            "role": "Resilience gate"
+          }
+        ],
+        "edges": [
+          {
+            "from": "api",
+            "to": "l1",
+            "label": "Checks local RAM"
+          },
+          {
+            "from": "l1",
+            "to": "rds",
+            "label": "Pipelined MGET"
+          },
+          {
+            "from": "rds",
+            "to": "cb",
+            "label": "Trips on >1% errors"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Hot-Key Protection",
+            "detail": "500ms L1 caching prevents single viral entities from saturating one Redis shard."
+          },
+          {
+            "label": "Fast Failover",
+            "detail": "3.5ms timeouts protect upstream checkout/bidding SLAs."
+          }
+        ],
+        "summary": "L1 caching and circuit-breaker fallbacks keep online feature reads under 5ms p99.",
+        "caption": "Serving resilience relies on bounding tail latency rather than blocking for stale retries."
+      }
+    },
+    {
+      "id": "stage-5",
+      "stageNumber": 5,
+      "level": "intermediate",
+      "title": "Flink Stateful Sliding Windows & Late Events",
+      "purpose": "Handle out-of-order mobile telemetry without corrupting real-time counters.",
+      "explanation": {
+        "foundation": "Think of **Flink Stateful Sliding Windows & Late Events** as the intuition layer for Design an Enterprise ML Feature Store (100K QPS, <5ms p99): Handle out-of-order mobile telemetry without corrupting real-time counters.",
+        "core": "Mobile events often arrive 30–120 seconds late. Flink uses event-time watermarks with a 2-minute allowed lateness window in RocksDB, emitting updated aggregates to Redis while routing events beyond 2 minutes to a side-output for offline Iceberg correction.",
+        "deepDive": "Under heavy load or partial failure, flink stateful sliding windows & late events becomes a critical lever for predictable latency and correctness. End-to-end architecture for multi-tenant ML feature platforms covering adaptive backfill throttling, event-time watermarks, and automated PSI drift fallback."
+      },
+      "codeExample": "watermark_strategy = (\n    WatermarkStrategy\n    .for_bounded_out_of_orderness(Duration.of_seconds(120))\n    .with_timestamp_assigner(lambda e, _: e['event_ts'])\n)",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stream Semantics",
+        "title": "Event-Time Watermarks & Late-Data Side Output",
+        "nodes": [
+          {
+            "id": "wm",
+            "label": "Bounded Watermark",
+            "sub": "120s out-of-orderness",
+            "role": "Event-time clock"
+          },
+          {
+            "id": "rdb",
+            "label": "RocksDB State",
+            "sub": "Incremental checkpoints",
+            "role": "Window memory"
+          },
+          {
+            "id": "out",
+            "label": "Redis Upsert",
+            "sub": "Updated window value",
+            "role": "Online sync"
+          },
+          {
+            "id": "side",
+            "label": "Late Side-Output",
+            "sub": ">120s events -> Iceberg",
+            "role": "Offline repair"
+          }
+        ],
+        "edges": [
+          {
+            "from": "wm",
+            "to": "rdb",
+            "label": "Triggers window eval"
+          },
+          {
+            "from": "rdb",
+            "to": "out",
+            "label": "Emits timely updates"
+          },
+          {
+            "from": "wm",
+            "to": "side",
+            "label": "Diverts expired events"
+          }
+        ],
+        "cards": [
+          {
+            "label": "RocksDB Spillover",
+            "detail": "Disk-backed RocksDB state supports 100M+ active window keys without JVM OOM."
+          },
+          {
+            "label": "Side-Output Repair",
+            "detail": "Ultra-late events still land in Iceberg for accurate offline training."
+          }
+        ],
+        "summary": "Event-time watermarks and side-outputs balance real-time accuracy with offline completeness.",
+        "caption": "Bounded lateness prevents unbounded state growth in Flink RocksDB."
+      }
+    },
+    {
+      "id": "stage-6",
+      "stageNumber": 6,
+      "level": "advanced",
+      "title": "Feature Drift Monitoring & Automated Remediation",
+      "purpose": "Detect distribution shifts and stale pipelines before model accuracy collapses.",
+      "explanation": {
+        "foundation": "Think of **Feature Drift Monitoring & Automated Remediation** as the intuition layer for Design an Enterprise ML Feature Store (100K QPS, <5ms p99): Detect distribution shifts and stale pipelines before model accuracy collapses.",
+        "core": "A Feature Drift Monitor computes hourly Population Stability Index (PSI) and null-rate checks on 1% sampled serving vectors. If a Flink job lags or a feature's null rate spikes above 5%, automated alerts fire and the Inference API shifts traffic to a fallback baseline model.",
+        "deepDive": "Under heavy load or partial failure, feature drift monitoring & automated remediation becomes a critical lever for predictable latency and correctness. End-to-end architecture for multi-tenant ML feature platforms covering adaptive backfill throttling, event-time watermarks, and automated PSI drift fallback."
+      },
+      "codeExample": "def evaluate_feature_health(null_rate, psi, lag_sec):\n    if null_rate > 0.05 or psi > 0.25 or lag_sec > 300:\n        model_router.enable_fallback_policy('baseline_v1')\n        return 'DEGRADED'\n    return 'HEALTHY'",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Observability",
+        "title": "Drift Monitor & Automated Model Fallback",
+        "nodes": [
+          {
+            "id": "log",
+            "label": "1% Inference Sample",
+            "sub": "Served feature vectors",
+            "role": "Telemetry source"
+          },
+          {
+            "id": "mon",
+            "label": "Drift & Lag Monitor",
+            "sub": "PSI, null-rate, Flink lag",
+            "role": "Anomaly detector"
+          },
+          {
+            "id": "rtr",
+            "label": "Model Traffic Router",
+            "sub": "Shifts to safe baseline",
+            "role": "Blast-radius control"
+          },
+          {
+            "id": "rep",
+            "label": "Auto-Backfill Trigger",
+            "sub": "Re-hydrates Redis keys",
+            "role": "Self-healing"
+          }
+        ],
+        "edges": [
+          {
+            "from": "log",
+            "to": "mon",
+            "label": "Streams live stats"
+          },
+          {
+            "from": "mon",
+            "to": "rtr",
+            "label": "Triggers baseline fallback"
+          },
+          {
+            "from": "mon",
+            "to": "rep",
+            "label": "Launches repair job"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Multi-Signal Health",
+            "detail": "Combine PSI drift, null-rate spikes, and Kafka consumer lag."
+          },
+          {
+            "label": "Safe Fallback",
+            "detail": "Routing to a simpler model without the broken feature preserves revenue."
+          }
+        ],
+        "summary": "Automated drift detection pairs statistical PSI checks with instant fallback routing.",
+        "caption": "Detecting feature degradation early prevents silent revenue loss from stale ML predictions."
+      }
+    },
+    {
+      "id": "stage-7",
+      "stageNumber": 7,
+      "level": "advanced",
+      "title": "Multi-Tenant Isolation & Backfill Throttling",
+      "purpose": "Prevent massive historical backfills from saturating live online Redis shards.",
+      "explanation": {
+        "foundation": "Think of **Multi-Tenant Isolation & Backfill Throttling** as the intuition layer for Design an Enterprise ML Feature Store (100K QPS, <5ms p99): Prevent massive historical backfills from saturating live online Redis shards.",
+        "core": "When teams backfill 90 days of features into Redis, naive writes can trigger 500K+ write OPS and spike p99 read latency. Token-bucket rate limiters throttle backfill writers based on live Redis CPU/latency headroom, pausing automatically if read p99 crosses 3ms.",
+        "deepDive": "Under heavy load or partial failure, multi-tenant isolation & backfill throttling becomes a critical lever for predictable latency and correctness. End-to-end architecture for multi-tenant ML feature platforms covering adaptive backfill throttling, event-time watermarks, and automated PSI drift fallback."
+      },
+      "codeExample": "def adaptive_backfill_write(batch, redis_monitor):\n    if redis_monitor.read_p99_ms() > 3.0:\n        time.sleep(0.25)  # Backoff to protect live inference\n    rate_limiter.acquire(len(batch))\n    redis_client.pipeline_set(batch)",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Multi-Tenancy",
+        "title": "Adaptive Backfill Throttling on Live Redis",
+        "nodes": [
+          {
+            "id": "spk",
+            "label": "Spark Backfill Writers",
+            "sub": "Bulk key hydration",
+            "role": "Background load"
+          },
+          {
+            "id": "tb",
+            "label": "Token-Bucket Limiter",
+            "sub": "Adaptive write quota",
+            "role": "Throttle gate"
+          },
+          {
+            "id": "mon",
+            "label": "Redis p99 Feedback",
+            "sub": "3ms read SLA sensor",
+            "role": "Backpressure signal"
+          },
+          {
+            "id": "rds",
+            "label": "Online Redis Cluster",
+            "sub": "Protected live reads",
+            "role": "Shared serving tier"
+          }
+        ],
+        "edges": [
+          {
+            "from": "spk",
+            "to": "tb",
+            "label": "Requests write tokens"
+          },
+          {
+            "from": "mon",
+            "to": "tb",
+            "label": "Shrinks quota if p99 > 3ms"
+          },
+          {
+            "from": "tb",
+            "to": "rds",
+            "label": "Flushes paced writes"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Read-Priority QoS",
+            "detail": "Live inference reads always preempt background backfill writes."
+          },
+          {
+            "label": "Dedicated Bulk Pipeline",
+            "detail": "Use Redis RDB/snapshot pre-warming for >100M key initial loads."
+          }
+        ],
+        "summary": "Adaptive token-bucket throttling protects live inference SLAs during heavy feature backfills.",
+        "caption": "Feedback-driven rate limiting lets background hydrations share Redis safely with production traffic."
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-1",
+        "question": "You need to backfill 100M historical user feature vectors into the live Redis Cluster serving 100K QPS at <5ms p99. What is the safest way to avoid degrading live inference?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Disable Redis persistence and run unthrottled parallel Spark writes",
+            "correct": false,
+            "feedback": "Unthrottled bulk writes will saturate Redis single-threaded event loops and spike read p99."
+          },
+          {
+            "id": "b",
+            "text": "Use adaptive token-bucket throttling driven by live Redis p99 read latency feedback",
+            "correct": true,
+            "feedback": "Correct! Feedback-driven rate limiting backs off automatically whenever read p99 approaches the SLA."
+          },
+          {
+            "id": "c",
+            "text": "Flush the entire Redis cluster first and let inference repopulate it",
+            "correct": false,
+            "feedback": "Flushing Redis causes 100% cache misses and breaks all live ML models."
+          },
+          {
+            "id": "d",
+            "text": "Run the backfill directly inside the synchronous inference gRPC handler",
+            "correct": false,
+            "feedback": "Synchronous backfills inside inference would violate the 5ms SLA immediately."
+          }
+        ],
+        "explanation": "Adaptive throttling based on live Redis p99 read latency protects production inference while hydrating historical keys."
+      },
+      {
+        "id": "kc-2",
+        "question": "How do you eliminate expensive all-to-all Spark shuffles when running a point-in-time ASOF join between 100M labels and 50B historical feature rows in Apache Iceberg?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Co-partition/bucket both tables by entity_id and apply a bounded lookback date filter",
+            "correct": true,
+            "feedback": "Correct! Matching Iceberg bucket layouts on entity_id enables local sort-merge ASOF joins without wide shuffles."
+          },
+          {
+            "id": "b",
+            "text": "Load all 50B feature rows into driver memory using broadcast()",
+            "correct": false,
+            "feedback": "50B rows will immediately OOM the Spark driver."
+          },
+          {
+            "id": "c",
+            "text": "Replace the ASOF join with a cross join and filter afterward",
+            "correct": false,
+            "feedback": "A cross join explodes to 5e18 combinations and will never complete."
+          },
+          {
+            "id": "d",
+            "text": "Query Redis MGET from inside Spark executors for historical timestamps",
+            "correct": false,
+            "feedback": "Redis only stores the latest feature state, not historical point-in-time snapshots."
+          }
+        ],
+        "explanation": "Co-bucketing by entity_id and pruning partitions with a bounded lookback window enables shuffle-free sort-merge ASOF joins."
+      },
+      {
+        "id": "kc-3",
+        "question": "A viral celebrity triggers 15,000 QPS for a single merchant_id key in Redis, causing one shard's CPU to hit 100%. Which pattern mitigates this hot-key bottleneck?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Increase the Kafka partition count",
+            "correct": false,
+            "feedback": "Kafka partitions affect ingestion, not read hot-keys in Redis."
+          },
+          {
+            "id": "b",
+            "text": "Switch from Protobuf to JSON",
+            "correct": false,
+            "feedback": "JSON is larger and slower to parse than Protobuf, worsening shard CPU."
+          },
+          {
+            "id": "c",
+            "text": "Add a short-TTL (e.g., 500ms) in-process L1 cache in the inference service",
+            "correct": true,
+            "feedback": "Correct! A 500ms L1 cache collapses 15,000 QPS on a hot key down to ~2 QPS per inference pod."
+          },
+          {
+            "id": "d",
+            "text": "Increase the Iceberg compaction target file size",
+            "correct": false,
+            "feedback": "Iceberg file size has no effect on online Redis hot-key reads."
+          }
+        ],
+        "explanation": "A sub-second in-process L1 cache absorbs extreme read skew on hot keys without violating freshness."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Learn how to design a central ML Feature Store that serves live predictions in under 5ms while storing years of history for model training.",
+      "keyTakeaway": "To keep serving pipelines predictable under bursty prompts, <5ms p99), separate the hot Redis serving plane from the immutable Iceberg history plane, connected by a single declarative Flink/Spark registry.",
+      "byteSummary": "An enterprise ML Feature Store gives every model team a fast, reliable way to look up user and item stats.\n\nInstead of every team building their own database queries, a shared Flink pipeline writes live stats to Redis for fast predictions and saves history to Iceberg for training."
+    },
+    "intermediate": {
+      "summary": "Architect a 100K QPS Feature Store using Kafka, Flink RocksDB windows, Redis Cluster (<5ms p99), and bucketed Iceberg ASOF joins.",
+      "keyTakeaway": "To keep serving pipelines predictable under bursty prompts, <5ms p99), separate the hot Redis serving plane from the immutable Iceberg history plane, connected by a single declarative Flink/Spark registry.",
+      "byteSummary": "To serve 100K QPS under 5ms p99, pack feature views into single Protobuf Redis keys, shield hot keys with a 500ms L1 cache, and enforce 3.5ms circuit-breaker timeouts.\n\nOffline, bucketed Iceberg tables enable shuffle-free ASOF joins with bounded lookback windows."
+    },
+    "advanced": {
+      "summary": "End-to-end architecture for multi-tenant ML feature platforms covering adaptive backfill throttling, event-time watermarks, and automated PSI drift fallback.",
+      "keyTakeaway": "To keep serving pipelines predictable under bursty prompts, <5ms p99), separate the hot Redis serving plane from the immutable Iceberg history plane, connected by a single declarative Flink/Spark registry.",
+      "byteSummary": "Production feature stores must survive late mobile telemetry, hot-key spikes, and massive historical backfills simultaneously.\n\nUse Flink 120s bounded watermarks with late side-outputs, adaptive token-bucket backfill limiters tied to Redis p99 feedback, and automated PSI drift monitors."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "prerequisites": [
+    {
+      "title": "Point-in-Time ML Feature Store & ASOF Joins",
+      "summary": "A Point-in-Time ML Feature Store eliminates training-serving skew and temporal data leakage by pairing a low-latency online key-value store with an immutable offline time-travel lakehouse queried via ASOF joins."
+    }
+  ],
+  "simulation": {
+    "title": "Design an Enterprise ML Feature Store (100K QPS, <5ms p99) — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Input Workload"
+      },
+      {
+        "id": "entry",
+        "label": "Router / API",
+        "role": "Admission Control"
+      },
+      {
+        "id": "worker",
+        "label": "Processor",
+        "role": "Domain Logic"
+      },
+      {
+        "id": "store",
+        "label": "State Layer",
+        "role": "Durable Store"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "entry",
+        "label": "request"
+      },
+      {
+        "from": "entry",
+        "to": "worker",
+        "label": "dispatch"
+      },
+      {
+        "from": "worker",
+        "to": "store",
+        "label": "read/write"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Requirements & Capacity Envelope",
+        "actionLabel": "request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "entry"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "request",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Caller sends work to Router / API (Requirements & Capacity Envelope)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "High-Level Dual-Plane Architecture",
+        "actionLabel": "dispatch",
+        "status": "healthy",
+        "activeNodeIds": [
+          "entry",
+          "worker"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "dispatch",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Router / API coordinates with Processor while preserving the core invariant (High-Level Dual-Plane Architecture)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Point-in-Time Training Set Generation",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "worker",
+          "store"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, State Layer absorbs pressure without cascading (Point-in-Time Training Set Generation)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Multi-Tenant Isolation & Backfill Throttling",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "entry",
+          "worker",
+          "store"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Multi-Tenant Isolation & Backfill Throttling)."
+      }
+    ]
+  }
+}

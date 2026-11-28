@@ -1,0 +1,789 @@
+{
+  "id": "raft-consensus-safety",
+  "slug": "raft-consensus-safety",
+  "title": "Raft Consensus & Leader Election Safety",
+  "problemType": "architecture",
+  "difficulty": "hard",
+  "prompt": "You are designing a 5-node strongly consistent metadata store (etcd/Consul-style) using Raft across 3 availability zones (RTT 2 ms intra-AZ, 15 ms cross-AZ). During asymmetric network partitions and leader crashes, a naive implementation lost committed keys (the Raft Figure 8 anomaly) and served stale reads from deposed leaders. Design the Raft state transitions, commit rules, `ReadIndex` linearizable read path, and snapshotting invariants to guarantee zero split-brain and strict linearizability.",
+  "spark": {
+    "summary": "Raft guarantees state-machine safety across crash and network partitions through five strict invariants—Election Safety, Leader Append-Only, Log Matching, Leader Completeness, and State Machine Safety—all of which break if term/commit rules are shortcut.",
+    "keyTakeaway": "When a single bottleneck threatens end-to-end availability, never commit log entries from a previous term by counting replicas alone (Figure 8 bug); a leader may only advance `commitIndex` for entries from its `currentTerm`, and linearizable reads require `ReadIndex` quorum heartbeats.",
+    "byteSummary": "**Core Mechanics:** A 5-node metadata store (etcd/Consul-style) across 3 AZs (`15 ms` cross-AZ RTT) relies on Raft for linearizable consensus.\n\n**Visual & Structural Flow:** Depicts Why Previous-Term Entries Cannot Commit by Replica Count Alone (S1 (Term 2) -> S2 & S3 -> S5 (Term 3 log)); Follower, Candidate, and Leader Safety Transitions (FOLLOWER -> CANDIDATE -> LEADER).\n\n**Trade-Offs & Production:** Skipping `fsync()` on `currentTerm`, `votedFor`, and `log[]` before replying to `RequestVote` or `AppendEntries` allows a rebooted node to vote twice in the same term (two leaders in one term). Production Raft engines (etcd/tikv) enforce strict safety with bounded `150–300 ms` randomized election timeouts and `50 ms` heartbeats: **Log Up-to-Date Election Restriction**.\n\n**Failure Modes & Application:** Raft is the standard consensus protocol for strongly consistent control planes and sharded storage: **Kubernetes `etcd` & Consul**: Stores cluster state, service discovery, and leader leases."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why subtle Raft bugs silently corrupt distributed locks and metadata",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "Think of **Why subtle Raft bugs silently corrupt distributed locks and metadata** as the intuition layer for Raft Consensus & Leader Election Safety: The mechanism: understand how Why subtle Raft bugs silently corrupt distributed locks and metadata works from first principles.",
+        "core": "A 5-node metadata store (etcd/Consul-style) across 3 AZs (`15 ms` cross-AZ RTT) relies on Raft for linearizable consensus. If a leader commits entries from a *previous* term merely by counting replicas, or serves reads without verifying it is still the active quorum leader, a crash or asymmetric partition causes split-brain and lost committed keys.",
+        "deepDive": "Under heavy load or partial failure, why subtle raft bugs silently corrupt distributed locks and metadata becomes a critical lever for predictable latency and correctness. Raft guarantees state-machine safety across crash and network partitions through five strict invariants—Election Safety, Leader Append-Only, Log Matching, Leader Completeness, and State Machine Safety—all of which break if term/commit rules are shortcut."
+      },
+      "purpose": "The mechanism: understand how Why subtle Raft bugs silently corrupt distributed locks and metadata works from first principles."
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "The Raft Figure 8 anomaly and stale reads from deposed leaders",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Two classic bugs break Raft State Machine Safety:",
+        "core": "1. **Figure 8 Overwrite**: Leader `S1` (term 2) replicates entry `k` to `{S1, S2, S3}` and crashes before committing it. `S5` (which missed `k`, but had a higher-term entry from term 3) wins election in term 4 and overwrites `k`—even if `k` was already on a majority!\n2. **Deposed Leader Stale Reads**: A partitioned old leader continues serving its local in-memory state machine before its heartbeat timeout fires.",
+        "deepDive": "In production deployments of Raft Consensus & Leader Election Safety, watch how the raft figure 8 anomaly and stale reads from deposed leaders interacts with tail latency, retry amplification, and partial failures. Raft guarantees state-machine safety across crash and network partitions through five strict invariants—Election Safety, Leader Append-Only, Log Matching, Leader Completeness, and State Machine Safety—all of which break if term/commit rules are shortcut."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Raft Figure 8 & ReadIndex",
+        "title": "Why Previous-Term Entries Cannot Commit by Replica Count Alone",
+        "actors": [
+          {
+            "id": "s1",
+            "label": "S1 (Term 2)"
+          },
+          {
+            "id": "s23",
+            "label": "S2 & S3"
+          },
+          {
+            "id": "s5",
+            "label": "S5 (Term 3 log)"
+          }
+        ],
+        "events": [
+          {
+            "from": "s1",
+            "to": "s23",
+            "label": "Replicates Term-2 entry (3/5)",
+            "status": "warn"
+          },
+          {
+            "from": "s1",
+            "to": "s1",
+            "label": "S1 crashes before Term-4 commit",
+            "status": "fail"
+          },
+          {
+            "from": "s5",
+            "to": "s23",
+            "label": "S5 wins Term 4 (higher log term)",
+            "status": "warn"
+          },
+          {
+            "from": "s5",
+            "to": "s23",
+            "label": "Overwrites Term-2 entry!",
+            "status": "fail"
+          },
+          {
+            "from": "s1",
+            "to": "s23",
+            "label": "Fix: commit only currentTerm",
+            "status": "ok"
+          }
+        ],
+        "summary": "A leader may only advance commitIndex for entries from its currentTerm; older-term entries commit only indirectly."
+      },
+      "purpose": "The problem: see what breaks without The Raft Figure 8 anomaly and stale reads from deposed leaders under real concurrency or scale.",
+      "decisionFramework": {
+        "problem": "How to implement Raft Consensus & Leader Election Safety without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "When a single bottleneck threatens end-to-end availability, never commit log entries from a previous term by counting replicas alone (Figure 8 bug); a leader may only advance `commitIndex` for entries from its `currentTerm`, and linearizable reads require `ReadIndex` quorum heartbeats.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Raft Consensus & Leader Election Safety experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Why async WAL writes and unverified leader reads break linearizability",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Think of **Why async WAL writes and unverified leader reads break linearizability** as the intuition layer for Raft Consensus & Leader Election Safety: The problem: see what breaks without Why async WAL writes and unverified leader reads break linearizability under real concurrency or scale.",
+        "core": "Skipping `fsync()` on `currentTerm`, `votedFor`, and `log[]` before replying to `RequestVote` or `AppendEntries` allows a rebooted node to vote twice in the same term (two leaders in one term). Likewise, serving `GET` directly from the leader's in-memory map without a quorum check returns stale data during asymmetric partitions.",
+        "deepDive": "Under heavy load or partial failure, why async wal writes and unverified leader reads break linearizability becomes a critical lever for predictable latency and correctness. Raft guarantees state-machine safety across crash and network partitions through five strict invariants—Election Safety, Leader Append-Only, Log Matching, Leader Completeness, and State Machine Safety—all of which break if term/commit rules are shortcut."
+      },
+      "purpose": "The problem: see what breaks without Why async WAL writes and unverified leader reads break linearizability under real concurrency or scale.",
+      "sectionDiagram": {
+        "kind": "behavior-transition",
+        "eyebrow": "Design Trade-Off",
+        "title": "Why async WAL writes and unverified leader reads break linearizability",
+        "before": {
+          "label": "Async Primary / Split-Brain",
+          "metrics": [
+            "Stale leader overwrites state",
+            "Clock skew breaks lease order",
+            "Full-table sync on reboot"
+          ]
+        },
+        "after": {
+          "label": "Quorum + Monotonic Fencing",
+          "metrics": [
+            "Majority quorum prevents split-brain",
+            "Fencing tokens reject zombies",
+            "Merkle/WAL catch-up in O(log N)"
+          ]
+        }
+      }
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise solution: Five Raft Invariants, currentTerm Commit, and ReadIndex",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": {
+        "foundation": "Production Raft engines (etcd/tikv) enforce strict safety with bounded `150–300 ms` randomized election timeouts and `50 ms` heartbeats:",
+        "core": "- **Log Up-to-Date Election Restriction**: `RequestVote` rejects any candidate whose `(lastLogTerm, lastLogIndex)` is behind the voter's.\n- **currentTerm Commit Rule**: Leader advances `commitIndex` only when `log[N].term == currentTerm` and a majority (`3/5`) has persisted it (`fsync` `2–5 ms` batched).\n- **Linearizable `ReadIndex` (Zero Disk Writes)**: Leader records `readIndex = commitIndex`, sends a heartbeat round to confirm quorum, waits for `lastApplied >= readIndex`, and serves the read locally.",
+        "deepDive": "In production deployments of Raft Consensus & Leader Election Safety, watch how enterprise solution: five raft invariants, currentterm commit, and readindex interacts with tail latency, retry amplification, and partial failures. Raft guarantees state-machine safety across crash and network partitions through five strict invariants—Election Safety, Leader Append-Only, Log Matching, Leader Completeness, and State Machine Safety—all of which break if term/commit rules are shortcut."
+      },
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "Raft Node Roles",
+        "title": "Follower, Candidate, and Leader Safety Transitions",
+        "states": [
+          {
+            "id": "fol",
+            "label": "FOLLOWER",
+            "sublabel": "fsync term/vote/log",
+            "tone": "green"
+          },
+          {
+            "id": "cand",
+            "label": "CANDIDATE",
+            "sublabel": "150-300ms rand timeout",
+            "tone": "amber"
+          },
+          {
+            "id": "lead",
+            "label": "LEADER",
+            "sublabel": "ReadIndex + currentTerm",
+            "tone": "blue"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "fol",
+            "to": "cand",
+            "label": "electionTimeout elapsed"
+          },
+          {
+            "from": "cand",
+            "to": "lead",
+            "label": "3/5 votes + up-to-date log"
+          },
+          {
+            "from": "lead",
+            "to": "fol",
+            "label": "higher term observed"
+          }
+        ],
+        "summary": "Randomized 150-300ms election timeouts avoid split votes while ReadIndex guarantees linearizable reads without disk writes."
+      },
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where Raft consensus powers critical infrastructure",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Raft is the standard consensus protocol for strongly consistent control planes and sharded storage:",
+        "core": "- **Kubernetes `etcd` & Consul**: Stores cluster state, service discovery, and leader leases.\n- **Distributed Locks & Fencing Tokens**: Generates monotonically increasing `term` + `index` fencing tokens.\n- **TiKV / CockroachDB (Multi-Raft)**: Runs thousands of independent Raft groups per node for horizontal scale.",
+        "deepDive": "In production deployments of Raft Consensus & Leader Election Safety, watch how where raft consensus powers critical infrastructure interacts with tail latency, retry amplification, and partial failures. Raft guarantees state-machine safety across crash and network partitions through five strict invariants—Election Safety, Leader Append-Only, Log Matching, Leader Completeness, and State Machine Safety—all of which break if term/commit rules are shortcut."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "leader-election-patterns",
+          "title": "Concept: Leader Election Patterns",
+          "kind": "concept"
+        },
+        {
+          "slug": "replicated-logs-sequencing",
+          "title": "Concept: Replicated Logs & Sequencing",
+          "kind": "concept"
+        },
+        {
+          "slug": "split-brain-prevention",
+          "title": "Concept: Split-Brain Prevention",
+          "kind": "concept"
+        },
+        {
+          "slug": "design-lock-fencing-tokens",
+          "title": "System Design: Distributed Lock & Fencing Tokens",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "How does Raft's `ReadIndex` protocol serve linearizable reads without writing a no-op entry to the disk WAL on every read?",
+      "options": [
+        {
+          "id": "a",
+          "text": "The leader records commitIndex, confirms via a heartbeat round that it still holds a quorum, waits for lastApplied >= readIndex, and reads locally",
+          "correct": true,
+          "feedback": "Correct: the heartbeat quorum check proves no newer leader was elected without adding disk I/O."
+        },
+        {
+          "id": "b",
+          "text": "The leader forwards every read to all 5 followers and returns the union of results",
+          "correct": false,
+          "feedback": "Followers do not need to execute the read; only leadership confirmation is needed."
+        },
+        {
+          "id": "c",
+          "text": "It disables electionTimeouts while reads are in flight",
+          "correct": false,
+          "feedback": "Followers operate independently and cannot have their election timers disabled by a partitioned leader."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "How does Raft's `ReadIndex` protocol serve linearizable reads without writing a no-op entry to the disk WAL on every read?",
+        "options": [
+          {
+            "id": "a",
+            "text": "The leader records commitIndex, confirms via a heartbeat round that it still holds a quorum, waits for lastApplied >= readIndex, and reads locally",
+            "correct": true,
+            "feedback": "Correct: the heartbeat quorum check proves no newer leader was elected without adding disk I/O."
+          },
+          {
+            "id": "b",
+            "text": "The leader forwards every read to all 5 followers and returns the union of results",
+            "correct": false,
+            "feedback": "Followers do not need to execute the read; only leadership confirmation is needed."
+          },
+          {
+            "id": "c",
+            "text": "It disables electionTimeouts while reads are in flight",
+            "correct": false,
+            "feedback": "Followers operate independently and cannot have their election timers disabled by a partitioned leader."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why subtle Raft bugs silently corrupt distributed locks and metadata', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "b",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "c",
+            "text": "A 5-node metadata store (etcd/Consul-style) across 3 AZs (15 ms cross-AZ RTT) relies on Raft for linearizable consensus.",
+            "correct": true,
+            "feedback": "Correct: A 5-node metadata store (etcd/Consul-style) across 3 AZs (15 ms cross-AZ RTT) relies on Raft for linearizable consensus."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'The Raft Figure 8 anomaly and stale reads from deposed leaders', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "b",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "c",
+            "text": "Two classic bugs break Raft State Machine Safety: 1.",
+            "correct": true,
+            "feedback": "Correct: Two classic bugs break Raft State Machine Safety: 1."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** A 5-node metadata store (etcd/Consul-style) across 3 AZs (`15 ms` cross-AZ RTT) relies on Raft for linearizable consensus.\n\n**How It Flows:** Think of Raft Consensus & Leader Election Safety as a clear step-by-step chain: S1 (Term 2) -> S2 & S3 -> S5 (Term 3 log) -> FOLLOWER -> CANDIDATE.\n\n**Why Beginners Should Care:** Never commit log entries from a previous term by counting replicas alone (Figure 8 bug); a leader may only advance `commitIndex` for entries from its `currentTerm`, and linearizable reads require `ReadIndex` quorum heartbeats.",
+      "spark": {
+        "summary": "A 5-node metadata store (etcd/Consul-style) across 3 AZs (`15 ms` cross-AZ RTT) relies on Raft for linearizable consensus.",
+        "keyTakeaway": "Never commit log entries from a previous term by counting replicas alone (Figure 8 bug); a leader may only advance `commitIndex` for entries from its `currentTerm`, and."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why subtle Raft bugs silently corrupt distributed locks and metadata",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why subtle Raft bugs silently corrupt distributed locks and metadata works from first principles.",
+          "explanation": "A 5-node metadata store (etcd/Consul-style) across 3 AZs (`15 ms` cross-AZ RTT) relies on Raft for linearizable consensus. If a leader commits entries from a *previous* term merely by counting replicas, or serves reads without verifying it is still the active quorum leader, a crash or asymmetric partition causes split-brain and lost committed keys.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "The Raft Figure 8 anomaly and stale reads from deposed leaders",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without The Raft Figure 8 anomaly and stale reads from deposed leaders under real concurrency or scale.",
+          "explanation": "Two classic bugs break Raft State Machine Safety: 1. **Figure 8 Overwrite**: Leader `S1` (term 2) replicates entry `k` to `{S1, S2, S3}` and crashes before committing it. `S5` (which missed `k`, but had a higher-term entry from term 3) wins election in term 4 and overwrites `k`—even if `k` was already on a majority!",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Raft Figure 8 & ReadIndex",
+            "title": "Why Previous-Term Entries Cannot Commit by Replica Count Alone",
+            "actors": [
+              {
+                "id": "s1",
+                "label": "S1 (Term 2)"
+              },
+              {
+                "id": "s23",
+                "label": "S2 & S3"
+              },
+              {
+                "id": "s5",
+                "label": "S5 (Term 3 log)"
+              }
+            ],
+            "events": [
+              {
+                "from": "s1",
+                "to": "s23",
+                "label": "Replicates Term-2 entry (3/5)",
+                "status": "warn"
+              },
+              {
+                "from": "s1",
+                "to": "s1",
+                "label": "S1 crashes before Term-4 commit",
+                "status": "fail"
+              },
+              {
+                "from": "s5",
+                "to": "s23",
+                "label": "S5 wins Term 4 (higher log term)",
+                "status": "warn"
+              },
+              {
+                "from": "s5",
+                "to": "s23",
+                "label": "Overwrites Term-2 entry!",
+                "status": "fail"
+              },
+              {
+                "from": "s1",
+                "to": "s23",
+                "label": "Fix: commit only currentTerm",
+                "status": "ok"
+              }
+            ],
+            "summary": "A leader may only advance commitIndex for entries from its currentTerm; older-term entries commit only indirectly."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Why async WAL writes and unverified leader reads break linearizability",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "The problem: see what breaks without Why async WAL writes and unverified leader reads break linearizability under real concurrency or scale.",
+          "explanation": "Skipping `fsync()` on `currentTerm`, `votedFor`, and `log[]` before replying to `RequestVote` or `AppendEntries` allows a rebooted node to vote twice in the same term (two leaders in one term). Likewise, serving `GET` directly from the leader's in-memory map without a quorum check returns stale data during asymmetric partitions.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Five Raft Invariants, currentTerm Commit, and ReadIndex",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Production Raft engines (etcd/tikv) enforce strict safety with bounded `150–300 ms` randomized election timeouts and `50 ms` heartbeats: **Log Up-to-Date Election Restriction**: `RequestVote` rejects any candidate whose `(lastLogTerm, lastLogIndex)` is behind the voter's.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "state-machine",
+            "eyebrow": "Raft Node Roles",
+            "title": "Follower, Candidate, and Leader Safety Transitions",
+            "states": [
+              {
+                "id": "fol",
+                "label": "FOLLOWER",
+                "sublabel": "fsync term/vote/log",
+                "tone": "green"
+              },
+              {
+                "id": "cand",
+                "label": "CANDIDATE",
+                "sublabel": "150-300ms rand timeout",
+                "tone": "amber"
+              },
+              {
+                "id": "lead",
+                "label": "LEADER",
+                "sublabel": "ReadIndex + currentTerm",
+                "tone": "blue"
+              }
+            ],
+            "transitions": [
+              {
+                "from": "fol",
+                "to": "cand",
+                "label": "electionTimeout elapsed"
+              },
+              {
+                "from": "cand",
+                "to": "lead",
+                "label": "3/5 votes + up-to-date log"
+              },
+              {
+                "from": "lead",
+                "to": "fol",
+                "label": "higher term observed"
+              }
+            ],
+            "summary": "Randomized 150-300ms election timeouts avoid split votes while ReadIndex guarantees linearizable reads without disk writes."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Never commit log entries from a previous term by counting replicas alone (Figure 8 bug); a leader may only advance `commitIndex` for entries from its `currentTerm`, and.",
+      "summary": "Raft guarantees state-machine safety across crash and network partitions through five strict invariants—Election Safety, Leader Append-Only, Log Matching, Leader Completeness, and State Machine Safety—all of which break if term/commit rules are shortcut.",
+      "keyTakeaway": "When a single bottleneck threatens end-to-end availability, never commit log entries from a previous term by counting replicas alone (Figure 8 bug); a leader may only advance `commitIndex` for entries from its `currentTerm`, and linearizable reads require `ReadIndex` quorum heartbeats."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** A 5-node metadata store (etcd/Consul-style) across 3 AZs (`15 ms` cross-AZ RTT) relies on Raft for linearizable consensus.\n\n**Visual & Structural Flow:** Depicts Why Previous-Term Entries Cannot Commit by Replica Count Alone (S1 (Term 2) -> S2 & S3 -> S5 (Term 3 log)); Follower, Candidate, and Leader Safety Transitions (FOLLOWER -> CANDIDATE -> LEADER).\n\n**Trade-Offs & Production:** Skipping `fsync()` on `currentTerm`, `votedFor`, and `log[]` before replying to `RequestVote` or `AppendEntries` allows a rebooted node to vote twice in the same term (two leaders in one term). Production Raft engines (etcd/tikv) enforce strict safety with bounded `150–300 ms` randomized election timeouts and `50 ms` heartbeats: **Log Up-to-Date Election Restriction**.\n\n**Failure Modes & Application:** Raft is the standard consensus protocol for strongly consistent control planes and sharded storage: **Kubernetes `etcd` & Consul**: Stores cluster state, service discovery, and leader leases.",
+      "spark": {
+        "summary": "Raft guarantees state-machine safety across crash and network partitions through five strict invariants—Election Safety, Leader Append-Only, Log Matching, Leader Completeness, and State Machine Safety—all of which break if term/commit rules are shortcut.",
+        "keyTakeaway": "Never commit log entries from a previous term by counting replicas alone (Figure 8 bug); a leader may only advance `commitIndex` for entries from its `currentTerm`, and linearizable reads require `ReadIndex` quorum heartbeats."
+      },
+      "summary": "Raft guarantees state-machine safety across crash and network partitions through five strict invariants—Election Safety, Leader Append-Only, Log Matching, Leader Completeness, and State Machine Safety—all of which break if term/commit rules are shortcut.",
+      "keyTakeaway": "When a single bottleneck threatens end-to-end availability, never commit log entries from a previous term by counting replicas alone (Figure 8 bug); a leader may only advance `commitIndex` for entries from its `currentTerm`, and linearizable reads require `ReadIndex` quorum heartbeats."
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** Raft guarantees state-machine safety across crash and network partitions through five strict invariants—Election Safety, Leader Append-Only, Log Matching, Leader Completeness, and State Machine Safety—all of which break if term/commit rules are shortcut.\n\n**Production Trade-Offs:** Skipping `fsync()` on `currentTerm`, `votedFor`, and `log[]` before replying to `RequestVote` or `AppendEntries` allows a rebooted node to vote twice in the same term (two leaders in one term).\n\n**Failure Modes & Edge Cases:** Raft is the standard consensus protocol for strongly consistent control planes and sharded storage: **Kubernetes `etcd` & Consul**: Stores cluster state, service discovery, and leader leases.\n\n**Principal Takeaway:** Never commit log entries from a previous term by counting replicas alone (Figure 8 bug); a leader may only advance `commitIndex` for entries from its `currentTerm`, and linearizable reads require `ReadIndex` quorum heartbeats.",
+      "spark": {
+        "summary": "Raft guarantees state-machine safety across crash and network partitions through five strict invariants—Election Safety, Leader Append-Only, Log Matching, Leader Completeness, and State Machine Safety—all of which break if term/commit rules are shortcut.",
+        "keyTakeaway": "Never commit log entries from a previous term by counting replicas alone (Figure 8 bug); a leader may only advance `commitIndex` for entries from its `currentTerm`, and linearizable reads require `ReadIndex` quorum heartbeats."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why subtle Raft bugs silently corrupt distributed locks and metadata",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why subtle Raft bugs silently corrupt distributed locks and metadata works from first principles.",
+          "explanation": "A 5-node metadata store (etcd/Consul-style) across 3 AZs (`15 ms` cross-AZ RTT) relies on Raft for linearizable consensus. If a leader commits entries from a *previous* term merely by counting replicas, or serves reads without verifying it is still the active quorum leader, a crash or asymmetric partition causes split-brain and lost committed keys.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "The Raft Figure 8 anomaly and stale reads from deposed leaders",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without The Raft Figure 8 anomaly and stale reads from deposed leaders under real concurrency or scale.",
+          "explanation": "Two classic bugs break Raft State Machine Safety:\n\n1. **Figure 8 Overwrite**: Leader `S1` (term 2) replicates entry `k` to `{S1, S2, S3}` and crashes before committing it. `S5` (which missed `k`, but had a higher-term entry from term 3) wins election in term 4 and overwrites `k`—even if `k` was already on a majority!\n2. **Deposed Leader Stale Reads**: A partitioned old leader continues serving its local in-memory state machine before its heartbeat timeout fires.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Raft Figure 8 & ReadIndex",
+            "title": "Why Previous-Term Entries Cannot Commit by Replica Count Alone",
+            "actors": [
+              {
+                "id": "s1",
+                "label": "S1 (Term 2)"
+              },
+              {
+                "id": "s23",
+                "label": "S2 & S3"
+              },
+              {
+                "id": "s5",
+                "label": "S5 (Term 3 log)"
+              }
+            ],
+            "events": [
+              {
+                "from": "s1",
+                "to": "s23",
+                "label": "Replicates Term-2 entry (3/5)",
+                "status": "warn"
+              },
+              {
+                "from": "s1",
+                "to": "s1",
+                "label": "S1 crashes before Term-4 commit",
+                "status": "fail"
+              },
+              {
+                "from": "s5",
+                "to": "s23",
+                "label": "S5 wins Term 4 (higher log term)",
+                "status": "warn"
+              },
+              {
+                "from": "s5",
+                "to": "s23",
+                "label": "Overwrites Term-2 entry!",
+                "status": "fail"
+              },
+              {
+                "from": "s1",
+                "to": "s23",
+                "label": "Fix: commit only currentTerm",
+                "status": "ok"
+              }
+            ],
+            "summary": "A leader may only advance commitIndex for entries from its currentTerm; older-term entries commit only indirectly."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Why async WAL writes and unverified leader reads break linearizability",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "The problem: see what breaks without Why async WAL writes and unverified leader reads break linearizability under real concurrency or scale.",
+          "explanation": "Skipping `fsync()` on `currentTerm`, `votedFor`, and `log[]` before replying to `RequestVote` or `AppendEntries` allows a rebooted node to vote twice in the same term (two leaders in one term). Likewise, serving `GET` directly from the leader's in-memory map without a quorum check returns stale data during asymmetric partitions.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Five Raft Invariants, currentTerm Commit, and ReadIndex",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Production Raft engines (etcd/tikv) enforce strict safety with bounded `150–300 ms` randomized election timeouts and `50 ms` heartbeats:\n\n- **Log Up-to-Date Election Restriction**: `RequestVote` rejects any candidate whose `(lastLogTerm, lastLogIndex)` is behind the voter's.\n- **currentTerm Commit Rule**: Leader advances `commitIndex` only when `log[N].term == currentTerm` and a majority (`3/5`) has persisted it (`fsync` `2–5 ms` batched).\n- **Linearizable `ReadIndex` (Zero Disk Writes)**: Leader records `readIndex = commitIndex`, sends a heartbeat round to confirm quorum, waits for `lastApplied >= readIndex`, and serves the read locally.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "state-machine",
+            "eyebrow": "Raft Node Roles",
+            "title": "Follower, Candidate, and Leader Safety Transitions",
+            "states": [
+              {
+                "id": "fol",
+                "label": "FOLLOWER",
+                "sublabel": "fsync term/vote/log",
+                "tone": "green"
+              },
+              {
+                "id": "cand",
+                "label": "CANDIDATE",
+                "sublabel": "150-300ms rand timeout",
+                "tone": "amber"
+              },
+              {
+                "id": "lead",
+                "label": "LEADER",
+                "sublabel": "ReadIndex + currentTerm",
+                "tone": "blue"
+              }
+            ],
+            "transitions": [
+              {
+                "from": "fol",
+                "to": "cand",
+                "label": "electionTimeout elapsed"
+              },
+              {
+                "from": "cand",
+                "to": "lead",
+                "label": "3/5 votes + up-to-date log"
+              },
+              {
+                "from": "lead",
+                "to": "fol",
+                "label": "higher term observed"
+              }
+            ],
+            "summary": "Randomized 150-300ms election timeouts avoid split votes while ReadIndex guarantees linearizable reads without disk writes."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where Raft consensus powers critical infrastructure",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Raft is the standard consensus protocol for strongly consistent control planes and sharded storage:\n\n- **Kubernetes `etcd` & Consul**: Stores cluster state, service discovery, and leader leases.\n- **Distributed Locks & Fencing Tokens**: Generates monotonically increasing `term` + `index` fencing tokens.\n- **TiKV / CockroachDB (Multi-Raft)**: Runs thousands of independent Raft groups per node for horizontal scale.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Never commit log entries from a previous term by counting replicas alone (Figure 8 bug); a leader may only advance `commitIndex` for entries from its `currentTerm`, and linearizable reads require `ReadIndex` quorum heartbeats.",
+      "summary": "Raft guarantees state-machine safety across crash and network partitions through five strict invariants—Election Safety, Leader Append-Only, Log Matching, Leader Completeness, and State Machine Safety—all of which break if term/commit rules are shortcut.",
+      "keyTakeaway": "When a single bottleneck threatens end-to-end availability, never commit log entries from a previous term by counting replicas alone (Figure 8 bug); a leader may only advance `commitIndex` for entries from its `currentTerm`, and linearizable reads require `ReadIndex` quorum heartbeats."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "prerequisites": [
+    {
+      "title": "Split-Brain Prevention",
+      "summary": "Split-brain happens when a network partition splits a distributed cluster into isolated groups that both elect a primary and accept conflicting writes; preventing it requires strict majority quorums (N/2 + 1), time-bounded leases, and monotonic fencing tokens."
+    }
+  ],
+  "simulation": {
+    "title": "Raft Consensus & Leader Election Safety — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Client",
+        "role": "Fenced Request"
+      },
+      {
+        "id": "leader",
+        "label": "Quorum Leader",
+        "role": "Term & Log Index"
+      },
+      {
+        "id": "f1",
+        "label": "Replica 1",
+        "role": "Majority Vote"
+      },
+      {
+        "id": "f2",
+        "label": "Replica 2",
+        "role": "Async Catch-Up"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "leader",
+        "label": "write(token)"
+      },
+      {
+        "from": "leader",
+        "to": "f1",
+        "label": "AppendEntries"
+      },
+      {
+        "from": "leader",
+        "to": "f2",
+        "label": "quorum sync"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why subtle Raft bugs silently corrupt distributed locks and metadata",
+        "actionLabel": "write(token)",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "leader"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "write(token)",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Client sends work to Quorum Leader (Why subtle Raft bugs silently corrupt distributed locks and metadata)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "The Raft Figure 8 anomaly and stale reads from deposed leaders",
+        "actionLabel": "AppendEntries",
+        "status": "healthy",
+        "activeNodeIds": [
+          "leader",
+          "f1"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "AppendEntries",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Quorum Leader coordinates with Replica 1 while preserving the core invariant (The Raft Figure 8 anomaly and stale reads from deposed leaders)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Why async WAL writes and unverified leader reads break linearizability",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "f1",
+          "f2"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, Replica 2 absorbs pressure without cascading (Why async WAL writes and unverified leader reads break linearizability)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Where Raft consensus powers critical infrastructure",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "leader",
+          "f1",
+          "f2"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Where Raft consensus powers critical infrastructure)."
+      }
+    ]
+  }
+}

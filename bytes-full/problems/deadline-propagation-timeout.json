@@ -1,0 +1,786 @@
+{
+  "id": "deadline-propagation-timeout",
+  "slug": "deadline-propagation-timeout",
+  "title": "Deadline Propagation & Request Timeout Budgets",
+  "problemType": "architecture",
+  "difficulty": "medium",
+  "prompt": "Checkout traffic (4,500 RPS, 3,000 ms p99 SLA) flows through Envoy (30 s) -> OrderService (45 s) -> InventoryService (60 s, 3 retries) -> PricingDB (30 s). When PricingDB slows to 12 s on 12% of calls (540 RPS), Envoy returns 504 at 30 s while backends pin 56,700 threads/connections for up to 195 s, exhausting 2,000 HikariCP connections in 90 s. Fix timeout inversion.",
+  "spark": {
+    "summary": "Timeout inversion (downstream timeouts larger than upstream timeouts) lets backend services and databases keep grinding on zombie requests for 100-195 seconds after Envoy already returned 504.",
+    "keyTakeaway": "When a single bottleneck threatens end-to-end availability, propagate monotonic relative remaining deadlines (`grpc-timeout` / `X-Timeout-Remaining-Ms`), clamp every RPC and SQL query (`Statement.setQueryTimeout` + `MAX_EXECUTION_TIME`) to the remaining budget minus hop overhead, and enforce a 10% retry budget.",
+    "byteSummary": "**Core Mechanics:** In a 4-hop microservice tree (`4,500 RPS`, `45 ms` normal latency = `202` active threads), teams often configure each layer's timeout independently—putting `30 s` at Envoy, `45 s` at `OrderService`, and `60 s` with `3` retries at `InventoryService`.\n\n**Visual & Structural Flow:** Depicts Zombie 195s Work vs. Monotonic Deadline Cancellation (Envoy (3,000ms) -> OrderService -> InventoryService -> PricingDB); Relative Budget Clamping from Envoy Edge to JDBC Statement (Envoy Edge -> Hop Interceptor -> gRPC Context -> JDBC / MySQL).\n\n**Trade-Offs & Production:** Passing an absolute UTC epoch timestamp (`X-Deadline-Epoch`) breaks when nodes have `150 ms` (or multi-second) NTP clock skew, causing downstream servers to reject valid requests immediately. Monotonic deadline propagation is built into modern RPC and service-mesh stacks: **Google Stubby / gRPC**: `grpc-timeout` automatically decrements across hops and cancels downstream RPC trees when a client disconnects.\n\n**Failure Modes & Application:** Monotonic deadline propagation is built into modern RPC and service-mesh stacks: **Google Stubby / gRPC**: `grpc-timeout` automatically decrements across hops and cancels downstream RPC trees when a client disconnects."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why inverted timeouts turn minor slowdowns into total outages",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "Think of **Why inverted timeouts turn minor slowdowns into total outages** as the intuition layer for Deadline Propagation & Request Timeout Budgets: The mechanism: understand how Why inverted timeouts turn minor slowdowns into total outages works from first principles.",
+        "core": "In a 4-hop microservice tree (`4,500 RPS`, `45 ms` normal latency = `202` active threads), teams often configure each layer's timeout independently—putting `30 s` at Envoy, `45 s` at `OrderService`, and `60 s` with `3` retries at `InventoryService`. That **timeout inversion** guarantees downstream services keep burning CPU and DB connections long after the user already received a `504 Gateway Timeout`.",
+        "deepDive": "Under heavy load or partial failure, why inverted timeouts turn minor slowdowns into total outages becomes a critical lever for predictable latency and correctness. Timeout inversion (downstream timeouts larger than upstream timeouts) lets backend services and databases keep grinding on zombie requests for 100-195 seconds after Envoy already returned 504."
+      },
+      "purpose": "The mechanism: understand how Why inverted timeouts turn minor slowdowns into total outages works from first principles."
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "56,700 pinned threads (28x connection pool exhaustion) and 27x retry storms",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "When `PricingDB` slows to `12 s` on just `12%` of requests (`540 RPS`):",
+        "core": "1. **Zombie Work**: `540 RPS × ~105 s` avg zombie hold = `56,700` blocked threads/connections, exceeding the cluster's `2,000` HikariCP connections (`50 × 40 pods`) by **28x** in 90 seconds.\n2. **Retry Amplification**: 3 retries across 3 hops can multiply 1 failing request into `27` downstream calls.\n3. **Orphaned DB Queries**: Even if HTTP threads abort, MySQL/PostgreSQL keeps executing uncancelled SQL.",
+        "deepDive": "In production deployments of Deadline Propagation & Request Timeout Budgets, watch how 56,700 pinned threads (28x connection pool exhaustion) and 27x retry storms interacts with tail latency, retry amplification, and partial failures. Timeout inversion (downstream timeouts larger than upstream timeouts) lets backend services and databases keep grinding on zombie requests for 100-195 seconds after Envoy already returned 504."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Timeout Inversion vs. Deadline Budget",
+        "title": "Zombie 195s Work vs. Monotonic Deadline Cancellation",
+        "actors": [
+          {
+            "id": "envoy",
+            "label": "Envoy (3,000ms)"
+          },
+          {
+            "id": "ord",
+            "label": "OrderService"
+          },
+          {
+            "id": "inv",
+            "label": "InventoryService"
+          },
+          {
+            "id": "db",
+            "label": "PricingDB"
+          }
+        ],
+        "events": [
+          {
+            "from": "envoy",
+            "to": "ord",
+            "label": "x-envoy-upstream-rq-timeout-ms: 3000",
+            "status": "ok"
+          },
+          {
+            "from": "ord",
+            "to": "inv",
+            "label": "grpc-timeout: 2850m (-150ms hop)",
+            "status": "ok"
+          },
+          {
+            "from": "inv",
+            "to": "db",
+            "label": "MAX_EXECUTION_TIME=2700ms + cancel()",
+            "status": "warn"
+          },
+          {
+            "from": "inv",
+            "to": "ord",
+            "label": "Budget < 2x p99 -> skip retry, fail fast",
+            "status": "ok"
+          }
+        ],
+        "summary": "Decrementing relative remaining deadlines across every hop and SQL driver stops zombie work before the edge expires."
+      },
+      "purpose": "The problem: see what breaks without 56,700 pinned threads under real concurrency or scale.",
+      "decisionFramework": {
+        "problem": "How to implement Deadline Propagation & Request Timeout Budgets without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "When a single bottleneck threatens end-to-end availability, propagate monotonic relative remaining deadlines (`grpc-timeout` / `X-Timeout-Remaining-Ms`), clamp every RPC and SQL query (`Statement.setQueryTimeout` + `MAX_EXECUTION_TIME`) to the remaining budget minus hop overhead, and enforce a 10% retry budget.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Deadline Propagation & Request Timeout Budgets experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Naive fixes (absolute UTC epochs & blind multi-hop retries)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Think of **Naive fixes (absolute UTC epochs & blind multi-hop retries)** as the intuition layer for Deadline Propagation & Request Timeout Budgets: Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+        "core": "Passing an absolute UTC epoch timestamp (`X-Deadline-Epoch`) breaks when nodes have `150 ms` (or multi-second) NTP clock skew, causing downstream servers to reject valid requests immediately. Meanwhile, enabling 3 retries at every hop compounds latency and load exponentially.",
+        "deepDive": "Under heavy load or partial failure, naive fixes (absolute utc epochs & blind multi-hop retries) becomes a critical lever for predictable latency and correctness. Timeout inversion (downstream timeouts larger than upstream timeouts) lets backend services and databases keep grinding on zombie requests for 100-195 seconds after Envoy already returned 504."
+      },
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "Component Topology",
+        "title": "Naive fixes (absolute UTC epochs & blind multi-hop retries)",
+        "graphNodes": [
+          {
+            "id": "client",
+            "label": "Caller",
+            "role": "ingress",
+            "col": 0,
+            "row": 0,
+            "tone": "primary"
+          },
+          {
+            "id": "entry",
+            "label": "Router / API",
+            "role": "compute",
+            "col": 1,
+            "row": 0,
+            "tone": "tint"
+          },
+          {
+            "id": "worker",
+            "label": "Processor",
+            "role": "storage",
+            "col": 2,
+            "row": 0,
+            "tone": "tint"
+          },
+          {
+            "id": "store",
+            "label": "State Layer",
+            "role": "control",
+            "col": 0,
+            "row": 1,
+            "tone": "tint"
+          }
+        ],
+        "graphEdges": [
+          {
+            "from": "client",
+            "to": "entry",
+            "label": "request",
+            "style": "solid",
+            "tone": "green"
+          },
+          {
+            "from": "entry",
+            "to": "worker",
+            "label": "dispatch",
+            "style": "solid",
+            "tone": "green"
+          },
+          {
+            "from": "worker",
+            "to": "store",
+            "label": "read/write",
+            "style": "solid",
+            "tone": "green"
+          }
+        ]
+      }
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise solution: Relative Deadline Budgets + DB Cancellation + 10% Retry Cap",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": {
+        "foundation": "Enforce strict monotonic budgets across Java 21, gRPC, Envoy, and JDBC:",
+        "core": "- **Relative Remaining Duration**: Propagate `grpc-timeout` / `x-envoy-upstream-rq-timeout-ms` (relative ms, immune to `150 ms` NTP skew), subtracting `50-100 ms` hop overhead at each boundary.\n- **Clamp Every Downstream Call**: Set `timeout = min(remaining_budget - hop_overhead_ms, local_max_timeout)`.\n- **Cancel SQL Execution**: Propagate gRPC context cancellation into `Statement.setQueryTimeout()`, `Statement.cancel()`, MySQL `/*+ MAX_EXECUTION_TIME(ms) */`, and `innodb_lock_wait_timeout=5`.\n- **Bounded Retry Budget**: Retry at a single layer only if `remaining_budget >= 2 * p99_hop` and total retries stay within a `10%` Envoy `retry_budget`.",
+        "deepDive": "In production deployments of Deadline Propagation & Request Timeout Budgets, watch how enterprise solution: relative deadline budgets + db cancellation + 10% retry cap interacts with tail latency, retry amplification, and partial failures. Timeout inversion (downstream timeouts larger than upstream timeouts) lets backend services and databases keep grinding on zombie requests for 100-195 seconds after Envoy already returned 504."
+      },
+      "sectionDiagram": {
+        "kind": "wal-mvcc",
+        "eyebrow": "Budget Enforcement Stack",
+        "title": "Relative Budget Clamping from Envoy Edge to JDBC Statement",
+        "nodes": [
+          {
+            "label": "Envoy Edge",
+            "role": "3,000ms budget + 10% retry_budget"
+          },
+          {
+            "label": "Hop Interceptor",
+            "role": "min(rem - 75ms, local_max)"
+          },
+          {
+            "label": "gRPC Context",
+            "role": "Skips retry if rem < 2x p99"
+          },
+          {
+            "label": "JDBC / MySQL",
+            "role": "setQueryTimeout + Statement.cancel()"
+          }
+        ],
+        "edges": [
+          {
+            "label": "relative ms header"
+          },
+          {
+            "label": "propagates cancel"
+          }
+        ],
+        "summary": "Relative duration headers neutralize NTP skew while JDBC cancellation frees DB connections immediately on expiry."
+      },
+      "markdownContent": "```java\n// Clamp downstream gRPC + JDBC timeout to remaining request budget\nlong remainingMs = DeadlineContext.remainingMillis(3_000L); // default edge cap\nlong hopBudgetMs = Math.min(remainingMs - 75L, 2_500L);\nif (hopBudgetMs <= 50L) {\n    throw new DeadlineExceededException(\"Insufficient budget: \" + remainingMs + \"ms\");\n}\ntry (PreparedStatement ps = conn.prepareStatement(\n        \"SELECT /*+ MAX_EXECUTION_TIME(\" + hopBudgetMs + \") */ price FROM pricing WHERE sku = ?\")) {\n    ps.setQueryTimeout((int) Math.max(1, Math.ceil(hopBudgetMs / 1000.0)));\n    Context.current().addListener(ctx -> { try { ps.cancel(); } catch (SQLException ignored) {} }, cancelExec);\n    return ps.executeQuery();\n}\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where deadline propagation is used in production",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Monotonic deadline propagation is built into modern RPC and service-mesh stacks:",
+        "core": "- **Google Stubby / gRPC**: `grpc-timeout` automatically decrements across hops and cancels downstream RPC trees when a client disconnects.\n- **Envoy Service Mesh**: `x-envoy-upstream-rq-timeout-ms` and `retry_budget` prevent retry amplification across deep microservice graphs.",
+        "deepDive": "In production deployments of Deadline Propagation & Request Timeout Budgets, watch how where deadline propagation is used in production interacts with tail latency, retry amplification, and partial failures. Timeout inversion (downstream timeouts larger than upstream timeouts) lets backend services and databases keep grinding on zombie requests for 100-195 seconds after Envoy already returned 504."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "grpc-streaming-rpc",
+          "title": "Concept: gRPC & Streaming RPC",
+          "kind": "concept"
+        },
+        {
+          "slug": "service-mesh-fundamentals",
+          "title": "Concept: Service Mesh Fundamentals",
+          "kind": "concept"
+        },
+        {
+          "slug": "graceful-degradation",
+          "title": "Concept: Graceful Degradation",
+          "kind": "concept"
+        },
+        {
+          "slug": "cascading-gateway-timeouts",
+          "title": "System Design: Cascading 504 Gateway Timeouts",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why should deadline propagation transmit a *relative remaining duration* (e.g., `grpc-timeout: 1200m`) rather than an absolute UTC timestamp?",
+      "options": [
+        {
+          "id": "a",
+          "text": "Relative durations are immune to NTP clock skew across hosts, whereas absolute timestamps can cause a drifting downstream node to reject valid requests immediately",
+          "correct": true,
+          "feedback": "Correct: subtracting hop overhead from relative remaining time works safely even with 150 ms+ NTP skew."
+        },
+        {
+          "id": "b",
+          "text": "Relative durations automatically cancel running MySQL `UPDATE` statements without `Statement.cancel()`",
+          "correct": false,
+          "feedback": "You still must propagate cancellation to JDBC (`setQueryTimeout`, `Statement.cancel()`, `MAX_EXECUTION_TIME`)."
+        },
+        {
+          "id": "c",
+          "text": "Absolute UTC timestamps cannot be parsed by HTTP/2 headers",
+          "correct": false,
+          "feedback": "HTTP/2 headers can carry any ASCII string; the issue is clock skew between distributed nodes."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why should deadline propagation transmit a *relative remaining duration* (e.g., `grpc-timeout: 1200m`) rather than an absolute UTC timestamp?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Relative durations are immune to NTP clock skew across hosts, whereas absolute timestamps can cause a drifting downstream node to reject valid requests immediately",
+            "correct": true,
+            "feedback": "Correct: subtracting hop overhead from relative remaining time works safely even with 150 ms+ NTP skew."
+          },
+          {
+            "id": "b",
+            "text": "Relative durations automatically cancel running MySQL `UPDATE` statements without `Statement.cancel()`",
+            "correct": false,
+            "feedback": "You still must propagate cancellation to JDBC (`setQueryTimeout`, `Statement.cancel()`, `MAX_EXECUTION_TIME`)."
+          },
+          {
+            "id": "c",
+            "text": "Absolute UTC timestamps cannot be parsed by HTTP/2 headers",
+            "correct": false,
+            "feedback": "HTTP/2 headers can carry any ASCII string; the issue is clock skew between distributed nodes."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why inverted timeouts turn minor slowdowns into total outages', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "b",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "c",
+            "text": "In a 4-hop microservice tree (4,500 RPS, 45 ms normal latency = 202 active threads), teams often configure each layer's timeout independently—putting 30 s at Envoy, 45 s at…",
+            "correct": true,
+            "feedback": "Correct: In a 4-hop microservice tree (4,500 RPS, 45 ms normal latency = 202 active threads), teams often configure each layer's timeout independently—putting 30 s at Envoy, 45 s at…"
+          }
+        ]
+      },
+      {
+        "question": "Regarding '56,700 pinned threads (28x connection pool exhaustion) and 27x retry storms', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "When PricingDB slows to 12 s on just 12% of requests (540 RPS): 1.",
+            "correct": true,
+            "feedback": "Correct: When PricingDB slows to 12 s on just 12% of requests (540 RPS): 1."
+          },
+          {
+            "id": "b",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "c",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** In a 4-hop microservice tree (`4,500 RPS`, `45 ms` normal latency = `202` active threads), teams often configure each layer's timeout independently—putting `30 s` at Envoy, `45 s` at `OrderService`, and `60 s` with `3` retries at `InventoryService`.\n\n**How It Flows:** Think of Deadline Propagation & Request Timeout Budgets as a clear step-by-step chain: Envoy (3,000ms) -> OrderService -> InventoryService -> PricingDB -> Envoy Edge.\n\n**Why Beginners Should Care:** Propagate monotonic relative remaining deadlines (`grpc-timeout` / `X-Timeout-Remaining-Ms`), clamp every RPC and SQL query (`Statement.setQueryTimeout` + `MAX_EXECUTION_TIME`) to the remaining budget minus hop overhead, and enforce a 10% retry budget.",
+      "spark": {
+        "summary": "In a 4-hop microservice tree (`4,500 RPS`, `45 ms` normal latency = `202` active threads), teams often configure each layer's timeout independently—putting `30 s` at Envoy, `45 s` at `OrderService`, and `60 s` with `3` retries at `InventoryService`.",
+        "keyTakeaway": "Propagate monotonic relative remaining deadlines (`grpc-timeout` / `X-Timeout-Remaining-Ms`), clamp every RPC and SQL query (`Statement.setQueryTimeout` + `MAX_EXECUTION_TIME`) to."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why inverted timeouts turn minor slowdowns into total outages",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why inverted timeouts turn minor slowdowns into total outages works from first principles.",
+          "explanation": "In a 4-hop microservice tree (`4,500 RPS`, `45 ms` normal latency = `202` active threads), teams often configure each layer's timeout independently—putting `30 s` at Envoy, `45 s` at `OrderService`, and `60 s` with `3` retries at `InventoryService`. That **timeout inversion** guarantees downstream services keep burning CPU and DB connections long after the user already received a `504 Gateway Timeout`.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "56,700 pinned threads (28x connection pool exhaustion) and 27x retry storms",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without 56,700 pinned threads under real concurrency or scale.",
+          "explanation": "When `PricingDB` slows to `12 s` on just `12%` of requests (`540 RPS`): 1. **Zombie Work**: `540 RPS × ~105 s` avg zombie hold = `56,700` blocked threads/connections, exceeding the cluster's `2,000` HikariCP connections (`50 × 40 pods`) by **28x** in 90 seconds. 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Timeout Inversion vs. Deadline Budget",
+            "title": "Zombie 195s Work vs. Monotonic Deadline Cancellation",
+            "actors": [
+              {
+                "id": "envoy",
+                "label": "Envoy (3,000ms)"
+              },
+              {
+                "id": "ord",
+                "label": "OrderService"
+              },
+              {
+                "id": "inv",
+                "label": "InventoryService"
+              },
+              {
+                "id": "db",
+                "label": "PricingDB"
+              }
+            ],
+            "events": [
+              {
+                "from": "envoy",
+                "to": "ord",
+                "label": "x-envoy-upstream-rq-timeout-ms: 3000",
+                "status": "ok"
+              },
+              {
+                "from": "ord",
+                "to": "inv",
+                "label": "grpc-timeout: 2850m (-150ms hop)",
+                "status": "ok"
+              },
+              {
+                "from": "inv",
+                "to": "db",
+                "label": "MAX_EXECUTION_TIME=2700ms + cancel()",
+                "status": "warn"
+              },
+              {
+                "from": "inv",
+                "to": "ord",
+                "label": "Budget < 2x p99 -> skip retry, fail fast",
+                "status": "ok"
+              }
+            ],
+            "summary": "Decrementing relative remaining deadlines across every hop and SQL driver stops zombie work before the edge expires."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive fixes (absolute UTC epochs & blind multi-hop retries)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Passing an absolute UTC epoch timestamp (`X-Deadline-Epoch`) breaks when nodes have `150 ms` (or multi-second) NTP clock skew, causing downstream servers to reject valid requests immediately. Meanwhile, enabling 3 retries at every hop compounds latency and load exponentially.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Relative Deadline Budgets + DB Cancellation + 10% Retry Cap",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Enforce strict monotonic budgets across Java 21, gRPC, Envoy, and JDBC: **Relative Remaining Duration**: Propagate `grpc-timeout` / `x-envoy-upstream-rq-timeout-ms` (relative ms, immune to `150 ms` NTP skew), subtracting `50-100 ms` hop overhead at each boundary. **Clamp Every Downstream Call**: Set `timeout = min(remaining_budget - hop_overhead_ms, local_max_timeout)`.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "wal-mvcc",
+            "eyebrow": "Budget Enforcement Stack",
+            "title": "Relative Budget Clamping from Envoy Edge to JDBC Statement",
+            "nodes": [
+              {
+                "label": "Envoy Edge",
+                "role": "3,000ms budget + 10% retry_budget"
+              },
+              {
+                "label": "Hop Interceptor",
+                "role": "min(rem - 75ms, local_max)"
+              },
+              {
+                "label": "gRPC Context",
+                "role": "Skips retry if rem < 2x p99"
+              },
+              {
+                "label": "JDBC / MySQL",
+                "role": "setQueryTimeout + Statement.cancel()"
+              }
+            ],
+            "edges": [
+              {
+                "label": "relative ms header"
+              },
+              {
+                "label": "propagates cancel"
+              }
+            ],
+            "summary": "Relative duration headers neutralize NTP skew while JDBC cancellation frees DB connections immediately on expiry."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Propagate monotonic relative remaining deadlines (`grpc-timeout` / `X-Timeout-Remaining-Ms`), clamp every RPC and SQL query (`Statement.setQueryTimeout` + `MAX_EXECUTION_TIME`) to.",
+      "summary": "Timeout inversion (downstream timeouts larger than upstream timeouts) lets backend services and databases keep grinding on zombie requests for 100-195 seconds after Envoy already returned 504.",
+      "keyTakeaway": "When a single bottleneck threatens end-to-end availability, propagate monotonic relative remaining deadlines (`grpc-timeout` / `X-Timeout-Remaining-Ms`), clamp every RPC and SQL query (`Statement.setQueryTimeout` + `MAX_EXECUTION_TIME`) to the remaining budget minus hop overhead, and enforce a 10% retry budget."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** In a 4-hop microservice tree (`4,500 RPS`, `45 ms` normal latency = `202` active threads), teams often configure each layer's timeout independently—putting `30 s` at Envoy, `45 s` at `OrderService`, and `60 s` with `3` retries at `InventoryService`.\n\n**Visual & Structural Flow:** Depicts Zombie 195s Work vs. Monotonic Deadline Cancellation (Envoy (3,000ms) -> OrderService -> InventoryService -> PricingDB); Relative Budget Clamping from Envoy Edge to JDBC Statement (Envoy Edge -> Hop Interceptor -> gRPC Context -> JDBC / MySQL).\n\n**Trade-Offs & Production:** Passing an absolute UTC epoch timestamp (`X-Deadline-Epoch`) breaks when nodes have `150 ms` (or multi-second) NTP clock skew, causing downstream servers to reject valid requests immediately. Monotonic deadline propagation is built into modern RPC and service-mesh stacks: **Google Stubby / gRPC**: `grpc-timeout` automatically decrements across hops and cancels downstream RPC trees when a client disconnects.\n\n**Failure Modes & Application:** Monotonic deadline propagation is built into modern RPC and service-mesh stacks: **Google Stubby / gRPC**: `grpc-timeout` automatically decrements across hops and cancels downstream RPC trees when a client disconnects.",
+      "spark": {
+        "summary": "Timeout inversion (downstream timeouts larger than upstream timeouts) lets backend services and databases keep grinding on zombie requests for 100-195 seconds after Envoy already returned 504.",
+        "keyTakeaway": "Propagate monotonic relative remaining deadlines (`grpc-timeout` / `X-Timeout-Remaining-Ms`), clamp every RPC and SQL query (`Statement.setQueryTimeout` + `MAX_EXECUTION_TIME`) to the remaining budget minus hop overhead, and enforce a 10% retry budget."
+      },
+      "summary": "Timeout inversion (downstream timeouts larger than upstream timeouts) lets backend services and databases keep grinding on zombie requests for 100-195 seconds after Envoy already returned 504.",
+      "keyTakeaway": "When a single bottleneck threatens end-to-end availability, propagate monotonic relative remaining deadlines (`grpc-timeout` / `X-Timeout-Remaining-Ms`), clamp every RPC and SQL query (`Statement.setQueryTimeout` + `MAX_EXECUTION_TIME`) to the remaining budget minus hop overhead, and enforce a 10% retry budget."
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** Timeout inversion (downstream timeouts larger than upstream timeouts) lets backend services and databases keep grinding on zombie requests for 100-195 seconds after Envoy already returned 504.\n\n**Production Trade-Offs:** Passing an absolute UTC epoch timestamp (`X-Deadline-Epoch`) breaks when nodes have `150 ms` (or multi-second) NTP clock skew, causing downstream servers to reject valid requests immediately.\n\n**Failure Modes & Edge Cases:** Monotonic deadline propagation is built into modern RPC and service-mesh stacks: **Google Stubby / gRPC**: `grpc-timeout` automatically decrements across hops and cancels downstream RPC trees when a client disconnects.\n\n**Principal Takeaway:** Propagate monotonic relative remaining deadlines (`grpc-timeout` / `X-Timeout-Remaining-Ms`), clamp every RPC and SQL query (`Statement.setQueryTimeout` + `MAX_EXECUTION_TIME`) to the remaining budget minus hop overhead, and enforce a 10% retry budget.",
+      "spark": {
+        "summary": "Timeout inversion (downstream timeouts larger than upstream timeouts) lets backend services and databases keep grinding on zombie requests for 100-195 seconds after Envoy already returned 504.",
+        "keyTakeaway": "Propagate monotonic relative remaining deadlines (`grpc-timeout` / `X-Timeout-Remaining-Ms`), clamp every RPC and SQL query (`Statement.setQueryTimeout` + `MAX_EXECUTION_TIME`) to the remaining budget minus hop overhead, and enforce a 10% retry budget."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why inverted timeouts turn minor slowdowns into total outages",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why inverted timeouts turn minor slowdowns into total outages works from first principles.",
+          "explanation": "In a 4-hop microservice tree (`4,500 RPS`, `45 ms` normal latency = `202` active threads), teams often configure each layer's timeout independently—putting `30 s` at Envoy, `45 s` at `OrderService`, and `60 s` with `3` retries at `InventoryService`. That **timeout inversion** guarantees downstream services keep burning CPU and DB connections long after the user already received a `504 Gateway Timeout`.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "56,700 pinned threads (28x connection pool exhaustion) and 27x retry storms",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without 56,700 pinned threads under real concurrency or scale.",
+          "explanation": "When `PricingDB` slows to `12 s` on just `12%` of requests (`540 RPS`):\n\n1. **Zombie Work**: `540 RPS × ~105 s` avg zombie hold = `56,700` blocked threads/connections, exceeding the cluster's `2,000` HikariCP connections (`50 × 40 pods`) by **28x** in 90 seconds.\n2. **Retry Amplification**: 3 retries across 3 hops can multiply 1 failing request into `27` downstream calls.\n3. **Orphaned DB Queries**: Even if HTTP threads abort, MySQL/PostgreSQL keeps executing uncancelled SQL.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Timeout Inversion vs. Deadline Budget",
+            "title": "Zombie 195s Work vs. Monotonic Deadline Cancellation",
+            "actors": [
+              {
+                "id": "envoy",
+                "label": "Envoy (3,000ms)"
+              },
+              {
+                "id": "ord",
+                "label": "OrderService"
+              },
+              {
+                "id": "inv",
+                "label": "InventoryService"
+              },
+              {
+                "id": "db",
+                "label": "PricingDB"
+              }
+            ],
+            "events": [
+              {
+                "from": "envoy",
+                "to": "ord",
+                "label": "x-envoy-upstream-rq-timeout-ms: 3000",
+                "status": "ok"
+              },
+              {
+                "from": "ord",
+                "to": "inv",
+                "label": "grpc-timeout: 2850m (-150ms hop)",
+                "status": "ok"
+              },
+              {
+                "from": "inv",
+                "to": "db",
+                "label": "MAX_EXECUTION_TIME=2700ms + cancel()",
+                "status": "warn"
+              },
+              {
+                "from": "inv",
+                "to": "ord",
+                "label": "Budget < 2x p99 -> skip retry, fail fast",
+                "status": "ok"
+              }
+            ],
+            "summary": "Decrementing relative remaining deadlines across every hop and SQL driver stops zombie work before the edge expires."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive fixes (absolute UTC epochs & blind multi-hop retries)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Passing an absolute UTC epoch timestamp (`X-Deadline-Epoch`) breaks when nodes have `150 ms` (or multi-second) NTP clock skew, causing downstream servers to reject valid requests immediately. Meanwhile, enabling 3 retries at every hop compounds latency and load exponentially.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Relative Deadline Budgets + DB Cancellation + 10% Retry Cap",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Enforce strict monotonic budgets across Java 21, gRPC, Envoy, and JDBC:\n\n- **Relative Remaining Duration**: Propagate `grpc-timeout` / `x-envoy-upstream-rq-timeout-ms` (relative ms, immune to `150 ms` NTP skew), subtracting `50-100 ms` hop overhead at each boundary.\n- **Clamp Every Downstream Call**: Set `timeout = min(remaining_budget - hop_overhead_ms, local_max_timeout)`.\n- **Cancel SQL Execution**: Propagate gRPC context cancellation into `Statement.setQueryTimeout()`, `Statement.cancel()`, MySQL `/*+ MAX_EXECUTION_TIME(ms) */`, and `innodb_lock_wait_timeout=5`.\n- **Bounded Retry Budget**: Retry at a single layer only if `remaining_budget >= 2 * p99_hop` and total retries stay within a `10%` Envoy `retry_budget`.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "wal-mvcc",
+            "eyebrow": "Budget Enforcement Stack",
+            "title": "Relative Budget Clamping from Envoy Edge to JDBC Statement",
+            "nodes": [
+              {
+                "label": "Envoy Edge",
+                "role": "3,000ms budget + 10% retry_budget"
+              },
+              {
+                "label": "Hop Interceptor",
+                "role": "min(rem - 75ms, local_max)"
+              },
+              {
+                "label": "gRPC Context",
+                "role": "Skips retry if rem < 2x p99"
+              },
+              {
+                "label": "JDBC / MySQL",
+                "role": "setQueryTimeout + Statement.cancel()"
+              }
+            ],
+            "edges": [
+              {
+                "label": "relative ms header"
+              },
+              {
+                "label": "propagates cancel"
+              }
+            ],
+            "summary": "Relative duration headers neutralize NTP skew while JDBC cancellation frees DB connections immediately on expiry."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where deadline propagation is used in production",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Monotonic deadline propagation is built into modern RPC and service-mesh stacks:\n\n- **Google Stubby / gRPC**: `grpc-timeout` automatically decrements across hops and cancels downstream RPC trees when a client disconnects.\n- **Envoy Service Mesh**: `x-envoy-upstream-rq-timeout-ms` and `retry_budget` prevent retry amplification across deep microservice graphs.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Propagate monotonic relative remaining deadlines (`grpc-timeout` / `X-Timeout-Remaining-Ms`), clamp every RPC and SQL query (`Statement.setQueryTimeout` + `MAX_EXECUTION_TIME`) to the remaining budget minus hop overhead, and enforce a 10% retry budget.",
+      "summary": "Timeout inversion (downstream timeouts larger than upstream timeouts) lets backend services and databases keep grinding on zombie requests for 100-195 seconds after Envoy already returned 504.",
+      "keyTakeaway": "When a single bottleneck threatens end-to-end availability, propagate monotonic relative remaining deadlines (`grpc-timeout` / `X-Timeout-Remaining-Ms`), clamp every RPC and SQL query (`Statement.setQueryTimeout` + `MAX_EXECUTION_TIME`) to the remaining budget minus hop overhead, and enforce a 10% retry budget."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "simulation": {
+    "title": "Deadline Propagation & Request Timeout Budgets — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Input Workload"
+      },
+      {
+        "id": "entry",
+        "label": "Router / API",
+        "role": "Admission Control"
+      },
+      {
+        "id": "worker",
+        "label": "Processor",
+        "role": "Domain Logic"
+      },
+      {
+        "id": "store",
+        "label": "State Layer",
+        "role": "Durable Store"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "entry",
+        "label": "request"
+      },
+      {
+        "from": "entry",
+        "to": "worker",
+        "label": "dispatch"
+      },
+      {
+        "from": "worker",
+        "to": "store",
+        "label": "read/write"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why inverted timeouts turn minor slowdowns into total outages",
+        "actionLabel": "request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "entry"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "request",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Caller sends work to Router / API (Why inverted timeouts turn minor slowdowns into total outages)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "56,700 pinned threads (28x connection pool exhaustion) and 27x retry storms",
+        "actionLabel": "dispatch",
+        "status": "healthy",
+        "activeNodeIds": [
+          "entry",
+          "worker"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "dispatch",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Router / API coordinates with Processor while preserving the core invariant (56,700 pinned threads (28x connection pool exhaustion) and 27x retry storms)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Naive fixes (absolute UTC epochs & blind multi-hop retries)",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "worker",
+          "store"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, State Layer absorbs pressure without cascading (Naive fixes (absolute UTC epochs & blind multi-hop retries))."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Where deadline propagation is used in production",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "entry",
+          "worker",
+          "store"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Where deadline propagation is used in production)."
+      }
+    ]
+  }
+}

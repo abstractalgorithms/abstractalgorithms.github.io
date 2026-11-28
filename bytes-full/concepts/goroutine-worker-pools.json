@@ -1,0 +1,1076 @@
+{
+  "id": "concept-goroutine-worker-pools",
+  "slug": "goroutine-worker-pools",
+  "name": "Goroutine Worker Pools & Go Concurrency",
+  "domain": "Concurrency & Runtimes",
+  "tagline": "Bounding Go concurrency with a fixed set of N goroutines pulling from a bounded channel for predictable memory, backpressure, and context cancellation.",
+  "purpose": "Build a progressive mental model of goroutine worker pools—from Go's M:N scheduler and netpoller to bounding downstream connection pressure and avoiding goroutine leaks.",
+  "spark": {
+    "summary": "A goroutine worker pool bounds concurrency by running a fixed set of N lightweight goroutines pulling jobs from a shared channel, giving you predictable memory, backpressure, and clean cancellation via context.Context.",
+    "keyTakeaway": "When naive scans degrade into quadratic bottlenecks, spawning unbounded goroutines (go handle(req)) exhausts file descriptors, DB connection pools, and heap under load spikes; a bounded worker pool caps downstream pressure while keeping Go's M:N scheduler at peak efficiency.",
+    "byteSummary": "**Core Mechanics:** Goroutines start at just **2 KB of stack**, making it tempting to write `go process(item)` inside a million-item loop.\n\n**Visual & Structural Flow:** Depicts Producer -> Bounded Job Channel -> N Workers -> Shared Transport (HTTP / Kafka Producer -> chan Job (cap 1000) -> N=64 Worker Pool -> Downstream Pool); SIGTERM Drain Sequence Without Dropping In-Flight Jobs (kubelet SIGTERM -> Producer -> jobs chan -> Workers (N=64)).\n\n**Trade-Offs & Production:** Compare long-lived worker pools against scoped `errgroup` concurrency limits. In production Kubernetes pods, pair worker pools with `go test -race` in CI, `automaxprocs` for CFS quota alignment, and graceful `SIGTERM` draining that stops accepting new jobs.\n\n**Failure Modes & Application:** Explore backpressure queues, ephemeral port exhaustion, Kubernetes CFS throttling, and graceful shutdowns."
+  },
+  "learningJourney": [
+    {
+      "id": "01-what-it-is",
+      "eyebrow": "STAGE 01 · WHAT IT IS",
+      "title": "What is a Goroutine Worker Pool",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "Goroutines start at just **2 KB of stack**, making it tempting to write `go process(item)` inside a million-item loop. Go's **M:N scheduler** multiplexes goroutines (`G`) onto OS threads (`M`) across `P = GOMAXPROCS` logical processors using work-stealing and an `epoll`/`kqueue` **netpoller**.",
+        "core": "A **goroutine worker pool** places a fixed ceiling `N` on active workers pulling from a bounded `jobs` channel, ensuring downstream databases, APIs, and OS file descriptors (`ulimit -n`) never collapse under a thundering herd.",
+        "deepDive": "In production deployments of Goroutine Worker Pools & Go Concurrency, watch how what is a goroutine worker pool interacts with tail latency, retry amplification, and partial failures. A goroutine worker pool bounds concurrency by running a fixed set of N lightweight goroutines pulling jobs from a shared channel, giving you predictable memory, backpressure, and clean cancellation via context.Context."
+      },
+      "sectionDiagram": {
+        "kind": "cache-tier",
+        "eyebrow": "Bounded Pipeline",
+        "title": "Producer -> Bounded Job Channel -> N Workers -> Shared Transport",
+        "nodes": [
+          {
+            "id": "prod",
+            "label": "HTTP / Kafka Producer",
+            "role": "Ctx Timeout + Backpressure"
+          },
+          {
+            "id": "ch",
+            "label": "chan Job (cap 1000)",
+            "role": "Bounded Queue"
+          },
+          {
+            "id": "pool",
+            "label": "N=64 Worker Pool",
+            "role": "Select ctx.Done()"
+          },
+          {
+            "id": "db",
+            "label": "Downstream Pool",
+            "role": "MaxIdleConnsPerHost=64"
+          }
+        ],
+        "edges": [
+          {
+            "label": "Bounded send"
+          },
+          {
+            "label": "Capped concurrency"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Backpressure",
+            "detail": "When the 1,000-slot channel fills, producers block or fail fast with 429/503 instead of OOMing."
+          },
+          {
+            "label": "Netpoller Yield",
+            "detail": "Network I/O parks G in epoll/kqueue without blocking OS thread M."
+          },
+          {
+            "label": "Container Quota",
+            "detail": "Use uber-go/automaxprocs in Kubernetes so GOMAXPROCS matches cgroup CPU quota, not host cores."
+          }
+        ],
+        "summary": "A bounded channel + fixed N workers decouples spike ingestion from downstream connection limits."
+      },
+      "purpose": "The mechanism: understand how a Goroutine Worker Pool works from first principles."
+    },
+    {
+      "id": "02-why-we-need-it",
+      "eyebrow": "STAGE 02 · WHY WE NEED IT",
+      "title": "Why Unbounded Goroutines Cause Port Exhaustion & Leaks",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "Think of **Why Unbounded Goroutines Cause Port Exhaustion & Leaks** as the intuition layer for Goroutine Worker Pools & Go Concurrency: The problem: see what breaks without Why Unbounded Goroutines Cause Port Exhaustion & Leaks under real concurrency or scale.",
+        "core": "Spawning 50,000 concurrent goroutines for a webhook burst opens 42,000+ ephemeral TCP sockets—triggering `connect: cannot assign requested address` and `too many open files`. Meanwhile, a goroutine blocked on an unbuffered send when the caller already timed out leaks forever in heap.",
+        "deepDive": "Under heavy load or partial failure, why unbounded goroutines cause port exhaustion & leaks becomes a critical lever for predictable latency and correctness. A goroutine worker pool bounds concurrency by running a fixed set of N lightweight goroutines pulling jobs from a shared channel, giving you predictable memory, backpressure, and clean cancellation via context.Context."
+      },
+      "ideas": [
+        {
+          "title": "Always Select on `ctx.Done()`",
+          "description": "Wrap every channel send and receive in `select { case ch <- val: case <-ctx.Done(): return }` so canceled callers never leak workers."
+        },
+        {
+          "title": "Single-Owner Channel Closing",
+          "description": "Only the producer/coordinator closes `jobs` after all senders finish (`defer close(jobs)`); closing on the receiver side panics."
+        }
+      ],
+      "purpose": "The problem: see what breaks without Why Unbounded Goroutines Cause Port Exhaustion & Leaks under real concurrency or scale.",
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "Component Topology",
+        "title": "Why Unbounded Goroutines Cause Port Exhaustion & Leaks",
+        "graphNodes": [
+          {
+            "id": "prod",
+            "label": "Producers",
+            "role": "ingress",
+            "col": 0,
+            "row": 0,
+            "tone": "primary"
+          },
+          {
+            "id": "queue",
+            "label": "Bounded Queue",
+            "role": "compute",
+            "col": 1,
+            "row": 0,
+            "tone": "tint"
+          },
+          {
+            "id": "pool",
+            "label": "Worker Pool",
+            "role": "storage",
+            "col": 2,
+            "row": 0,
+            "tone": "tint"
+          },
+          {
+            "id": "sink",
+            "label": "Shared Memory",
+            "role": "control",
+            "col": 0,
+            "row": 1,
+            "tone": "tint"
+          }
+        ],
+        "graphEdges": [
+          {
+            "from": "prod",
+            "to": "queue",
+            "label": "offer(task)",
+            "style": "solid",
+            "tone": "green"
+          },
+          {
+            "from": "queue",
+            "to": "pool",
+            "label": "dispatch",
+            "style": "solid",
+            "tone": "green"
+          },
+          {
+            "from": "pool",
+            "to": "sink",
+            "label": "CAS update",
+            "style": "solid",
+            "tone": "green"
+          }
+        ]
+      },
+      "decisionFramework": {
+        "problem": "How to implement Goroutine Worker Pools & Go Concurrency without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "When naive scans degrade into quadratic bottlenecks, spawning unbounded goroutines (go handle(req)) exhausts file descriptors, DB connection pools, and heap under load spikes; a bounded worker pool caps downstream pressure while keeping Go's M:N scheduler at peak efficiency.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Goroutine Worker Pools & Go Concurrency experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-where-it-is-used",
+      "eyebrow": "STAGE 03 · WHERE IT IS USED",
+      "title": "Sizing Pools for I/O-Bound vs. CPU-Bound Workloads",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Think of **Sizing Pools for I/O-Bound vs. CPU-Bound Workloads** as the intuition layer for Goroutine Worker Pools & Go Concurrency: Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+        "core": "Pool size `N` depends on whether workers wait on network sockets or saturate CPU cores.",
+        "deepDive": "Under heavy load or partial failure, sizing pools for i/o-bound vs. cpu-bound workloads becomes a critical lever for predictable latency and correctness. A goroutine worker pool bounds concurrency by running a fixed set of N lightweight goroutines pulling jobs from a shared channel, giving you predictable memory, backpressure, and clean cancellation via context.Context."
+      },
+      "comparison": [
+        {
+          "choice": "I/O-Bound Fan-Out (Webhooks, S3, RPC)",
+          "benefits": [
+            "Size `N = 10–200` matched to downstream rate limits and `http.Transport.MaxConnsPerHost`."
+          ],
+          "costs": [
+            "Without per-job `context.WithTimeout`, one slow tenant causes head-of-line blocking across the shared pool."
+          ]
+        },
+        {
+          "choice": "CPU-Bound Batch (Hashing, Image Resize)",
+          "benefits": [
+            "Size `N = runtime.GOMAXPROCS(0)` (with `automaxprocs` in containers) to prevent CFS CPU throttling."
+          ],
+          "costs": [
+            "Exceeding CPU quota increases context-switch and cache-miss overhead without extra throughput."
+          ]
+        },
+        {
+          "choice": "Avoid: Strict Per-Key Ordering",
+          "benefits": [
+            "Shard jobs by `hash(key) % N` into `N` dedicated single-worker channels."
+          ],
+          "costs": [
+            "A single shared worker pool processes keys out of order."
+          ]
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "Lifecycle & Failure Recovery",
+        "title": "Sizing Pools for I/O-Bound vs. CPU-Bound Workloads",
+        "states": [
+          {
+            "id": "idle",
+            "label": "Worker Idle",
+            "tone": "neutral"
+          },
+          {
+            "id": "running",
+            "label": "Executing Task",
+            "tone": "good"
+          },
+          {
+            "id": "blocked",
+            "label": "Backpressure / Full",
+            "tone": "warn"
+          },
+          {
+            "id": "done",
+            "label": "Permit Released",
+            "tone": "good"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "idle",
+            "to": "running",
+            "label": "acquire permit"
+          },
+          {
+            "from": "running",
+            "to": "blocked",
+            "label": "queue saturated"
+          },
+          {
+            "from": "running",
+            "to": "done",
+            "label": "finally release"
+          }
+        ]
+      }
+    },
+    {
+      "id": "04-how-it-is-managed",
+      "eyebrow": "STAGE 04 · HOW IT IS MANAGED",
+      "title": "Context-Safe Worker Pool with Bounded Queue & WaitGroup",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Think of **Context-Safe Worker Pool with Bounded Queue & WaitGroup** as the intuition layer for Goroutine Worker Pools & Go Concurrency: Operational control: configure bounds, failure handling, and safe production defaults.",
+        "core": "Use a bounded `jobs` channel, `sync.WaitGroup` for clean drain, and `select` on `ctx.Done()` to prevent goroutine leaks during `SIGTERM` shutdowns.",
+        "deepDive": "Under heavy load or partial failure, context-safe worker pool with bounded queue & waitgroup becomes a critical lever for predictable latency and correctness. A goroutine worker pool bounds concurrency by running a fixed set of N lightweight goroutines pulling jobs from a shared channel, giving you predictable memory, backpressure, and clean cancellation via context.Context."
+      },
+      "markdownContent": "```go\npackage pool\n\nimport (\n\t\"context\"\n\t\"sync\"\n)\n\nfunc RunWorkerPool[T any](ctx context.Context, workers int, jobs <-chan T, fn func(context.Context, T) error) {\n\tvar wg sync.WaitGroup\n\twg.Add(workers)\n\tfor i := 0; i < workers; i++ {\n\t\tgo func() {\n\t\t\tdefer wg.Done()\n\t\t\tfor {\n\t\t\t\tselect {\n\t\t\t\tcase <-ctx.Done():\n\t\t\t\t\treturn\n\t\t\t\tcase job, ok := <-jobs:\n\t\t\t\t\tif !ok {\n\t\t\t\t\t\treturn\n\t\t\t\t\t}\n\t\t\t\t\t_ = fn(ctx, job)\n\t\t\t\t}\n\t\t\t}\n\t\t}()\n\t}\n\twg.Wait()\n}\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-alternatives",
+      "eyebrow": "STAGE 05 · ALTERNATIVES",
+      "title": "Alternatives: Fixed Worker Pool vs. errgroup.SetLimit vs. Keyed Shards",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": {
+        "foundation": "Think of **Alternatives: Fixed Worker Pool vs. errgroup.SetLimit vs. Keyed Shards** as the intuition layer for Goroutine Worker Pools & Go Concurrency: The trade-off: compare competing approaches across latency, consistency, and operational cost.",
+        "core": "Compare long-lived worker pools against scoped `errgroup` concurrency limits.",
+        "deepDive": "Under heavy load or partial failure, alternatives: fixed worker pool vs. errgroup.setlimit vs. keyed shards becomes a critical lever for predictable latency and correctness. A goroutine worker pool bounds concurrency by running a fixed set of N lightweight goroutines pulling jobs from a shared channel, giving you predictable memory, backpressure, and clean cancellation via context.Context."
+      },
+      "comparison": [
+        {
+          "choice": "Fixed Worker Pool (`chan` + `WaitGroup`)",
+          "benefits": [
+            "Reuses long-lived goroutines and per-worker `sync.Pool` buffers; ideal for continuous daemon pipelines."
+          ],
+          "costs": [
+            "Requires explicit channel-close and drain lifecycle management."
+          ]
+        },
+        {
+          "choice": "`golang.org/x/sync/errgroup` with `SetLimit(N)`",
+          "benefits": [
+            "Minimal boilerplate for per-request fan-out/fan-in with automatic first-error context cancellation."
+          ],
+          "costs": [
+            "Spawns a fresh goroutine per task (2 KB stack each) rather than reusing steady workers."
+          ]
+        },
+        {
+          "choice": "Key-Sharded Single-Worker Channels",
+          "benefits": [
+            "Guarantees strict per-`tenant_id` or per-`order_id` FIFO ordering while bounding concurrency."
+          ],
+          "costs": [
+            "Hot keys can saturate one shard while other workers sit idle."
+          ]
+        }
+      ],
+      "purpose": "The trade-off: compare competing approaches across latency, consistency, and operational cost."
+    },
+    {
+      "id": "06-production-architecture",
+      "eyebrow": "STAGE 06 · PRODUCTION ARCHITECTURE",
+      "title": "Production Guards: Race Detector, Backpressure & SIGTERM Drain",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Think of **Production Guards: Race Detector, Backpressure & SIGTERM Drain** as the intuition layer for Goroutine Worker Pools & Go Concurrency: Production architecture: see how the components compose end to end under real load.",
+        "core": "In production Kubernetes pods, pair worker pools with `go test -race` in CI, `automaxprocs` for CFS quota alignment, and graceful `SIGTERM` draining that stops accepting new jobs while letting in-flight workers finish within `terminationGracePeriodSeconds`.",
+        "deepDive": "Under heavy load or partial failure, production guards: race detector, backpressure & sigterm drain becomes a critical lever for predictable latency and correctness. A goroutine worker pool bounds concurrency by running a fixed set of N lightweight goroutines pulling jobs from a shared channel, giving you predictable memory, backpressure, and clean cancellation via context.Context."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Graceful Shutdown",
+        "title": "SIGTERM Drain Sequence Without Dropping In-Flight Jobs",
+        "actors": [
+          {
+            "id": "k8s",
+            "label": "kubelet SIGTERM"
+          },
+          {
+            "id": "srv",
+            "label": "Producer"
+          },
+          {
+            "id": "ch",
+            "label": "jobs chan"
+          },
+          {
+            "id": "wk",
+            "label": "Workers (N=64)"
+          }
+        ],
+        "events": [
+          {
+            "from": "k8s",
+            "label": "Send SIGTERM (30s grace)",
+            "to": "srv",
+            "status": "warn"
+          },
+          {
+            "from": "srv",
+            "label": "Stop ingress & close(jobs)",
+            "to": "ch",
+            "status": "ok"
+          },
+          {
+            "from": "ch",
+            "label": "Drain buffered jobs to workers",
+            "to": "wk",
+            "status": "ok"
+          },
+          {
+            "from": "wk",
+            "label": "wg.Wait() returns -> exit 0",
+            "to": "srv",
+            "status": "ok"
+          }
+        ],
+        "summary": "Closing the jobs channel on SIGTERM lets workers drain buffered tasks cleanly before wg.Wait() exits."
+      },
+      "purpose": "Production architecture: see how the components compose end to end under real load."
+    },
+    {
+      "id": "07-problems-and-further-reading",
+      "eyebrow": "STAGE 07 · PROBLEMS SOLVED & FURTHER DEEP DIVE",
+      "title": "Problems Solved by Bounded Worker Pools",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Think of **Problems Solved by Bounded Worker Pools** as the intuition layer for Goroutine Worker Pools & Go Concurrency: Applied problems: connect these internals to concrete system design and debugging scenarios.",
+        "core": "Explore backpressure queues, ephemeral port exhaustion, Kubernetes CFS throttling, and graceful shutdowns.",
+        "deepDive": "Under heavy load or partial failure, problems solved by bounded worker pools becomes a critical lever for predictable latency and correctness. A goroutine worker pool bounds concurrency by running a fixed set of N lightweight goroutines pulling jobs from a shared channel, giving you predictable memory, backpressure, and clean cancellation via context.Context."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "bounded-task-queues",
+          "title": "Problem: Bounded Task Queues & Backpressure",
+          "kind": "problem"
+        },
+        {
+          "slug": "ephemeral-port-exhaustion",
+          "title": "Problem: Ephemeral Port Exhaustion & Connection Pooling",
+          "kind": "problem"
+        },
+        {
+          "slug": "k8s-cpu-throttling",
+          "title": "Problem: Fixing Kubernetes CFS CPU Throttling",
+          "kind": "problem"
+        },
+        {
+          "slug": "graceful-shutdown-rolling",
+          "title": "Problem: Graceful Shutdown in Rolling Deployments",
+          "kind": "problem"
+        },
+        {
+          "slug": "java-virtual-threads",
+          "title": "Concept: Java Virtual Threads & Structured Concurrency",
+          "kind": "concept"
+        }
+      ],
+      "purpose": "Applied problems: connect these internals to concrete system design and debugging scenarios.",
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Request & State Flow",
+        "title": "Problems Solved by Bounded Worker Pools",
+        "actors": [
+          {
+            "id": "prod",
+            "label": "Producer Thread"
+          },
+          {
+            "id": "queue",
+            "label": "Bounded Queue / Ring"
+          },
+          {
+            "id": "pool",
+            "label": "Worker Pool"
+          },
+          {
+            "id": "sink",
+            "label": "Shared State"
+          }
+        ],
+        "events": [
+          {
+            "from": "prod",
+            "to": "queue",
+            "label": "Try non-blocking offer / CAS"
+          },
+          {
+            "from": "queue",
+            "to": "pool",
+            "label": "Dispatch to idle worker thread"
+          },
+          {
+            "from": "pool",
+            "to": "sink",
+            "label": "Execute without holding outer locks"
+          },
+          {
+            "from": "pool",
+            "to": "prod",
+            "label": "Release permit / signal completion"
+          }
+        ]
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "A Go service running in a 2-vCPU Kubernetes pod on a 64-core host launches a CPU-bound worker pool sized to `runtime.GOMAXPROCS(0)`. Why does it experience severe latency spikes without `automaxprocs`?",
+      "options": [
+        {
+          "id": "a",
+          "text": "By default Go reads the host's 64 cores instead of the 2-vCPU cgroup quota, spawning 64 OS threads that burn the 200ms CFS quota immediately and get throttled",
+          "correct": true,
+          "feedback": "Correct: `automaxprocs` sets `GOMAXPROCS` to the container's cgroup CPU limit, eliminating CFS throttling."
+        },
+        {
+          "id": "b",
+          "text": "Because `chan` buffers are limited to `GOMAXPROCS` elements",
+          "correct": false,
+          "feedback": "Channel capacity is independent of `GOMAXPROCS`."
+        },
+        {
+          "id": "c",
+          "text": "Because Go's netpoller only works when `GOMAXPROCS == 1`",
+          "correct": false,
+          "feedback": "The netpoller works at any `GOMAXPROCS` value."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "A Go service running in a 2-vCPU Kubernetes pod on a 64-core host launches a CPU-bound worker pool sized to `runtime.GOMAXPROCS(0)`. Why does it experience severe latency spikes without `automaxprocs`?",
+        "options": [
+          {
+            "id": "a",
+            "text": "By default Go reads the host's 64 cores instead of the 2-vCPU cgroup quota, spawning 64 OS threads that burn the 200ms CFS quota immediately and get throttled",
+            "correct": true,
+            "feedback": "Correct: `automaxprocs` sets `GOMAXPROCS` to the container's cgroup CPU limit, eliminating CFS throttling."
+          },
+          {
+            "id": "b",
+            "text": "Because `chan` buffers are limited to `GOMAXPROCS` elements",
+            "correct": false,
+            "feedback": "Channel capacity is independent of `GOMAXPROCS`."
+          },
+          {
+            "id": "c",
+            "text": "Because Go's netpoller only works when `GOMAXPROCS == 1`",
+            "correct": false,
+            "feedback": "The netpoller works at any `GOMAXPROCS` value."
+          }
+        ]
+      },
+      {
+        "question": "What is the main benefit—and corresponding operational trade-off—of using I/O-Bound Fan-Out (Webhooks, S3, RPC) in Goroutine Worker Pools & Go Concurrency?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Relying solely on Strict Per-Key Ordering avoids all operational and latency trade-offs",
+            "correct": false,
+            "feedback": "Incorrect: every production option in Goroutine Worker Pools & Go Concurrency carries concrete latency, consistency, or operational costs."
+          },
+          {
+            "id": "b",
+            "text": "Advantage: Size N = 10–200 matched to downstream rate limits and http.Transport.MaxConnsPerHost. Cost: Without per-job context.WithTimeout, one slow tenant causes head-of-line blocking across the shared pool.",
+            "correct": true,
+            "feedback": "Correct: I/O-Bound Fan-Out (Webhooks, S3, RPC) delivers size N = 10–200 matched to downstream rate limits and http.Transport.MaxConnsPerHost. while requiring you to manage without per-job context.WithTimeout, one slow tenant causes head-of-line blocking across the shared pool."
+          },
+          {
+            "id": "c",
+            "text": "Advantage: Size N = runtime.GOMAXPROCS(0) (with automaxprocs in containers) to prevent CFS CPU throttling. It has zero operational or latency overhead compared to CPU-Bound Batch (Hashing, Image Resize).",
+            "correct": false,
+            "feedback": "Not quite: that describes CPU-Bound Batch (Hashing, Image Resize), whereas I/O-Bound Fan-Out (Webhooks, S3, RPC) specifically trades off: Without per-job context.WithTimeout, one slow tenant causes head-of-line blocking across the shared pool."
+          }
+        ]
+      },
+      {
+        "question": "Why is Single-Owner Channel Closing critical when operating Goroutine Worker Pools & Go Concurrency in production?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Only the producer/coordinator closes jobs after all senders finish (defer close(jobs)); closing on the receiver side panics.",
+            "correct": true,
+            "feedback": "Correct: Only the producer/coordinator closes jobs after all senders finish (defer close(jobs)); closing on the receiver side panics."
+          },
+          {
+            "id": "b",
+            "text": "It only applies during local unit testing and can be disabled in production to save memory.",
+            "correct": false,
+            "feedback": "Incorrect: 'Single-Owner Channel Closing' directly governs production reliability and correctness under real traffic."
+          },
+          {
+            "id": "c",
+            "text": "It replaces the need for observability, timeouts, or capacity planning across Goroutine Worker Pools & Go Concurrency.",
+            "correct": false,
+            "feedback": "Incorrect: 'Single-Owner Channel Closing' works alongside proper bounds, monitoring, and failure isolation."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** Goroutines start at just **2 KB of stack**, making it tempting to write `go process(item)` inside a million-item loop.\n\n**How It Flows:** Think of Goroutine Worker Pools & Go Concurrency as a clear step-by-step chain: HTTP / Kafka Producer -> chan Job (cap 1000) -> N=64 Worker Pool -> Downstream Pool -> kubelet SIGTERM.\n\n**Why Beginners Should Care:** Spawning unbounded goroutines (go handle(req)) exhausts file descriptors, DB connection pools, and heap under load spikes; a bounded worker pool caps downstream pressure while keeping Go's M:N scheduler at peak efficiency.",
+      "spark": {
+        "summary": "Goroutines start at just **2 KB of stack**, making it tempting to write `go process(item)` inside a million-item loop.",
+        "keyTakeaway": "Spawning unbounded goroutines (go handle(req)) exhausts file descriptors, DB connection pools, and heap under load spikes; a bounded worker pool caps downstream pressure while."
+      },
+      "learningJourney": [
+        {
+          "id": "01-what-it-is",
+          "title": "What is a Goroutine Worker Pool",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how a Goroutine Worker Pool works from first principles.",
+          "explanation": "Goroutines start at just **2 KB of stack**, making it tempting to write `go process(item)` inside a million-item loop. Go's **M:N scheduler** multiplexes goroutines (`G`) onto OS threads (`M`) across `P = GOMAXPROCS` logical processors using work-stealing and an `epoll`/`kqueue` **netpoller**.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Bounded Pipeline",
+            "title": "Producer -> Bounded Job Channel -> N Workers -> Shared Transport",
+            "nodes": [
+              {
+                "id": "prod",
+                "label": "HTTP / Kafka Producer",
+                "role": "Ctx Timeout + Backpressure"
+              },
+              {
+                "id": "ch",
+                "label": "chan Job (cap 1000)",
+                "role": "Bounded Queue"
+              },
+              {
+                "id": "pool",
+                "label": "N=64 Worker Pool",
+                "role": "Select ctx.Done()"
+              },
+              {
+                "id": "db",
+                "label": "Downstream Pool",
+                "role": "MaxIdleConnsPerHost=64"
+              }
+            ],
+            "edges": [
+              {
+                "label": "Bounded send"
+              },
+              {
+                "label": "Capped concurrency"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Backpressure",
+                "detail": "When the 1,000-slot channel fills, producers block or fail fast with 429/503 instead of OOMing."
+              },
+              {
+                "label": "Netpoller Yield",
+                "detail": "Network I/O parks G in epoll/kqueue without blocking OS thread M."
+              },
+              {
+                "label": "Container Quota",
+                "detail": "Use uber-go/automaxprocs in Kubernetes so GOMAXPROCS matches cgroup CPU quota, not host cores."
+              }
+            ],
+            "summary": "A bounded channel + fixed N workers decouples spike ingestion from downstream connection limits."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-why-we-need-it",
+          "title": "Why Unbounded Goroutines Cause Port Exhaustion & Leaks",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without Why Unbounded Goroutines Cause Port Exhaustion & Leaks under real concurrency or scale.",
+          "explanation": "Spawning 50,000 concurrent goroutines for a webhook burst opens 42,000+ ephemeral TCP sockets—triggering `connect: cannot assign requested address` and `too many open files`. Meanwhile, a goroutine blocked on an unbuffered send when the caller already timed out leaks forever in heap.",
+          "ideas": [
+            {
+              "title": "Always Select on `ctx.Done()`",
+              "description": "Wrap every channel send and receive in `select { case ch <- val: case <-ctx.Done(): return }` so canceled callers never leak workers."
+            },
+            {
+              "title": "Single-Owner Channel Closing",
+              "description": "Only the producer/coordinator closes `jobs` after all senders finish (`defer close(jobs)`); closing on the receiver side panics."
+            }
+          ],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-where-it-is-used",
+          "title": "Sizing Pools for I/O-Bound vs. CPU-Bound Workloads",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Pool size `N` depends on whether workers wait on network sockets or saturate CPU cores.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "06-production-architecture",
+          "title": "Production Guards: Race Detector, Backpressure & SIGTERM Drain",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Production architecture: see how the components compose end to end under real load.",
+          "explanation": "In production Kubernetes pods, pair worker pools with `go test -race` in CI, `automaxprocs` for CFS quota alignment, and graceful `SIGTERM` draining that stops accepting new jobs while letting in-flight workers finish within `terminationGracePeriodSeconds`.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Graceful Shutdown",
+            "title": "SIGTERM Drain Sequence Without Dropping In-Flight Jobs",
+            "actors": [
+              {
+                "id": "k8s",
+                "label": "kubelet SIGTERM"
+              },
+              {
+                "id": "srv",
+                "label": "Producer"
+              },
+              {
+                "id": "ch",
+                "label": "jobs chan"
+              },
+              {
+                "id": "wk",
+                "label": "Workers (N=64)"
+              }
+            ],
+            "events": [
+              {
+                "from": "k8s",
+                "label": "Send SIGTERM (30s grace)",
+                "to": "srv",
+                "status": "warn"
+              },
+              {
+                "from": "srv",
+                "label": "Stop ingress & close(jobs)",
+                "to": "ch",
+                "status": "ok"
+              },
+              {
+                "from": "ch",
+                "label": "Drain buffered jobs to workers",
+                "to": "wk",
+                "status": "ok"
+              },
+              {
+                "from": "wk",
+                "label": "wg.Wait() returns -> exit 0",
+                "to": "srv",
+                "status": "ok"
+              }
+            ],
+            "summary": "Closing the jobs channel on SIGTERM lets workers drain buffered tasks cleanly before wg.Wait() exits."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Spawning unbounded goroutines (go handle(req)) exhausts file descriptors, DB connection pools, and heap under load spikes; a bounded worker pool caps downstream pressure while.",
+      "summary": "A goroutine worker pool bounds concurrency by running a fixed set of N lightweight goroutines pulling jobs from a shared channel, giving you predictable memory, backpressure, and clean cancellation via context.Context.",
+      "keyTakeaway": "When naive scans degrade into quadratic bottlenecks, spawning unbounded goroutines (go handle(req)) exhausts file descriptors, DB connection pools, and heap under load spikes; a bounded worker pool caps downstream pressure while keeping Go's M:N scheduler at peak efficiency."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** Goroutines start at just **2 KB of stack**, making it tempting to write `go process(item)` inside a million-item loop.\n\n**Visual & Structural Flow:** Depicts Producer -> Bounded Job Channel -> N Workers -> Shared Transport (HTTP / Kafka Producer -> chan Job (cap 1000) -> N=64 Worker Pool -> Downstream Pool); SIGTERM Drain Sequence Without Dropping In-Flight Jobs (kubelet SIGTERM -> Producer -> jobs chan -> Workers (N=64)).\n\n**Trade-Offs & Production:** Compare long-lived worker pools against scoped `errgroup` concurrency limits. In production Kubernetes pods, pair worker pools with `go test -race` in CI, `automaxprocs` for CFS quota alignment, and graceful `SIGTERM` draining that stops accepting new jobs.\n\n**Failure Modes & Application:** Explore backpressure queues, ephemeral port exhaustion, Kubernetes CFS throttling, and graceful shutdowns.",
+      "spark": {
+        "summary": "A goroutine worker pool bounds concurrency by running a fixed set of N lightweight goroutines pulling jobs from a shared channel, giving you predictable memory, backpressure, and clean cancellation via context.Context.",
+        "keyTakeaway": "Spawning unbounded goroutines (go handle(req)) exhausts file descriptors, DB connection pools, and heap under load spikes; a bounded worker pool caps downstream pressure while keeping Go's M:N scheduler at peak efficiency."
+      },
+      "summary": "A goroutine worker pool bounds concurrency by running a fixed set of N lightweight goroutines pulling jobs from a shared channel, giving you predictable memory, backpressure, and clean cancellation via context.Context.",
+      "keyTakeaway": "When naive scans degrade into quadratic bottlenecks, spawning unbounded goroutines (go handle(req)) exhausts file descriptors, DB connection pools, and heap under load spikes; a bounded worker pool caps downstream pressure while keeping Go's M:N scheduler at peak efficiency."
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** A goroutine worker pool bounds concurrency by running a fixed set of N lightweight goroutines pulling jobs from a shared channel, giving you predictable memory, backpressure, and clean cancellation via context.Context.\n\n**Production Trade-Offs:** Use a bounded `jobs` channel, `sync.WaitGroup` for clean drain, and `select` on `ctx.Done()` to prevent goroutine leaks during `SIGTERM` shutdowns.\n\n**Failure Modes & Edge Cases:** Explore backpressure queues, ephemeral port exhaustion, Kubernetes CFS throttling, and graceful shutdowns.\n\n**Principal Takeaway:** Spawning unbounded goroutines (go handle(req)) exhausts file descriptors, DB connection pools, and heap under load spikes; a bounded worker pool caps downstream pressure while keeping Go's M:N scheduler at peak efficiency.",
+      "spark": {
+        "summary": "A goroutine worker pool bounds concurrency by running a fixed set of N lightweight goroutines pulling jobs from a shared channel, giving you predictable memory, backpressure, and clean cancellation via context.Context.",
+        "keyTakeaway": "Spawning unbounded goroutines (go handle(req)) exhausts file descriptors, DB connection pools, and heap under load spikes; a bounded worker pool caps downstream pressure while keeping Go's M:N scheduler at peak efficiency."
+      },
+      "learningJourney": [
+        {
+          "id": "01-what-it-is",
+          "title": "What is a Goroutine Worker Pool",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how a Goroutine Worker Pool works from first principles.",
+          "explanation": "Goroutines start at just **2 KB of stack**, making it tempting to write `go process(item)` inside a million-item loop. Go's **M:N scheduler** multiplexes goroutines (`G`) onto OS threads (`M`) across `P = GOMAXPROCS` logical processors using work-stealing and an `epoll`/`kqueue` **netpoller**.\n\nA **goroutine worker pool** places a fixed ceiling `N` on active workers pulling from a bounded `jobs` channel, ensuring downstream databases, APIs, and OS file descriptors (`ulimit -n`) never collapse under a thundering herd.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Bounded Pipeline",
+            "title": "Producer -> Bounded Job Channel -> N Workers -> Shared Transport",
+            "nodes": [
+              {
+                "id": "prod",
+                "label": "HTTP / Kafka Producer",
+                "role": "Ctx Timeout + Backpressure"
+              },
+              {
+                "id": "ch",
+                "label": "chan Job (cap 1000)",
+                "role": "Bounded Queue"
+              },
+              {
+                "id": "pool",
+                "label": "N=64 Worker Pool",
+                "role": "Select ctx.Done()"
+              },
+              {
+                "id": "db",
+                "label": "Downstream Pool",
+                "role": "MaxIdleConnsPerHost=64"
+              }
+            ],
+            "edges": [
+              {
+                "label": "Bounded send"
+              },
+              {
+                "label": "Capped concurrency"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Backpressure",
+                "detail": "When the 1,000-slot channel fills, producers block or fail fast with 429/503 instead of OOMing."
+              },
+              {
+                "label": "Netpoller Yield",
+                "detail": "Network I/O parks G in epoll/kqueue without blocking OS thread M."
+              },
+              {
+                "label": "Container Quota",
+                "detail": "Use uber-go/automaxprocs in Kubernetes so GOMAXPROCS matches cgroup CPU quota, not host cores."
+              }
+            ],
+            "summary": "A bounded channel + fixed N workers decouples spike ingestion from downstream connection limits."
+          },
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-why-we-need-it",
+          "title": "Why Unbounded Goroutines Cause Port Exhaustion & Leaks",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without Why Unbounded Goroutines Cause Port Exhaustion & Leaks under real concurrency or scale.",
+          "explanation": "Spawning 50,000 concurrent goroutines for a webhook burst opens 42,000+ ephemeral TCP sockets—triggering `connect: cannot assign requested address` and `too many open files`. Meanwhile, a goroutine blocked on an unbuffered send when the caller already timed out leaks forever in heap.",
+          "caveats": null,
+          "ideas": [
+            {
+              "title": "Always Select on `ctx.Done()`",
+              "description": "Wrap every channel send and receive in `select { case ch <- val: case <-ctx.Done(): return }` so canceled callers never leak workers."
+            },
+            {
+              "title": "Single-Owner Channel Closing",
+              "description": "Only the producer/coordinator closes `jobs` after all senders finish (`defer close(jobs)`); closing on the receiver side panics."
+            }
+          ],
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "03-where-it-is-used",
+          "title": "Sizing Pools for I/O-Bound vs. CPU-Bound Workloads",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Pool size `N` depends on whether workers wait on network sockets or saturate CPU cores.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-how-it-is-managed",
+          "title": "Context-Safe Worker Pool with Bounded Queue & WaitGroup",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Use a bounded `jobs` channel, `sync.WaitGroup` for clean drain, and `select` on `ctx.Done()` to prevent goroutine leaks during `SIGTERM` shutdowns.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "05-alternatives",
+          "title": "Alternatives: Fixed Worker Pool vs. errgroup.SetLimit vs. Keyed Shards",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "The trade-off: compare competing approaches across latency, consistency, and operational cost.",
+          "explanation": "Compare long-lived worker pools against scoped `errgroup` concurrency limits.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "06-production-architecture",
+          "title": "Production Guards: Race Detector, Backpressure & SIGTERM Drain",
+          "eyebrow": "Advanced Path · Stage 06",
+          "purpose": "Production architecture: see how the components compose end to end under real load.",
+          "explanation": "In production Kubernetes pods, pair worker pools with `go test -race` in CI, `automaxprocs` for CFS quota alignment, and graceful `SIGTERM` draining that stops accepting new jobs while letting in-flight workers finish within `terminationGracePeriodSeconds`.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Graceful Shutdown",
+            "title": "SIGTERM Drain Sequence Without Dropping In-Flight Jobs",
+            "actors": [
+              {
+                "id": "k8s",
+                "label": "kubelet SIGTERM"
+              },
+              {
+                "id": "srv",
+                "label": "Producer"
+              },
+              {
+                "id": "ch",
+                "label": "jobs chan"
+              },
+              {
+                "id": "wk",
+                "label": "Workers (N=64)"
+              }
+            ],
+            "events": [
+              {
+                "from": "k8s",
+                "label": "Send SIGTERM (30s grace)",
+                "to": "srv",
+                "status": "warn"
+              },
+              {
+                "from": "srv",
+                "label": "Stop ingress & close(jobs)",
+                "to": "ch",
+                "status": "ok"
+              },
+              {
+                "from": "ch",
+                "label": "Drain buffered jobs to workers",
+                "to": "wk",
+                "status": "ok"
+              },
+              {
+                "from": "wk",
+                "label": "wg.Wait() returns -> exit 0",
+                "to": "srv",
+                "status": "ok"
+              }
+            ],
+            "summary": "Closing the jobs channel on SIGTERM lets workers drain buffered tasks cleanly before wg.Wait() exits."
+          },
+          "level": "L7 · STAFF / PRINCIPAL"
+        },
+        {
+          "id": "07-problems-and-further-reading",
+          "title": "Problems Solved by Bounded Worker Pools",
+          "eyebrow": "Advanced Path · Stage 07",
+          "purpose": "Applied problems: connect these internals to concrete system design and debugging scenarios.",
+          "explanation": "Explore backpressure queues, ephemeral port exhaustion, Kubernetes CFS throttling, and graceful shutdowns.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Spawning unbounded goroutines (go handle(req)) exhausts file descriptors, DB connection pools, and heap under load spikes; a bounded worker pool caps downstream pressure while keeping Go's M:N scheduler at peak efficiency.",
+      "summary": "A goroutine worker pool bounds concurrency by running a fixed set of N lightweight goroutines pulling jobs from a shared channel, giving you predictable memory, backpressure, and clean cancellation via context.Context.",
+      "keyTakeaway": "When naive scans degrade into quadratic bottlenecks, spawning unbounded goroutines (go handle(req)) exhausts file descriptors, DB connection pools, and heap under load spikes; a bounded worker pool caps downstream pressure while keeping Go's M:N scheduler at peak efficiency."
+    }
+  },
+  "pedagogicalFramework": "PRIME",
+  "prerequisites": [
+    {
+      "title": "Python GIL-Free Concurrency, Asyncio & Coroutines",
+      "summary": "Free-threaded Python (PEP 703, CPython 3.13t+) removes the Global Interpreter Lock so multiple threads execute Python bytecode simultaneously across CPU cores within a single shared memory space."
+    }
+  ],
+  "simulation": {
+    "title": "Goroutine Worker Pools & Go Concurrency — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "prod",
+        "label": "Producers",
+        "role": "Concurrent Tasks"
+      },
+      {
+        "id": "queue",
+        "label": "Bounded Queue",
+        "role": "Backpressure Gate"
+      },
+      {
+        "id": "pool",
+        "label": "Worker Pool",
+        "role": "Isolated Threads"
+      },
+      {
+        "id": "sink",
+        "label": "Shared Memory",
+        "role": "CAS / Padded State"
+      }
+    ],
+    "edges": [
+      {
+        "from": "prod",
+        "to": "queue",
+        "label": "offer(task)"
+      },
+      {
+        "from": "queue",
+        "to": "pool",
+        "label": "dispatch"
+      },
+      {
+        "from": "pool",
+        "to": "sink",
+        "label": "CAS update"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "What is a Goroutine Worker Pool",
+        "actionLabel": "offer(task)",
+        "status": "healthy",
+        "activeNodeIds": [
+          "prod",
+          "queue"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "offer(task)",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Producers sends work to Bounded Queue (What is a Goroutine Worker Pool)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Why Unbounded Goroutines Cause Port Exhaustion & Leaks",
+        "actionLabel": "dispatch",
+        "status": "healthy",
+        "activeNodeIds": [
+          "queue",
+          "pool"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "dispatch",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Bounded Queue coordinates with Worker Pool while preserving the core invariant (Why Unbounded Goroutines Cause Port Exhaustion & Leaks)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Sizing Pools for I/O-Bound vs. CPU-Bound Workloads",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "pool",
+          "sink"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, Shared Memory absorbs pressure without cascading (Sizing Pools for I/O-Bound vs. CPU-Bound Workloads)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Problems Solved by Bounded Worker Pools",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "prod",
+          "queue",
+          "pool",
+          "sink"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Problems Solved by Bounded Worker Pools)."
+      }
+    ]
+  }
+}

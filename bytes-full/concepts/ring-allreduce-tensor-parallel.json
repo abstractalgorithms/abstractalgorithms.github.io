@@ -1,0 +1,546 @@
+{
+  "id": "ring-allreduce-tensor-parallel",
+  "slug": "ring-allreduce-tensor-parallel",
+  "name": "Ring AllReduce & Tensor Parallelism Across Multi-GPU Clusters",
+  "domain": "AI & Machine Learning Systems",
+  "tagline": "Bandwidth-optimal collective gradient aggregation and intra-layer Megatron matrix partitioning.",
+  "purpose": "Understand why naive parameter servers choke on 100B+ parameter gradient syncs, how Ring AllReduce achieves 2(N-1)/N bandwidth efficiency, and how column-then-row Tensor Parallelism cuts sync points in half.",
+  "pedagogicalFramework": "PRIME",
+  "prerequisites": [
+    {
+      "title": "Transformer Attention & MLP Dimensions",
+      "summary": "Know how projection matrices W_QKV and MLP layers W_1, W_2 map hidden dimension h to 4h and back, because Tensor Parallelism splits those exact inner dimensions."
+    },
+    {
+      "title": "PCIe vs. NVLink & RDMA Interconnects",
+      "summary": "Understand the 10x–20x bandwidth gap between intra-node NVLink (900 GB/s on H100) and inter-node InfiniBand/RoCE (400 Gbps = 50 GB/s per NIC)."
+    }
+  ],
+  "spark": {
+    "summary": "Ring AllReduce splits tensors into N chunks across N GPUs so every link transfers 2*(N-1)/N * M bytes regardless of cluster size, while Megatron Tensor Parallelism pairs column-wise and row-wise splits to need only one AllReduce per block.",
+    "keyTakeaway": "When a single GPU cannot hold model weights or a parameter server saturates its NIC during gradient sync, pair Ring AllReduce for bandwidth-optimal collective reduction with column-then-row Tensor Parallelism inside NVLink domains so communication stays off slower inter-node fabrics.",
+    "byteSummary": "Training a 70B-parameter model in BF16 with AdamW requires ~140 GB for weights alone and over 1 TB once gradients and FP32 optimizer states are counted—far beyond an 80 GB H100. If you push every gradient to a central Parameter Server, that single node's NIC must ingest N * M bytes per step, turning into an O(N) bottleneck.\n\nRing AllReduce eliminates the central coordinator by arranging N GPUs in a logical ring and splitting the M-byte gradient tensor into N chunks. In Phase 1 (Scatter-Reduce, N-1 steps), each GPU sends one chunk to its clockwise neighbor and accumulates what it receives counterclockwise until every GPU holds the fully summed value of exactly one chunk. In Phase 2 (AllGather, N-1 steps), GPUs circulate those finalized chunks around the ring so every rank ends with the complete summed tensor. Total data sent per GPU is 2 * (N-1)/N * M—nearly constant as N grows.\n\nFor layers too large to fit on one GPU, Megatron-style Tensor Parallelism (TP) splits each MLP and Attention block across GPUs inside a high-bandwidth NVLink domain. Splitting the first linear layer W1 column-wise keeps the GeLU activation independent on each GPU without any sync; splitting the second linear layer W2 row-wise produces partial sums that combine via a single AllReduce at the end of the block. Because TP triggers an AllReduce on every forward and backward layer boundary, keeping TP <= 8 (intra-node NVLink) is critical—running TP across 50 GB/s InfiniBand stalls tensor cores on network latency."
+  },
+  "learningJourney": [
+    {
+      "id": "stage-1-problem-broken-trace",
+      "stageNumber": 1,
+      "title": "P · Problem & The Parameter-Server Bottleneck",
+      "whyThisMatters": "Shows why centralizing gradient aggregation collapses linearly as GPU count grows.",
+      "explanation": {
+        "foundation": "Imagine 64 GPUs each holding a 10 GB gradient vector. If all 64 GPUs send their 10 GB vector to one Parameter Server (PS) to be averaged and broadcast back, that single PS NIC must receive 640 GB and transmit 640 GB every training step.",
+        "core": "With a 400 Gbps (50 GB/s) NIC, receiving and broadcasting 1.28 TB takes at least 25.6 seconds per step—longer than the forward and backward math itself. Worse, in a naive peer-to-peer All-to-All where every GPU sends M bytes to N-1 peers, link congestion scales quadratically.",
+        "deepDive": "At 1,024 GPUs, a centralized PS leaves 99% of cluster FLOPs idle waiting on one node's PCIe root complex and network port. Collective communication primitives (AllReduce) replace the hub with symmetric peer-to-peer rings or trees so every GPU's NIC works at full duplex simultaneously."
+      },
+      "sectionDiagram": {
+        "kind": "behavior-transition",
+        "eyebrow": "Communication Bottleneck",
+        "title": "Parameter Server O(N) Fan-In vs. Ring AllReduce O(1) Per-Link",
+        "before": {
+          "label": "Central Parameter Server",
+          "metrics": [
+            "Root NIC ingests N * M bytes",
+            "63 GPUs idle during reduction",
+            "Single point of congestion"
+          ]
+        },
+        "after": {
+          "label": "Symmetric Ring AllReduce",
+          "metrics": [
+            "Each GPU sends 2*(N-1)/N * M",
+            "All N NICs active in full duplex",
+            "Throughput independent of N"
+          ]
+        }
+      }
+    },
+    {
+      "id": "stage-2-ring-allreduce-intuition",
+      "stageNumber": 2,
+      "title": "R · Representation: Scatter-Reduce + AllGather",
+      "whyThisMatters": "Derives the exact 2*(N-1)/N byte bound that makes Ring AllReduce bandwidth-optimal.",
+      "explanation": {
+        "foundation": "Arrange N GPUs in a circle: GPU 0 -> GPU 1 -> ... -> GPU N-1 -> GPU 0. Slice the M-byte tensor into N equal chunks of size M/N. Every step, each GPU sends one chunk to its right neighbor while receiving one chunk from its left neighbor.",
+        "core": "In Phase 1 (Scatter-Reduce, N-1 steps), each GPU adds the incoming chunk into its local buffer and forwards the running sum. After N-1 steps, GPU k holds the complete global sum for chunk k. In Phase 2 (AllGather, N-1 steps), each GPU forwards its finalized chunk around the ring without adding, overwriting local chunks until all N GPUs hold all N summed chunks.",
+        "deepDive": "Each of the 2*(N-1) steps transfers M/N bytes per GPU, so total bytes sent per GPU is 2 * (N-1)/N * M. On N=8 GPUs with M=1 GB, each GPU sends 1.75 GB; on N=1,024 GPUs, each GPU sends 1.998 GB. Bandwidth cost converges to 2M regardless of N, though latency grows as 2*(N-1)*alpha."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "2-Phase Ring Collective",
+        "title": "Scatter-Reduce Followed by AllGather Across N Ranks",
+        "actors": [
+          {
+            "id": "g0",
+            "label": "GPU 0"
+          },
+          {
+            "id": "g1",
+            "label": "GPU 1"
+          },
+          {
+            "id": "g2",
+            "label": "GPU 2"
+          },
+          {
+            "id": "g3",
+            "label": "GPU 3"
+          }
+        ],
+        "events": [
+          {
+            "from": "g0",
+            "to": "g1",
+            "label": "Phase 1: Send chunk[0], accumulate"
+          },
+          {
+            "from": "g1",
+            "to": "g2",
+            "label": "Phase 1: Forward partial sum"
+          },
+          {
+            "from": "g2",
+            "to": "g3",
+            "label": "Phase 2: Broadcast final chunk"
+          },
+          {
+            "from": "g3",
+            "to": "g0",
+            "label": "Phase 2: Complete tensor copy"
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-3-invariant-tensor-parallel",
+      "stageNumber": 3,
+      "title": "I · Invariant: Column-Then-Row Tensor Parallelism",
+      "whyThisMatters": "Shows how Megatron-LM avoids synchronizing before non-linearities like GeLU or Softmax.",
+      "explanation": {
+        "foundation": "When a single MLP weight matrix W1 is too large for one GPU, you can slice it across GPUs. If you sliced W1 row-wise, every GPU would hold only a partial dot product and would have to AllReduce before applying GeLU(x), because GeLU(a + b) != GeLU(a) + GeLU(b).",
+        "core": "Megatron-LM avoids that extra sync by splitting W1 column-wise: W1 = [W1_A | W1_B]. Both GPUs receive the full input X, compute Y_A = GeLU(X * W1_A) and Y_B = GeLU(X * W1_B) completely independently, and then feed into W2 split row-wise: W2 = [W2_A; W2_B]. Because matrix multiplication distributes over row splits, Y_A*W2_A + Y_B*W2_B equals the exact unsharded output after a single AllReduce.",
+        "deepDive": "The same column-then-row trick applies to Multi-Head Attention: Q, K, V projections are split column-wise by attention head (so each GPU computes a subset of heads independently), and the output projection W_O is split row-wise, requiring just one AllReduce per attention block and one per MLP block (two per Transformer layer)."
+      },
+      "codeExample": {
+        "language": "python",
+        "title": "Megatron Column-Parallel + Row-Parallel MLP Block (PyTorch Conceptual)",
+        "code": "import torch\nimport torch.distributed as dist\n\ndef tp_mlp_forward(x, w1_col_shard, w2_row_shard, tp_group):\n    # x: [batch, seq, h] replicated across TP ranks\n    # w1_col_shard: [h, 4h / tp_size] -> independent GeLU!\n    h_local = torch.nn.functional.gelu(x @ w1_col_shard)\n    # w2_row_shard: [4h / tp_size, h] -> partial sum\n    y_partial = h_local @ w2_row_shard\n    # Single AllReduce combines partial sums across TP ranks\n    dist.all_reduce(y_partial, op=dist.ReduceOp.SUM, group=tp_group)\n    return y_partial\n"
+      },
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "Megatron MLP Split",
+        "title": "Column-Wise W1 -> Local GeLU -> Row-Wise W2 -> Single AllReduce",
+        "graphNodes": [
+          {
+            "id": "x",
+            "label": "Input X (Replicated)",
+            "role": "ingress",
+            "col": 0,
+            "row": 0,
+            "tone": "primary"
+          },
+          {
+            "id": "fc1a",
+            "label": "GPU 0: W1_col + GeLU",
+            "role": "compute",
+            "col": 1,
+            "row": 0,
+            "tone": "tint"
+          },
+          {
+            "id": "fc1b",
+            "label": "GPU 1: W1_col + GeLU",
+            "role": "compute",
+            "col": 2,
+            "row": 0,
+            "tone": "tint"
+          },
+          {
+            "id": "ar",
+            "label": "Single AllReduce (Sum)",
+            "role": "control",
+            "col": 0,
+            "row": 1,
+            "tone": "tint"
+          }
+        ],
+        "graphEdges": [
+          {
+            "from": "x",
+            "to": "fc1a",
+            "label": "broadcast",
+            "style": "solid",
+            "tone": "green"
+          },
+          {
+            "from": "x",
+            "to": "fc1b",
+            "label": "broadcast",
+            "style": "solid",
+            "tone": "green"
+          },
+          {
+            "from": "fc1a",
+            "to": "ar",
+            "label": "W2_row partial",
+            "style": "solid",
+            "tone": "green"
+          },
+          {
+            "from": "fc1b",
+            "to": "ar",
+            "label": "W2_row partial",
+            "style": "solid",
+            "tone": "green"
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-4-mechanics-at-scale",
+      "stageNumber": 4,
+      "title": "M · Mechanics at Scale: NVLink Bounds & Tree Fallbacks",
+      "whyThisMatters": "Explains why TP stops at 8 GPUs and when NCCL switches from Ring to Double-Binary Tree.",
+      "explanation": {
+        "foundation": "Ring AllReduce maximizes bandwidth, but its step count grows linearly with N: 2*(N-1) hops. For small tensors (like 1 MB biases or small TP activations), latency per hop—not bandwidth—dominates total step time.",
+        "core": "On an 8-GPU H100 node with 900 GB/s NVLink, transferring a 64 MB activation tensor via Ring AllReduce takes ~2 * (7/8) * 64 MB / 450 GB/s ~ 0.25 ms. Moving that exact same TP AllReduce across 50 GB/s InfiniBand adds ~2.3 ms per layer—times 80 layers, that is 368 ms of pure network stall per forward+backward pass.",
+        "deepDive": "NCCL dynamically picks Ring for large contiguous tensors (Data Parallel gradients, >32 MB) where bandwidth dominates, and Double-Binary Tree for medium/small tensors on large N where O(log N) latency beats O(N) ring hops. Pairing Tensor Parallelism inside NVLink (TP=8) with Pipeline/Data Parallelism across InfiniBand keeps hot AllReduces off the network."
+      },
+      "decisionFramework": {
+        "problem": "How to scale collective reduction and tensor sharding from 8 GPUs to 1,024 GPUs without stalling compute.",
+        "naiveSolution": "Stretch Tensor Parallelism across all 1,024 GPUs or use a single-node Parameter Server.",
+        "whyItFails": "Parameter Servers hit an O(N) NIC bottleneck, while cross-node Tensor Parallelism hits 2*(L) synchronous AllReduces per step over slower InfiniBand.",
+        "alternatives": "Ring AllReduce vs. Double-Binary Tree AllReduce; TP inside NVLink vs. Pipeline Parallelism (PP) + Data Parallelism (DP) across nodes.",
+        "decision": "Keep Tensor Parallelism strictly within the intra-node NVLink domain (TP <= 8), use Ring/Tree AllReduce for Data Parallel gradients, and overlap backward compute with gradient bucketing.",
+        "tradeOffs": "Requires 3D topology-aware rank placement (NCCL topo detection) and careful microbatch tuning to hide pipeline and DP communication."
+      },
+      "sectionDiagram": {
+        "kind": "quorum-cluster",
+        "eyebrow": "Fabric Hierarchy",
+        "title": "Intra-Node NVLink (900 GB/s) vs. Inter-Node InfiniBand (50 GB/s)",
+        "nodes": [
+          {
+            "id": "nv0",
+            "label": "Node 0 (8x H100 NVLink)",
+            "role": "TP=8 Ring"
+          },
+          {
+            "id": "nv1",
+            "label": "Node 1 (8x H100 NVLink)",
+            "role": "TP=8 Ring"
+          },
+          {
+            "id": "ib",
+            "label": "InfiniBand Leaf/Spine",
+            "role": "DP Ring / PP P2P"
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-5-edge-cases-assumptions",
+      "stageNumber": 5,
+      "title": "E · Edge Cases, Assumptions & When NOT to Use It",
+      "whyThisMatters": "Prevents silent straggler amplification, floating-point non-determinism, and premature TP sharding.",
+      "explanation": {
+        "foundation": "Ring AllReduce is lock-step synchronous: if 1 GPU out of 1,024 throttles thermally or hits a PCIe error, all 1,023 other GPUs stall waiting for its ring chunk.",
+        "core": "When NOT to use Tensor Parallelism: if your model fits on 1 GPU with activation checkpointing, TP=1 always beats TP=2+ because it eliminates AllReduce overhead completely. Similarly, do not use Ring AllReduce for tiny tensors (<1 MB) across hundreds of ranks—latency dominates, so use Tree AllReduce or fuse gradients into 25 MB+ buckets.",
+        "deepDive": "Assumptions & Limitations: Bandwidth calculations assume homogeneous full-duplex links, zero stragglers, and contiguous bucketed BF16/FP32 tensors. In practice, BF16 accumulation order across ring ranks is non-associative, which can introduce minor numerical drift unless FP32 reduction buffers are used. Glossary: TP (Tensor Parallelism), PP (Pipeline Parallelism), DP (Data Parallelism), NVLink (high-speed intra-node GPU interconnect), NCCL (NVIDIA Collective Communications Library)."
+      },
+      "decisionExercise": {
+        "prompt": "You are training a 7B-parameter model on 64x 80 GB H100 GPUs (8 nodes x 8 GPUs). The model weights + optimizer states fit comfortably on 1 node (or even 1–2 GPUs with ZeRO-2). Your team proposes setting TP=16 across two nodes. What should you do?",
+        "options": [
+          {
+            "id": "a",
+            "label": "Use TP=16 across two nodes so each GPU holds 1/16th of every matrix.",
+            "isCorrect": false,
+            "explanation": "Cross-node TP forces per-layer synchronous AllReduces over InfiniBand, which is ~18x slower than NVLink and severely underutilizes tensor cores."
+          },
+          {
+            "id": "b",
+            "label": "Keep TP=1 (or TP=2 intra-node if needed for long context) and scale with Data Parallelism + ZeRO-1/2 + gradient bucketing.",
+            "isCorrect": true,
+            "explanation": "DP only syncs gradients once per backward step (overlapped with compute) rather than twice per layer, maximizing MFU."
+          },
+          {
+            "id": "c",
+            "label": "Route all gradients through GPU 0 as a central Parameter Server.",
+            "isCorrect": false,
+            "explanation": "A central Parameter Server creates an O(N) NIC bottleneck at GPU 0."
+          }
+        ]
+      },
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "Fault & Straggler Guard",
+        "title": "Ring Health -> Straggler Stall -> Watchdog Timeout -> Checkpoint Rollback",
+        "states": [
+          {
+            "id": "sync",
+            "label": "Healthy Ring",
+            "tone": "good"
+          },
+          {
+            "id": "lag",
+            "label": "Straggler Rank",
+            "tone": "warn"
+          },
+          {
+            "id": "abort",
+            "label": "NCCL Timeout",
+            "tone": "warn"
+          },
+          {
+            "id": "recover",
+            "label": "Restart from Ckpt",
+            "tone": "info"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "sync",
+            "to": "lag",
+            "label": "thermal / ECC stall"
+          },
+          {
+            "from": "lag",
+            "to": "abort",
+            "label": "watchdog > 60s"
+          },
+          {
+            "from": "abort",
+            "to": "recover",
+            "label": "cordon bad node"
+          }
+        ]
+      }
+    }
+  ],
+  "simulation": {
+    "title": "Ring AllReduce & TP Sync — 4-GPU Execution Walkthrough",
+    "nodes": [
+      {
+        "id": "g0",
+        "label": "GPU 0",
+        "role": "TP Rank 0 / Ring 0"
+      },
+      {
+        "id": "g1",
+        "label": "GPU 1",
+        "role": "TP Rank 1 / Ring 1"
+      },
+      {
+        "id": "g2",
+        "label": "GPU 2",
+        "role": "TP Rank 2 / Ring 2"
+      },
+      {
+        "id": "g3",
+        "label": "GPU 3",
+        "role": "TP Rank 3 / Ring 3"
+      }
+    ],
+    "edges": [
+      {
+        "from": "g0",
+        "to": "g1",
+        "label": "NVLink Ring Hop"
+      },
+      {
+        "from": "g1",
+        "to": "g2",
+        "label": "NVLink Ring Hop"
+      },
+      {
+        "from": "g2",
+        "to": "g3",
+        "label": "NVLink Ring Hop"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Local Column-Parallel + GeLU",
+        "actionLabel": "Compute independent shards",
+        "status": "healthy",
+        "activeNodeIds": [
+          "g0",
+          "g1",
+          "g2",
+          "g3"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "syncs_needed": 0,
+          "nvlink_bw_pct": 0,
+          "phase": "W1 + GeLU"
+        },
+        "explanation": "Each GPU multiplies replicated X by its column shard W1_i and applies GeLU locally—zero communication required."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Row-Parallel W2 Partial Sums",
+        "actionLabel": "Compute partial outputs",
+        "status": "healthy",
+        "activeNodeIds": [
+          "g0",
+          "g1"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "Scatter-Reduce",
+          "chunks_remaining": 3,
+          "bytes_per_gpu": "0.75 M"
+        },
+        "explanation": "GPUs multiply by row-sharded W2_i and begin Phase 1 Scatter-Reduce around the 4-GPU ring (N-1 = 3 steps)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "AllGather Finalized Chunks",
+        "actionLabel": "Circulate summed chunks",
+        "status": "healthy",
+        "activeNodeIds": [
+          "g2",
+          "g3"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "AllGather",
+          "total_sent": "1.50 M",
+          "link_util": "96%"
+        },
+        "explanation": "Phase 2 AllGather circulates each GPU's fully summed chunk around the ring so all 4 ranks hold the exact output."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Straggler Detection Under Skew",
+        "actionLabel": "Watchdog monitors ring stall",
+        "status": "warning",
+        "activeNodeIds": [
+          "g1",
+          "g2"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "Straggler Check",
+          "stall_ms": 42,
+          "action": "Overlapped Bucket"
+        },
+        "explanation": "If a rank stalls, the whole ring pauses; bucketing DP gradients overlaps backward compute to mask small jitter."
+      }
+    ]
+  },
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-1",
+        "question": "For N = 16 GPUs syncing a 2 GB gradient tensor via Ring AllReduce, roughly how much data does each GPU transmit in total across both phases?",
+        "options": [
+          {
+            "id": "a",
+            "text": "2 GB total (1 GB Scatter-Reduce + 1 GB AllGather)",
+            "correct": false,
+            "feedback": "Each phase transfers (N-1)/N * M, so two phases transfer nearly 2M, not 1M."
+          },
+          {
+            "id": "b",
+            "text": "3.75 GB total (2 * 15/16 * 2 GB)",
+            "correct": true,
+            "feedback": "Correct! Each GPU sends (N-1)/N * M in Scatter-Reduce and again in AllGather: 2 * (15/16) * 2 GB = 3.75 GB."
+          },
+          {
+            "id": "c",
+            "text": "32 GB total (N * 2 GB)",
+            "correct": false,
+            "feedback": "O(N * M) is the Parameter Server bottleneck, not Ring AllReduce."
+          },
+          {
+            "id": "d",
+            "text": "128 MB total (M / N)",
+            "correct": false,
+            "feedback": "M/N is the size of a single chunk per step, not the total over 2*(N-1) steps."
+          }
+        ],
+        "explanation": "Ring AllReduce runs N-1 steps of Scatter-Reduce plus N-1 steps of AllGather, each moving M/N bytes per GPU, totaling 2*(N-1)/N * M."
+      },
+      {
+        "id": "kc-2",
+        "question": "Why does Megatron Tensor Parallelism split the first MLP linear layer W1 column-wise and the second linear layer W2 row-wise?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Column-wise W1 keeps each GPU's GeLU activation independent without an AllReduce, and row-wise W2 combines via a single AllReduce.",
+            "correct": true,
+            "feedback": "Correct! GeLU is element-wise, so splitting columns lets each GPU apply GeLU locally before row-parallel W2."
+          },
+          {
+            "id": "b",
+            "text": "Row-wise W1 is impossible to store in BF16 memory.",
+            "correct": false,
+            "feedback": "Both splits use the exact same memory; the difference is communication frequency."
+          },
+          {
+            "id": "c",
+            "text": "Column-wise W1 eliminates all communication in both forward and backward passes.",
+            "correct": false,
+            "feedback": "One AllReduce is still needed after W2 in the forward pass (and its conjugate in the backward pass)."
+          },
+          {
+            "id": "d",
+            "text": "PyTorch autograd only supports column-wise matrix multiplication.",
+            "correct": false,
+            "feedback": "Autograd supports any split; the choice is purely to minimize AllReduce syncs."
+          }
+        ],
+        "explanation": "Because GeLU(A + B) != GeLU(A) + GeLU(B), splitting W1 row-wise would force an extra AllReduce before GeLU."
+      },
+      {
+        "id": "kc-3",
+        "question": "When is Double-Binary Tree AllReduce preferred over Ring AllReduce inside NCCL?",
+        "options": [
+          {
+            "id": "a",
+            "text": "When tensor sizes are very large (>256 MB) on an 8-GPU NVLink node.",
+            "correct": false,
+            "feedback": "For huge tensors on small N, Ring AllReduce maximizes full-duplex link bandwidth."
+          },
+          {
+            "id": "b",
+            "text": "When N is large (hundreds of GPUs) and message sizes are small-to-medium, where O(log N) latency beats O(N) ring hops.",
+            "correct": true,
+            "feedback": "Correct! Ring latency scales as 2*(N-1)*alpha, whereas Tree latency scales as O(log N)."
+          },
+          {
+            "id": "c",
+            "text": "When GPUs have no network interconnect at all.",
+            "correct": false,
+            "feedback": "AllReduce always requires an interconnect."
+          },
+          {
+            "id": "d",
+            "text": "Whenever optimizer states are stored on CPU RAM.",
+            "correct": false,
+            "feedback": "CPU offload affects host-to-device PCIe transfers, not collective tree vs. ring topology."
+          }
+        ],
+        "explanation": "Ring AllReduce is bandwidth-optimal but has O(N) step latency; Tree AllReduce achieves O(log N) latency for smaller payloads at high rank counts."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Ring AllReduce lets GPUs share and sum gradients in a circle without a central bottleneck, while Tensor Parallelism splits giant matrices across GPUs in the same server.",
+      "keyTakeaway": "When a model outgrows one GPU, split layers across fast intra-node NVLink GPUs and sync gradients in a ring so no single node chokes.",
+      "byteSummary": "Instead of sending every GPU's gradients to one central server, Ring AllReduce passes small slices around a circle of GPUs twice—once to sum them, once to share the totals. Inside each server, Tensor Parallelism splits big Transformer layers column-then-row so GPUs only pause to sync once per block."
+    },
+    "intermediate": {
+      "summary": "Ring AllReduce achieves 2*(N-1)/N * M per-GPU transfer volume via Scatter-Reduce + AllGather, while Megatron TP pairs column-parallel W1 with row-parallel W2 to halve AllReduce syncs.",
+      "keyTakeaway": "When scaling multi-GPU training, keep Tensor Parallelism within NVLink (TP <= 8) and use Ring/Tree AllReduce with gradient bucketing across nodes.",
+      "byteSummary": "Ring AllReduce divides an M-byte tensor into N chunks and runs 2*(N-1) pipelined ring steps, keeping per-GPU traffic bounded at ~2M even as N grows. Pairing column-parallel W1 (independent GeLU) with row-parallel W2 reduces each Transformer MLP/Attention block to a single AllReduce."
+    },
+    "advanced": {
+      "summary": "Topology-aware 3D parallelism bounds Ring AllReduce O(N) latency with NCCL Tree fallback, overlaps backward DP gradient buckets, and isolates TP=8 inside NVLink domains.",
+      "keyTakeaway": "When latency-bound collectives or straggler ranks threaten MFU, switch small payloads to Double-Binary Tree AllReduce, bucket DP gradients, and keep TP strictly inside NVLink.",
+      "byteSummary": "At 1,024+ GPUs, Ring AllReduce's 2*(N-1)*alpha latency dominates small tensors while BF16 non-associativity requires careful FP32 reduction. NCCL pairs intra-node NVLink TP=8 with inter-node Tree/Ring DP AllReduce and overlapped backward buckets to sustain >50% Model FLOPs Utilization."
+    }
+  }
+}

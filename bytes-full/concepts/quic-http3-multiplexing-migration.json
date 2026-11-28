@@ -1,0 +1,800 @@
+{
+  "id": "concept-quic-http3-multiplexing-migration",
+  "slug": "quic-http3-multiplexing-migration",
+  "name": "QUIC & HTTP/3: 0-RTT Handshakes, Stream Multiplexing & Connection Migration",
+  "domain": "Distributed Systems",
+  "tagline": "Eliminate TCP head-of-line blocking and dropped mobile connections with UDP-based multiplexed streams, 0-RTT TLS 1.3, and Connection ID migration.",
+  "purpose": "Master QUIC and HTTP/3 transport mechanics—independent stream framing, 0-RTT anti-replay guards, Connection ID migration, and UDP GSO/eBPF scaling.",
+  "spark": {
+    "summary": "QUIC + HTTP/3 moves multiplexed streaming and TLS 1.3 into user-space over UDP, isolating packet loss per stream and surviving Wi-Fi-to-5G IP changes via Connection IDs.",
+    "keyTakeaway": "When cross-zone coordination becomes the latency bottleneck, stream Multiplexing &, decoupling streams from TCP's single ordered buffer and binding connections to cryptographic Connection IDs instead of 4-tuple IPs cuts mobile tail latency and eliminates connection drops.",
+    "byteSummary": "HTTP/2 solved head-of-line (HOL) blocking at the application layer by multiplexing many logical streams over a single TCP connection, but it left a fatal bottleneck underneath: TCP itself enforces a strict, in-order byte stream. When a single packet carrying Stream 1 bytes is dropped on a lossy mobile network, the OS kernel TCP receive buffer stalls delivery of Streams 2 and 3 until that lost packet is retransmitted and acknowledged—even though Streams 2 and 3 arrived intact.\n\nQUIC (RFC 9000) and HTTP/3 (RFC 9114) move transport framing, loss recovery, and TLS 1.3 encryption into user-space over UDP. Each HTTP/3 stream owns an independent ordered byte offset inside QUIC STREAM frames, so packet loss on Stream 1 pauses only Stream 1 while Streams 2 and 3 continue delivering frames immediately. Furthermore, QUIC integrates TLS 1.3 directly into the transport handshake (1-RTT cold start, 0-RTT session resumption) and decouples connection identity from the 4-tuple (src_ip, src_port, dst_ip, dst_port) via an explicit 64-bit Connection ID (CID).\n\nKey trade-offs center on UDP middlebox traversal, CPU encryption overhead without kernel-offload GRO/GSO, and security guardrails: unverified UDP source addresses require a 3x amplification limit before address validation, and 0-RTT early data is replayable and must be restricted strictly to idempotent GET/HEAD requests or protected by anti-replay strike registers."
+  },
+  "learningJourney": [
+    {
+      "id": "01-c-hol-blocking",
+      "eyebrow": "STAGE 01 · TRANSPORT BOTTLENECK",
+      "title": "Why TCP + HTTP/2 Suffers Transport Head-of-Line Blocking",
+      "level": "foundation",
+      "purpose": "Contrast HTTP/2's single-TCP byte stream bottleneck against QUIC's independent per-stream framing over UDP.",
+      "explanation": {
+        "foundation": "Assuming a single TCP connection carries 3 concurrent HTTP/2 streams, TCP views all bytes as one opaque, strictly ordered stream. If packet #42 (belonging to Stream 1) is lost, packets #43 and #44 (Streams 2 and 3) sit trapped in the kernel's out-of-order receive queue for an entire RTT + retransmission delay.",
+        "core": "QUIC replaces TCP's monolithic byte stream with independent STREAM frames multiplexed over UDP datagrams. Each UDP packet is decrypted and processed independently; losing packet #42 blocks only Stream 1's reassembly buffer while Streams 2 and 3 deliver data immediately.",
+        "deepDive": "At 2% packet loss (common on congested LTE/5G), HTTP/3 cuts p99 page-load tail latency by 25-40% compared to HTTP/2 over TCP, and uses QPACK (instead of HPACK) so dynamic header-table updates never stall unrelated streams."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 01 · TRANSPORT BOTTLENECK",
+        "title": "Why TCP + HTTP/2 Suffers Transport Head-of-Line Blocking",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "HTTP/2 over TCP",
+            "sub": "1 Kernel Byte Stream",
+            "role": "Coupled Buffer"
+          },
+          {
+            "id": "n2",
+            "label": "Packet #42 Lost",
+            "sub": "Stalls Streams 2 & 3",
+            "role": "TCP HOL Stall"
+          },
+          {
+            "id": "n3",
+            "label": "QUIC over UDP",
+            "sub": "Independent STREAM Frames",
+            "role": "Decoupled Transport"
+          },
+          {
+            "id": "n4",
+            "label": "Streams 2 & 3 Flow",
+            "sub": "Zero Cross-Stream Stall",
+            "role": "Low Tail Latency"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "drops 1 pkt"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "replaced by"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "isolates loss"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Kernel TCP Constraint",
+            "detail": "The OS TCP stack has no visibility into HTTP/2 stream IDs, forcing all streams to wait on any single gap."
+          },
+          {
+            "label": "Independent Framing",
+            "detail": "QUIC decodes each UDP datagram independently in user space and delivers intact streams immediately."
+          },
+          {
+            "label": "QPACK Header Safety",
+            "detail": "HTTP/3 replaces HPACK with QPACK to avoid header-compression HOL blocking across streams."
+          }
+        ],
+        "summary": "QUIC eliminates TCP head-of-line blocking by isolating packet loss to the affected stream instead of stalling all multiplexed requests.",
+        "caption": "QUIC eliminates TCP head-of-line blocking by isolating packet loss to the affected stream instead of stalling all multiplexed requests."
+      }
+    },
+    {
+      "id": "02-c-handshake-0rtt",
+      "eyebrow": "STAGE 02 · HANDSHAKE & 0-RTT",
+      "title": "Merged TLS 1.3 Transport Handshake & 0-RTT Resumption",
+      "level": "foundation",
+      "purpose": "Reduce cold connection setup to 1-RTT and warm resumptions to 0-RTT while guarding against replay attacks.",
+      "explanation": {
+        "foundation": "TCP + TLS 1.3 requires 1 RTT for TCP SYN/SYN-ACK/ACK followed by 1-2 RTTs for TLS negotiation before encrypted HTTP bytes flow. QUIC embeds TLS 1.3 CRYPTO frames directly inside the Initial UDP packet, completing both transport and crypto setup in 1 RTT.",
+        "core": "For returning clients holding a session ticket, QUIC allows 0-RTT early data to ride alongside the Initial handshake packet. Because a network attacker can capture and replay that first UDP datagram, 0-RTT MUST never carry non-idempotent mutations (like POST /pay).",
+        "deepDive": "Production servers enforce a strict replay window (e.g., 10s ticket age tolerance) paired with a distributed Bloom/strike register keyed by the 0-RTT obfuscated ticket nonce, rejecting replays with HTTP 425 Too Early."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 02 · HANDSHAKE & 0-RTT",
+        "title": "Merged TLS 1.3 Transport Handshake & 0-RTT Resumption",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "QUIC Initial + TLS",
+            "sub": "CRYPTO Frame in 1st UDP",
+            "role": "1-RTT Cold Start"
+          },
+          {
+            "id": "n2",
+            "label": "0-RTT Early Data",
+            "sub": "Cached Session Ticket",
+            "role": "Zero-Wait Payload"
+          },
+          {
+            "id": "n3",
+            "label": "Anti-Replay Guard",
+            "sub": "Strike Register + 425",
+            "role": "Replay Defense"
+          },
+          {
+            "id": "n4",
+            "label": "Idempotent GET/HEAD",
+            "sub": "Safe Fast Execution",
+            "role": "Verified Path"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "on resume"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "screened by"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "admits safe"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Combined Handshake",
+            "detail": "Transport parameters and TLS 1.3 key exchange complete in a single round-trip."
+          },
+          {
+            "label": "0-RTT Replay Risk",
+            "detail": "Attackers can replay the initial 0-RTT UDP datagram; restrict 0-RTT strictly to idempotent reads."
+          },
+          {
+            "label": "HTTP 425 Too Early",
+            "detail": "If a 0-RTT ticket is replayed or arrives outside the clock window, return 425 so the client retries in 1-RTT."
+          }
+        ],
+        "summary": "Merging TLS 1.3 into QUIC Initial packets achieves 1-RTT cold setup and 0-RTT resumption guarded by anti-replay registers.",
+        "caption": "Merging TLS 1.3 into QUIC Initial packets achieves 1-RTT cold setup and 0-RTT resumption guarded by anti-replay registers."
+      },
+      "decisionFramework": {
+        "problem": "How to implement QUIC & HTTP/3: 0-RTT Handshakes, Stream Multiplexing & Connection Migration without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "When cross-zone coordination becomes the latency bottleneck, stream Multiplexing &, decoupling streams from TCP's single ordered buffer and binding connections to cryptographic Connection IDs instead of 4-tuple IPs cuts mobile tail latency and eliminates connection drops.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When QUIC & HTTP/3: 0-RTT Handshakes, Stream Multiplexing & Connection Migration experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-c-cid-migration",
+      "eyebrow": "STAGE 03 · CONNECTION MIGRATION",
+      "title": "64-Bit Connection IDs & Seamless Wi-Fi-to-5G Migration",
+      "level": "intermediate",
+      "purpose": "Keep active streams alive across client IP and NAT port changes using cryptographic Connection IDs and PATH_CHALLENGE.",
+      "explanation": {
+        "foundation": "A TCP connection is permanently bound to its 4-tuple (src_ip, src_port, dst_ip, dst_port). Walking out of Wi-Fi onto 5G breaks every active TCP socket, forcing slow DNS/TCP/TLS reconnects and aborted uploads.",
+        "core": "QUIC identifies connections by an explicit Connection ID (CID) in the short packet header. When a phone switches from Wi-Fi to 5G, it keeps sending encrypted packets with the same server CID from its new IP.",
+        "deepDive": "To prevent off-path attackers from spoofing a peer's IP migration (traffic redirection attack), the server issues a 64-bit random PATH_CHALLENGE frame to the new address and switches congestion-control state only after receiving PATH_RESPONSE."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 03 · CONNECTION MIGRATION",
+        "title": "64-Bit Connection IDs & Seamless Wi-Fi-to-5G Migration",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "Wi-Fi -> 5G Switch",
+            "sub": "Client IP:Port Changes",
+            "role": "Network Handoff"
+          },
+          {
+            "id": "n2",
+            "label": "QUIC Short Header",
+            "sub": "Same Destination CID",
+            "role": "4-Tuple Decoupled"
+          },
+          {
+            "id": "n3",
+            "label": "PATH_CHALLENGE",
+            "sub": "8-Byte Nonce Probe",
+            "role": "Return-Routability"
+          },
+          {
+            "id": "n4",
+            "label": "PATH_RESPONSE OK",
+            "sub": "Zero-Drop Migration",
+            "role": "Active Streams Kept"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "keeps CID"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "validates path"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "continues"
+          }
+        ],
+        "cards": [
+          {
+            "label": "CID Decoupling",
+            "detail": "Connections survive Wi-Fi/5G switches and carrier NAT rebinding without re-handshaking."
+          },
+          {
+            "label": "Linkability Defense",
+            "detail": "Clients rotate to a fresh pre-issued NEW_CONNECTION_ID on migration so passive observers cannot track IPs."
+          },
+          {
+            "label": "Congestion Reset",
+            "detail": "Reset cwnd and RTT estimates on the new path because 5G bandwidth differs from Wi-Fi."
+          }
+        ],
+        "summary": "Explicit Connection IDs and PATH_CHALLENGE validation keep streams alive across Wi-Fi-to-5G handoffs without IP tracking.",
+        "caption": "Explicit Connection IDs and PATH_CHALLENGE validation keep streams alive across Wi-Fi-to-5G handoffs without IP tracking."
+      }
+    },
+    {
+      "id": "04-c-safe-impl",
+      "eyebrow": "STAGE 04 · SAFE IMPLEMENTATION",
+      "title": "3x Amplification Guard & Replay-Safe 0-RTT Admission",
+      "level": "intermediate",
+      "purpose": "Enforce RFC 9000's 3x unvalidated-address byte cap and reject replayed or non-idempotent 0-RTT requests.",
+      "explanation": {
+        "foundation": "Because UDP lacks TCP's 3-way handshake, a spoofed client IP could trick a QUIC server into sending huge TLS certificates to a victim. RFC 9000 mandates that servers send at most 3x the bytes received from an unvalidated address.",
+        "core": "```python\nclass QuicIngressGuard:\n    def __init__(self, strike_register) -> None:\n        self.strike_register = strike_register\n\n    def max_unvalidated_send_bytes(self, rx_bytes: int, addr_validated: bool) -> int:\n        if rx_bytes < 0:\n            raise ValueError('rx_bytes cannot be negative')\n        if addr_validated:\n            return 1 << 30  # Governed by congestion controller\n        return rx_bytes * 3\n\n    def admit_zero_rtt(self, method: str, ticket_nonce: str) -> tuple[bool, int]:\n        if method not in {'GET', 'HEAD', 'OPTIONS'}:\n            return (False, 425)  # Reject non-idempotent 0-RTT\n        if not self.strike_register.record_once(ticket_nonce):\n            return (False, 425)  # Replay detected\n        return (True, 200)\n```",
+        "deepDive": "Padding Client Initial packets to at least 1,200 bytes gives the server a 3,600-byte unvalidated budget—enough to return its Initial + Handshake certificate chain without stalling."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 04 · SAFE IMPLEMENTATION",
+        "title": "3x Amplification Guard & Replay-Safe 0-RTT Admission",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "Unvalidated UDP",
+            "sub": "1,200B Padded Initial",
+            "role": "Ingress Packet"
+          },
+          {
+            "id": "n2",
+            "label": "3x Byte Cap Gate",
+            "sub": "Max Send <= 3 * rx_bytes",
+            "role": "DDoS Reflection Shield"
+          },
+          {
+            "id": "n3",
+            "label": "0-RTT Method Check",
+            "sub": "GET/HEAD + Strike Check",
+            "role": "Replay Filter"
+          },
+          {
+            "id": "n4",
+            "label": "200 OK or 425 Retry",
+            "sub": "Safe 1-RTT Fallback",
+            "role": "Guarded Outcome"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "caps response"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "screens 0-RTT"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "admits or 425"
+          }
+        ],
+        "cards": [
+          {
+            "label": "3x Amplification Rule",
+            "detail": "Never send >3x received bytes before address validation completes via Handshake ACK or RETRY token."
+          },
+          {
+            "label": "1,200-Byte Minimum",
+            "detail": "Drop unpadded Client Initials <1,200 bytes so servers aren't forced to fragment handshake replies."
+          },
+          {
+            "label": "Fail-Closed 0-RTT",
+            "detail": "Return HTTP 425 Too Early on non-idempotent verbs or duplicate ticket nonces."
+          }
+        ],
+        "summary": "Enforcing the 3x unvalidated byte limit and 425 Too Early anti-replay checks prevents UDP amplification and duplicate mutations.",
+        "caption": "Enforcing the 3x unvalidated byte limit and 425 Too Early anti-replay checks prevents UDP amplification and duplicate mutations."
+      }
+    },
+    {
+      "id": "05-c-udp-offload",
+      "eyebrow": "STAGE 05 · SCALING & KERNEL OFFLOAD",
+      "title": "Closing the UDP CPU Gap with GSO, GRO & eBPF CID Routing",
+      "level": "advanced",
+      "purpose": "Cut user-space QUIC syscall overhead using UDP GSO/GRO batching and stateless eBPF Connection-ID routing.",
+      "explanation": {
+        "foundation": "Naive user-space QUIC calls sendmsg()/recvmsg() once per 1,200-byte UDP packet, burning 2-3x more CPU than kernel TCP with TSO/GRO.",
+        "core": "Modern Linux kernels (5.0+) support UDP_SEGMENT (GSO) and UDP_GRO, allowing user-space QUIC stacks to pass 64 KB batches in one syscall while the NIC segments/coalesces packets in hardware.",
+        "deepDive": "At L4 load balancers, ECMP hashing on the 4-tuple breaks whenever a mobile client migrates IPs. Embedding a 16-bit Server ID inside the QUIC CID lets stateless eBPF/XDP load balancers route packets consistently regardless of client IP."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 05 · SCALING & KERNEL OFFLOAD",
+        "title": "Closing the UDP CPU Gap with GSO, GRO & eBPF CID Routing",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "64 KB App Buffer",
+            "sub": "Batched QUIC Frames",
+            "role": "User Space"
+          },
+          {
+            "id": "n2",
+            "label": "UDP_SEGMENT (GSO)",
+            "sub": "1 Syscall -> 50 Packets",
+            "role": "Kernel / NIC Offload"
+          },
+          {
+            "id": "n3",
+            "label": "eBPF L4 Router",
+            "sub": "Hash CID Server-ID Bits",
+            "role": "Stateless ECMP"
+          },
+          {
+            "id": "n4",
+            "label": "Target QUIC Worker",
+            "sub": "2.5x Lower CPU / Gbps",
+            "role": "Scaled Edge"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "batches via"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "transmits to"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "pins CID to"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Syscall Batching",
+            "detail": "UDP GSO/GRO cuts kernel-userspace context switches by ~40x on bulk HTTP/3 downloads."
+          },
+          {
+            "label": "Stateless L4 Routing",
+            "detail": "Routing by embedded Server-ID bits in the CID preserves stickiness across IP migrations without shared state."
+          },
+          {
+            "label": "PACING / BBRv2",
+            "detail": "User-space pacing spreads bursts evenly instead of dumping 50-packet GSO trains into shallow Wi-Fi buffers."
+          }
+        ],
+        "summary": "UDP GSO/GRO batching and eBPF Connection-ID routing match TCP throughput while keeping mobile migrations sticky.",
+        "caption": "UDP GSO/GRO batching and eBPF Connection-ID routing match TCP throughput while keeping mobile migrations sticky."
+      }
+    },
+    {
+      "id": "06-c-middlebox",
+      "eyebrow": "STAGE 06 · FAULT ISOLATION & FALLBACK",
+      "title": "Happy Eyeballs v2 Fallback for Blocked UDP/443 Networks",
+      "level": "advanced",
+      "purpose": "Isolate corporate firewalls that drop UDP/443 by racing HTTP/3 against HTTP/2 over TCP without user-visible stalls.",
+      "explanation": {
+        "foundation": "Roughly 3-7% of enterprise firewalls and hotel captive portals drop or rate-limit UDP port 443, which would hang a QUIC-only client.",
+        "core": "Browsers advertise HTTP/3 via the `Alt-Svc: h3=\":443\"; ma=86400` header or HTTPS DNS records, and race QUIC against TCP+TLS using a 50-100 ms Happy Eyeballs head-start timer.",
+        "deepDive": "If UDP/443 fails or stalls twice consecutively on a network, the client caches a negative Alt-Svc cooldown for that Wi-Fi SSID and serves HTTP/2 over TCP immediately."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 06 · FAULT ISOLATION & FALLBACK",
+        "title": "Happy Eyeballs v2 Fallback for Blocked UDP/443 Networks",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "Alt-Svc / HTTPS DNS",
+            "sub": "Client Probes UDP/443",
+            "role": "QUIC Attempt"
+          },
+          {
+            "id": "n2",
+            "label": "50-100ms Race Timer",
+            "sub": "Parallel TCP+TLS Start",
+            "role": "Happy Eyeballs"
+          },
+          {
+            "id": "n3",
+            "label": "UDP Blocked / Drops",
+            "sub": "Seamless HTTP/2 Win",
+            "role": "Zero Hang"
+          },
+          {
+            "id": "n4",
+            "label": "Per-SSID Cooldown",
+            "sub": "Skip UDP on Bad Wi-Fi",
+            "role": "Fast Subsequent"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "starts timer"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "on UDP drop"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "caches"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Never QUIC-Only",
+            "detail": "Always maintain an HTTP/2 over TCP fallback path on port 443 for restrictive enterprise networks."
+          },
+          {
+            "label": "Short Race Delay",
+            "detail": "A 50-100 ms head start prevents wasted TCP handshakes on healthy networks while bounding worst-case fallback."
+          },
+          {
+            "label": "Per-Network Memory",
+            "detail": "Scope negative QUIC cache entries to network SSID/BSSID so switching to 5G re-enables HTTP/3."
+          }
+        ],
+        "summary": "Happy Eyeballs racing and per-SSID negative caching insulate users from UDP-blocking firewalls with zero hangs.",
+        "caption": "Happy Eyeballs racing and per-SSID negative caching insulate users from UDP-blocking firewalls with zero hangs."
+      }
+    },
+    {
+      "id": "07-c-observability",
+      "eyebrow": "STAGE 07 · OBSERVABILITY & GUARDRAILS",
+      "title": "Tracking QUIC Loss, 0-RTT Rejections & CID Migration Health",
+      "level": "advanced",
+      "purpose": "Monitor encrypted QUIC connections via QLOG traces, 425 replay rates, and fallback ratios.",
+      "explanation": {
+        "foundation": "Because QUIC encrypts transport headers (packet numbers, ACKs, stream IDs), passive network taps like tcpdump cannot inspect retransmissions.",
+        "core": "Production stacks emit structured **QLOG** event streams from the endpoints themselves, tracking packet loss, spin-bit RTT, 0-RTT acceptance vs. 425 rejections, and CID migration success.",
+        "deepDive": "Alert whenever HTTP/3 fallback-to-TCP rate spikes above 10% (indicating regional ISP UDP throttling) or when unvalidated 3x amplification drops climb during DDoS floods."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 07 · OBSERVABILITY & GUARDRAILS",
+        "title": "Tracking QUIC Loss, 0-RTT Rejections & CID Migration Health",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "Endpoint QLOG",
+            "sub": "Sampled Loss & RTT",
+            "role": "Encrypted Visibility"
+          },
+          {
+            "id": "n2",
+            "label": "0-RTT / 425 Ratio",
+            "sub": "Replay & Clock Skew",
+            "role": "Security Metric"
+          },
+          {
+            "id": "n3",
+            "label": "H3 -> H2 Fallback %",
+            "sub": "ISP UDP Throttling",
+            "role": "Reachability KPI"
+          },
+          {
+            "id": "n4",
+            "label": "Auto-Disable Alt-Svc",
+            "sub": "Shed Broken Region",
+            "role": "Guardrail"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "correlates"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "pairs with"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "triggers"
+          }
+        ],
+        "cards": [
+          {
+            "label": "No Passive Tcpdump",
+            "detail": "QUIC encrypts ACK/sequence metadata—endpoint QLOG sampling is mandatory for transport debugging."
+          },
+          {
+            "label": "Regional UDP Alerts",
+            "detail": "Spike in H3->H2 fallback by ASN pinpoints carrier UDP shaping immediately."
+          },
+          {
+            "label": "0-RTT Replay Spikes",
+            "detail": "Sudden 425 surges indicate either replay attacks or clock skew across edge PoPs."
+          }
+        ],
+        "summary": "Sampled endpoint QLOG telemetry, 425 replay ratios, and ASN fallback alerts make encrypted QUIC observable.",
+        "caption": "Sampled endpoint QLOG telemetry, 425 replay ratios, and ASN fallback alerts make encrypted QUIC observable."
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-quic-1",
+        "question": "A mobile client downloads 3 parallel assets over HTTP/2 (TCP) vs. HTTP/3 (QUIC). Packet #19 belonging exclusively to Stream 1 is dropped. What happens to Streams 2 and 3?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Both HTTP/2 and HTTP/3 stall Streams 2 and 3 until packet #19 is retransmitted.",
+            "correct": false,
+            "feedback": "Only TCP stalls all streams; QUIC delivers Stream 2 and 3 frames independently."
+          },
+          {
+            "id": "b",
+            "text": "HTTP/2 stalls Streams 2 and 3 in the TCP receive buffer, whereas HTTP/3 delivers Streams 2 and 3 immediately.",
+            "correct": true,
+            "feedback": "Correct! TCP enforces one global byte order, whereas QUIC isolates loss per STREAM frame."
+          },
+          {
+            "id": "c",
+            "text": "HTTP/3 drops Streams 2 and 3 permanently because UDP is unreliable.",
+            "correct": false,
+            "feedback": "QUIC implements per-stream reliability and retransmission on top of UDP."
+          },
+          {
+            "id": "d",
+            "text": "HTTP/2 continues Streams 2 and 3 because HPACK separates stream buffers.",
+            "correct": false,
+            "feedback": "HPACK is application-layer; the kernel TCP buffer still blocks all upper streams on any gap."
+          }
+        ],
+        "explanation": "TCP enforces strict in-order byte delivery across the whole socket, while QUIC tracks offsets independently per stream."
+      },
+      {
+        "id": "kc-quic-2",
+        "question": "Why must an HTTP/3 edge gateway reject `POST /api/v1/transfer` sent inside QUIC 0-RTT early data with HTTP 425 Too Early?",
+        "options": [
+          {
+            "id": "a",
+            "text": "0-RTT packets are unencrypted and expose JSON payloads.",
+            "correct": false,
+            "feedback": "0-RTT data is encrypted with the resumption PSK; the risk is replayability, not plaintext."
+          },
+          {
+            "id": "b",
+            "text": "0-RTT only supports UDP payloads smaller than 256 bytes.",
+            "correct": false,
+            "feedback": "0-RTT has no 256-byte limit; it is constrained by the 3x amplification cap and replay safety."
+          },
+          {
+            "id": "c",
+            "text": "An attacker can capture and replay the initial 0-RTT UDP datagram before the handshake completes, causing duplicate state mutations.",
+            "correct": true,
+            "feedback": "Correct! Because 0-RTT lacks fresh server-contributed entropy, it is replayable and must be restricted to idempotent requests."
+          },
+          {
+            "id": "d",
+            "text": "0-RTT requires a separate TCP fallback socket for POST bodies.",
+            "correct": false,
+            "feedback": "POST requests simply wait 1 RTT for the handshake to complete over the same QUIC connection."
+          }
+        ],
+        "explanation": "0-RTT early data lacks fresh server randomness and can be replayed by an on-path attacker, so non-idempotent mutations must be rejected with 425 Too Early."
+      },
+      {
+        "id": "kc-quic-3",
+        "question": "When a mobile user walks from office Wi-Fi onto 5G cellular, why does an active QUIC connection survive without re-handshaking?",
+        "options": [
+          {
+            "id": "a",
+            "text": "QUIC connections are identified by an explicit Connection ID (CID) in the header rather than the client's IP:Port 4-tuple.",
+            "correct": true,
+            "feedback": "Correct! Explicit CIDs plus PATH_CHALLENGE/PATH_RESPONSE let the server migrate the connection to the new 5G IP seamlessly."
+          },
+          {
+            "id": "b",
+            "text": "The mobile OS keeps the old Wi-Fi IP address active inside the 5G tunnel forever.",
+            "correct": false,
+            "feedback": "Client source IP and NAT port change when switching interfaces."
+          },
+          {
+            "id": "c",
+            "text": "UDP sockets automatically broadcast packets to all nearby cell towers.",
+            "correct": false,
+            "feedback": "Migration relies on explicit CIDs and return-routability validation, not broadcast."
+          },
+          {
+            "id": "d",
+            "text": "QUIC disables TLS encryption during cellular handoffs.",
+            "correct": false,
+            "feedback": "All migrated packets remain fully AEAD-encrypted and authenticated."
+          }
+        ],
+        "explanation": "Decoupling connection identity from the 4-tuple via cryptographic Connection IDs allows seamless migration across network interfaces."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "HTTP/3 runs over UDP via QUIC so one lost packet only pauses one stream, and phones can switch from Wi-Fi to 5G without dropping calls or downloads.",
+      "keyTakeaway": "When cross-zone coordination becomes the latency bottleneck, Stream Multiplexing &, decoupling streams from TCP's single ordered buffer and binding connections to cryptographic Connection IDs instead of 4-tuple IPs cuts mobile tail latency and eliminates connection drops.",
+      "byteSummary": "In HTTP/2 over TCP, all requests share one strict line—if one packet goes missing, everyone waits. QUIC over UDP gives each request its own lane, merges security setup into 1 round-trip, and uses a Connection ID badge so switching from Wi-Fi to 5G never breaks the connection."
+    },
+    "intermediate": {
+      "summary": "QUIC moves framing, congestion control, and TLS 1.3 into user-space over UDP, enabling per-stream loss isolation, 0-RTT resumption, and CID migration.",
+      "keyTakeaway": "When cross-zone coordination becomes the latency bottleneck, Stream Multiplexing &, decoupling streams from TCP's single ordered buffer and binding connections to cryptographic Connection IDs instead of 4-tuple IPs cuts mobile tail latency and eliminates connection drops.",
+      "byteSummary": "HTTP/2 solved head-of-line (HOL) blocking at the application layer by multiplexing many logical streams over a single TCP connection, but it left a fatal bottleneck underneath: TCP itself enforces a strict, in-order byte stream. When a single packet carrying Stream 1 bytes is dropped on a lossy mobile network, the OS kernel TCP receive buffer stalls delivery of Streams 2 and 3 until that lost packet is retransmitted and acknowledged—even though Streams 2 and 3 arrived intact.\n\nQUIC (RFC 9000) and HTTP/3 (RFC 9114) move transport framing, loss recovery, and TLS 1.3 encryption into user-space over UDP. Each HTTP/3 stream owns an independent ordered byte offset inside QUIC STREAM frames, so packet loss on Stream 1 pauses only Stream 1 while Streams 2 and 3 continue delivering frames immediately. Furthermore, QUIC integrates TLS 1.3 directly into the transport handshake (1-RTT cold start, 0-RTT session resumption) and decouples connection identity from the 4-tuple (src_ip, src_port, dst_ip, dst_port) via an explicit 64-bit Connection ID (CID).\n\nKey trade-offs center on UDP middlebox traversal, CPU encryption overhead without kernel-offload GRO/GSO, and security guardrails: unverified UDP source addresses require a 3x amplification limit before address validation, and 0-RTT early data is replayable and must be restricted strictly to idempotent GET/HEAD requests or protected by anti-replay strike registers."
+    },
+    "advanced": {
+      "summary": "At edge scale, QUIC requires UDP GSO/GRO syscall batching, stateless eBPF Connection-ID routing across ECMP pools, distributed 0-RTT strike registers, and endpoint QLOG observability.",
+      "keyTakeaway": "When cross-zone coordination becomes the latency bottleneck, Stream Multiplexing &, decoupling streams from TCP's single ordered buffer and binding connections to cryptographic Connection IDs instead of 4-tuple IPs cuts mobile tail latency and eliminates connection drops.",
+      "byteSummary": "HTTP/2 solved head-of-line (HOL) blocking at the application layer by multiplexing many logical streams over a single TCP connection, but it left a fatal bottleneck underneath: TCP itself enforces a strict, in-order byte stream. When a single packet carrying Stream 1 bytes is dropped on a lossy mobile network, the OS kernel TCP receive buffer stalls delivery of Streams 2 and 3 until that lost packet is retransmitted and acknowledged—even though Streams 2 and 3 arrived intact.\n\nQUIC (RFC 9000) and HTTP/3 (RFC 9114) move transport framing, loss recovery, and TLS 1.3 encryption into user-space over UDP. Each HTTP/3 stream owns an independent ordered byte offset inside QUIC STREAM frames, so packet loss on Stream 1 pauses only Stream 1 while Streams 2 and 3 continue delivering frames immediately. Furthermore, QUIC integrates TLS 1.3 directly into the transport handshake (1-RTT cold start, 0-RTT session resumption) and decouples connection identity from the 4-tuple (src_ip, src_port, dst_ip, dst_port) via an explicit 64-bit Connection ID (CID).\n\nKey trade-offs center on UDP middlebox traversal, CPU encryption overhead without kernel-offload GRO/GSO, and security guardrails: unverified UDP source addresses require a 3x amplification limit before address validation, and 0-RTT early data is replayable and must be restricted strictly to idempotent GET/HEAD requests or protected by anti-replay strike registers."
+    }
+  },
+  "pedagogicalFramework": "PRIME",
+  "simulation": {
+    "title": "QUIC & HTTP/3: 0-RTT Handshakes, Stream Multiplexing & Connection Migration — Interactive Execution Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Workload & Budget"
+      },
+      {
+        "id": "router",
+        "label": "Gateway / Router",
+        "role": "Admission & Dispatch"
+      },
+      {
+        "id": "engine",
+        "label": "Core Engine",
+        "role": "Primary Execution"
+      },
+      {
+        "id": "replica",
+        "label": "Replica / Fallback",
+        "role": "Durability & Recovery"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "router",
+        "label": "request"
+      },
+      {
+        "from": "router",
+        "to": "engine",
+        "label": "route"
+      },
+      {
+        "from": "engine",
+        "to": "replica",
+        "label": "sync / fallback"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why TCP + HTTP/2 Suffers Transport Head-of-Line Blocking",
+        "actionLabel": "Dispatch nominal request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "router"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "Ingress",
+          "p99_ms": 8,
+          "error_rate": "0.0%"
+        },
+        "explanation": "Caller sends work into the gateway with explicit timeout and concurrency bounds (Why TCP + HTTP/2 Suffers Transport Head-of-Line Blocking)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Merged TLS 1.3 Transport Handshake & 0-RTT Resumption",
+        "actionLabel": "Execute core invariant",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "Core Path",
+          "p99_ms": 18,
+          "in_flight": 124
+        },
+        "explanation": "The core engine processes the hot path while keeping state transitions deterministic (Merged TLS 1.3 Transport Handshake & 0-RTT Resumption)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "64-Bit Connection IDs & Seamless Wi-Fi-to-5G Migration",
+        "actionLabel": "Detect skew or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Degraded",
+          "p99_ms": 64,
+          "retries_capped": "true"
+        },
+        "explanation": "Under load or replica lag, bounded backoff and isolation prevent cascading saturation (64-Bit Connection IDs & Seamless Wi-Fi-to-5G Migration)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Tracking QUIC Loss, 0-RTT Rejections & CID Migration Health",
+        "actionLabel": "Converge & restore SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 11,
+          "drift": 0
+        },
+        "explanation": "State converges cleanly and telemetry confirms the system returned within its SLO envelope (Tracking QUIC Loss, 0-RTT Rejections & CID Migration Health)."
+      }
+    ]
+  }
+}

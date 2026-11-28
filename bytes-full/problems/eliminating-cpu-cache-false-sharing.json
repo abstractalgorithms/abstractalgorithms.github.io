@@ -1,0 +1,880 @@
+{
+  "id": "problem-eliminating-cpu-cache-false-sharing",
+  "slug": "eliminating-cpu-cache-false-sharing",
+  "title": "Eliminating CPU Cache-Line False Sharing",
+  "problemType": "concurrency",
+  "difficulty": "hard",
+  "prompt": "A high-frequency Java telemetry ingestion service runs 8 worker threads on an 8-core x86_64 server, each incrementing its own dedicated counter in a shared long[8] array (or adjacent volatile fields in a metrics object) at 100M events/sec. Despite zero locks and zero logical data sharing, CPU utilization spikes to 100% sys/kernel-like stall cycles and total throughput collapses from ~800M ops/sec to ~25M ops/sec. Diagnose the hardware root cause and redesign the counter structure in Java to restore linear multi-core scaling.",
+  "spark": {
+    "summary": "When 8 threads increment adjacent slots in a long[8] array, all 8 counters share one 64-byte CPU cache line, causing MESI Read-For-Ownership (RFO) bouncing that collapses throughput from 800M to 25M ops/sec; padding/striping via LongAdder restores linear scaling.",
+    "keyTakeaway": "When 8 threads increment adjacent slots in a long[8] array, all 8 counters share one 64-byte CPU cache line, causin, separate per-thread hot counters onto distinct 64-byte cache lines using LongAdder or @Contended padding to eliminate cross-core MESI RFO invalidations.",
+    "byteSummary": "**Core Mechanics:** Modern x86_64 CPUs transfer memory between L1/L2 caches and RAM in **64-byte cache lines**, not individual 8-byte `long`s. A `long[8]` array occupies `64` contiguous bytes—fitting **all 8 thread counters on a single cache line**.\n\n**Visual & Structural Flow:** Depicts False Sharing on long[8] (1 Cache Line) vs. Padded Stripes (Core 0 (idx 0) -> MESI Interconnect -> Core 1 (idx 1)); Thread-Local L1 Cache Lines via LongAdder / 64B Stride (Core 0..7 -> L1 Cache Line 0 -> L1 Cache Line 1 -> Scraper (100ms)).\n\n**Trade-Offs & Production:** Switching from `long[]` to `AtomicLong[]` or separate `volatile long c0, c1...` fields does **not** fix false sharing: **Adjacent Heap Layout**: `volatile long` fields in the same. High-frequency Java telemetry engines eliminate false sharing cleanly in JDK 17+: **`java.util.concurrent.atomic.LongAdder`**: Uses internal `@Contended`-padded `Cell` stripes.\n\n**Failure Modes & Application:** Eliminating false sharing is a staple of low-latency infrastructure: **LMAX Disruptor Ring Buffer**: Padding `Sequence` cursors (`p1..p7`) so producer and consumer heads never share a cache line."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why 64-byte cache-line false sharing kills lock-free scaling",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "Modern x86_64 CPUs transfer memory between L1/L2 caches and RAM in **64-byte cache lines**, not individual 8-byte `long`s.",
+        "core": "A `long[8]` array occupies `64` contiguous bytes—fitting **all 8 thread counters on a single cache line**.",
+        "deepDive": "Even with zero locks and distinct array indices, every core writing its own `long` must broadcast a **Read-For-Ownership (RFO)** under the **MESI** coherence protocol, invalidating all other cores' L1 caches and collapsing throughput from `800M` to `25M ops/sec`."
+      },
+      "purpose": "The mechanism: understand how Why 64-byte cache-line false sharing kills lock-free scaling works from first principles.",
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Stage 1 Interaction",
+        "title": "Why 64-byte cache-line false sharing kills lock-free scali...",
+        "actors": [
+          {
+            "id": "caller",
+            "label": "Client / Caller"
+          },
+          {
+            "id": "coord",
+            "label": "Coordinator"
+          },
+          {
+            "id": "store",
+            "label": "State / Engine"
+          }
+        ],
+        "steps": [
+          {
+            "from": "caller",
+            "to": "coord",
+            "label": "1. Dispatch request + bounds"
+          },
+          {
+            "from": "coord",
+            "to": "store",
+            "label": "2. Execute deterministic step"
+          },
+          {
+            "from": "store",
+            "to": "coord",
+            "label": "3. Return state & proof"
+          },
+          {
+            "from": "coord",
+            "to": "caller",
+            "label": "4. Ack with bounded latency"
+          }
+        ]
+      }
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "What happens during MESI RFO cache-line ping-ponging",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "When Core 0 writes `counters[0]` and Core 1 writes `counters[1]` concurrently:",
+        "core": "1. **Cache-Line Ownership Theft**: Core 0 transitions the shared 64-byte line to `Modified`, invalidating Core 1's copy.\n2. **HITM Stall Cycles**: Core 1 stalls waiting to fetch the `Modified` line (`HITM` in `perf c2c`) over the inter-core mesh.\n3. **Serialized Execution**: Instead of 8× parallel speed, all 8 cores serialize on one cache line.",
+        "deepDive": "In production deployments of Eliminating CPU Cache-Line False Sharing, watch how what happens during mesi rfo cache-line ping-ponging interacts with tail latency, retry amplification, and partial failures. When 8 threads increment adjacent slots in a long[8] array, all 8 counters share one 64-byte CPU cache line, causing MESI Read-For-Ownership (RFO) bouncing that collapses throughput from 800M to 25M ops/sec; padding/striping via LongAdder restores linear scaling."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "MESI Coherence Ping-Pong",
+        "title": "False Sharing on long[8] (1 Cache Line) vs. Padded Stripes",
+        "actors": [
+          {
+            "id": "c0",
+            "label": "Core 0 (idx 0)"
+          },
+          {
+            "id": "bus",
+            "label": "MESI Interconnect"
+          },
+          {
+            "id": "c1",
+            "label": "Core 1 (idx 1)"
+          }
+        ],
+        "events": [
+          {
+            "from": "c0",
+            "to": "bus",
+            "label": "Write counters[0] -> RFO invalidate",
+            "status": "warn"
+          },
+          {
+            "from": "bus",
+            "to": "c1",
+            "label": "Invalidate L1 line (idx 1 lost!)",
+            "status": "fail"
+          },
+          {
+            "from": "c1",
+            "to": "bus",
+            "label": "Write counters[1] -> HITM stall!",
+            "status": "fail"
+          },
+          {
+            "from": "c0",
+            "to": "c0",
+            "label": "Fix: pad 64B / LongAdder -> L1 local",
+            "status": "ok"
+          }
+        ],
+        "summary": "Padding each counter to >= 64 bytes (or using LongAdder) keeps each core's writes in its own L1 cache line."
+      },
+      "purpose": "The problem: see what breaks without What happens during MESI RFO cache-line ping-ponging under real concurrency or scale.",
+      "decisionFramework": {
+        "problem": "How to implement Eliminating CPU Cache-Line False Sharing without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "When 8 threads increment adjacent slots in a long[8] array, all 8 counters share one 64-byte CPU cache line, causin, separate per-thread hot counters onto distinct 64-byte cache lines using LongAdder or @Contended padding to eliminate cross-core MESI RFO invalidations.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Eliminating CPU Cache-Line False Sharing experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Naive solution (and why AtomicLong[] or volatile fields still suffer)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Switching from `long[]` to `AtomicLong[]` or separate `volatile long c0, c1...` fields does **not** fix false sharing:",
+        "core": "- **Adjacent Heap Layout**: `volatile long` fields in the same object sit side-by-side in memory on the same 64-byte line.\n- **`AtomicLong` Array Density**: Contiguous `AtomicLong` references/objects can still share cache lines, and `AtomicLong` CAS retries under contention.",
+        "deepDive": "In production deployments of Eliminating CPU Cache-Line False Sharing, watch how naive solution (and why atomiclong[] or volatile fields still suffer) interacts with tail latency, retry amplification, and partial failures. When 8 threads increment adjacent slots in a long[8] array, all 8 counters share one 64-byte CPU cache line, causing MESI Read-For-Ownership (RFO) bouncing that collapses throughput from 800M to 25M ops/sec; padding/striping via LongAdder restores linear scaling."
+      },
+      "purpose": "The problem: see what breaks without Naive solution under real concurrency or scale.",
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "Stage 3 Lifecycle",
+        "title": "Naive solution (and why AtomicLong[] or volatile fields st...",
+        "states": [
+          {
+            "id": "init",
+            "label": "Ready / Idle",
+            "tone": "neutral"
+          },
+          {
+            "id": "active",
+            "label": "In-Flight",
+            "tone": "info"
+          },
+          {
+            "id": "verified",
+            "label": "Committed",
+            "tone": "good"
+          },
+          {
+            "id": "degraded",
+            "label": "Fallback / Retry",
+            "tone": "warn"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "init",
+            "to": "active",
+            "label": "acquire"
+          },
+          {
+            "from": "active",
+            "to": "verified",
+            "label": "quorum ok"
+          },
+          {
+            "from": "active",
+            "to": "degraded",
+            "label": "timeout / skew"
+          },
+          {
+            "from": "degraded",
+            "to": "init",
+            "label": "backoff reset"
+          }
+        ]
+      }
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise solution: Striped LongAdder / 64-Byte Padded Cells",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": {
+        "foundation": "High-frequency Java telemetry engines eliminate false sharing cleanly in JDK 17+:",
+        "core": "- **`java.util.concurrent.atomic.LongAdder`**: Uses internal `@Contended`-padded `Cell` stripes hashed by thread probe; each thread increments its own 64-byte-isolated `Cell` in `< 5 ns` amortized, and the 100 ms scraper calls `.sum()` to aggregate.\n- **Explicit 64-Byte Stride / `@Contended`**: When indexing by fixed worker ID (`0..7`), pad each slot to `64` bytes (stride of `8` longs = `64` bytes, or `16` longs = `128` bytes to defeat hardware spatial prefetchers) with zero JVM flags required.\n- **Verification**: Validate with **JMH** + `perf c2c` (`L1-dcache-load-misses` and `HITM` drop by `> 95%`).",
+        "deepDive": "In production deployments of Eliminating CPU Cache-Line False Sharing, watch how enterprise solution: striped longadder / 64-byte padded cells interacts with tail latency, retry amplification, and partial failures. When 8 threads increment adjacent slots in a long[8] array, all 8 counters share one 64-byte CPU cache line, causing MESI Read-For-Ownership (RFO) bouncing that collapses throughput from 800M to 25M ops/sec; padding/striping via LongAdder restores linear scaling."
+      },
+      "sectionDiagram": {
+        "kind": "cache-tier",
+        "eyebrow": "Cache-Line Isolation",
+        "title": "Thread-Local L1 Cache Lines via LongAdder / 64B Stride",
+        "nodes": [
+          {
+            "label": "Core 0..7",
+            "role": "8 writer threads"
+          },
+          {
+            "label": "L1 Cache Line 0",
+            "role": "64B padded Cell[0]"
+          },
+          {
+            "label": "L1 Cache Line 1",
+            "role": "64B padded Cell[1]"
+          },
+          {
+            "label": "Scraper (100ms)",
+            "role": "sum() across cells"
+          }
+        ],
+        "cards": [
+          {
+            "label": "LongAdder Stripes",
+            "detail": "Maintains @Contended-padded Cell[] so writers never share cache lines."
+          },
+          {
+            "label": "128B Stride Option",
+            "detail": "Using stride=16 longs also avoids adjacent-line hardware prefetcher bouncing."
+          },
+          {
+            "label": "Zero Lock Hot Path",
+            "detail": "Achieves < 5 ns amortized increment and linear 16-core scaling."
+          },
+          {
+            "label": "perf c2c Verified",
+            "detail": "Eliminates cross-core HITM stalls in hardware performance counters."
+          }
+        ],
+        "summary": "Isolating each thread's counter on its own 64-byte (or 128-byte) cache line restores 800M+ ops/sec linear scaling."
+      },
+      "markdownContent": "```java\nimport java.util.concurrent.atomic.LongAdder;\n\n// Option 1: JDK standard striped & @Contended-padded counter\npublic final class TelemetryCounters {\n    private final LongAdder events = new LongAdder();\n    public void record() { events.increment(); }         // <5 ns, zero RFO bouncing\n    public long snapshot() { return events.sum(); }    // called every 100ms\n}\n\n// Option 2: Fixed worker-ID array with 128-byte stride (no -XX:-RestrictContended needed)\npublic final class PaddedWorkerCounters {\n    private static final int STRIDE = 16; // 16 * 8B = 128B (defeats spatial prefetcher)\n    private final long[] slots;\n    public PaddedWorkerCounters(int workers) { this.slots = new long[workers * STRIDE]; }\n    public void inc(int workerId) { slots[workerId * STRIDE]++; }\n    public long total(int workers) {\n        long s = 0;\n        for (int i = 0; i < workers; i++) s += slots[i * STRIDE];\n        return s;\n    }\n}\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where Cache-Line Padding applies in High-Throughput Systems",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Eliminating false sharing is a staple of low-latency infrastructure:",
+        "core": "- **LMAX Disruptor Ring Buffer**: Padding `Sequence` cursors (`p1..p7`) so producer and consumer heads never share a cache line.\n- **Metrics & Observability Agents**: `LongAdder` / `Striped64` powering Micrometer, Prometheus, and Netty byte counters.\n- **HFT & Telemetry Pipelines**: Per-core statistics arrays padded to 64/128 bytes.",
+        "deepDive": "In production deployments of Eliminating CPU Cache-Line False Sharing, watch how where cache-line padding applies in high-throughput systems interacts with tail latency, retry amplification, and partial failures. When 8 threads increment adjacent slots in a long[8] array, all 8 counters share one 64-byte CPU cache line, causing MESI Read-For-Ownership (RFO) bouncing that collapses throughput from 800M to 25M ops/sec; padding/striping via LongAdder restores linear scaling."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "lock-free-atomics",
+          "title": "Concept: Lock-Free Atomics",
+          "kind": "concept"
+        },
+        {
+          "slug": "memory-models-happens-before",
+          "title": "Concept: Memory Models & Happens-Before",
+          "kind": "concept"
+        },
+        {
+          "slug": "cpu-profiling-flamegraphs",
+          "title": "Concept: CPU Profiling & Flamegraphs",
+          "kind": "concept"
+        },
+        {
+          "slug": "double-checked-locking-memory-barriers",
+          "title": "Problem: Double-Checked Locking & Memory Barriers",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "Stage 5 Lifecycle",
+        "title": "Where Cache-Line Padding applies in High-Throughput System...",
+        "states": [
+          {
+            "id": "init",
+            "label": "Ready / Idle",
+            "tone": "neutral"
+          },
+          {
+            "id": "active",
+            "label": "In-Flight",
+            "tone": "info"
+          },
+          {
+            "id": "verified",
+            "label": "Committed",
+            "tone": "good"
+          },
+          {
+            "id": "degraded",
+            "label": "Fallback / Retry",
+            "tone": "warn"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "init",
+            "to": "active",
+            "label": "acquire"
+          },
+          {
+            "from": "active",
+            "to": "verified",
+            "label": "quorum ok"
+          },
+          {
+            "from": "active",
+            "to": "degraded",
+            "label": "timeout / skew"
+          },
+          {
+            "from": "degraded",
+            "to": "init",
+            "label": "backoff reset"
+          }
+        ]
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why does incrementing distinct indices of a shared long[8] array across 8 CPU cores collapse throughput?",
+      "options": [
+        {
+          "id": "a",
+          "text": "All 8 longs (64 bytes) fit in a single CPU cache line, causing continuous MESI Read-For-Ownership (RFO) invalidations between cores",
+          "correct": true,
+          "feedback": "Correct: false sharing occurs because cache coherence operates at 64-byte cache-line granularity, not 8-byte element granularity."
+        },
+        {
+          "id": "b",
+          "text": "Because Java arrays acquire an implicit synchronized lock on every write",
+          "correct": false,
+          "feedback": "Array element writes are lock-free; the stall is hardware cache-coherence traffic."
+        },
+        {
+          "id": "c",
+          "text": "Because 64-bit longs overflow after 25M increments",
+          "correct": false,
+          "feedback": "A 64-bit signed long holds up to ~9.22e18."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why does incrementing distinct indices of a shared long[8] array across 8 CPU cores collapse throughput?",
+        "options": [
+          {
+            "id": "a",
+            "text": "All 8 longs (64 bytes) fit in a single CPU cache line, causing continuous MESI Read-For-Ownership (RFO) invalidations between cores",
+            "correct": true,
+            "feedback": "Correct: false sharing occurs because cache coherence operates at 64-byte cache-line granularity, not 8-byte element granularity."
+          },
+          {
+            "id": "b",
+            "text": "Because Java arrays acquire an implicit synchronized lock on every write",
+            "correct": false,
+            "feedback": "Array element writes are lock-free; the stall is hardware cache-coherence traffic."
+          },
+          {
+            "id": "c",
+            "text": "Because 64-bit longs overflow after 25M increments",
+            "correct": false,
+            "feedback": "A 64-bit signed long holds up to ~9.22e18."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why 64-byte cache-line false sharing kills lock-free scaling', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "b",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "c",
+            "text": "Modern x86_64 CPUs transfer memory between L1/L2 caches and RAM in **64-byte cache lines**, not individual 8-byte longs.",
+            "correct": true,
+            "feedback": "Correct: Modern x86_64 CPUs transfer memory between L1/L2 caches and RAM in **64-byte cache lines**, not individual 8-byte longs."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'What happens during MESI RFO cache-line ping-ponging', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "b",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "c",
+            "text": "When Core 0 writes counters[0] and Core 1 writes counters[1] concurrently: 1.",
+            "correct": true,
+            "feedback": "Correct: When Core 0 writes counters[0] and Core 1 writes counters[1] concurrently: 1."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** Modern x86_64 CPUs transfer memory between L1/L2 caches and RAM in **64-byte cache lines**, not individual 8-byte `long`s.\n\n**How It Flows:** Think of Eliminating CPU Cache-Line False Sharing as a clear step-by-step chain: Core 0 (idx 0) -> MESI Interconnect -> Core 1 (idx 1) -> Core 0..7 -> L1 Cache Line 0.\n\n**Why Beginners Should Care:** Separate per-thread hot counters onto distinct 64-byte cache lines using LongAdder or @Contended padding to eliminate cross-core MESI RFO invalidations.",
+      "spark": {
+        "summary": "Modern x86_64 CPUs transfer memory between L1/L2 caches and RAM in **64-byte cache lines**, not individual 8-byte `long`s.",
+        "keyTakeaway": "Separate per-thread hot counters onto distinct 64-byte cache lines using LongAdder or @Contended padding to eliminate cross-core MESI RFO invalidations."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why 64-byte cache-line false sharing kills lock-free scaling",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why 64-byte cache-line false sharing kills lock-free scaling works from first principles.",
+          "explanation": "Modern x86_64 CPUs transfer memory between L1/L2 caches and RAM in **64-byte cache lines**, not individual 8-byte `long`s. A `long[8]` array occupies `64` contiguous bytes—fitting **all 8 thread counters on a single cache line**.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "What happens during MESI RFO cache-line ping-ponging",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without What happens during MESI RFO cache-line ping-ponging under real concurrency or scale.",
+          "explanation": "When Core 0 writes `counters[0]` and Core 1 writes `counters[1]` concurrently: 1. **Cache-Line Ownership Theft**: Core 0 transitions the shared 64-byte line to `Modified`, invalidating Core 1's copy. 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "MESI Coherence Ping-Pong",
+            "title": "False Sharing on long[8] (1 Cache Line) vs. Padded Stripes",
+            "actors": [
+              {
+                "id": "c0",
+                "label": "Core 0 (idx 0)"
+              },
+              {
+                "id": "bus",
+                "label": "MESI Interconnect"
+              },
+              {
+                "id": "c1",
+                "label": "Core 1 (idx 1)"
+              }
+            ],
+            "events": [
+              {
+                "from": "c0",
+                "to": "bus",
+                "label": "Write counters[0] -> RFO invalidate",
+                "status": "warn"
+              },
+              {
+                "from": "bus",
+                "to": "c1",
+                "label": "Invalidate L1 line (idx 1 lost!)",
+                "status": "fail"
+              },
+              {
+                "from": "c1",
+                "to": "bus",
+                "label": "Write counters[1] -> HITM stall!",
+                "status": "fail"
+              },
+              {
+                "from": "c0",
+                "to": "c0",
+                "label": "Fix: pad 64B / LongAdder -> L1 local",
+                "status": "ok"
+              }
+            ],
+            "summary": "Padding each counter to >= 64 bytes (or using LongAdder) keeps each core's writes in its own L1 cache line."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive solution (and why AtomicLong[] or volatile fields still suffer)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "The problem: see what breaks without Naive solution under real concurrency or scale.",
+          "explanation": "Switching from `long[]` to `AtomicLong[]` or separate `volatile long c0, c1...` fields does **not** fix false sharing: **Adjacent Heap Layout**: `volatile long` fields in the same object sit side-by-side in memory on the same 64-byte line. **`AtomicLong` Array Density**: Contiguous `AtomicLong` references/objects can still share cache lines, and `AtomicLong` CAS retries under contention.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Striped LongAdder / 64-Byte Padded Cells",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "High-frequency Java telemetry engines eliminate false sharing cleanly in JDK 17+: **`java.util.concurrent.atomic.LongAdder`**: Uses internal `@Contended`-padded `Cell` stripes hashed by thread probe; each thread increments its own 64-byte-isolated `Cell` in `< 5 ns` amortized, and the 100 ms scraper calls `.sum()` to aggregate.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Cache-Line Isolation",
+            "title": "Thread-Local L1 Cache Lines via LongAdder / 64B Stride",
+            "nodes": [
+              {
+                "label": "Core 0..7",
+                "role": "8 writer threads"
+              },
+              {
+                "label": "L1 Cache Line 0",
+                "role": "64B padded Cell[0]"
+              },
+              {
+                "label": "L1 Cache Line 1",
+                "role": "64B padded Cell[1]"
+              },
+              {
+                "label": "Scraper (100ms)",
+                "role": "sum() across cells"
+              }
+            ],
+            "cards": [
+              {
+                "label": "LongAdder Stripes",
+                "detail": "Maintains @Contended-padded Cell[] so writers never share cache lines."
+              },
+              {
+                "label": "128B Stride Option",
+                "detail": "Using stride=16 longs also avoids adjacent-line hardware prefetcher bouncing."
+              },
+              {
+                "label": "Zero Lock Hot Path",
+                "detail": "Achieves < 5 ns amortized increment and linear 16-core scaling."
+              },
+              {
+                "label": "perf c2c Verified",
+                "detail": "Eliminates cross-core HITM stalls in hardware performance counters."
+              }
+            ],
+            "summary": "Isolating each thread's counter on its own 64-byte (or 128-byte) cache line restores 800M+ ops/sec linear scaling."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Separate per-thread hot counters onto distinct 64-byte cache lines using LongAdder or @Contended padding to eliminate cross-core MESI RFO invalidations.",
+      "summary": "When 8 threads increment adjacent slots in a long[8] array, all 8 counters share one 64-byte CPU cache line, causing MESI Read-For-Ownership (RFO) bouncing that collapses throughput from 800M to 25M ops/sec; padding/striping via LongAdder restores linear scaling.",
+      "keyTakeaway": "When 8 threads increment adjacent slots in a long[8] array, all 8 counters share one 64-byte CPU cache line, causin, separate per-thread hot counters onto distinct 64-byte cache lines using LongAdder or @Contended padding to eliminate cross-core MESI RFO invalidations."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** Modern x86_64 CPUs transfer memory between L1/L2 caches and RAM in **64-byte cache lines**, not individual 8-byte `long`s. A `long[8]` array occupies `64` contiguous bytes—fitting **all 8 thread counters on a single cache line**.\n\n**Visual & Structural Flow:** Depicts False Sharing on long[8] (1 Cache Line) vs. Padded Stripes (Core 0 (idx 0) -> MESI Interconnect -> Core 1 (idx 1)); Thread-Local L1 Cache Lines via LongAdder / 64B Stride (Core 0..7 -> L1 Cache Line 0 -> L1 Cache Line 1 -> Scraper (100ms)).\n\n**Trade-Offs & Production:** Switching from `long[]` to `AtomicLong[]` or separate `volatile long c0, c1...` fields does **not** fix false sharing: **Adjacent Heap Layout**: `volatile long` fields in the same. High-frequency Java telemetry engines eliminate false sharing cleanly in JDK 17+: **`java.util.concurrent.atomic.LongAdder`**: Uses internal `@Contended`-padded `Cell` stripes.\n\n**Failure Modes & Application:** Eliminating false sharing is a staple of low-latency infrastructure: **LMAX Disruptor Ring Buffer**: Padding `Sequence` cursors (`p1..p7`) so producer and consumer heads never share a cache line.",
+      "spark": {
+        "summary": "When 8 threads increment adjacent slots in a long[8] array, all 8 counters share one 64-byte CPU cache line, causing MESI Read-For-Ownership (RFO) bouncing that collapses throughput from 800M to 25M ops/sec; padding/striping via LongAdder restores linear scaling.",
+        "keyTakeaway": "Separate per-thread hot counters onto distinct 64-byte cache lines using LongAdder or @Contended padding to eliminate cross-core MESI RFO invalidations."
+      },
+      "summary": "When 8 threads increment adjacent slots in a long[8] array, all 8 counters share one 64-byte CPU cache line, causing MESI Read-For-Ownership (RFO) bouncing that collapses throughput from 800M to 25M ops/sec; padding/striping via LongAdder restores linear scaling.",
+      "keyTakeaway": "When 8 threads increment adjacent slots in a long[8] array, all 8 counters share one 64-byte CPU cache line, causin, separate per-thread hot counters onto distinct 64-byte cache lines using LongAdder or @Contended padding to eliminate cross-core MESI RFO invalidations."
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** When 8 threads increment adjacent slots in a long[8] array, all 8 counters share one 64-byte CPU cache line, causing MESI Read-For-Ownership (RFO) bouncing that collapses throughput from 800M to 25M ops/sec; padding/striping via LongAdder restores linear scaling.\n\n**Production Trade-Offs:** Switching from `long[]` to `AtomicLong[]` or separate `volatile long c0, c1...` fields does **not** fix false sharing: **Adjacent Heap Layout**: `volatile long` fields in the same object sit side-by-side in memory on the same 64-byte line.\n\n**Failure Modes & Edge Cases:** Eliminating false sharing is a staple of low-latency infrastructure: **LMAX Disruptor Ring Buffer**: Padding `Sequence` cursors (`p1..p7`) so producer and consumer heads never share a cache line.\n\n**Principal Takeaway:** Separate per-thread hot counters onto distinct 64-byte cache lines using LongAdder or @Contended padding to eliminate cross-core MESI RFO invalidations.",
+      "spark": {
+        "summary": "When 8 threads increment adjacent slots in a long[8] array, all 8 counters share one 64-byte CPU cache line, causing MESI Read-For-Ownership (RFO) bouncing that collapses throughput from 800M to 25M ops/sec; padding/striping via LongAdder restores linear scaling.",
+        "keyTakeaway": "Separate per-thread hot counters onto distinct 64-byte cache lines using LongAdder or @Contended padding to eliminate cross-core MESI RFO invalidations."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why 64-byte cache-line false sharing kills lock-free scaling",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why 64-byte cache-line false sharing kills lock-free scaling works from first principles.",
+          "explanation": "Modern x86_64 CPUs transfer memory between L1/L2 caches and RAM in **64-byte cache lines**, not individual 8-byte `long`s. A `long[8]` array occupies `64` contiguous bytes—fitting **all 8 thread counters on a single cache line**. Even with zero locks and distinct array indices, every core writing its own `long` must broadcast a **Read-For-Ownership (RFO)** under the **MESI** coherence protocol, invalidating all other cores' L1 caches and collapsing throughput from `800M` to `25M ops/sec`.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "What happens during MESI RFO cache-line ping-ponging",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without What happens during MESI RFO cache-line ping-ponging under real concurrency or scale.",
+          "explanation": "When Core 0 writes `counters[0]` and Core 1 writes `counters[1]` concurrently:\n\n1. **Cache-Line Ownership Theft**: Core 0 transitions the shared 64-byte line to `Modified`, invalidating Core 1's copy.\n2. **HITM Stall Cycles**: Core 1 stalls waiting to fetch the `Modified` line (`HITM` in `perf c2c`) over the inter-core mesh.\n3. **Serialized Execution**: Instead of 8× parallel speed, all 8 cores serialize on one cache line.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "MESI Coherence Ping-Pong",
+            "title": "False Sharing on long[8] (1 Cache Line) vs. Padded Stripes",
+            "actors": [
+              {
+                "id": "c0",
+                "label": "Core 0 (idx 0)"
+              },
+              {
+                "id": "bus",
+                "label": "MESI Interconnect"
+              },
+              {
+                "id": "c1",
+                "label": "Core 1 (idx 1)"
+              }
+            ],
+            "events": [
+              {
+                "from": "c0",
+                "to": "bus",
+                "label": "Write counters[0] -> RFO invalidate",
+                "status": "warn"
+              },
+              {
+                "from": "bus",
+                "to": "c1",
+                "label": "Invalidate L1 line (idx 1 lost!)",
+                "status": "fail"
+              },
+              {
+                "from": "c1",
+                "to": "bus",
+                "label": "Write counters[1] -> HITM stall!",
+                "status": "fail"
+              },
+              {
+                "from": "c0",
+                "to": "c0",
+                "label": "Fix: pad 64B / LongAdder -> L1 local",
+                "status": "ok"
+              }
+            ],
+            "summary": "Padding each counter to >= 64 bytes (or using LongAdder) keeps each core's writes in its own L1 cache line."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive solution (and why AtomicLong[] or volatile fields still suffer)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "The problem: see what breaks without Naive solution under real concurrency or scale.",
+          "explanation": "Switching from `long[]` to `AtomicLong[]` or separate `volatile long c0, c1...` fields does **not** fix false sharing:\n\n- **Adjacent Heap Layout**: `volatile long` fields in the same object sit side-by-side in memory on the same 64-byte line.\n- **`AtomicLong` Array Density**: Contiguous `AtomicLong` references/objects can still share cache lines, and `AtomicLong` CAS retries under contention.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Striped LongAdder / 64-Byte Padded Cells",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "High-frequency Java telemetry engines eliminate false sharing cleanly in JDK 17+:\n\n- **`java.util.concurrent.atomic.LongAdder`**: Uses internal `@Contended`-padded `Cell` stripes hashed by thread probe; each thread increments its own 64-byte-isolated `Cell` in `< 5 ns` amortized, and the 100 ms scraper calls `.sum()` to aggregate.\n- **Explicit 64-Byte Stride / `@Contended`**: When indexing by fixed worker ID (`0..7`), pad each slot to `64` bytes (stride of `8` longs = `64` bytes, or `16` longs = `128` bytes to defeat hardware spatial prefetchers) with zero JVM flags required.\n- **Verification**: Validate with **JMH** + `perf c2c` (`L1-dcache-load-misses` and `HITM` drop by `> 95%`).",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Cache-Line Isolation",
+            "title": "Thread-Local L1 Cache Lines via LongAdder / 64B Stride",
+            "nodes": [
+              {
+                "label": "Core 0..7",
+                "role": "8 writer threads"
+              },
+              {
+                "label": "L1 Cache Line 0",
+                "role": "64B padded Cell[0]"
+              },
+              {
+                "label": "L1 Cache Line 1",
+                "role": "64B padded Cell[1]"
+              },
+              {
+                "label": "Scraper (100ms)",
+                "role": "sum() across cells"
+              }
+            ],
+            "cards": [
+              {
+                "label": "LongAdder Stripes",
+                "detail": "Maintains @Contended-padded Cell[] so writers never share cache lines."
+              },
+              {
+                "label": "128B Stride Option",
+                "detail": "Using stride=16 longs also avoids adjacent-line hardware prefetcher bouncing."
+              },
+              {
+                "label": "Zero Lock Hot Path",
+                "detail": "Achieves < 5 ns amortized increment and linear 16-core scaling."
+              },
+              {
+                "label": "perf c2c Verified",
+                "detail": "Eliminates cross-core HITM stalls in hardware performance counters."
+              }
+            ],
+            "summary": "Isolating each thread's counter on its own 64-byte (or 128-byte) cache line restores 800M+ ops/sec linear scaling."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where Cache-Line Padding applies in High-Throughput Systems",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Eliminating false sharing is a staple of low-latency infrastructure:\n\n- **LMAX Disruptor Ring Buffer**: Padding `Sequence` cursors (`p1..p7`) so producer and consumer heads never share a cache line.\n- **Metrics & Observability Agents**: `LongAdder` / `Striped64` powering Micrometer, Prometheus, and Netty byte counters.\n- **HFT & Telemetry Pipelines**: Per-core statistics arrays padded to 64/128 bytes.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Separate per-thread hot counters onto distinct 64-byte cache lines using LongAdder or @Contended padding to eliminate cross-core MESI RFO invalidations.",
+      "summary": "When 8 threads increment adjacent slots in a long[8] array, all 8 counters share one 64-byte CPU cache line, causing MESI Read-For-Ownership (RFO) bouncing that collapses throughput from 800M to 25M ops/sec; padding/striping via LongAdder restores linear scaling.",
+      "keyTakeaway": "When 8 threads increment adjacent slots in a long[8] array, all 8 counters share one 64-byte CPU cache line, causin, separate per-thread hot counters onto distinct 64-byte cache lines using LongAdder or @Contended padding to eliminate cross-core MESI RFO invalidations."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "simulation": {
+    "title": "Eliminating CPU Cache-Line False Sharing — Interactive Execution Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Workload & Budget"
+      },
+      {
+        "id": "router",
+        "label": "Gateway / Router",
+        "role": "Admission & Dispatch"
+      },
+      {
+        "id": "engine",
+        "label": "Core Engine",
+        "role": "Primary Execution"
+      },
+      {
+        "id": "replica",
+        "label": "Replica / Fallback",
+        "role": "Durability & Recovery"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "router",
+        "label": "request"
+      },
+      {
+        "from": "router",
+        "to": "engine",
+        "label": "route"
+      },
+      {
+        "from": "engine",
+        "to": "replica",
+        "label": "sync / fallback"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why 64-byte cache-line false sharing kills lock-free scaling",
+        "actionLabel": "Dispatch nominal request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "router"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "Ingress",
+          "p99_ms": 8,
+          "error_rate": "0.0%"
+        },
+        "explanation": "Caller sends work into the gateway with explicit timeout and concurrency bounds (Why 64-byte cache-line false sharing kills lock-free scaling)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "What happens during MESI RFO cache-line ping-ponging",
+        "actionLabel": "Execute core invariant",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "Core Path",
+          "p99_ms": 18,
+          "in_flight": 124
+        },
+        "explanation": "The core engine processes the hot path while keeping state transitions deterministic (What happens during MESI RFO cache-line ping-ponging)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Naive solution (and why AtomicLong[] or volatile fields stil",
+        "actionLabel": "Detect skew or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Degraded",
+          "p99_ms": 64,
+          "retries_capped": "true"
+        },
+        "explanation": "Under load or replica lag, bounded backoff and isolation prevent cascading saturation (Naive solution (and why AtomicLong[] or volatile fields still suffer))."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Where Cache-Line Padding applies in High-Throughput Systems",
+        "actionLabel": "Converge & restore SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 11,
+          "drift": 0
+        },
+        "explanation": "State converges cleanly and telemetry confirms the system returned within its SLO envelope (Where Cache-Line Padding applies in High-Throughput Systems)."
+      }
+    ]
+  }
+}

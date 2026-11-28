@@ -1,0 +1,625 @@
+{
+  "id": "prob-design-high-throughput-log-ingestion-pipeline",
+  "slug": "design-high-throughput-log-ingestion-pipeline",
+  "title": "Design a High-Throughput Distributed Log Ingestion & Tail Pipeline",
+  "problemType": "system-design",
+  "difficulty": "hard",
+  "prompt": "Design a distributed log ingestion and real-time tailing pipeline capable of ingesting 5 million events/sec (5 GB/s sustained, 15 GB/s burst) from thousands of microservice producers, persisting durable partitioned commit logs, serving real-time consumer groups with sub-50 ms p99 tail latency, and tiering cold segments to object storage without exhausting broker CPU or dropping acknowledged events.",
+  "spark": {
+    "summary": "Combine producer micro-batching, token-bucket backpressure, sequential page-cache appends, and zero-copy `sendfile()` consumer tailers with offset checkpointing and object-storage cold tiering.",
+    "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, sequential append-only commit logs + kernel page-cache residency + zero-copy `sendfile()` let commodity NVMe brokers sustain multi-GB/s ingest and fan-out without user-space buffer bloat.",
+    "byteSummary": "Sustaining 5 GB/s ingest and 15+ GB/s fan-out requires eliminating random disk seeks and user-space memory copies on both the write and read paths. Producers compress and micro-batch records (e.g., 64 KB or 10 ms linger) by partition key and send them through an edge ingest gateway protected by per-tenant token-bucket backpressure (`429 Retry-After` + jitter).\n\nBrokers append batches sequentially to partitioned, segmented commit logs (`1 GB` active segment + sparse offset index), letting the Linux kernel page cache absorb writes and flush asynchronously or via `fdatasync` per quorum policy. Hot real-time consumers tail the active segment straight from the kernel page cache using zero-copy `sendfile()`, avoiding user-space GC pauses and `memcpy()` saturation.\n\nTo prevent cold backfill readers from evicting hot tail pages, historical reads beyond the page-cache window read via `POSIX_FADV_DONTNEED` or fetch immutable closed segments tiered to object storage (S3). Poison-pill or schema-invalid batches are routed after bounded exponential retries to a partitioned Dead Letter Queue (DLQ) so one bad tenant never stalls downstream consumer offsets."
+  },
+  "learningJourney": [
+    {
+      "id": "01-requirements-and-scale",
+      "eyebrow": "STAGE 01 · REQUIREMENTS & MATH",
+      "title": "Throughput, Fan-Out, and Back-of-the-Envelope Sizing",
+      "level": "foundation",
+      "purpose": "Quantify sustained ingest, burst headroom, replication bandwidth, and disk/NIC limits before choosing storage primitives.",
+      "explanation": {
+        "foundation": "- **Ingest**: 5M events/s × 1 KB avg = **5 GB/s** sustained (**15 GB/s** burst, 3× headroom).",
+        "core": "- **Replication (RF=3)**: Leader receives 5 GB/s and replicates 2× to followers = **10 GB/s** inter-broker traffic. - **Consumer Fan-Out (3×)**: **15 GB/s** outbound read bandwidth.",
+        "deepDive": "- **Why standard B-Tree DBs fail**: Random 4 KB page updates and WAL + index amplification collapse under 5M inserts/s; only **sequential append-only commit logs** hit NVMe/NIC line rate."
+      },
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "Stage 1 Topology",
+        "title": "Throughput, Fan-Out, and Back-of-the-Envelope Sizing",
+        "nodes": [
+          {
+            "id": "edge",
+            "label": "Edge Router",
+            "tier": "ingress"
+          },
+          {
+            "id": "worker",
+            "label": "Design a High-Throug Worker",
+            "tier": "compute"
+          },
+          {
+            "id": "state",
+            "label": "Primary State",
+            "tier": "storage"
+          },
+          {
+            "id": "obs",
+            "label": "Telemetry & Audit",
+            "tier": "control"
+          }
+        ],
+        "edges": [
+          {
+            "from": "edge",
+            "to": "worker",
+            "label": "route"
+          },
+          {
+            "from": "worker",
+            "to": "state",
+            "label": "read / mutate"
+          },
+          {
+            "from": "worker",
+            "to": "obs",
+            "label": "emit metrics"
+          }
+        ]
+      }
+    },
+    {
+      "id": "02-ingest-gateway-backpressure",
+      "eyebrow": "STAGE 02 · INGEST & BACKPRESSURE",
+      "title": "Producer Micro-Batching & Token-Bucket Admission Control",
+      "level": "foundation",
+      "purpose": "Absorb traffic spikes gracefully using client batching, zstd compression, and per-tenant token-bucket shedding.",
+      "explanation": {
+        "foundation": "Instead of sending 5M individual RPCs/sec, producer SDKs group records per partition (`batch.size = 64 KB`, `linger.ms = 10`) and compress batches with `zstd` (typically 3–4× reduction, cutting wire ingress from 5 GB/s to ~1.5 GB/s).",
+        "core": "At the Ingest Gateway, each tenant has a **token-bucket rate limiter** backed by per-partition queue-depth signals:\n- If broker page-cache dirty ratio or replication lag exceeds threshold, the gateway returns `429 Too Many Requests` with `Retry-After`.\n- Producers apply **bounded exponential backoff with full jitter** and spill locally to a bounded ring buffer before dropping/sampling low-priority debug logs.",
+        "deepDive": "In production deployments of Design a High-Throughput Distributed Log Ingestion & Tail Pipeline, watch how producer micro-batching & token-bucket admission control interacts with tail latency, retry amplification, and partial failures. End-to-end 5 GB/s ingest & 15 GB/s fan-out architecture covering `sendfile()`/`kTLS`, page-cache isolation, sparse `.index` binary search, ISR bounds, and S3 tiered segments."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Stage 2 Interaction",
+        "title": "Producer Micro-Batching & Token-Bucket Admission Control",
+        "actors": [
+          {
+            "id": "caller",
+            "label": "Client / Caller"
+          },
+          {
+            "id": "coord",
+            "label": "Coordinator"
+          },
+          {
+            "id": "store",
+            "label": "State / Engine"
+          }
+        ],
+        "steps": [
+          {
+            "from": "caller",
+            "to": "coord",
+            "label": "1. Dispatch request + bounds"
+          },
+          {
+            "from": "coord",
+            "to": "store",
+            "label": "2. Execute deterministic step"
+          },
+          {
+            "from": "store",
+            "to": "coord",
+            "label": "3. Return state & proof"
+          },
+          {
+            "from": "coord",
+            "to": "caller",
+            "label": "4. Ack with bounded latency"
+          }
+        ]
+      },
+      "decisionFramework": {
+        "problem": "How to implement Design a High-Throughput Distributed Log Ingestion & Tail Pipeline without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "To keep the architecture evolvable without sacrificing reliability, sequential append-only commit logs + kernel page-cache residency + zero-copy `sendfile()` let commodity NVMe brokers sustain multi-GB/s ingest and fan-out without user-space buffer bloat.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Design a High-Throughput Distributed Log Ingestion & Tail Pipeline experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-partitioned-commit-log",
+      "eyebrow": "STAGE 03 · STORAGE ENGINE",
+      "title": "Segmented Append-Only Commit Log & Sparse Offset Index",
+      "level": "intermediate",
+      "purpose": "Design the on-disk segment layout and sparse index so writes stay sequential and offset seeks complete in O(1) memory + 1 disk hop.",
+      "explanation": {
+        "foundation": "Each topic is sharded into $P$ partitions; each partition is an ordered sequence of immutable **1 GB `.log` segments** plus one active tail segment:",
+        "core": "- **`.log` file**: Raw length-prefixed record batches appended sequentially.\n- **`.index` file**: Sparse memory-mapped index mapping every ~4 KB of log bytes (`offset -> physical_byte_position`). Finding any offset requires a binary search in RAM followed by a single sequential read.\n- **Durability**: Synchronous quorum ack (`acks=all`, min-ISR=2) relies on multi-AZ replica memory + periodic OS page-cache flush, avoiding per-batch `fsync()` stalls unless strict financial durability is required.",
+        "deepDive": "In production deployments of Design a High-Throughput Distributed Log Ingestion & Tail Pipeline, watch how segmented append-only commit log & sparse offset index interacts with tail latency, retry amplification, and partial failures. End-to-end 5 GB/s ingest & 15 GB/s fan-out architecture covering `sendfile()`/`kTLS`, page-cache isolation, sparse `.index` binary search, ISR bounds, and S3 tiered segments."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "title": "Partitioned Commit Log Segment Append & Sparse Index",
+        "nodes": [
+          {
+            "id": "batch",
+            "label": "Compressed Batch",
+            "sub": "64 KB zstd"
+          },
+          {
+            "id": "active",
+            "label": "Active Segment",
+            "sub": "Sequential Append"
+          },
+          {
+            "id": "index",
+            "label": "Sparse .index",
+            "sub": "4 KB Stride (mmap)"
+          },
+          {
+            "id": "closed",
+            "label": "Closed 1 GB Segments",
+            "sub": "Tiered to S3"
+          }
+        ],
+        "caption": "Caption: Batches append sequentially to the active segment while a sparse mmap'd index enables fast offset seeks."
+      }
+    },
+    {
+      "id": "04-zero-copy-consumer-tailing",
+      "eyebrow": "STAGE 04 · ZERO-COPY READ PATH",
+      "title": "Zero-Copy sendfile() Consumer Tailing & Page-Cache Isolation",
+      "level": "intermediate",
+      "purpose": "Serve 15 GB/s of real-time consumer fan-out directly from the kernel page cache without user-space copies or GC stalls.",
+      "explanation": {
+        "foundation": "Because real-time consumers tail within seconds of the producer head, the active `.log` segment is already hot in the **Linux Kernel Page Cache**.",
+        "core": "- Brokers serve consumer `Fetch(partition, offset, max_bytes)` requests via **`sendfile()`**, streaming bytes straight from the page cache to the consumer TCP socket via NIC scatter-gather DMA.\n- **Zero user-space allocation**: The broker JVM/Go/Rust process never allocates heap buffers for fetched payloads, eliminating GC pauses under 15 GB/s fan-out.\n- **Cold-tail protection**: Backfill consumers reading hours-old data are tagged to bypass or `POSIX_FADV_DONTNEED` pages—or routed to S3-backed tier readers—so they never evict the hot tail.",
+        "deepDive": "In production deployments of Design a High-Throughput Distributed Log Ingestion & Tail Pipeline, watch how zero-copy sendfile() consumer tailing & page-cache isolation interacts with tail latency, retry amplification, and partial failures. End-to-end 5 GB/s ingest & 15 GB/s fan-out architecture covering `sendfile()`/`kTLS`, page-cache isolation, sparse `.index` binary search, ISR bounds, and S3 tiered segments."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Stage 4 Interaction",
+        "title": "Zero-Copy sendfile() Consumer Tailing & Page-Cache Isolati...",
+        "actors": [
+          {
+            "id": "caller",
+            "label": "Client / Caller"
+          },
+          {
+            "id": "coord",
+            "label": "Coordinator"
+          },
+          {
+            "id": "store",
+            "label": "State / Engine"
+          }
+        ],
+        "steps": [
+          {
+            "from": "caller",
+            "to": "coord",
+            "label": "1. Dispatch request + bounds"
+          },
+          {
+            "from": "coord",
+            "to": "store",
+            "label": "2. Execute deterministic step"
+          },
+          {
+            "from": "store",
+            "to": "coord",
+            "label": "3. Return state & proof"
+          },
+          {
+            "from": "coord",
+            "to": "caller",
+            "label": "4. Ack with bounded latency"
+          }
+        ]
+      }
+    },
+    {
+      "id": "05-safe-consumer-checkpoint-code",
+      "eyebrow": "STAGE 05 · SAFE CONSUMER CODE",
+      "title": "Idempotent Batch Processing with Bounded Retry, Backoff & DLQ",
+      "level": "intermediate",
+      "purpose": "Implement a consumer worker that commits offsets only after durable sink writes, with bounded exponential backoff and DLQ routing.",
+      "explanation": {
+        "foundation": "At-least-once tailing requires committing offsets **only after** the downstream sink succeeds (never auto-commit before processing). Poison-pill records must be bounded and diverted to a DLQ rather than blocking the partition forever.",
+        "core": "```python\nimport time, random",
+        "deepDive": "def process_batch_with_dlq(records, sink, dlq, checkpoint_store, partition, max_retries=3):\n    for rec in records:\n        delivered = False\n        for attempt in range(max_retries):\n            try:\n                sink.write_idempotent(rec.idempotency_key, rec.payload)\n                delivered = True\n                break\n            except TransientSinkError:\n                backoff = min(2.0, (0.05 * (2 ** attempt)) + random.uniform(0, 0.05))\n                time.sleep(backoff)\n            except SchemaValidationError as err:\n                dlq.publish(partition, rec.offset, rec.payload, reason=str(err))\n                delivered = True  # Diverted to DLQ; safe to advance offset\n                break\n        if not delivered:\n            dlq.publish(partition, rec.offset, rec.payload, reason='max_retries_exhausted')\n        checkpoint_store.commit_offset(partition, rec.offset + 1)\n```"
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Stage 5 Interaction",
+        "title": "Idempotent Batch Processing with Bounded Retry, Backoff & ...",
+        "actors": [
+          {
+            "id": "caller",
+            "label": "Client / Caller"
+          },
+          {
+            "id": "coord",
+            "label": "Coordinator"
+          },
+          {
+            "id": "store",
+            "label": "State / Engine"
+          }
+        ],
+        "steps": [
+          {
+            "from": "caller",
+            "to": "coord",
+            "label": "1. Dispatch request + bounds"
+          },
+          {
+            "from": "coord",
+            "to": "store",
+            "label": "2. Execute deterministic step"
+          },
+          {
+            "from": "store",
+            "to": "coord",
+            "label": "3. Return state & proof"
+          },
+          {
+            "from": "coord",
+            "to": "caller",
+            "label": "4. Ack with bounded latency"
+          }
+        ]
+      }
+    },
+    {
+      "id": "06-cold-tiering-and-compaction",
+      "eyebrow": "STAGE 06 · TIERED STORAGE",
+      "title": "Immutable Segment Tiering to Object Storage (S3)",
+      "level": "advanced",
+      "purpose": "Decouple compute/NVMe retention from multi-month compliance retention using asynchronous S3 segment uploads.",
+      "explanation": {
+        "foundation": "Keeping 30–90 days of 5 GB/s logs on replicated NVMe drives would require petabytes of expensive local SSDs. Instead:",
+        "core": "1. Once a 1 GB segment rolls over and is immutable, an async uploader streams `(segment.log, segment.index)` to **Object Storage (S3)** and records the remote manifest in metadata storage.\n2. Local NVMe retains only the last 4–24 hours of hot segments.\n3. Rebalances and broker replacements become fast because brokers only re-replicate the hot tail, while historical replays fetch byte ranges directly from S3.",
+        "deepDive": "In production deployments of Design a High-Throughput Distributed Log Ingestion & Tail Pipeline, watch how immutable segment tiering to object storage (s3) interacts with tail latency, retry amplification, and partial failures. End-to-end 5 GB/s ingest & 15 GB/s fan-out architecture covering `sendfile()`/`kTLS`, page-cache isolation, sparse `.index` binary search, ISR bounds, and S3 tiered segments."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Stage 6 Interaction",
+        "title": "Immutable Segment Tiering to Object Storage (S3)",
+        "actors": [
+          {
+            "id": "caller",
+            "label": "Client / Caller"
+          },
+          {
+            "id": "coord",
+            "label": "Coordinator"
+          },
+          {
+            "id": "store",
+            "label": "State / Engine"
+          }
+        ],
+        "steps": [
+          {
+            "from": "caller",
+            "to": "coord",
+            "label": "1. Dispatch request + bounds"
+          },
+          {
+            "from": "coord",
+            "to": "store",
+            "label": "2. Execute deterministic step"
+          },
+          {
+            "from": "store",
+            "to": "coord",
+            "label": "3. Return state & proof"
+          },
+          {
+            "from": "coord",
+            "to": "caller",
+            "label": "4. Ack with bounded latency"
+          }
+        ]
+      }
+    },
+    {
+      "id": "07-failure-modes-and-mitigations",
+      "eyebrow": "STAGE 07 · FAILURE MODES",
+      "title": "Hot Partitions, Slow Consumers, and ISR Shrinking",
+      "level": "advanced",
+      "purpose": "Anticipate and mitigate partition skew, follower lag, and consumer group rebalance storms.",
+      "explanation": {
+        "foundation": "- **Hot Partition Skew**: If a single `tenant_id` generates 40% of traffic, hash partitioning pins one broker.",
+        "core": "Mitigate with **salted keys** (`tenant_id#rand(0..k)`) for stateless logs or adaptive shard splitting. - **Follower Lag & ISR Shrink**: A degraded disk on one replica slows `acks=all` writes. Enforce `replica.lag.time.max.ms` to drop slow followers from the ISR cleanly while alerting on reduced redundancy.",
+        "deepDive": "- **Rebalance Storms**: Long consumer GC pauses trigger group rebalances. Use **incremental cooperative rebalancing** and static group membership (`group.instance.id`)."
+      },
+      "sectionDiagram": {
+        "kind": "behavior-transition",
+        "eyebrow": "Stage 7 Trade-Off",
+        "title": "Hot Partitions, Slow Consumers, and ISR Shrinking",
+        "before": {
+          "label": "Naive Unbounded Path",
+          "metrics": [
+            "Unbounded retries",
+            "Tail latency spikes",
+            "Silent state drift"
+          ]
+        },
+        "after": {
+          "label": "Bounded Engineering Path",
+          "metrics": [
+            "Explicit budgets",
+            "Predictable p99",
+            "Verifiable invariants"
+          ]
+        }
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-1",
+        "question": "A backfill job starts reading 12-hour-old log segments from disk, and real-time consumer p99 tail latency immediately jumps from 15 ms to 450 ms. What is the most likely root cause?",
+        "options": [
+          {
+            "id": "a",
+            "text": "The backfill read thrashing evicted hot tail segments from the kernel page cache, forcing real-time `sendfile()` consumers to hit disk.",
+            "correct": true,
+            "feedback": "Correct! Unrestricted sequential historical reads push hot tail pages out of the Linux page cache. Routing historical reads to S3 tiered storage or using `POSIX_FADV_DONTNEED` protects the hot tail."
+          },
+          {
+            "id": "b",
+            "text": "The sparse `.index` file exceeded 4 KB.",
+            "correct": false,
+            "feedback": "Unrestricted sequential historical reads push hot tail pages out of the Linux page cache. Routing historical reads to S3 tiered storage or using `POSIX_FADV_DONTNEED` protects the hot tail."
+          },
+          {
+            "id": "c",
+            "text": "Producers switched from `zstd` to `gzip` compression.",
+            "correct": false,
+            "feedback": "Unrestricted sequential historical reads push hot tail pages out of the Linux page cache. Routing historical reads to S3 tiered storage or using `POSIX_FADV_DONTNEED` protects the hot tail."
+          },
+          {
+            "id": "d",
+            "text": "Token-bucket backpressure dropped all consumer heartbeats.",
+            "correct": false,
+            "feedback": "Unrestricted sequential historical reads push hot tail pages out of the Linux page cache. Routing historical reads to S3 tiered storage or using `POSIX_FADV_DONTNEED` protects the hot tail."
+          }
+        ],
+        "correctIndex": 0,
+        "explanation": "Unrestricted sequential historical reads push hot tail pages out of the Linux page cache. Routing historical reads to S3 tiered storage or using `POSIX_FADV_DONTNEED` protects the hot tail."
+      },
+      {
+        "id": "kc-2",
+        "question": "Why should a log consumer avoid committing offsets immediately upon receiving a batch from `Fetch()`, before writing to its downstream database?",
+        "options": [
+          {
+            "id": "a",
+            "text": "If the worker crashes after committing the offset but before the sink write succeeds, those records are permanently skipped (data loss).",
+            "correct": true,
+            "feedback": "Correct! At-least-once delivery requires committing offsets only after durable sink persistence (or DLQ diversion) so a crash replays the uncommitted batch."
+          },
+          {
+            "id": "b",
+            "text": "`sendfile()` requires offsets to be committed before TCP ACK.",
+            "correct": false,
+            "feedback": "At-least-once delivery requires committing offsets only after durable sink persistence (or DLQ diversion) so a crash replays the uncommitted batch."
+          },
+          {
+            "id": "c",
+            "text": "Committing early disables `zstd` decompression.",
+            "correct": false,
+            "feedback": "At-least-once delivery requires committing offsets only after durable sink persistence (or DLQ diversion) so a crash replays the uncommitted batch."
+          },
+          {
+            "id": "d",
+            "text": "The broker deletes segments as soon as an offset is committed.",
+            "correct": false,
+            "feedback": "At-least-once delivery requires committing offsets only after durable sink persistence (or DLQ diversion) so a crash replays the uncommitted batch."
+          }
+        ],
+        "correctIndex": 0,
+        "explanation": "At-least-once delivery requires committing offsets only after durable sink persistence (or DLQ diversion) so a crash replays the uncommitted batch."
+      },
+      {
+        "id": "kc-3",
+        "question": "During a 3× traffic burst from one noisy tenant, broker disk queues saturate and all other tenants' ingest latency spikes. Which architectural control isolates healthy tenants?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Enforce per-tenant token-bucket admission control at the Ingest Gateway returning `429 Retry-After` before writes hit shared broker page cache.",
+            "correct": true,
+            "feedback": "Correct! Per-tenant token buckets at the edge gateway shed or throttle the noisy tenant before it exhausts shared broker page cache and I/O queues."
+          },
+          {
+            "id": "b",
+            "text": "Disable producer micro-batching so every event is sent immediately.",
+            "correct": false,
+            "feedback": "Per-tenant token buckets at the edge gateway shed or throttle the noisy tenant before it exhausts shared broker page cache and I/O queues."
+          },
+          {
+            "id": "c",
+            "text": "Reduce replication factor from 3 to 1 during bursts.",
+            "correct": false,
+            "feedback": "Per-tenant token buckets at the edge gateway shed or throttle the noisy tenant before it exhausts shared broker page cache and I/O queues."
+          },
+          {
+            "id": "d",
+            "text": "Force `fsync()` on every single incoming record.",
+            "correct": false,
+            "feedback": "Per-tenant token buckets at the edge gateway shed or throttle the noisy tenant before it exhausts shared broker page cache and I/O queues."
+          }
+        ],
+        "correctIndex": 0,
+        "explanation": "Per-tenant token buckets at the edge gateway shed or throttle the noisy tenant before it exhausts shared broker page cache and I/O queues."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "A high-throughput log pipeline batches events, appends them sequentially to partitioned log files, and streams them to consumers using zero-copy OS transfers.",
+      "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, sequential append-only commit logs + kernel page-cache residency + zero-copy `sendfile()` let commodity NVMe brokers sustain multi-GB/s ingest and fan-out without user-space buffer bloat.",
+      "byteSummary": "When millions of logs arrive every second, writing them one by one to a database is too slow. Instead, producers group logs into batches, an ingest gateway limits noisy senders, and brokers append batches to the end of partitioned log files.\n\nBecause recent logs stay in the OS memory cache, consumers can tail them in real time with `sendfile()` without copying data into app memory, while older logs move to cheap object storage like S3."
+    },
+    "intermediate": {
+      "summary": "Combine producer micro-batching, token-bucket backpressure, segmented append-only commit logs, zero-copy `sendfile()` tailing, and S3 cold tiering.",
+      "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, sequential append-only commit logs + kernel page-cache residency + zero-copy `sendfile()` let commodity NVMe brokers sustain multi-GB/s ingest and fan-out without user-space buffer bloat.",
+      "byteSummary": "To sustain 5 GB/s ingest and 15 GB/s fan-out, producers batch and `zstd`-compress records by partition key behind per-tenant token-bucket admission control.\n\nBrokers append to 1 GB segmented commit logs indexed by sparse `mmap()` `.index` files. Hot consumers tail via zero-copy `sendfile()` from the kernel page cache, while closed segments tier to S3 and failed records route after bounded retries to a DLQ."
+    },
+    "advanced": {
+      "summary": "End-to-end 5 GB/s ingest & 15 GB/s fan-out architecture covering `sendfile()`/`kTLS`, page-cache isolation, sparse `.index` binary search, ISR bounds, and S3 tiered segments.",
+      "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, sequential append-only commit logs + kernel page-cache residency + zero-copy `sendfile()` let commodity NVMe brokers sustain multi-GB/s ingest and fan-out without user-space buffer bloat.",
+      "byteSummary": "At 5M events/s (15 GB/s burst, 3× RF, 3× fan-out), eliminating random I/O and user-space `memcpy()` is mandatory. Producer batching + `zstd` + per-tenant token buckets bound ingress; sequential 1 GB `.log` appends + sparse 4 KB-stride `.index` files keep writes at NVMe line rate.\n\nHot consumers use `sendfile()` directly from page cache while cold replays use `POSIX_FADV_DONTNEED` or S3 byte-range reads. Bounded `acks=all` ISR timeouts, salted hot keys, and idempotent DLQ consumer checkpoints prevent cascading stalls."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "prerequisites": [
+    {
+      "title": "Zero-Copy I/O, sendfile & io_uring",
+      "summary": "Zero-copy I/O keeps file bytes inside the Linux kernel page cache and streams them straight to a network socket via DMA scatter-gather, while io_uring batches asynchronous syscalls over shared memory ring buffers."
+    },
+    {
+      "title": "Backpressure & Flow Control",
+      "summary": "Backpressure lets a slow consumer signal an upstream producer to slow down or pause, preventing unbounded memory growth and out-of-memory crashes."
+    },
+    {
+      "title": "Dead Letter Queues",
+      "summary": "A secondary quarantine queue that captures messages a consumer repeatedly fails to process after a bounded number of retries, preventing poison pills from blocking healthy traffic."
+    }
+  ],
+  "simulation": {
+    "title": "Design a High-Throughput Distributed Log Ingestion & Tail Pipeline — Interactive Execution Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Workload & Budget"
+      },
+      {
+        "id": "router",
+        "label": "Gateway / Router",
+        "role": "Admission & Dispatch"
+      },
+      {
+        "id": "engine",
+        "label": "Core Engine",
+        "role": "Primary Execution"
+      },
+      {
+        "id": "replica",
+        "label": "Replica / Fallback",
+        "role": "Durability & Recovery"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "router",
+        "label": "request"
+      },
+      {
+        "from": "router",
+        "to": "engine",
+        "label": "route"
+      },
+      {
+        "from": "engine",
+        "to": "replica",
+        "label": "sync / fallback"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Throughput, Fan-Out, and Back-of-the-Envelope Sizing",
+        "actionLabel": "Dispatch nominal request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "router"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "Ingress",
+          "p99_ms": 8,
+          "error_rate": "0.0%"
+        },
+        "explanation": "Caller sends work into the gateway with explicit timeout and concurrency bounds (Throughput, Fan-Out, and Back-of-the-Envelope Sizing)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Producer Micro-Batching & Token-Bucket Admission Control",
+        "actionLabel": "Execute core invariant",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "Core Path",
+          "p99_ms": 18,
+          "in_flight": 124
+        },
+        "explanation": "The core engine processes the hot path while keeping state transitions deterministic (Producer Micro-Batching & Token-Bucket Admission Control)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Segmented Append-Only Commit Log & Sparse Offset Index",
+        "actionLabel": "Detect skew or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Degraded",
+          "p99_ms": 64,
+          "retries_capped": "true"
+        },
+        "explanation": "Under load or replica lag, bounded backoff and isolation prevent cascading saturation (Segmented Append-Only Commit Log & Sparse Offset Index)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Hot Partitions, Slow Consumers, and ISR Shrinking",
+        "actionLabel": "Converge & restore SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 11,
+          "drift": 0
+        },
+        "explanation": "State converges cleanly and telemetry confirms the system returned within its SLO envelope (Hot Partitions, Slow Consumers, and ISR Shrinking)."
+      }
+    ]
+  }
+}

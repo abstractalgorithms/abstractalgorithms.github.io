@@ -1,0 +1,778 @@
+{
+  "id": "design-memory-pubsub",
+  "slug": "design-memory-pubsub",
+  "title": "Design a Thread-Safe In-Memory Pub-Sub Message Queue (LLD)",
+  "problemType": "low-level-design",
+  "difficulty": "hard",
+  "prompt": "Implement a thread-safe in-memory Pub-Sub broker supporting `createTopic`, `publish`, `subscribe`, and `resetOffset`—where slow subscribers never block fast subscribers or unrelated topics, and caught-up consumers sleep without busy-waiting.",
+  "spark": {
+    "summary": "Design an in-memory Kafka-like Pub-Sub broker supporting multiple topics, concurrent publishers, independent subscriber offsets, and non-spinning `Condition` signaling.",
+    "keyTakeaway": "When traffic spikes expose hidden coupling, model each `Topic` with an append-only log guarded by a per-topic `ReentrantLock` + `Condition`, and give each `SubscriberWorker` its own `AtomicInteger` offset so slow consumers never block fast ones.",
+    "byteSummary": "**Core Mechanics:** Unlike a point-to-point `BlockingQueue` (where 1 consumer pops and removes each message), Pub-Sub requires every subscriber on a topic to receive all messages independently and support `resetOffset()` for replay—all while isolating slow subscribers and unrelated topics.\n\n**Visual & Structural Flow:** Depicts Per-Topic Append Log + Condition Wakeup for Independent Consumers (Publisher -> Topic Log (Lock+Cond) -> Fast Sub (off=42) -> Slow Sub (off=10)); Topic-Isolated Append Log & Per-Subscriber Cursors (Broker Registry -> Topic Append Log -> Fast Worker -> Slow / Replay Worker).\n\n**Trade-Offs & Production:** Duplicating messages into `N` separate `BlockingQueue`s wastes `N×` memory and cannot support `resetOffset(0)` replay. This exact in-memory model scales out into distributed streaming logs: **Apache Kafka & Redpanda**: Store immutable per-partition append logs on disk and track per-consumer-group offsets independently for replay.\n\n**Failure Modes & Application:** This exact in-memory model scales out into distributed streaming logs: **Apache Kafka & Redpanda**: Store immutable per-partition append logs on disk and track per-consumer-group offsets independently for replay."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why fan-out Pub-Sub needs independent offsets and per-topic locks",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "Think of **Why fan-out Pub-Sub needs independent offsets and per-topic locks** as the intuition layer for Design a Thread-Safe In-Memory Pub-Sub Message Queue (LLD): The mechanism: understand how Why fan-out Pub-Sub needs independent offsets and per-topic locks works from first principles.",
+        "core": "Unlike a point-to-point `BlockingQueue` (where 1 consumer pops and removes each message), Pub-Sub requires every subscriber on a topic to receive all messages independently and support `resetOffset()` for replay—all while isolating slow subscribers and unrelated topics.",
+        "deepDive": "Under heavy load or partial failure, why fan-out pub-sub needs independent offsets and per-topic locks becomes a critical lever for predictable latency and correctness. Design an in-memory Kafka-like Pub-Sub broker supporting multiple topics, concurrent publishers, independent subscriber offsets, and non-spinning `Condition` signaling."
+      },
+      "purpose": "The mechanism: understand how Why fan-out Pub-Sub needs independent offsets and per-topic locks works from first principles."
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "Head-of-line blocking, busy-wait CPU burn, and global-lock contention",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Naive in-memory brokers break in three ways:",
+        "core": "1. **Synchronous Fan-Out**: Calling `subscriber.onMessage(msg)` directly inside `publish()` lets one slow subscriber stall the publisher and all fast subscribers.\n2. **Busy-Wait Polling**: `while (offset >= log.size()) {}` burns 100% CPU when caught up.\n3. **Global Broker Lock**: Synchronizing all topics on one lock causes `Topic A` traffic to block `Topic B`.",
+        "deepDive": "In production deployments of Design a Thread-Safe In-Memory Pub-Sub Message Queue (LLD), watch how head-of-line blocking, busy-wait cpu burn, and global-lock contention interacts with tail latency, retry amplification, and partial failures. Design an in-memory Kafka-like Pub-Sub broker supporting multiple topics, concurrent publishers, independent subscriber offsets, and non-spinning `Condition` signaling."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Non-Blocking Fan-Out",
+        "title": "Per-Topic Append Log + Condition Wakeup for Independent Consumers",
+        "actors": [
+          {
+            "id": "pub",
+            "label": "Publisher"
+          },
+          {
+            "id": "topic",
+            "label": "Topic Log (Lock+Cond)"
+          },
+          {
+            "id": "fast",
+            "label": "Fast Sub (off=42)"
+          },
+          {
+            "id": "slow",
+            "label": "Slow Sub (off=10)"
+          }
+        ],
+        "events": [
+          {
+            "from": "pub",
+            "to": "topic",
+            "label": "append(msg) + cond.signalAll()",
+            "status": "ok"
+          },
+          {
+            "from": "topic",
+            "to": "fast",
+            "label": "Wakes & reads idx 42 immediately",
+            "status": "ok"
+          },
+          {
+            "from": "topic",
+            "to": "slow",
+            "label": "Reads idx 10 at own pace (no blocking!)",
+            "status": "warn"
+          }
+        ],
+        "summary": "Publishers append and signalAll() in O(1) while each SubscriberWorker advances its own offset independently."
+      },
+      "purpose": "The problem: see what breaks without Head-of-line blocking, busy-wait CPU burn, and global-lock contention under real concurrency or scale.",
+      "decisionFramework": {
+        "problem": "How to implement Design a Thread-Safe In-Memory Pub-Sub Message Queue (LLD) without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "When traffic spikes expose hidden coupling, model each `Topic` with an append-only log guarded by a per-topic `ReentrantLock` + `Condition`, and give each `SubscriberWorker` its own `AtomicInteger` offset so slow consumers never block fast ones.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Design a Thread-Safe In-Memory Pub-Sub Message Queue (LLD) experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Naive `BlockingQueue` per subscriber or `Thread.sleep(10)` loops",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Think of **Naive `BlockingQueue` per subscriber or `Thread.sleep(10)` loops** as the intuition layer for Design a Thread-Safe In-Memory Pub-Sub Message Queue (LLD): Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+        "core": "Duplicating messages into `N` separate `BlockingQueue`s wastes `N×` memory and cannot support `resetOffset(0)` replay. Meanwhile, `Thread.sleep(10)` polling wastes CPU and adds `10 ms` artificial tail latency.",
+        "deepDive": "Under heavy load or partial failure, naive `blockingqueue` per subscriber or `thread.sleep(10)` loops becomes a critical lever for predictable latency and correctness. Design an in-memory Kafka-like Pub-Sub broker supporting multiple topics, concurrent publishers, independent subscriber offsets, and non-spinning `Condition` signaling."
+      },
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "Component Topology",
+        "title": "Naive `BlockingQueue` per subscriber or `Thread.sleep(10)` loops",
+        "graphNodes": [
+          {
+            "id": "prod",
+            "label": "Producer",
+            "role": "ingress",
+            "col": 0,
+            "row": 0,
+            "tone": "primary"
+          },
+          {
+            "id": "broker",
+            "label": "Partition Log",
+            "role": "compute",
+            "col": 1,
+            "row": 0,
+            "tone": "tint"
+          },
+          {
+            "id": "cons",
+            "label": "Consumer",
+            "role": "storage",
+            "col": 2,
+            "row": 0,
+            "tone": "tint"
+          },
+          {
+            "id": "dlq",
+            "label": "Dead-Letter Queue",
+            "role": "control",
+            "col": 0,
+            "row": 1,
+            "tone": "tint"
+          }
+        ],
+        "graphEdges": [
+          {
+            "from": "prod",
+            "to": "broker",
+            "label": "append(key)",
+            "style": "solid",
+            "tone": "green"
+          },
+          {
+            "from": "broker",
+            "to": "cons",
+            "label": "poll(offset)",
+            "style": "solid",
+            "tone": "green"
+          },
+          {
+            "from": "cons",
+            "to": "dlq",
+            "label": "dead-letter",
+            "style": "solid",
+            "tone": "green"
+          }
+        ]
+      }
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise solution: Per-Topic Log + `Condition` + `AtomicInteger` Offsets",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": {
+        "foundation": "Build clean isolation across topics and subscribers:",
+        "core": "- **`ConcurrentHashMap<String, Topic>`**: `createTopic` uses `putIfAbsent` with zero global lock during `publish()`.\n- **Per-Topic `ReentrantLock` + `Condition`**: `publish()` appends to `List<Message>` and calls `newMessageCond.signalAll()`. `SubscriberWorker` sleeps via `newMessageCond.await()` inside a `while (offset.get() >= topic.size())` loop (handling spurious wakeups).\n- **Independent `AtomicInteger` Offset**: Each `SubscriberWorker` tracks its own offset; `resetOffset(newOffset)` sets the offset and signals the condition variable to replay immediately.",
+        "deepDive": "In production deployments of Design a Thread-Safe In-Memory Pub-Sub Message Queue (LLD), watch how enterprise solution: per-topic log + `condition` + `atomicinteger` offsets interacts with tail latency, retry amplification, and partial failures. Design an in-memory Kafka-like Pub-Sub broker supporting multiple topics, concurrent publishers, independent subscriber offsets, and non-spinning `Condition` signaling."
+      },
+      "sectionDiagram": {
+        "kind": "cache-tier",
+        "eyebrow": "Broker Memory Layout",
+        "title": "Topic-Isolated Append Log & Per-Subscriber Cursors",
+        "nodes": [
+          {
+            "label": "Broker Registry",
+            "role": "ConcurrentHashMap<Topic>"
+          },
+          {
+            "label": "Topic Append Log",
+            "role": "Per-topic Lock + Condition"
+          },
+          {
+            "label": "Fast Worker",
+            "role": "AtomicInteger offset=42"
+          },
+          {
+            "label": "Slow / Replay Worker",
+            "role": "resetOffset(0) + signalAll()"
+          }
+        ],
+        "edges": [
+          {
+            "label": "O(1) append"
+          },
+          {
+            "label": "zero-copy offset read"
+          }
+        ],
+        "summary": "Sharing one immutable append log per topic avoids N-way message copying and enables instant offset replay."
+      },
+      "markdownContent": "```java\npublic class Topic {\n    private final List<Message> log = new ArrayList<>();\n    private final ReentrantLock lock = new ReentrantLock();\n    private final Condition hasNew = lock.newCondition();\n\n    public void publish(Message msg) {\n        lock.lock();\n        try {\n            log.add(msg);\n            hasNew.signalAll();\n        } finally { lock.unlock(); }\n    }\n\n    public Message readAt(AtomicInteger offset) throws InterruptedException {\n        lock.lock();\n        try {\n            while (offset.get() >= log.size()) {\n                hasNew.await(); // Sleeps with zero CPU spin until publish or resetOffset\n            }\n            return log.get(offset.getAndIncrement());\n        } finally { lock.unlock(); }\n    }\n}\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where append-log Pub-Sub architectures are used",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "This exact in-memory model scales out into distributed streaming logs:",
+        "core": "- **Apache Kafka & Redpanda**: Store immutable per-partition append logs on disk and track per-consumer-group offsets independently for replay.\n- **In-Process Event Buses**: High-frequency trading and game servers use ring-buffer/append-log buses to fan out market ticks to isolated strategy threads.",
+        "deepDive": "In production deployments of Design a Thread-Safe In-Memory Pub-Sub Message Queue (LLD), watch how where append-log pub-sub architectures are used interacts with tail latency, retry amplification, and partial failures. Design an in-memory Kafka-like Pub-Sub broker supporting multiple topics, concurrent publishers, independent subscriber offsets, and non-spinning `Condition` signaling."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "thread-safe-queues",
+          "title": "Concept: Thread-Safe Queues (LLD)",
+          "kind": "concept"
+        },
+        {
+          "slug": "message-queues",
+          "title": "Concept: Message Queues",
+          "kind": "concept"
+        },
+        {
+          "slug": "replicated-logs-sequencing",
+          "title": "Concept: Replicated Logs & Sequencing",
+          "kind": "concept"
+        },
+        {
+          "slug": "implement-bounded-blocking",
+          "title": "System Design: Bounded Blocking Queue",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why should `SubscriberWorker` check `while (offset.get() >= log.size())` around `Condition.await()` instead of an `if` statement?",
+      "options": [
+        {
+          "id": "a",
+          "text": "To guard against spurious wakeups and concurrent `resetOffset()` or multiple-consumer races before reading `log.get()`",
+          "correct": true,
+          "feedback": "Correct: `while` re-verifies the predicate after `await()` returns, preventing `IndexOutOfBoundsException`."
+        },
+        {
+          "id": "b",
+          "text": "Because `Condition.await()` does not release the `ReentrantLock` on the first iteration",
+          "correct": false,
+          "feedback": "`Condition.await()` atomically releases the lock while sleeping and re-acquires it before returning."
+        },
+        {
+          "id": "c",
+          "text": "So that slow subscribers automatically block `publish()` calls on other topics",
+          "correct": false,
+          "feedback": "Each topic has its own lock and log, and `publish()` never waits for subscribers."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why should `SubscriberWorker` check `while (offset.get() >= log.size())` around `Condition.await()` instead of an `if` statement?",
+        "options": [
+          {
+            "id": "a",
+            "text": "To guard against spurious wakeups and concurrent `resetOffset()` or multiple-consumer races before reading `log.get()`",
+            "correct": true,
+            "feedback": "Correct: `while` re-verifies the predicate after `await()` returns, preventing `IndexOutOfBoundsException`."
+          },
+          {
+            "id": "b",
+            "text": "Because `Condition.await()` does not release the `ReentrantLock` on the first iteration",
+            "correct": false,
+            "feedback": "`Condition.await()` atomically releases the lock while sleeping and re-acquires it before returning."
+          },
+          {
+            "id": "c",
+            "text": "So that slow subscribers automatically block `publish()` calls on other topics",
+            "correct": false,
+            "feedback": "Each topic has its own lock and log, and `publish()` never waits for subscribers."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why fan-out Pub-Sub needs independent offsets and per-topic locks', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Unlike a point-to-point BlockingQueue (where 1 consumer pops and removes each message), Pub-Sub requires every subscriber on a topic to receive all messages independently…",
+            "correct": true,
+            "feedback": "Correct: Unlike a point-to-point BlockingQueue (where 1 consumer pops and removes each message), Pub-Sub requires every subscriber on a topic to receive all messages independently…"
+          },
+          {
+            "id": "b",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "c",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Head-of-line blocking, busy-wait CPU burn, and global-lock contention', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Naive in-memory brokers break in three ways: 1.",
+            "correct": true,
+            "feedback": "Correct: Naive in-memory brokers break in three ways: 1."
+          },
+          {
+            "id": "b",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "c",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** Unlike a point-to-point `BlockingQueue` (where 1 consumer pops and removes each message), Pub-Sub requires every subscriber on a topic to receive all messages independently and support `resetOffset()` for replay—all.\n\n**How It Flows:** Think of Design a Thread-Safe In-Memory Pub-Sub Message Queue (LLD) as a clear step-by-step chain: Publisher -> Topic Log (Lock+Cond) -> Fast Sub (off=42) -> Slow Sub (off=10) -> Broker Registry.\n\n**Why Beginners Should Care:** Model each `Topic` with an append-only log guarded by a per-topic `ReentrantLock` + `Condition`, and give each `SubscriberWorker` its own `AtomicInteger` offset so slow consumers never block fast ones.",
+      "spark": {
+        "summary": "Unlike a point-to-point `BlockingQueue` (where 1 consumer pops and removes each message), Pub-Sub requires every subscriber on a topic to receive all messages independently and support `resetOffset()` for replay—all.",
+        "keyTakeaway": "Model each `Topic` with an append-only log guarded by a per-topic `ReentrantLock` + `Condition`, and give each `SubscriberWorker` its own `AtomicInteger` offset so slow consumers never block fast ones."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why fan-out Pub-Sub needs independent offsets and per-topic locks",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why fan-out Pub-Sub needs independent offsets and per-topic locks works from first principles.",
+          "explanation": "Unlike a point-to-point `BlockingQueue` (where 1 consumer pops and removes each message), Pub-Sub requires every subscriber on a topic to receive all messages independently and support `resetOffset()` for replay—all while isolating slow subscribers and unrelated topics.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Head-of-line blocking, busy-wait CPU burn, and global-lock contention",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without Head-of-line blocking, busy-wait CPU burn, and global-lock contention under real concurrency or scale.",
+          "explanation": "Naive in-memory brokers break in three ways: 1. **Synchronous Fan-Out**: Calling `subscriber.onMessage(msg)` directly inside `publish()` lets one slow subscriber stall the publisher and all fast subscribers. 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Non-Blocking Fan-Out",
+            "title": "Per-Topic Append Log + Condition Wakeup for Independent Consumers",
+            "actors": [
+              {
+                "id": "pub",
+                "label": "Publisher"
+              },
+              {
+                "id": "topic",
+                "label": "Topic Log (Lock+Cond)"
+              },
+              {
+                "id": "fast",
+                "label": "Fast Sub (off=42)"
+              },
+              {
+                "id": "slow",
+                "label": "Slow Sub (off=10)"
+              }
+            ],
+            "events": [
+              {
+                "from": "pub",
+                "to": "topic",
+                "label": "append(msg) + cond.signalAll()",
+                "status": "ok"
+              },
+              {
+                "from": "topic",
+                "to": "fast",
+                "label": "Wakes & reads idx 42 immediately",
+                "status": "ok"
+              },
+              {
+                "from": "topic",
+                "to": "slow",
+                "label": "Reads idx 10 at own pace (no blocking!)",
+                "status": "warn"
+              }
+            ],
+            "summary": "Publishers append and signalAll() in O(1) while each SubscriberWorker advances its own offset independently."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive `BlockingQueue` per subscriber or `Thread.sleep(10)` loops",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Duplicating messages into `N` separate `BlockingQueue`s wastes `N×` memory and cannot support `resetOffset(0)` replay. Meanwhile, `Thread.sleep(10)` polling wastes CPU and adds `10 ms` artificial tail latency.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Per-Topic Log + `Condition` + `AtomicInteger` Offsets",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Build clean isolation across topics and subscribers: **`ConcurrentHashMap<String, Topic>`**: `createTopic` uses `putIfAbsent` with zero global lock during `publish()`. **Per-Topic `ReentrantLock` + `Condition`**: `publish()` appends to `List<Message>` and calls `newMessageCond.signalAll()`.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Broker Memory Layout",
+            "title": "Topic-Isolated Append Log & Per-Subscriber Cursors",
+            "nodes": [
+              {
+                "label": "Broker Registry",
+                "role": "ConcurrentHashMap<Topic>"
+              },
+              {
+                "label": "Topic Append Log",
+                "role": "Per-topic Lock + Condition"
+              },
+              {
+                "label": "Fast Worker",
+                "role": "AtomicInteger offset=42"
+              },
+              {
+                "label": "Slow / Replay Worker",
+                "role": "resetOffset(0) + signalAll()"
+              }
+            ],
+            "edges": [
+              {
+                "label": "O(1) append"
+              },
+              {
+                "label": "zero-copy offset read"
+              }
+            ],
+            "summary": "Sharing one immutable append log per topic avoids N-way message copying and enables instant offset replay."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Model each `Topic` with an append-only log guarded by a per-topic `ReentrantLock` + `Condition`, and give each `SubscriberWorker` its own `AtomicInteger` offset so slow consumers never block fast ones.",
+      "summary": "Design an in-memory Kafka-like Pub-Sub broker supporting multiple topics, concurrent publishers, independent subscriber offsets, and non-spinning `Condition` signaling.",
+      "keyTakeaway": "When traffic spikes expose hidden coupling, model each `Topic` with an append-only log guarded by a per-topic `ReentrantLock` + `Condition`, and give each `SubscriberWorker` its own `AtomicInteger` offset so slow consumers never block fast ones."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** Unlike a point-to-point `BlockingQueue` (where 1 consumer pops and removes each message), Pub-Sub requires every subscriber on a topic to receive all messages independently and support `resetOffset()` for replay—all while isolating slow subscribers and unrelated topics.\n\n**Visual & Structural Flow:** Depicts Per-Topic Append Log + Condition Wakeup for Independent Consumers (Publisher -> Topic Log (Lock+Cond) -> Fast Sub (off=42) -> Slow Sub (off=10)); Topic-Isolated Append Log & Per-Subscriber Cursors (Broker Registry -> Topic Append Log -> Fast Worker -> Slow / Replay Worker).\n\n**Trade-Offs & Production:** Duplicating messages into `N` separate `BlockingQueue`s wastes `N×` memory and cannot support `resetOffset(0)` replay. This exact in-memory model scales out into distributed streaming logs: **Apache Kafka & Redpanda**: Store immutable per-partition append logs on disk and track per-consumer-group offsets independently for replay.\n\n**Failure Modes & Application:** This exact in-memory model scales out into distributed streaming logs: **Apache Kafka & Redpanda**: Store immutable per-partition append logs on disk and track per-consumer-group offsets independently for replay.",
+      "spark": {
+        "summary": "Design an in-memory Kafka-like Pub-Sub broker supporting multiple topics, concurrent publishers, independent subscriber offsets, and non-spinning `Condition` signaling.",
+        "keyTakeaway": "Model each `Topic` with an append-only log guarded by a per-topic `ReentrantLock` + `Condition`, and give each `SubscriberWorker` its own `AtomicInteger` offset so slow consumers never block fast ones."
+      },
+      "summary": "Design an in-memory Kafka-like Pub-Sub broker supporting multiple topics, concurrent publishers, independent subscriber offsets, and non-spinning `Condition` signaling.",
+      "keyTakeaway": "When traffic spikes expose hidden coupling, model each `Topic` with an append-only log guarded by a per-topic `ReentrantLock` + `Condition`, and give each `SubscriberWorker` its own `AtomicInteger` offset so slow consumers never block fast ones."
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** Design an in-memory Kafka-like Pub-Sub broker supporting multiple topics, concurrent publishers, independent subscriber offsets, and non-spinning `Condition` signaling.\n\n**Production Trade-Offs:** Duplicating messages into `N` separate `BlockingQueue`s wastes `N×` memory and cannot support `resetOffset(0)` replay. Meanwhile, `Thread.sleep(10)` polling wastes CPU and adds `10 ms` artificial tail latency.\n\n**Failure Modes & Edge Cases:** This exact in-memory model scales out into distributed streaming logs: **Apache Kafka & Redpanda**: Store immutable per-partition append logs on disk and track per-consumer-group offsets independently for replay.\n\n**Principal Takeaway:** Model each `Topic` with an append-only log guarded by a per-topic `ReentrantLock` + `Condition`, and give each `SubscriberWorker` its own `AtomicInteger` offset so slow consumers never block fast ones.",
+      "spark": {
+        "summary": "Design an in-memory Kafka-like Pub-Sub broker supporting multiple topics, concurrent publishers, independent subscriber offsets, and non-spinning `Condition` signaling.",
+        "keyTakeaway": "Model each `Topic` with an append-only log guarded by a per-topic `ReentrantLock` + `Condition`, and give each `SubscriberWorker` its own `AtomicInteger` offset so slow consumers never block fast ones."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why fan-out Pub-Sub needs independent offsets and per-topic locks",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why fan-out Pub-Sub needs independent offsets and per-topic locks works from first principles.",
+          "explanation": "Unlike a point-to-point `BlockingQueue` (where 1 consumer pops and removes each message), Pub-Sub requires every subscriber on a topic to receive all messages independently and support `resetOffset()` for replay—all while isolating slow subscribers and unrelated topics.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Head-of-line blocking, busy-wait CPU burn, and global-lock contention",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without Head-of-line blocking, busy-wait CPU burn, and global-lock contention under real concurrency or scale.",
+          "explanation": "Naive in-memory brokers break in three ways:\n\n1. **Synchronous Fan-Out**: Calling `subscriber.onMessage(msg)` directly inside `publish()` lets one slow subscriber stall the publisher and all fast subscribers.\n2. **Busy-Wait Polling**: `while (offset >= log.size()) {}` burns 100% CPU when caught up.\n3. **Global Broker Lock**: Synchronizing all topics on one lock causes `Topic A` traffic to block `Topic B`.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Non-Blocking Fan-Out",
+            "title": "Per-Topic Append Log + Condition Wakeup for Independent Consumers",
+            "actors": [
+              {
+                "id": "pub",
+                "label": "Publisher"
+              },
+              {
+                "id": "topic",
+                "label": "Topic Log (Lock+Cond)"
+              },
+              {
+                "id": "fast",
+                "label": "Fast Sub (off=42)"
+              },
+              {
+                "id": "slow",
+                "label": "Slow Sub (off=10)"
+              }
+            ],
+            "events": [
+              {
+                "from": "pub",
+                "to": "topic",
+                "label": "append(msg) + cond.signalAll()",
+                "status": "ok"
+              },
+              {
+                "from": "topic",
+                "to": "fast",
+                "label": "Wakes & reads idx 42 immediately",
+                "status": "ok"
+              },
+              {
+                "from": "topic",
+                "to": "slow",
+                "label": "Reads idx 10 at own pace (no blocking!)",
+                "status": "warn"
+              }
+            ],
+            "summary": "Publishers append and signalAll() in O(1) while each SubscriberWorker advances its own offset independently."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive `BlockingQueue` per subscriber or `Thread.sleep(10)` loops",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Duplicating messages into `N` separate `BlockingQueue`s wastes `N×` memory and cannot support `resetOffset(0)` replay. Meanwhile, `Thread.sleep(10)` polling wastes CPU and adds `10 ms` artificial tail latency.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Per-Topic Log + `Condition` + `AtomicInteger` Offsets",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Build clean isolation across topics and subscribers:\n\n- **`ConcurrentHashMap<String, Topic>`**: `createTopic` uses `putIfAbsent` with zero global lock during `publish()`.\n- **Per-Topic `ReentrantLock` + `Condition`**: `publish()` appends to `List<Message>` and calls `newMessageCond.signalAll()`. `SubscriberWorker` sleeps via `newMessageCond.await()` inside a `while (offset.get() >= topic.size())` loop (handling spurious wakeups).\n- **Independent `AtomicInteger` Offset**: Each `SubscriberWorker` tracks its own offset; `resetOffset(newOffset)` sets the offset and signals the condition variable to replay immediately.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Broker Memory Layout",
+            "title": "Topic-Isolated Append Log & Per-Subscriber Cursors",
+            "nodes": [
+              {
+                "label": "Broker Registry",
+                "role": "ConcurrentHashMap<Topic>"
+              },
+              {
+                "label": "Topic Append Log",
+                "role": "Per-topic Lock + Condition"
+              },
+              {
+                "label": "Fast Worker",
+                "role": "AtomicInteger offset=42"
+              },
+              {
+                "label": "Slow / Replay Worker",
+                "role": "resetOffset(0) + signalAll()"
+              }
+            ],
+            "edges": [
+              {
+                "label": "O(1) append"
+              },
+              {
+                "label": "zero-copy offset read"
+              }
+            ],
+            "summary": "Sharing one immutable append log per topic avoids N-way message copying and enables instant offset replay."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where append-log Pub-Sub architectures are used",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "This exact in-memory model scales out into distributed streaming logs:\n\n- **Apache Kafka & Redpanda**: Store immutable per-partition append logs on disk and track per-consumer-group offsets independently for replay.\n- **In-Process Event Buses**: High-frequency trading and game servers use ring-buffer/append-log buses to fan out market ticks to isolated strategy threads.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Model each `Topic` with an append-only log guarded by a per-topic `ReentrantLock` + `Condition`, and give each `SubscriberWorker` its own `AtomicInteger` offset so slow consumers never block fast ones.",
+      "summary": "Design an in-memory Kafka-like Pub-Sub broker supporting multiple topics, concurrent publishers, independent subscriber offsets, and non-spinning `Condition` signaling.",
+      "keyTakeaway": "When traffic spikes expose hidden coupling, model each `Topic` with an append-only log guarded by a per-topic `ReentrantLock` + `Condition`, and give each `SubscriberWorker` its own `AtomicInteger` offset so slow consumers never block fast ones."
+    }
+  },
+  "pedagogicalFramework": "CLASSE",
+  "prerequisites": [
+    {
+      "title": "Thread-Safe LLD: Locking, Condition Variables & In-Memory Pub-Sub Queues",
+      "summary": "Thread-safe Low-Level Design balances correctness and throughput using fine-grained per-entity locks (per-seat, per-topic, per-floor), Condition/BlockingQueue signaling, and optimistic versioning rather than coarse global mutexes."
+    },
+    {
+      "title": "Core LLD Behavioral Patterns: State, Strategy & Observer in Practice",
+      "summary": "Behavioral patterns—State, Strategy, and Observer—eliminate brittle if-else chains in Low-Level Design interviews and production systems by encapsulating lifecycle transitions, interchangeable algorithms, and event notifications behind clean interfaces."
+    }
+  ],
+  "simulation": {
+    "title": "Design a Thread-Safe In-Memory Pub-Sub Message Queue (LLD) — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "prod",
+        "label": "Producer",
+        "role": "Idempotent Publish"
+      },
+      {
+        "id": "broker",
+        "label": "Partition Log",
+        "role": "Ordered Append"
+      },
+      {
+        "id": "cons",
+        "label": "Consumer",
+        "role": "Deduplicated Sink"
+      },
+      {
+        "id": "dlq",
+        "label": "Dead-Letter Queue",
+        "role": "Poison Isolation"
+      }
+    ],
+    "edges": [
+      {
+        "from": "prod",
+        "to": "broker",
+        "label": "append(key)"
+      },
+      {
+        "from": "broker",
+        "to": "cons",
+        "label": "poll(offset)"
+      },
+      {
+        "from": "cons",
+        "to": "dlq",
+        "label": "dead-letter"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why fan-out Pub-Sub needs independent offsets and per-topic locks",
+        "actionLabel": "append(key)",
+        "status": "healthy",
+        "activeNodeIds": [
+          "prod",
+          "broker"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "append(key)",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Producer sends work to Partition Log (Why fan-out Pub-Sub needs independent offsets and per-topic locks)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Head-of-line blocking, busy-wait CPU burn, and global-lock contention",
+        "actionLabel": "poll(offset)",
+        "status": "healthy",
+        "activeNodeIds": [
+          "broker",
+          "cons"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "poll(offset)",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Partition Log coordinates with Consumer while preserving the core invariant (Head-of-line blocking, busy-wait CPU burn, and global-lock contention)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Naive `BlockingQueue` per subscriber or `Thread.sleep(10)` loops",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "cons",
+          "dlq"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, Dead-Letter Queue absorbs pressure without cascading (Naive `BlockingQueue` per subscriber or `Thread.sleep(10)` loops)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Where append-log Pub-Sub architectures are used",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "prod",
+          "broker",
+          "cons",
+          "dlq"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Where append-log Pub-Sub architectures are used)."
+      }
+    ]
+  }
+}

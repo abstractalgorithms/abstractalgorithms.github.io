@@ -1,0 +1,901 @@
+{
+  "id": "prefill-decode-split",
+  "slug": "prefill-decode-split",
+  "name": "Disaggregated LLM Serving (Prefill vs. Decode Pools)",
+  "domain": "AI & Machine Learning Systems",
+  "tagline": "Isolate compute-bound prompt prefill from HBM-bandwidth-bound token decode across dedicated GPU pools connected via RDMA/NVLink KV transfer.",
+  "purpose": "Eliminate prefill-decode interference so long RAG prompts do not spike inter-token latency (ITL) for active streaming users.",
+  "spark": {
+    "summary": "Disaggregated LLM serving separates prompt prefill (compute-bound TTFT) and autoregressive token decode (HBM-bandwidth-bound ITL) onto independent GPU pools, transferring computed KV-cache blocks over RDMA or NVLink without stalling in-flight decode batches.",
+    "keyTakeaway": "When batching and tail latency compete for accelerator cycles, prefill and decode sit on opposite sides of the GPU Roofline model; colocating them forces long prompts to stall every streaming decode user, whereas disaggregating lets each pool scale and parallelize independently.",
+    "byteSummary": "**Core Mechanics:** LLM inference splits into two physics-opposite phases: **Prefill** (compute-bound GEMMs over all prompt tokens, governing Time-to-First-Token `TTFT`) and **Decode** (HBM-bandwidth-bound single-token generation, governing Inter-Token Latency `ITL`). Colocating both on one GPU causes 16K-token prefills to freeze active decode streams.\n\n**Visual & Structural Flow:** Depicts `Prompt Queue` -> `Prefill Pool (Compute-Bound GPUs)` -> `RDMA / NVLink KV Transfer` (`KV Blocks` transferred without stalling decode) -> `Decode Pool (HBM-Bandwidth-Bound GPUs)` running `Continuous Batching (ITL < 25ms)` -> `SSE Client`, achieving `Zero Prefill-Decode Interference`.\n\n**Trade-Offs & Production:** Disaggregation requires high-bandwidth interconnects (`InfiniBand RDMA` or `NVLink`) so KV transfer time stays below `TTFT` budgets, and allows asymmetric tensor/pipeline parallelism (e.g., high TP on Prefill, high DP/batching on Decode).\n\n**Failure Modes & Application:** Bound KV-transfer queues with admission backpressure and fall back to local chunked prefill if RDMA links degrade."
+  },
+  "learningJourney": [
+    {
+      "id": "01-what-it-is",
+      "eyebrow": "STAGE 01 · THE MECHANISM",
+      "title": "Prefill vs. Decode Physics & Disaggregated Pools",
+      "level": "L5 · APPLIED DESIGN",
+      "purpose": "The mechanism: understand why separating compute-bound prefill and bandwidth-bound decode unlocks strict TTFT and ITL SLOs.",
+      "explanation": {
+        "foundation": "In a standard colocated vLLM/TensorRT-LLM replica, a single scheduler interleaves prompt prefill and autoregressive decode on the same GPUs. **Prefill** processes `N` prompt tokens in parallel (`O(N)` matrix-matrix multiplications), saturating Tensor Core FLOPs. **Decode** generates 1 token per sequence per step, streaming model weights and KV-cache from HBM (`HBM-bandwidth-bound`).",
+        "core": "**Disaggregated serving** (used in DistServe, Splitwise, and Mooncake) assigns dedicated **Prefill GPUs** to compute the initial KV-cache and first token, streams the KV-cache blocks asynchronously over **RDMA / NVLink** (`mooncake` / `NIXL`), and hands the sequence to **Decode GPUs** optimized for large continuous batches.",
+        "deepDive": "In production deployments of Disaggregated LLM Serving (Prefill vs. Decode Pools), watch how prefill vs. decode physics & disaggregated pools interacts with tail latency, retry amplification, and partial failures. Disaggregated LLM serving separates prompt prefill (compute-bound TTFT) and autoregressive token decode (HBM-bandwidth-bound ITL) onto independent GPU pools, transferring computed KV-cache blocks over RDMA or NVLink without stalling in-flight decode batches."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Disaggregated Serving Path",
+        "title": "Prefill Pool -> RDMA KV Transfer -> Decode Pool",
+        "nodes": [
+          {
+            "label": "Prompt Queue",
+            "role": "Route by prompt len"
+          },
+          {
+            "label": "Prefill Pool",
+            "role": "Compute-bound TTFT"
+          },
+          {
+            "label": "RDMA KV Bridge",
+            "role": "Async block transfer"
+          },
+          {
+            "label": "Decode Pool",
+            "role": "Continuous batch ITL"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Zero Interference",
+            "detail": "Long 32K prefills never preempt or stall active decode iterations."
+          },
+          {
+            "label": "Asymmetric Tuning",
+            "detail": "Prefill uses high Tensor Parallelism (TP); Decode scales batch size + FP8 KV."
+          },
+          {
+            "label": "KV Transfer Math",
+            "detail": "Transfer bytes = 2 * layers * kv_heads * head_dim * seq_len * dtype_bytes."
+          }
+        ],
+        "summary": "Caption: Separating Prefill and Decode lets each pool optimize for its side of the GPU Roofline while RDMA transfers KV blocks asynchronously."
+      }
+    },
+    {
+      "id": "02-why-we-need-it",
+      "eyebrow": "STAGE 02 · THE PROBLEM",
+      "title": "Why Colocation Causes Tail-Latency Collapse",
+      "level": "L5 · APPLIED DESIGN",
+      "purpose": "The problem: trace how a single 32K-token RAG prompt stalls 64 concurrent streaming users.",
+      "explanation": {
+        "foundation": "Think of **Why Colocation Causes Tail-Latency Collapse** as the intuition layer for Disaggregated LLM Serving (Prefill vs. Decode Pools): The problem: trace how a single 32K-token RAG prompt stalls 64 concurrent streaming users.",
+        "core": "Even with **chunked prefill**, colocating 32K-token RAG prompts with 100-token chat streams forces a painful tug-of-war: smaller prefill chunks protect decode `ITL` (`<25 ms`) at the cost of multi-second `TTFT`, while larger prefill chunks violate `ITL` SLOs for every user currently streaming tokens on that GPU.",
+        "deepDive": "Under heavy load or partial failure, why colocation causes tail-latency collapse becomes a critical lever for predictable latency and correctness. Disaggregated LLM serving separates prompt prefill (compute-bound TTFT) and autoregressive token decode (HBM-bandwidth-bound ITL) onto independent GPU pools, transferring computed KV-cache blocks over RDMA or NVLink without stalling in-flight decode batches."
+      },
+      "ideas": [
+        {
+          "title": "Goodput vs. Raw Throughput",
+          "description": "Measuring requests/sec that satisfy BOTH TTFT and ITL SLOs reveals colocated GPUs lose up to 40% goodput under mixed prompt lengths."
+        },
+        {
+          "title": "Network Bandwidth Requirement",
+          "description": "A 70B GQA-8 model in FP8 generates ~80 KB of KV-cache per token; a 10K-token prompt transfers ~800 MB (~2 ms on 400 Gbps RDMA, ~64 ms on 100 Gbps Ethernet)."
+        }
+      ],
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Request & State Flow",
+        "title": "Why Colocation Causes Tail-Latency Collapse",
+        "actors": [
+          {
+            "id": "user",
+            "label": "User / Agent"
+          },
+          {
+            "id": "gw",
+            "label": "Model Router"
+          },
+          {
+            "id": "ret",
+            "label": "Vector / Prefix Cache"
+          },
+          {
+            "id": "gpu",
+            "label": "GPU Inference Worker"
+          }
+        ],
+        "events": [
+          {
+            "from": "user",
+            "to": "gw",
+            "label": "Submit prompt + ACL context"
+          },
+          {
+            "from": "gw",
+            "to": "ret",
+            "label": "Fetch KV prefix / hybrid RAG chunks"
+          },
+          {
+            "from": "ret",
+            "to": "gpu",
+            "label": "Prefill & continuous-batched decode"
+          },
+          {
+            "from": "gpu",
+            "to": "user",
+            "label": "Stream tokens via SSE + guardrails"
+          }
+        ]
+      },
+      "decisionFramework": {
+        "problem": "How to implement Disaggregated LLM Serving (Prefill vs. Decode Pools) without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "When batching and tail latency compete for accelerator cycles, prefill and decode sit on opposite sides of the GPU Roofline model; colocating them forces long prompts to stall every streaming decode user, whereas disaggregating lets each pool scale and parallelize independently.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Disaggregated LLM Serving (Prefill vs. Decode Pools) experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-where-it-is-used",
+      "eyebrow": "STAGE 03 · WHERE IT IS USED",
+      "title": "When to Disaggregate (and When Colocated Chunked Prefill Wins)",
+      "level": "L5 · APPLIED DESIGN",
+      "purpose": "Scope boundary: choose disaggregation for high-QPS long-context clusters with RDMA, not single-node deployments.",
+      "explanation": {
+        "foundation": "Think of **When to Disaggregate (and When Colocated Chunked Prefill Wins)** as the intuition layer for Disaggregated LLM Serving (Prefill vs. Decode Pools): Scope boundary: choose disaggregation for high-QPS long-context clusters with RDMA, not single-node deployments.",
+        "core": "Adopt disaggregated serving when serving **long-context RAG, coding assistants, or agentic workloads** across multi-node InfiniBand/RoCEv2 clusters with strict `TTFT` + `ITL` SLAs. For small single-node 8B deployments or <1K-token prompts, colocated **chunked prefill** avoids network KV-transfer complexity.",
+        "deepDive": "Under heavy load or partial failure, when to disaggregate (and when colocated chunked prefill wins) becomes a critical lever for predictable latency and correctness. Disaggregated LLM serving separates prompt prefill (compute-bound TTFT) and autoregressive token decode (HBM-bandwidth-bound ITL) onto independent GPU pools, transferring computed KV-cache blocks over RDMA or NVLink without stalling in-flight decode batches."
+      },
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "Lifecycle & Failure Recovery",
+        "title": "When to Disaggregate (and When Colocated Chunked Prefill Wins)",
+        "states": [
+          {
+            "id": "prefill",
+            "label": "Prefill (Compute-Bound)",
+            "tone": "info"
+          },
+          {
+            "id": "decode",
+            "label": "Decode (Memory-BW)",
+            "tone": "info"
+          },
+          {
+            "id": "stream",
+            "label": "SSE Streaming",
+            "tone": "good"
+          },
+          {
+            "id": "evict",
+            "label": "KV Cache Pressure",
+            "tone": "warn"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "prefill",
+            "to": "decode",
+            "label": "KV blocks allocated"
+          },
+          {
+            "from": "decode",
+            "to": "stream",
+            "label": "token sampled"
+          },
+          {
+            "from": "decode",
+            "to": "evict",
+            "label": "VRAM > 90%"
+          }
+        ]
+      }
+    },
+    {
+      "id": "04-how-it-is-managed",
+      "eyebrow": "STAGE 04 · HOW IT IS MANAGED",
+      "title": "KV-Cache Transfer Budgeting, Layer-Wise Pipelining & Fallback",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "purpose": "Operational control: overlap KV-block transfers with layer computation and bound transfer queues.",
+      "explanation": {
+        "foundation": "Think of **KV-Cache Transfer Budgeting, Layer-Wise Pipelining & Fallback** as the intuition layer for Disaggregated LLM Serving (Prefill vs. Decode Pools): Operational control: overlap KV-block transfers with layer computation and bound transfer queues.",
+        "core": "Overlap **layer-wise KV transfer** (`NIXL` / `GPUDirect RDMA`) so Layer `i`'s KV blocks begin transferring while Prefill computes Layer `i+1`. Pair with **prefix caching** on the Prefill pool so shared system prompts are neither recomputed nor re-transferred when the Decode pool already holds those KV block hashes.",
+        "deepDive": "Under heavy load or partial failure, kv-cache transfer budgeting, layer-wise pipelining & fallback becomes a critical lever for predictable latency and correctness. Disaggregated LLM serving separates prompt prefill (compute-bound TTFT) and autoregressive token decode (HBM-bandwidth-bound ITL) onto independent GPU pools, transferring computed KV-cache blocks over RDMA or NVLink without stalling in-flight decode batches."
+      },
+      "markdownContent": "```python\ndef estimate_kv_transfer_ms(layers: int, kv_heads: int, head_dim: int, seq_len: int, bytes_per_elem: int, link_gbps: float) -> float:\n    \"\"\"Compute theoretical KV-cache transfer time between Prefill and Decode pools.\"\"\"\n    if link_gbps <= 0:\n        raise ValueError(\"Interconnect bandwidth must be positive\")\n    total_bytes = 2 * layers * kv_heads * head_dim * seq_len * bytes_per_elem\n    bytes_per_sec = (link_gbps * 1e9) / 8.0\n    return (total_bytes / bytes_per_sec) * 1000.0\n```",
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "Component Topology",
+        "title": "KV-Cache Transfer Budgeting, Layer-Wise Pipelining & Fallback",
+        "graphNodes": [
+          {
+            "id": "user",
+            "label": "Caller / Agent",
+            "role": "ingress",
+            "col": 0,
+            "row": 0,
+            "tone": "primary"
+          },
+          {
+            "id": "gw",
+            "label": "LLM Gateway",
+            "role": "compute",
+            "col": 1,
+            "row": 0,
+            "tone": "tint"
+          },
+          {
+            "id": "ret",
+            "label": "Radix / Vector",
+            "role": "storage",
+            "col": 2,
+            "row": 0,
+            "tone": "tint"
+          },
+          {
+            "id": "gpu",
+            "label": "GPU Pool",
+            "role": "control",
+            "col": 0,
+            "row": 1,
+            "tone": "tint"
+          }
+        ],
+        "graphEdges": [
+          {
+            "from": "user",
+            "to": "gw",
+            "label": "prompt",
+            "style": "solid",
+            "tone": "green"
+          },
+          {
+            "from": "gw",
+            "to": "ret",
+            "label": "prefix / RAG",
+            "style": "solid",
+            "tone": "green"
+          },
+          {
+            "from": "ret",
+            "to": "gpu",
+            "label": "batched decode",
+            "style": "solid",
+            "tone": "green"
+          }
+        ]
+      }
+    },
+    {
+      "id": "05-alternatives",
+      "eyebrow": "STAGE 05 · THE TRADE-OFF",
+      "title": "Colocated Chunked Prefill vs. Disaggregated Serving",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "purpose": "The trade-off: balance interconnect cost against independent prefill/decode autoscaling.",
+      "explanation": {
+        "foundation": "Think of **Colocated Chunked Prefill vs. Disaggregated Serving** as the intuition layer for Disaggregated LLM Serving (Prefill vs. Decode Pools): The trade-off: balance interconnect cost against independent prefill/decode autoscaling.",
+        "core": "Colocated chunked prefill minimizes hardware fragmentation on small clusters, whereas disaggregation maximizes SLA goodput and lets you autoscale Prefill GPUs separately from Decode GPUs.",
+        "deepDive": "Under heavy load or partial failure, colocated chunked prefill vs. disaggregated serving becomes a critical lever for predictable latency and correctness. Disaggregated LLM serving separates prompt prefill (compute-bound TTFT) and autoregressive token decode (HBM-bandwidth-bound ITL) onto independent GPU pools, transferring computed KV-cache blocks over RDMA or NVLink without stalling in-flight decode batches."
+      },
+      "comparison": [
+        {
+          "choice": "Colocated Chunked Prefill",
+          "benefits": [
+            "Zero network KV-transfer overhead; works over standard Ethernet."
+          ],
+          "costs": [
+            "Prefill and decode compete for HBM bandwidth and SM compute; mixed workloads degrade goodput."
+          ]
+        },
+        {
+          "choice": "Disaggregated Prefill / Decode",
+          "benefits": [
+            "Zero prefill-decode interference; independent TP/batching and autoscaling per phase."
+          ],
+          "costs": [
+            "Requires high-speed RDMA/NVLink and distributed KV-block registry coordination."
+          ]
+        }
+      ]
+    },
+    {
+      "id": "06-production-architecture",
+      "eyebrow": "STAGE 06 · PRODUCTION ARCHITECTURE",
+      "title": "KV-Aware Router + Mooncake/NIXL Disaggregated Pool",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "purpose": "Production architecture: route prompts by prefix-cache affinity and stream KV blocks over RDMA.",
+      "explanation": {
+        "foundation": "Think of **KV-Aware Router + Mooncake/NIXL Disaggregated Pool** as the intuition layer for Disaggregated LLM Serving (Prefill vs. Decode Pools): Production architecture: route prompts by prefix-cache affinity and stream KV blocks over RDMA.",
+        "core": "A **KV-aware gateway router** hashes the prompt prefix to pick a Prefill worker with warm prefix blocks, streams newly computed KV blocks via GPUDirect RDMA to an available Decode worker with free PagedAttention slots, and fails over to local chunked prefill if RDMA congestion exceeds threshold.",
+        "deepDive": "Under heavy load or partial failure, kv-aware router + mooncake/nixl disaggregated pool becomes a critical lever for predictable latency and correctness. Disaggregated LLM serving separates prompt prefill (compute-bound TTFT) and autoregressive token decode (HBM-bandwidth-bound ITL) onto independent GPU pools, transferring computed KV-cache blocks over RDMA or NVLink without stalling in-flight decode batches."
+      },
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "Request Lifecycle",
+        "title": "Disaggregated Request & KV Handoff States",
+        "states": [
+          {
+            "id": "prefill",
+            "label": "PREFILLING",
+            "sublabel": "Compute-bound SMs",
+            "tone": "blue"
+          },
+          {
+            "id": "xfer",
+            "label": "KV_TRANSFER",
+            "sublabel": "RDMA / NVLink",
+            "tone": "amber"
+          },
+          {
+            "id": "decode",
+            "label": "DECODING",
+            "sublabel": "SSE token stream",
+            "tone": "green"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "prefill",
+            "to": "xfer",
+            "label": "First token + KV ready"
+          },
+          {
+            "from": "xfer",
+            "to": "decode",
+            "label": "Blocks pinned in Decode"
+          },
+          {
+            "from": "decode",
+            "to": "prefill",
+            "label": "Next turn (prefix hit)"
+          }
+        ],
+        "summary": "Caption: Once Prefill computes the initial KV blocks and first token, RDMA pins them on a Decode worker for uninterrupted token streaming."
+      }
+    },
+    {
+      "id": "07-problems-and-further-reading",
+      "eyebrow": "STAGE 07 · APPLIED PROBLEMS",
+      "title": "Related Inference & KV-Cache Problems",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "purpose": "Applied problems: connect disaggregated serving to PagedAttention and speculative decoding.",
+      "explanation": {
+        "foundation": "Think of **Related Inference & KV-Cache Problems** as the intuition layer for Disaggregated LLM Serving (Prefill vs. Decode Pools): Applied problems: connect disaggregated serving to PagedAttention and speculative decoding.",
+        "core": "Dive deeper into virtual KV-cache paging and draft-verify speculative decoding.",
+        "deepDive": "Under heavy load or partial failure, related inference & kv-cache problems becomes a critical lever for predictable latency and correctness. Disaggregated LLM serving separates prompt prefill (compute-bound TTFT) and autoregressive token decode (HBM-bandwidth-bound ITL) onto independent GPU pools, transferring computed KV-cache blocks over RDMA or NVLink without stalling in-flight decode batches."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "llm-kv-cache",
+          "title": "Problem: LLM KV-Cache Eviction & PagedAttention",
+          "kind": "problem"
+        },
+        {
+          "slug": "speculative-decoding-llm",
+          "title": "Problem: Speculative Decoding for LLM Inference",
+          "kind": "problem"
+        },
+        {
+          "slug": "model-serving-batching",
+          "title": "Concept: Model Serving & GPU Batching",
+          "kind": "concept"
+        }
+      ]
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "question": "Why does colocating a 32K-token RAG prompt prefill with active chat decode streams spike Inter-Token Latency (ITL)?",
+        "options": [
+          {
+            "id": "a",
+            "text": "The 32K prompt prefill saturates Tensor Core compute for hundreds of milliseconds, delaying the next decode step for all active streams",
+            "correct": true,
+            "feedback": "Correct: colocated scheduling stalls decode iterations whenever a large unchunked prefill runs."
+          },
+          {
+            "id": "b",
+            "text": "Decode requires more FP32 FLOPs than prefill",
+            "correct": false,
+            "feedback": "Incorrect: decode is HBM-bandwidth-bound, whereas prefill is compute-bound."
+          },
+          {
+            "id": "c",
+            "text": "SSE connections drop whenever KV-cache exceeds 1 GB",
+            "correct": false,
+            "feedback": "Incorrect: SSE stays open; the latency spike comes from GPU compute preemption."
+          }
+        ]
+      },
+      {
+        "question": "What hardware capability is critical for disaggregated LLM serving at long context lengths (16K–64K)?",
+        "options": [
+          {
+            "id": "a",
+            "text": "High-bandwidth RDMA / NVLink interconnect so KV-cache block transfer completes within a few milliseconds",
+            "correct": true,
+            "feedback": "Correct: transferring hundreds of MB of KV-cache per request over slow 10 Gbps Ethernet would blow the TTFT budget."
+          },
+          {
+            "id": "b",
+            "text": "NVMe swap space replacing GPU HBM during decode",
+            "correct": false,
+            "feedback": "Incorrect: NVMe is orders of magnitude slower than HBM and would ruin ITL."
+          },
+          {
+            "id": "c",
+            "text": "Disabling continuous batching on the Decode pool",
+            "correct": false,
+            "feedback": "Incorrect: the Decode pool relies on continuous batching to maximize HBM arithmetic intensity."
+          }
+        ]
+      },
+      {
+        "question": "How does prefix caching reduce cross-pool network traffic in a disaggregated cluster?",
+        "options": [
+          {
+            "id": "a",
+            "text": "If the Decode worker already caches the shared system-prompt KV blocks by hash, Prefill only transfers the newly computed user-suffix blocks",
+            "correct": true,
+            "feedback": "Correct: skipping transfer of already-cached prefix blocks cuts RDMA traffic proportionally."
+          },
+          {
+            "id": "b",
+            "text": "It converts FP8 weights to FP32",
+            "correct": false,
+            "feedback": "Incorrect: FP32 quadruples weight size."
+          },
+          {
+            "id": "c",
+            "text": "It removes the attention mechanism from layers 1–16",
+            "correct": false,
+            "feedback": "Incorrect: prefix caching reuses exact KV tensors without dropping layers."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** Disaggregated LLM serving separates prompt prefill (compute-bound TTFT) and autoregressive token decode (HBM-bandwidth-bound ITL) onto independent GPU pools, transferring computed KV-cache blocks over RDMA or NVLink without stalling in-flight decode batches.\n\n**Key Takeaway:** Prefill and decode sit on opposite sides of the GPU Roofline model; colocating them forces long prompts to stall every streaming decode user, whereas disaggregating lets each pool scale and parallelize independently.",
+      "spark": {
+        "summary": "Disaggregated LLM serving separates prompt prefill (compute-bound TTFT) and autoregressive token decode (HBM-bandwidth-bound ITL) onto independent GPU pools, transferring computed KV-cache blocks over RDMA or NVLink without stalling in-flight decode batches.",
+        "keyTakeaway": "Prefill and decode sit on opposite sides of the GPU Roofline model; colocating them forces long prompts to stall every streaming decode user, whereas disaggregating lets each pool scale and parallelize independently.",
+        "byteSummary": "**Core Mechanics:** LLM inference splits into two physics-opposite phases: **Prefill** (compute-bound GEMMs over all prompt tokens, governing Time-to-First-Token `TTFT`) and **Decode** (HBM-bandwidth-bound single-token generation, governing Inter-Token Latency `ITL`). Colocating both on one GPU causes 16K-token prefills to freeze active decode streams.\n\n**Visual & Structural Flow:** Depicts `Prompt Queue` -> `Prefill Pool (Compute-Bound GPUs)` -> `RDMA / NVLink KV Transfer` (`KV Blocks` transferred without stalling decode) -> `Decode Pool (HBM-Bandwidth-Bound GPUs)` running `Continuous Batching (ITL < 25ms)` -> `SSE Client`, achieving `Zero Prefill-Decode Interference`.\n\n**Trade-Offs & Production:** Disaggregation requires high-bandwidth interconnects (`InfiniBand RDMA` or `NVLink`) so KV transfer time stays below `TTFT` budgets, and allows asymmetric tensor/pipeline parallelism (e.g., high TP on Prefill, high DP/batching on Decode).\n\n**Failure Modes & Application:** Bound KV-transfer queues with admission backpressure and fall back to local chunked prefill if RDMA links degrade."
+      },
+      "learningJourney": [
+        {
+          "id": "01-what-it-is",
+          "eyebrow": "STAGE 01 · THE MECHANISM",
+          "title": "Prefill vs. Decode Physics & Disaggregated Pools",
+          "level": "L5 · APPLIED DESIGN",
+          "purpose": "The mechanism: understand why separating compute-bound prefill and bandwidth-bound decode unlocks strict TTFT and ITL SLOs.",
+          "explanation": "In a standard colocated vLLM/TensorRT-LLM replica, a single scheduler interleaves prompt prefill and autoregressive decode on the same GPUs. **Prefill** processes `N` prompt tokens in parallel (`O(N)` matrix-matrix multiplications), saturating Tensor Core FLOPs. **Decode** generates 1 token per sequence per step, streaming model weights and KV-cache from HBM (`HBM-bandwidth-bound`).\n\n**Disaggregated serving** (used in DistServe, Splitwise, and Mooncake) assigns dedicated **Prefill GPUs** to compute the initial KV-cache and first token, streams the KV-cache blocks asynchronously over **RDMA / NVLink** (`mooncake` / `NIXL`), and hands the sequence to **Decode GPUs** optimized for large continuous batches.",
+          "sectionDiagram": {
+            "kind": "pipeline",
+            "eyebrow": "Disaggregated Serving Path",
+            "title": "Prefill Pool -> RDMA KV Transfer -> Decode Pool",
+            "nodes": [
+              {
+                "label": "Prompt Queue",
+                "role": "Route by prompt len"
+              },
+              {
+                "label": "Prefill Pool",
+                "role": "Compute-bound TTFT"
+              },
+              {
+                "label": "RDMA KV Bridge",
+                "role": "Async block transfer"
+              },
+              {
+                "label": "Decode Pool",
+                "role": "Continuous batch ITL"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Zero Interference",
+                "detail": "Long 32K prefills never preempt or stall active decode iterations."
+              },
+              {
+                "label": "Asymmetric Tuning",
+                "detail": "Prefill uses high Tensor Parallelism (TP); Decode scales batch size + FP8 KV."
+              },
+              {
+                "label": "KV Transfer Math",
+                "detail": "Transfer bytes = 2 * layers * kv_heads * head_dim * seq_len * dtype_bytes."
+              }
+            ],
+            "summary": "Caption: Separating Prefill and Decode lets each pool optimize for its side of the GPU Roofline while RDMA transfers KV blocks asynchronously."
+          }
+        },
+        {
+          "id": "02-why-we-need-it",
+          "eyebrow": "STAGE 02 · THE PROBLEM",
+          "title": "Why Colocation Causes Tail-Latency Collapse",
+          "level": "L5 · APPLIED DESIGN",
+          "purpose": "The problem: trace how a single 32K-token RAG prompt stalls 64 concurrent streaming users.",
+          "explanation": "Even with **chunked prefill**, colocating 32K-token RAG prompts with 100-token chat streams forces a painful tug-of-war: smaller prefill chunks protect decode `ITL` (`<25 ms`) at the cost of multi-second `TTFT`, while larger prefill chunks violate `ITL` SLOs for every user currently streaming tokens on that GPU.",
+          "ideas": [
+            {
+              "title": "Goodput vs. Raw Throughput",
+              "description": "Measuring requests/sec that satisfy BOTH TTFT and ITL SLOs reveals colocated GPUs lose up to 40% goodput under mixed prompt lengths."
+            },
+            {
+              "title": "Network Bandwidth Requirement",
+              "description": "A 70B GQA-8 model in FP8 generates ~80 KB of KV-cache per token; a 10K-token prompt transfers ~800 MB (~2 ms on 400 Gbps RDMA, ~64 ms on 100 Gbps Ethernet)."
+            }
+          ]
+        },
+        {
+          "id": "03-where-it-is-used",
+          "eyebrow": "STAGE 03 · WHERE IT IS USED",
+          "title": "When to Disaggregate (and When Colocated Chunked Prefill Wins)",
+          "level": "L5 · APPLIED DESIGN",
+          "purpose": "Scope boundary: choose disaggregation for high-QPS long-context clusters with RDMA, not single-node deployments.",
+          "explanation": "Adopt disaggregated serving when serving **long-context RAG, coding assistants, or agentic workloads** across multi-node InfiniBand/RoCEv2 clusters with strict `TTFT` + `ITL` SLAs. For small single-node 8B deployments or <1K-token prompts, colocated **chunked prefill** avoids network KV-transfer complexity."
+        }
+      ],
+      "finalSummary": "Prefill and decode sit on opposite sides of the GPU Roofline model; colocating them forces long prompts to stall every streaming decode user, whereas disaggregating lets each pool scale and parallelize independently.",
+      "summary": "Disaggregated LLM serving separates prompt prefill (compute-bound TTFT) and autoregressive token decode (HBM-bandwidth-bound ITL) onto independent GPU pools, transferring computed KV-cache blocks over RDMA or NVLink without stalling in-flight decode batches.",
+      "keyTakeaway": "When batching and tail latency compete for accelerator cycles, prefill and decode sit on opposite sides of the GPU Roofline model; colocating them forces long prompts to stall every streaming decode user, whereas disaggregating lets each pool scale and parallelize independently."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** LLM inference splits into two physics-opposite phases: **Prefill** (compute-bound GEMMs over all prompt tokens, governing Time-to-First-Token `TTFT`) and **Decode** (HBM-bandwidth-bound single-token generation, governing Inter-Token Latency `ITL`). Colocating both on one GPU causes 16K-token prefills to freeze active decode streams.\n\n**Visual & Structural Flow:** Depicts `Prompt Queue` -> `Prefill Pool (Compute-Bound GPUs)` -> `RDMA / NVLink KV Transfer` (`KV Blocks` transferred without stalling decode) -> `Decode Pool (HBM-Bandwidth-Bound GPUs)` running `Continuous Batching (ITL < 25ms)` -> `SSE Client`, achieving `Zero Prefill-Decode Interference`.\n\n**Trade-Offs & Production:** Disaggregation requires high-bandwidth interconnects (`InfiniBand RDMA` or `NVLink`) so KV transfer time stays below `TTFT` budgets, and allows asymmetric tensor/pipeline parallelism (e.g., high TP on Prefill, high DP/batching on Decode).\n\n**Failure Modes & Application:** Bound KV-transfer queues with admission backpressure and fall back to local chunked prefill if RDMA links degrade.",
+      "spark": {
+        "summary": "Disaggregated LLM serving separates prompt prefill (compute-bound TTFT) and autoregressive token decode (HBM-bandwidth-bound ITL) onto independent GPU pools, transferring computed KV-cache blocks over RDMA or NVLink without stalling in-flight decode batches.",
+        "keyTakeaway": "Prefill and decode sit on opposite sides of the GPU Roofline model; colocating them forces long prompts to stall every streaming decode user, whereas disaggregating lets each pool scale and parallelize independently.",
+        "byteSummary": "**Core Mechanics:** LLM inference splits into two physics-opposite phases: **Prefill** (compute-bound GEMMs over all prompt tokens, governing Time-to-First-Token `TTFT`) and **Decode** (HBM-bandwidth-bound single-token generation, governing Inter-Token Latency `ITL`). Colocating both on one GPU causes 16K-token prefills to freeze active decode streams.\n\n**Visual & Structural Flow:** Depicts `Prompt Queue` -> `Prefill Pool (Compute-Bound GPUs)` -> `RDMA / NVLink KV Transfer` (`KV Blocks` transferred without stalling decode) -> `Decode Pool (HBM-Bandwidth-Bound GPUs)` running `Continuous Batching (ITL < 25ms)` -> `SSE Client`, achieving `Zero Prefill-Decode Interference`.\n\n**Trade-Offs & Production:** Disaggregation requires high-bandwidth interconnects (`InfiniBand RDMA` or `NVLink`) so KV transfer time stays below `TTFT` budgets, and allows asymmetric tensor/pipeline parallelism (e.g., high TP on Prefill, high DP/batching on Decode).\n\n**Failure Modes & Application:** Bound KV-transfer queues with admission backpressure and fall back to local chunked prefill if RDMA links degrade."
+      },
+      "summary": "Disaggregated LLM serving separates prompt prefill (compute-bound TTFT) and autoregressive token decode (HBM-bandwidth-bound ITL) onto independent GPU pools, transferring computed KV-cache blocks over RDMA or NVLink without stalling in-flight decode batches.",
+      "keyTakeaway": "When batching and tail latency compete for accelerator cycles, prefill and decode sit on opposite sides of the GPU Roofline model; colocating them forces long prompts to stall every streaming decode user, whereas disaggregating lets each pool scale and parallelize independently."
+    },
+    "advanced": {
+      "byteSummary": "**Core Mechanics:** LLM inference splits into two physics-opposite phases: **Prefill** (compute-bound GEMMs over all prompt tokens, governing Time-to-First-Token `TTFT`) and **Decode** (HBM-bandwidth-bound single-token generation, governing Inter-Token Latency `ITL`). Colocating both on one GPU causes 16K-token prefills to freeze active decode streams.\n\n**Visual & Structural Flow:** Depicts `Prompt Queue` -> `Prefill Pool (Compute-Bound GPUs)` -> `RDMA / NVLink KV Transfer` (`KV Blocks` transferred without stalling decode) -> `Decode Pool (HBM-Bandwidth-Bound GPUs)` running `Continuous Batching (ITL < 25ms)` -> `SSE Client`, achieving `Zero Prefill-Decode Interference`.\n\n**Trade-Offs & Production:** Disaggregation requires high-bandwidth interconnects (`InfiniBand RDMA` or `NVLink`) so KV transfer time stays below `TTFT` budgets, and allows asymmetric tensor/pipeline parallelism (e.g., high TP on Prefill, high DP/batching on Decode).\n\n**Failure Modes & Application:** Bound KV-transfer queues with admission backpressure and fall back to local chunked prefill if RDMA links degrade.",
+      "spark": {
+        "summary": "Disaggregated LLM serving separates prompt prefill (compute-bound TTFT) and autoregressive token decode (HBM-bandwidth-bound ITL) onto independent GPU pools, transferring computed KV-cache blocks over RDMA or NVLink without stalling in-flight decode batches.",
+        "keyTakeaway": "Prefill and decode sit on opposite sides of the GPU Roofline model; colocating them forces long prompts to stall every streaming decode user, whereas disaggregating lets each pool scale and parallelize independently.",
+        "byteSummary": "**Core Mechanics:** LLM inference splits into two physics-opposite phases: **Prefill** (compute-bound GEMMs over all prompt tokens, governing Time-to-First-Token `TTFT`) and **Decode** (HBM-bandwidth-bound single-token generation, governing Inter-Token Latency `ITL`). Colocating both on one GPU causes 16K-token prefills to freeze active decode streams.\n\n**Visual & Structural Flow:** Depicts `Prompt Queue` -> `Prefill Pool (Compute-Bound GPUs)` -> `RDMA / NVLink KV Transfer` (`KV Blocks` transferred without stalling decode) -> `Decode Pool (HBM-Bandwidth-Bound GPUs)` running `Continuous Batching (ITL < 25ms)` -> `SSE Client`, achieving `Zero Prefill-Decode Interference`.\n\n**Trade-Offs & Production:** Disaggregation requires high-bandwidth interconnects (`InfiniBand RDMA` or `NVLink`) so KV transfer time stays below `TTFT` budgets, and allows asymmetric tensor/pipeline parallelism (e.g., high TP on Prefill, high DP/batching on Decode).\n\n**Failure Modes & Application:** Bound KV-transfer queues with admission backpressure and fall back to local chunked prefill if RDMA links degrade."
+      },
+      "learningJourney": [
+        {
+          "id": "01-what-it-is",
+          "eyebrow": "STAGE 01 · THE MECHANISM",
+          "title": "Prefill vs. Decode Physics & Disaggregated Pools",
+          "level": "L5 · APPLIED DESIGN",
+          "purpose": "The mechanism: understand why separating compute-bound prefill and bandwidth-bound decode unlocks strict TTFT and ITL SLOs.",
+          "explanation": "In a standard colocated vLLM/TensorRT-LLM replica, a single scheduler interleaves prompt prefill and autoregressive decode on the same GPUs. **Prefill** processes `N` prompt tokens in parallel (`O(N)` matrix-matrix multiplications), saturating Tensor Core FLOPs. **Decode** generates 1 token per sequence per step, streaming model weights and KV-cache from HBM (`HBM-bandwidth-bound`).\n\n**Disaggregated serving** (used in DistServe, Splitwise, and Mooncake) assigns dedicated **Prefill GPUs** to compute the initial KV-cache and first token, streams the KV-cache blocks asynchronously over **RDMA / NVLink** (`mooncake` / `NIXL`), and hands the sequence to **Decode GPUs** optimized for large continuous batches.",
+          "sectionDiagram": {
+            "kind": "pipeline",
+            "eyebrow": "Disaggregated Serving Path",
+            "title": "Prefill Pool -> RDMA KV Transfer -> Decode Pool",
+            "nodes": [
+              {
+                "label": "Prompt Queue",
+                "role": "Route by prompt len"
+              },
+              {
+                "label": "Prefill Pool",
+                "role": "Compute-bound TTFT"
+              },
+              {
+                "label": "RDMA KV Bridge",
+                "role": "Async block transfer"
+              },
+              {
+                "label": "Decode Pool",
+                "role": "Continuous batch ITL"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Zero Interference",
+                "detail": "Long 32K prefills never preempt or stall active decode iterations."
+              },
+              {
+                "label": "Asymmetric Tuning",
+                "detail": "Prefill uses high Tensor Parallelism (TP); Decode scales batch size + FP8 KV."
+              },
+              {
+                "label": "KV Transfer Math",
+                "detail": "Transfer bytes = 2 * layers * kv_heads * head_dim * seq_len * dtype_bytes."
+              }
+            ],
+            "summary": "Caption: Separating Prefill and Decode lets each pool optimize for its side of the GPU Roofline while RDMA transfers KV blocks asynchronously."
+          }
+        },
+        {
+          "id": "02-why-we-need-it",
+          "eyebrow": "STAGE 02 · THE PROBLEM",
+          "title": "Why Colocation Causes Tail-Latency Collapse",
+          "level": "L5 · APPLIED DESIGN",
+          "purpose": "The problem: trace how a single 32K-token RAG prompt stalls 64 concurrent streaming users.",
+          "explanation": "Even with **chunked prefill**, colocating 32K-token RAG prompts with 100-token chat streams forces a painful tug-of-war: smaller prefill chunks protect decode `ITL` (`<25 ms`) at the cost of multi-second `TTFT`, while larger prefill chunks violate `ITL` SLOs for every user currently streaming tokens on that GPU.",
+          "ideas": [
+            {
+              "title": "Goodput vs. Raw Throughput",
+              "description": "Measuring requests/sec that satisfy BOTH TTFT and ITL SLOs reveals colocated GPUs lose up to 40% goodput under mixed prompt lengths."
+            },
+            {
+              "title": "Network Bandwidth Requirement",
+              "description": "A 70B GQA-8 model in FP8 generates ~80 KB of KV-cache per token; a 10K-token prompt transfers ~800 MB (~2 ms on 400 Gbps RDMA, ~64 ms on 100 Gbps Ethernet)."
+            }
+          ]
+        },
+        {
+          "id": "03-where-it-is-used",
+          "eyebrow": "STAGE 03 · WHERE IT IS USED",
+          "title": "When to Disaggregate (and When Colocated Chunked Prefill Wins)",
+          "level": "L5 · APPLIED DESIGN",
+          "purpose": "Scope boundary: choose disaggregation for high-QPS long-context clusters with RDMA, not single-node deployments.",
+          "explanation": "Adopt disaggregated serving when serving **long-context RAG, coding assistants, or agentic workloads** across multi-node InfiniBand/RoCEv2 clusters with strict `TTFT` + `ITL` SLAs. For small single-node 8B deployments or <1K-token prompts, colocated **chunked prefill** avoids network KV-transfer complexity."
+        },
+        {
+          "id": "04-how-it-is-managed",
+          "eyebrow": "STAGE 04 · HOW IT IS MANAGED",
+          "title": "KV-Cache Transfer Budgeting, Layer-Wise Pipelining & Fallback",
+          "level": "L6 · SCALE & TRADE-OFFS",
+          "purpose": "Operational control: overlap KV-block transfers with layer computation and bound transfer queues.",
+          "explanation": "Overlap **layer-wise KV transfer** (`NIXL` / `GPUDirect RDMA`) so Layer `i`'s KV blocks begin transferring while Prefill computes Layer `i+1`. Pair with **prefix caching** on the Prefill pool so shared system prompts are neither recomputed nor re-transferred when the Decode pool already holds those KV block hashes.",
+          "markdownContent": "```python\ndef estimate_kv_transfer_ms(layers: int, kv_heads: int, head_dim: int, seq_len: int, bytes_per_elem: int, link_gbps: float) -> float:\n    \"\"\"Compute theoretical KV-cache transfer time between Prefill and Decode pools.\"\"\"\n    if link_gbps <= 0:\n        raise ValueError(\"Interconnect bandwidth must be positive\")\n    total_bytes = 2 * layers * kv_heads * head_dim * seq_len * bytes_per_elem\n    bytes_per_sec = (link_gbps * 1e9) / 8.0\n    return (total_bytes / bytes_per_sec) * 1000.0\n```"
+        },
+        {
+          "id": "05-alternatives",
+          "eyebrow": "STAGE 05 · THE TRADE-OFF",
+          "title": "Colocated Chunked Prefill vs. Disaggregated Serving",
+          "level": "L6 · SCALE & TRADE-OFFS",
+          "purpose": "The trade-off: balance interconnect cost against independent prefill/decode autoscaling.",
+          "explanation": "Colocated chunked prefill minimizes hardware fragmentation on small clusters, whereas disaggregation maximizes SLA goodput and lets you autoscale Prefill GPUs separately from Decode GPUs.",
+          "comparison": [
+            {
+              "choice": "Colocated Chunked Prefill",
+              "benefits": [
+                "Zero network KV-transfer overhead; works over standard Ethernet."
+              ],
+              "costs": [
+                "Prefill and decode compete for HBM bandwidth and SM compute; mixed workloads degrade goodput."
+              ]
+            },
+            {
+              "choice": "Disaggregated Prefill / Decode",
+              "benefits": [
+                "Zero prefill-decode interference; independent TP/batching and autoscaling per phase."
+              ],
+              "costs": [
+                "Requires high-speed RDMA/NVLink and distributed KV-block registry coordination."
+              ]
+            }
+          ]
+        },
+        {
+          "id": "06-production-architecture",
+          "eyebrow": "STAGE 06 · PRODUCTION ARCHITECTURE",
+          "title": "KV-Aware Router + Mooncake/NIXL Disaggregated Pool",
+          "level": "L7 · STAFF / PRINCIPAL",
+          "purpose": "Production architecture: route prompts by prefix-cache affinity and stream KV blocks over RDMA.",
+          "explanation": "A **KV-aware gateway router** hashes the prompt prefix to pick a Prefill worker with warm prefix blocks, streams newly computed KV blocks via GPUDirect RDMA to an available Decode worker with free PagedAttention slots, and fails over to local chunked prefill if RDMA congestion exceeds threshold.",
+          "sectionDiagram": {
+            "kind": "state-machine",
+            "eyebrow": "Request Lifecycle",
+            "title": "Disaggregated Request & KV Handoff States",
+            "states": [
+              {
+                "id": "prefill",
+                "label": "PREFILLING",
+                "sublabel": "Compute-bound SMs",
+                "tone": "blue"
+              },
+              {
+                "id": "xfer",
+                "label": "KV_TRANSFER",
+                "sublabel": "RDMA / NVLink",
+                "tone": "amber"
+              },
+              {
+                "id": "decode",
+                "label": "DECODING",
+                "sublabel": "SSE token stream",
+                "tone": "green"
+              }
+            ],
+            "transitions": [
+              {
+                "from": "prefill",
+                "to": "xfer",
+                "label": "First token + KV ready"
+              },
+              {
+                "from": "xfer",
+                "to": "decode",
+                "label": "Blocks pinned in Decode"
+              },
+              {
+                "from": "decode",
+                "to": "prefill",
+                "label": "Next turn (prefix hit)"
+              }
+            ],
+            "summary": "Caption: Once Prefill computes the initial KV blocks and first token, RDMA pins them on a Decode worker for uninterrupted token streaming."
+          }
+        },
+        {
+          "id": "07-problems-and-further-reading",
+          "eyebrow": "STAGE 07 · APPLIED PROBLEMS",
+          "title": "Related Inference & KV-Cache Problems",
+          "level": "L7 · STAFF / PRINCIPAL",
+          "purpose": "Applied problems: connect disaggregated serving to PagedAttention and speculative decoding.",
+          "explanation": "Dive deeper into virtual KV-cache paging and draft-verify speculative decoding.",
+          "supportingConcepts": [
+            {
+              "slug": "llm-kv-cache",
+              "title": "Problem: LLM KV-Cache Eviction & PagedAttention",
+              "kind": "problem"
+            },
+            {
+              "slug": "speculative-decoding-llm",
+              "title": "Problem: Speculative Decoding for LLM Inference",
+              "kind": "problem"
+            },
+            {
+              "slug": "model-serving-batching",
+              "title": "Concept: Model Serving & GPU Batching",
+              "kind": "concept"
+            }
+          ]
+        }
+      ],
+      "finalSummary": "Prefill and decode sit on opposite sides of the GPU Roofline model; colocating them forces long prompts to stall every streaming decode user, whereas disaggregating lets each pool scale and parallelize independently.",
+      "summary": "Disaggregated LLM serving separates prompt prefill (compute-bound TTFT) and autoregressive token decode (HBM-bandwidth-bound ITL) onto independent GPU pools, transferring computed KV-cache blocks over RDMA or NVLink without stalling in-flight decode batches.",
+      "keyTakeaway": "When batching and tail latency compete for accelerator cycles, prefill and decode sit on opposite sides of the GPU Roofline model; colocating them forces long prompts to stall every streaming decode user, whereas disaggregating lets each pool scale and parallelize independently."
+    }
+  },
+  "pedagogicalFramework": "PRIME",
+  "prerequisites": [
+    {
+      "title": "Model Serving & GPU Batching",
+      "summary": "Group concurrent inference requests into tensor batches on the GPU to shift workloads from memory-bandwidth-bound to compute-bound without blowing tail latency."
+    },
+    {
+      "title": "LLM Quantization, GPTQ/AWQ & Inference Performance",
+      "summary": "LLM quantization compresses 16-bit model weights and KV caches into 8-bit or 4-bit representations (FP8, AWQ, GPTQ, GGUF) to slash VRAM usage by 2-4x and accelerate memory-bandwidth-bound token generation."
+    },
+    {
+      "title": "Transformer Attention",
+      "summary": "Self-attention lets every token dynamically weight and aggregate information from all other tokens in a sequence in parallel, replacing sequential recurrent bottlenecks with matrix multiplications over Query, Key, and Value projections."
+    }
+  ],
+  "simulation": {
+    "title": "Disaggregated LLM Serving (Prefill vs. Decode Pools) — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "user",
+        "label": "Caller / Agent",
+        "role": "Prompt & Tool Loop"
+      },
+      {
+        "id": "gw",
+        "label": "LLM Gateway",
+        "role": "Routing & Guardrails"
+      },
+      {
+        "id": "ret",
+        "label": "Radix / Vector",
+        "role": "Prefix & RAG Lookup"
+      },
+      {
+        "id": "gpu",
+        "label": "GPU Pool",
+        "role": "Paged KV & Decode"
+      }
+    ],
+    "edges": [
+      {
+        "from": "user",
+        "to": "gw",
+        "label": "prompt"
+      },
+      {
+        "from": "gw",
+        "to": "ret",
+        "label": "prefix / RAG"
+      },
+      {
+        "from": "ret",
+        "to": "gpu",
+        "label": "batched decode"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Prefill vs. Decode Physics & Disaggregated Pools",
+        "actionLabel": "prompt",
+        "status": "healthy",
+        "activeNodeIds": [
+          "user",
+          "gw"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "prompt",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Caller / Agent sends work to LLM Gateway (Prefill vs. Decode Physics & Disaggregated Pools)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Why Colocation Causes Tail-Latency Collapse",
+        "actionLabel": "prefix / RAG",
+        "status": "healthy",
+        "activeNodeIds": [
+          "gw",
+          "ret"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "prefix / RAG",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "LLM Gateway coordinates with Radix / Vector while preserving the core invariant (Why Colocation Causes Tail-Latency Collapse)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "When to Disaggregate (and When Colocated Chunked Prefill Wins)",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "ret",
+          "gpu"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, GPU Pool absorbs pressure without cascading (When to Disaggregate (and When Colocated Chunked Prefill Wins))."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Related Inference & KV-Cache Problems",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "user",
+          "gw",
+          "ret",
+          "gpu"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Related Inference & KV-Cache Problems)."
+      }
+    ]
+  }
+}

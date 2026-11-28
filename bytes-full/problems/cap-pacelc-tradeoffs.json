@@ -1,0 +1,694 @@
+{
+  "id": "cap-pacelc-tradeoffs",
+  "slug": "cap-pacelc-tradeoffs",
+  "title": "CAP & PACELC Consistency-Latency Trade-Offs",
+  "problemType": "architecture",
+  "difficulty": "medium",
+  "prompt": "A global e-commerce service runs on a 3-region Raft cluster (us-east-1, eu-west-1, ap-south-1; RTTs: US-EU 75 ms, EU-IN 130 ms, US-IN 195 ms) with 60,000 RPS catalog reads (95%) and 3,000 RPS ledger writes (5%). Default PC/EC linearizable reads and writes push ap-south-1 checkout p99 past 390 ms and catalog reads past 150 ms (SLA < 120 ms). Redesign using PACELC.",
+  "spark": {
+    "summary": "Even with zero network partitions, PC/EC multi-region Raft clusters pay cross-continent quorum and leaseholder RTTs on every read and write, blowing past tail-latency SLAs.",
+    "keyTakeaway": "When a single bottleneck threatens end-to-end availability, apply PACELC per workload: keep monetary/inventory writes PC/EC on regional leaseholders, and serve 95% catalog reads PA/EL via local follower reads (`AS OF SYSTEM TIME '-5s'`) with HLC session tokens for read-your-own-writes.",
+    "byteSummary": "**Core Mechanics:** CAP only describes behavior during a network partition (`P`). In practice, partitions are rare, while **Else (`E`, normal operation)** is 99.99% of production time.\n\n**Visual & Structural Flow:** Depicts PC/EC Remote Leaseholder Tax vs. Regional Homing (us-east-1 (Lease) -> eu-west-1 (75ms) -> ap-south-1 (195ms)); HLC Session Router: Local Follower Reads vs. Leaseholder Writes (API Edge Router -> Local Follower (<4ms) -> Regional Leaseholder -> Remote DR Replicas).\n\n**Trade-Offs & Production:** Two naive shortcuts fail in production: **Co-Locating All 3 Raft Replicas in One Region**: Achieves `< 5 ms` writes, but a single region outage loses quorum and availability. Every global distributed database exposes explicit PACELC knobs: **CockroachDB & YugabyteDB**: `REGIONAL BY ROW` tables pin leaseholders to user geography while.\n\n**Failure Modes & Application:** Every global distributed database exposes explicit PACELC knobs: **CockroachDB & YugabyteDB**: `REGIONAL BY ROW` tables pin leaseholders to user geography while `follower_read_timestamp()` serves global `GLOBAL` catalog tables locally."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why CAP alone misses the everyday speed-of-light tax",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "CAP only describes behavior during a network partition (`P`).",
+        "core": "In practice, partitions are rare, while **Else (`E`, normal operation)** is 99.99% of production time.",
+        "deepDive": "Under PACELC, a `PC/EC` database (like multi-region Raft/Paxos) still pays cross-ocean RTTs (`195 ms` US-IN, `75 ms` US-EU) on every linearizable read and quorum write even when every link is healthy."
+      },
+      "purpose": "The mechanism: understand how Why CAP alone misses the everyday speed-of-light tax works from first principles."
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "390 ms checkout latency and 11,700 pinned connections",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "When Raft leaseholders sit in `us-east-1`:",
+        "core": "1. **Read & Write RTT Amplification**: `ap-south-1` catalog reads (`57,000 RPS`) travel `195 ms` to the remote leaseholder; `ap-south-1` writes wait for `IN-US` + quorum replication (`390 ms+` p99).\n2. **Connection Pool Bloat**: `60,000 RPS × 0.195 s = 11,700` concurrent open DB connections just waiting on speed-of-light travel.",
+        "deepDive": "In production deployments of CAP & PACELC Consistency-Latency Trade-Offs, watch how 390 ms checkout latency and 11,700 pinned connections interacts with tail latency, retry amplification, and partial failures. Even with zero network partitions, PC/EC multi-region Raft clusters pay cross-continent quorum and leaseholder RTTs on every read and write, blowing past tail-latency SLAs."
+      },
+      "sectionDiagram": {
+        "kind": "quorum-cluster",
+        "eyebrow": "Geo-Distributed Raft Quorum",
+        "title": "PC/EC Remote Leaseholder Tax vs. Regional Homing",
+        "nodes": [
+          {
+            "label": "us-east-1 (Lease)",
+            "role": "3,000 w/s + US reads"
+          },
+          {
+            "label": "eu-west-1 (75ms)",
+            "role": "Follower read <4ms (-5s)"
+          },
+          {
+            "label": "ap-south-1 (195ms)",
+            "role": "Follower read <4ms (-5s)"
+          }
+        ],
+        "edges": [
+          {
+            "label": "US-EU 75ms / US-IN 195ms"
+          }
+        ],
+        "summary": "Serving catalog reads from local followers cuts 57,000 RPS from 195 ms to <4 ms, slashing open connections 50x."
+      },
+      "purpose": "The problem: see what breaks without 390 ms checkout latency and 11,700 pinned connections under real concurrency or scale.",
+      "decisionFramework": {
+        "problem": "How to implement CAP & PACELC Consistency-Latency Trade-Offs without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "When a single bottleneck threatens end-to-end availability, apply PACELC per workload: keep monetary/inventory writes PC/EC on regional leaseholders, and serve 95% catalog reads PA/EL via local follower reads (`AS OF SYSTEM TIME '-5s'`) with HLC session tokens for read-your-own-writes.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When CAP & PACELC Consistency-Latency Trade-Offs experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Naive fixes (and why they break durability or RYW)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Two naive shortcuts fail in production:",
+        "core": "- **Co-Locating All 3 Raft Replicas in One Region**: Achieves `< 5 ms` writes, but a single region outage loses quorum and availability.\n- **Unbounded Async Follower Reads**: A user updates their shipping address, refreshes, hits a follower `5 s` behind, and sees the old address (Read-Your-Own-Writes violation).",
+        "deepDive": "In production deployments of CAP & PACELC Consistency-Latency Trade-Offs, watch how naive fixes (and why they break durability or ryw) interacts with tail latency, retry amplification, and partial failures. Even with zero network partitions, PC/EC multi-region Raft clusters pay cross-continent quorum and leaseholder RTTs on every read and write, blowing past tail-latency SLAs."
+      },
+      "purpose": "The problem: see what breaks without Naive fixes under real concurrency or scale.",
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Request & State Flow",
+        "title": "Naive fixes (and why they break durability or RYW)",
+        "actors": [
+          {
+            "id": "client",
+            "label": "Caller"
+          },
+          {
+            "id": "entry",
+            "label": "Service Entry"
+          },
+          {
+            "id": "worker",
+            "label": "Core Processor"
+          },
+          {
+            "id": "store",
+            "label": "State Store"
+          }
+        ],
+        "events": [
+          {
+            "from": "client",
+            "to": "entry",
+            "label": "Submit bounded request"
+          },
+          {
+            "from": "entry",
+            "to": "worker",
+            "label": "Apply domain invariant"
+          },
+          {
+            "from": "worker",
+            "to": "store",
+            "label": "Persist or read state"
+          },
+          {
+            "from": "entry",
+            "to": "client",
+            "label": "Return verified response"
+          }
+        ]
+      }
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise solution: Workload-Split PACELC + Bounded Staleness",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": {
+        "foundation": "Split workloads explicitly across `PC/EC` and `PA/EL`:",
+        "core": "- **Catalog Reads (`95%` = `57,000 RPS`, `PA/EL`)**: Serve from local regional replicas with bounded staleness (`AS OF SYSTEM TIME '-5s'`), cutting latency from `195 ms` to `< 4 ms` and open connections from `11,700` to `228`.\n- **Geo-Partitioned Writes (`5%` = `3,000 RPS`, `PC/EC`)**: Home user/order Raft ranges to the user's region (5-replica Raft: 3 in home region for `< 8 ms` local quorum, 2 remote for DR) while keeping global inventory/wallet writes strongly consistent.\n- **Read-Your-Own-Writes Guard**: Attach an HLC session cookie (`last_write_hlc`) for `5 s` after a mutation to route that user's reads to the leaseholder.",
+        "deepDive": "In production deployments of CAP & PACELC Consistency-Latency Trade-Offs, watch how enterprise solution: workload-split pacelc + bounded staleness interacts with tail latency, retry amplification, and partial failures. Even with zero network partitions, PC/EC multi-region Raft clusters pay cross-continent quorum and leaseholder RTTs on every read and write, blowing past tail-latency SLAs."
+      },
+      "sectionDiagram": {
+        "kind": "cache-tier",
+        "eyebrow": "Workload-Split PACELC",
+        "title": "HLC Session Router: Local Follower Reads vs. Leaseholder Writes",
+        "nodes": [
+          {
+            "label": "API Edge Router",
+            "role": "Checks last_write_hlc cookie"
+          },
+          {
+            "label": "Local Follower (<4ms)",
+            "role": "PA/EL catalog AS OF -5s"
+          },
+          {
+            "label": "Regional Leaseholder",
+            "role": "PC/EC 3-AZ local quorum (<8ms)"
+          },
+          {
+            "label": "Remote DR Replicas",
+            "role": "HLC --max-offset=250ms"
+          }
+        ],
+        "edges": [
+          {
+            "label": "95% catalog -> local"
+          },
+          {
+            "label": "5% write / RYW -> lease"
+          }
+        ],
+        "summary": "Catalog traffic stays local at <4 ms while mutations and 5-second RYW windows route to the regional leaseholder."
+      },
+      "markdownContent": "```sql\n-- 1. PA/EL Catalog Read (< 4ms on local ap-south-1 follower)\nSELECT sku_id, price_cents, title\nFROM catalog\nAS OF SYSTEM TIME follower_read_timestamp()\nWHERE sku_id = 'SKU-9912';\n\n-- 2. PC/EC Geo-Partitioned Order Table (CockroachDB REGIONAL BY ROW)\nALTER TABLE orders SET LOCALITY REGIONAL BY ROW;\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where PACELC workload splitting is used in production",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Every global distributed database exposes explicit PACELC knobs:",
+        "core": "- **CockroachDB & YugabyteDB**: `REGIONAL BY ROW` tables pin leaseholders to user geography while `follower_read_timestamp()` serves global `GLOBAL` catalog tables locally.\n- **Google Spanner**: Uses TrueTime (`< 7 ms` uncertainty) to serve stale reads (`exact_staleness = 15s`) at any replica with zero lock contention.",
+        "deepDive": "In production deployments of CAP & PACELC Consistency-Latency Trade-Offs, watch how where pacelc workload splitting is used in production interacts with tail latency, retry amplification, and partial failures. Even with zero network partitions, PC/EC multi-region Raft clusters pay cross-continent quorum and leaseholder RTTs on every read and write, blowing past tail-latency SLAs."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "cap-theorem-consistency",
+          "title": "Concept: CAP Theorem & Consistency Models",
+          "kind": "concept"
+        },
+        {
+          "slug": "consistency-replication",
+          "title": "Concept: Consistency & Replication",
+          "kind": "concept"
+        },
+        {
+          "slug": "multi-region-active",
+          "title": "Concept: Multi-Region Active-Active",
+          "kind": "concept"
+        },
+        {
+          "slug": "read-your-own",
+          "title": "System Design: Read-Your-Own-Writes Consistency",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "How do you prevent Read-Your-Own-Writes (RYW) anomalies when serving 95% of reads via `AS OF SYSTEM TIME '-5s'` local follower reads?",
+      "options": [
+        {
+          "id": "a",
+          "text": "Record the mutation's HLC timestamp in a short-lived session cookie/header and route that user's reads to the leaseholder for the 5-second staleness window",
+          "correct": true,
+          "feedback": "Correct: routing only recent writers to the leaseholder preserves RYW while keeping 95%+ of traffic on <4 ms local followers."
+        },
+        {
+          "id": "b",
+          "text": "Disable Hybrid Logical Clocks so followers always serve the highest local timestamp regardless of commit status",
+          "correct": false,
+          "feedback": "Disabling HLC breaks causal snapshot consistency across replicas."
+        },
+        {
+          "id": "c",
+          "text": "Force every catalog read to acquire a 3-continent Raft quorum",
+          "correct": false,
+          "feedback": "Quorum reads reintroduce the 195 ms+ speed-of-light penalty on all 57,000 RPS."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "How do you prevent Read-Your-Own-Writes (RYW) anomalies when serving 95% of reads via `AS OF SYSTEM TIME '-5s'` local follower reads?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Record the mutation's HLC timestamp in a short-lived session cookie/header and route that user's reads to the leaseholder for the 5-second staleness window",
+            "correct": true,
+            "feedback": "Correct: routing only recent writers to the leaseholder preserves RYW while keeping 95%+ of traffic on <4 ms local followers."
+          },
+          {
+            "id": "b",
+            "text": "Disable Hybrid Logical Clocks so followers always serve the highest local timestamp regardless of commit status",
+            "correct": false,
+            "feedback": "Disabling HLC breaks causal snapshot consistency across replicas."
+          },
+          {
+            "id": "c",
+            "text": "Force every catalog read to acquire a 3-continent Raft quorum",
+            "correct": false,
+            "feedback": "Quorum reads reintroduce the 195 ms+ speed-of-light penalty on all 57,000 RPS."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why CAP alone misses the everyday speed-of-light tax', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "CAP only describes behavior during a network partition (P).",
+            "correct": true,
+            "feedback": "Correct: CAP only describes behavior during a network partition (P)."
+          },
+          {
+            "id": "b",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "c",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          }
+        ]
+      },
+      {
+        "question": "Regarding '390 ms checkout latency and 11,700 pinned connections', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "When Raft leaseholders sit in us-east-1: 1.",
+            "correct": true,
+            "feedback": "Correct: When Raft leaseholders sit in us-east-1: 1."
+          },
+          {
+            "id": "b",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "c",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** CAP only describes behavior during a network partition (`P`).\n\n**How It Flows:** Think of CAP & PACELC Consistency-Latency Trade-Offs as a clear step-by-step chain: us-east-1 (Lease) -> eu-west-1 (75ms) -> ap-south-1 (195ms) -> API Edge Router -> Local Follower (<4ms).\n\n**Why Beginners Should Care:** Apply PACELC per workload: keep monetary/inventory writes PC/EC on regional leaseholders, and serve 95% catalog reads PA/EL via local follower reads (`AS OF SYSTEM TIME '-5s'`).",
+      "spark": {
+        "summary": "CAP only describes behavior during a network partition (`P`).",
+        "keyTakeaway": "Apply PACELC per workload: keep monetary/inventory writes PC/EC on regional leaseholders, and serve 95% catalog reads PA/EL via local follower reads (`AS OF SYSTEM TIME '-5s'`)."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why CAP alone misses the everyday speed-of-light tax",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why CAP alone misses the everyday speed-of-light tax works from first principles.",
+          "explanation": "CAP only describes behavior during a network partition (`P`). In practice, partitions are rare, while **Else (`E`, normal operation)** is 99.99% of production time. Under PACELC, a `PC/EC` database (like multi-region Raft/Paxos) still pays cross-ocean RTTs (`195 ms` US-IN, `75 ms` US-EU) on every linearizable read and quorum write even when every link is healthy.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "390 ms checkout latency and 11,700 pinned connections",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without 390 ms checkout latency and 11,700 pinned connections under real concurrency or scale.",
+          "explanation": "When Raft leaseholders sit in `us-east-1`: 1. **Read & Write RTT Amplification**: `ap-south-1` catalog reads (`57,000 RPS`) travel `195 ms` to the remote leaseholder; `ap-south-1` writes wait for `IN-US` + quorum replication (`390 ms+` p99). 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "quorum-cluster",
+            "eyebrow": "Geo-Distributed Raft Quorum",
+            "title": "PC/EC Remote Leaseholder Tax vs. Regional Homing",
+            "nodes": [
+              {
+                "label": "us-east-1 (Lease)",
+                "role": "3,000 w/s + US reads"
+              },
+              {
+                "label": "eu-west-1 (75ms)",
+                "role": "Follower read <4ms (-5s)"
+              },
+              {
+                "label": "ap-south-1 (195ms)",
+                "role": "Follower read <4ms (-5s)"
+              }
+            ],
+            "edges": [
+              {
+                "label": "US-EU 75ms / US-IN 195ms"
+              }
+            ],
+            "summary": "Serving catalog reads from local followers cuts 57,000 RPS from 195 ms to <4 ms, slashing open connections 50x."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive fixes (and why they break durability or RYW)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "The problem: see what breaks without Naive fixes under real concurrency or scale.",
+          "explanation": "Two naive shortcuts fail in production: **Co-Locating All 3 Raft Replicas in One Region**: Achieves `< 5 ms` writes, but a single region outage loses quorum and availability. **Unbounded Async Follower Reads**: A user updates their shipping address, refreshes, hits a follower `5 s` behind, and sees the old address (Read-Your-Own-Writes violation).",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Workload-Split PACELC + Bounded Staleness",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Split workloads explicitly across `PC/EC` and `PA/EL`: **Catalog Reads (`95%` = `57,000 RPS`, `PA/EL`)**: Serve from local regional replicas with bounded staleness (`AS OF SYSTEM TIME '-5s'`), cutting latency from `195 ms` to `< 4 ms` and open connections from `11,700` to `228`.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Workload-Split PACELC",
+            "title": "HLC Session Router: Local Follower Reads vs. Leaseholder Writes",
+            "nodes": [
+              {
+                "label": "API Edge Router",
+                "role": "Checks last_write_hlc cookie"
+              },
+              {
+                "label": "Local Follower (<4ms)",
+                "role": "PA/EL catalog AS OF -5s"
+              },
+              {
+                "label": "Regional Leaseholder",
+                "role": "PC/EC 3-AZ local quorum (<8ms)"
+              },
+              {
+                "label": "Remote DR Replicas",
+                "role": "HLC --max-offset=250ms"
+              }
+            ],
+            "edges": [
+              {
+                "label": "95% catalog -> local"
+              },
+              {
+                "label": "5% write / RYW -> lease"
+              }
+            ],
+            "summary": "Catalog traffic stays local at <4 ms while mutations and 5-second RYW windows route to the regional leaseholder."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Apply PACELC per workload: keep monetary/inventory writes PC/EC on regional leaseholders, and serve 95% catalog reads PA/EL via local follower reads (`AS OF SYSTEM TIME '-5s'`).",
+      "summary": "Even with zero network partitions, PC/EC multi-region Raft clusters pay cross-continent quorum and leaseholder RTTs on every read and write, blowing past tail-latency SLAs.",
+      "keyTakeaway": "When a single bottleneck threatens end-to-end availability, apply PACELC per workload: keep monetary/inventory writes PC/EC on regional leaseholders, and serve 95% catalog reads PA/EL via local follower reads (`AS OF SYSTEM TIME '-5s'`) with HLC session tokens for read-your-own-writes."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** CAP only describes behavior during a network partition (`P`). In practice, partitions are rare, while **Else (`E`, normal operation)** is 99.99% of production time.\n\n**Visual & Structural Flow:** Depicts PC/EC Remote Leaseholder Tax vs. Regional Homing (us-east-1 (Lease) -> eu-west-1 (75ms) -> ap-south-1 (195ms)); HLC Session Router: Local Follower Reads vs. Leaseholder Writes (API Edge Router -> Local Follower (<4ms) -> Regional Leaseholder -> Remote DR Replicas).\n\n**Trade-Offs & Production:** Two naive shortcuts fail in production: **Co-Locating All 3 Raft Replicas in One Region**: Achieves `< 5 ms` writes, but a single region outage loses quorum and availability. Every global distributed database exposes explicit PACELC knobs: **CockroachDB & YugabyteDB**: `REGIONAL BY ROW` tables pin leaseholders to user geography while.\n\n**Failure Modes & Application:** Every global distributed database exposes explicit PACELC knobs: **CockroachDB & YugabyteDB**: `REGIONAL BY ROW` tables pin leaseholders to user geography while `follower_read_timestamp()` serves global `GLOBAL` catalog tables locally.",
+      "spark": {
+        "summary": "Even with zero network partitions, PC/EC multi-region Raft clusters pay cross-continent quorum and leaseholder RTTs on every read and write, blowing past tail-latency SLAs.",
+        "keyTakeaway": "Apply PACELC per workload: keep monetary/inventory writes PC/EC on regional leaseholders, and serve 95% catalog reads PA/EL via local follower reads (`AS OF SYSTEM TIME '-5s'`) with HLC session tokens for read-your-own-writes."
+      },
+      "summary": "Even with zero network partitions, PC/EC multi-region Raft clusters pay cross-continent quorum and leaseholder RTTs on every read and write, blowing past tail-latency SLAs.",
+      "keyTakeaway": "When a single bottleneck threatens end-to-end availability, apply PACELC per workload: keep monetary/inventory writes PC/EC on regional leaseholders, and serve 95% catalog reads PA/EL via local follower reads (`AS OF SYSTEM TIME '-5s'`) with HLC session tokens for read-your-own-writes."
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** Even with zero network partitions, PC/EC multi-region Raft clusters pay cross-continent quorum and leaseholder RTTs on every read and write, blowing past tail-latency SLAs.\n\n**Production Trade-Offs:** Two naive shortcuts fail in production: **Co-Locating All 3 Raft Replicas in One Region**: Achieves `< 5 ms` writes, but a single region outage loses quorum and availability.\n\n**Failure Modes & Edge Cases:** Every global distributed database exposes explicit PACELC knobs: **CockroachDB & YugabyteDB**: `REGIONAL BY ROW` tables pin leaseholders to user geography while `follower_read_timestamp()` serves global `GLOBAL` catalog tables locally.\n\n**Principal Takeaway:** Apply PACELC per workload: keep monetary/inventory writes PC/EC on regional leaseholders, and serve 95% catalog reads PA/EL via local follower reads (`AS OF SYSTEM TIME '-5s'`) with HLC session tokens for read-your-own-writes.",
+      "spark": {
+        "summary": "Even with zero network partitions, PC/EC multi-region Raft clusters pay cross-continent quorum and leaseholder RTTs on every read and write, blowing past tail-latency SLAs.",
+        "keyTakeaway": "Apply PACELC per workload: keep monetary/inventory writes PC/EC on regional leaseholders, and serve 95% catalog reads PA/EL via local follower reads (`AS OF SYSTEM TIME '-5s'`) with HLC session tokens for read-your-own-writes."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why CAP alone misses the everyday speed-of-light tax",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why CAP alone misses the everyday speed-of-light tax works from first principles.",
+          "explanation": "CAP only describes behavior during a network partition (`P`). In practice, partitions are rare, while **Else (`E`, normal operation)** is 99.99% of production time. Under PACELC, a `PC/EC` database (like multi-region Raft/Paxos) still pays cross-ocean RTTs (`195 ms` US-IN, `75 ms` US-EU) on every linearizable read and quorum write even when every link is healthy.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "390 ms checkout latency and 11,700 pinned connections",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without 390 ms checkout latency and 11,700 pinned connections under real concurrency or scale.",
+          "explanation": "When Raft leaseholders sit in `us-east-1`:\n\n1. **Read & Write RTT Amplification**: `ap-south-1` catalog reads (`57,000 RPS`) travel `195 ms` to the remote leaseholder; `ap-south-1` writes wait for `IN-US` + quorum replication (`390 ms+` p99).\n2. **Connection Pool Bloat**: `60,000 RPS × 0.195 s = 11,700` concurrent open DB connections just waiting on speed-of-light travel.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "quorum-cluster",
+            "eyebrow": "Geo-Distributed Raft Quorum",
+            "title": "PC/EC Remote Leaseholder Tax vs. Regional Homing",
+            "nodes": [
+              {
+                "label": "us-east-1 (Lease)",
+                "role": "3,000 w/s + US reads"
+              },
+              {
+                "label": "eu-west-1 (75ms)",
+                "role": "Follower read <4ms (-5s)"
+              },
+              {
+                "label": "ap-south-1 (195ms)",
+                "role": "Follower read <4ms (-5s)"
+              }
+            ],
+            "edges": [
+              {
+                "label": "US-EU 75ms / US-IN 195ms"
+              }
+            ],
+            "summary": "Serving catalog reads from local followers cuts 57,000 RPS from 195 ms to <4 ms, slashing open connections 50x."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive fixes (and why they break durability or RYW)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "The problem: see what breaks without Naive fixes under real concurrency or scale.",
+          "explanation": "Two naive shortcuts fail in production:\n\n- **Co-Locating All 3 Raft Replicas in One Region**: Achieves `< 5 ms` writes, but a single region outage loses quorum and availability.\n- **Unbounded Async Follower Reads**: A user updates their shipping address, refreshes, hits a follower `5 s` behind, and sees the old address (Read-Your-Own-Writes violation).",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Workload-Split PACELC + Bounded Staleness",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Split workloads explicitly across `PC/EC` and `PA/EL`:\n\n- **Catalog Reads (`95%` = `57,000 RPS`, `PA/EL`)**: Serve from local regional replicas with bounded staleness (`AS OF SYSTEM TIME '-5s'`), cutting latency from `195 ms` to `< 4 ms` and open connections from `11,700` to `228`.\n- **Geo-Partitioned Writes (`5%` = `3,000 RPS`, `PC/EC`)**: Home user/order Raft ranges to the user's region (5-replica Raft: 3 in home region for `< 8 ms` local quorum, 2 remote for DR) while keeping global inventory/wallet writes strongly consistent.\n- **Read-Your-Own-Writes Guard**: Attach an HLC session cookie (`last_write_hlc`) for `5 s` after a mutation to route that user's reads to the leaseholder.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Workload-Split PACELC",
+            "title": "HLC Session Router: Local Follower Reads vs. Leaseholder Writes",
+            "nodes": [
+              {
+                "label": "API Edge Router",
+                "role": "Checks last_write_hlc cookie"
+              },
+              {
+                "label": "Local Follower (<4ms)",
+                "role": "PA/EL catalog AS OF -5s"
+              },
+              {
+                "label": "Regional Leaseholder",
+                "role": "PC/EC 3-AZ local quorum (<8ms)"
+              },
+              {
+                "label": "Remote DR Replicas",
+                "role": "HLC --max-offset=250ms"
+              }
+            ],
+            "edges": [
+              {
+                "label": "95% catalog -> local"
+              },
+              {
+                "label": "5% write / RYW -> lease"
+              }
+            ],
+            "summary": "Catalog traffic stays local at <4 ms while mutations and 5-second RYW windows route to the regional leaseholder."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where PACELC workload splitting is used in production",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Every global distributed database exposes explicit PACELC knobs:\n\n- **CockroachDB & YugabyteDB**: `REGIONAL BY ROW` tables pin leaseholders to user geography while `follower_read_timestamp()` serves global `GLOBAL` catalog tables locally.\n- **Google Spanner**: Uses TrueTime (`< 7 ms` uncertainty) to serve stale reads (`exact_staleness = 15s`) at any replica with zero lock contention.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Apply PACELC per workload: keep monetary/inventory writes PC/EC on regional leaseholders, and serve 95% catalog reads PA/EL via local follower reads (`AS OF SYSTEM TIME '-5s'`) with HLC session tokens for read-your-own-writes.",
+      "summary": "Even with zero network partitions, PC/EC multi-region Raft clusters pay cross-continent quorum and leaseholder RTTs on every read and write, blowing past tail-latency SLAs.",
+      "keyTakeaway": "When a single bottleneck threatens end-to-end availability, apply PACELC per workload: keep monetary/inventory writes PC/EC on regional leaseholders, and serve 95% catalog reads PA/EL via local follower reads (`AS OF SYSTEM TIME '-5s'`) with HLC session tokens for read-your-own-writes."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "simulation": {
+    "title": "CAP & PACELC Consistency-Latency Trade-Offs — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Input Workload"
+      },
+      {
+        "id": "entry",
+        "label": "Router / API",
+        "role": "Admission Control"
+      },
+      {
+        "id": "worker",
+        "label": "Processor",
+        "role": "Domain Logic"
+      },
+      {
+        "id": "store",
+        "label": "State Layer",
+        "role": "Durable Store"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "entry",
+        "label": "request"
+      },
+      {
+        "from": "entry",
+        "to": "worker",
+        "label": "dispatch"
+      },
+      {
+        "from": "worker",
+        "to": "store",
+        "label": "read/write"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why CAP alone misses the everyday speed-of-light tax",
+        "actionLabel": "request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "entry"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "request",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Caller sends work to Router / API (Why CAP alone misses the everyday speed-of-light tax)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "390 ms checkout latency and 11,700 pinned connections",
+        "actionLabel": "dispatch",
+        "status": "healthy",
+        "activeNodeIds": [
+          "entry",
+          "worker"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "dispatch",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Router / API coordinates with Processor while preserving the core invariant (390 ms checkout latency and 11,700 pinned connections)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Naive fixes (and why they break durability or RYW)",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "worker",
+          "store"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, State Layer absorbs pressure without cascading (Naive fixes (and why they break durability or RYW))."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Where PACELC workload splitting is used in production",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "entry",
+          "worker",
+          "store"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Where PACELC workload splitting is used in production)."
+      }
+    ]
+  }
+}

@@ -1,0 +1,833 @@
+{
+  "id": "spring-blocking-io",
+  "slug": "spring-blocking-io",
+  "title": "Migrate a Blocking Spring Boot Service to Java Virtual Threads Without Pinning",
+  "problemType": "system-design",
+  "difficulty": "hard",
+  "prompt": "After enabling Java 21 virtual threads in a Spring Boot API that fans out to 3 REST services and Postgres, P99 latency spikes under load and JFR shows `jdk.VirtualThreadPinned` events. Diagnose and fix.",
+  "spark": {
+    "summary": "Diagnose carrier-thread pinning, HikariCP connection exhaustion, and ThreadLocal memory bloat when enabling Java 21+ Virtual Threads on a high-throughput Spring Boot service.",
+    "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, enable spring.threads.virtual.enabled=true, swap synchronized I/O guards for ReentrantLock, bound downstream fan-out with Semaphores, and replace ThreadLocal caches with ScopedValue.",
+    "byteSummary": "**Core Mechanics:** After enabling Java 21 Virtual Threads (`spring.threads.virtual.enabled=true`) in a Spring Boot API fanning out to **3 REST services and Postgres** at **10,000+ req/s**, p99 latency spikes under load and JFR emits `jdk.VirtualThreadPinned` events.\n\n**Visual & Structural Flow:** Depicts synchronized Pinning vs. ReentrantLock Unmounting (VirtualThread #1 -> OS Carrier (Core 1) -> VirtualThread #2 -> Postgres / REST); Unmounted I/O Fan-Out with Structured Concurrency & Bulkheads (Tomcat (VT Enabled) -> ReentrantLock -> Semaphore / Hikari -> StructuredTaskScope).\n\n**Trade-Offs & Production:** Simply flipping `spring.threads.virtual.enabled=true` without auditing JDBC drivers, `synchronized` blocks, `ThreadLocal`s, and HikariCP pool sizes leaves. Migrate Spring Boot imperative services safely to 10,000+ RPS on Java 21: **Eliminate Pinning**: Enable `-Djdk.tracePinnedThreads=full` / JFR `jdk.VirtualThreadPinned` in staging.\n\n**Failure Modes & Application:** Virtual threads bridge imperative simplicity with reactive scalability: **BFF & API Aggregators**: Fanning out to multiple REST/gRPC/DB backends concurrently with `StructuredTaskScope`."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why Virtual Threads & Pinning Prevention Matter",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "Think of **Why Virtual Threads & Pinning Prevention Matter** as the intuition layer for Migrate a Blocking Spring Boot Service to Java Virtual Threads Without Pinning: The mechanism: understand how Why Virtual Threads & Pinning Prevention Matter works from first principles.",
+        "core": "After enabling Java 21 Virtual Threads (`spring.threads.virtual.enabled=true`) in a Spring Boot API fanning out to **3 REST services and Postgres** at **10,000+ req/s**, p99 latency spikes under load and JFR emits `jdk.VirtualThreadPinned` events. While keeping imperative JDBC/`RestClient` code, we must eliminate carrier-thread pinning and bound downstream fan-out.",
+        "deepDive": "Under heavy load or partial failure, why virtual threads & pinning prevention matter becomes a critical lever for predictable latency and correctness. Diagnose carrier-thread pinning, HikariCP connection exhaustion, and ThreadLocal memory bloat when enabling Java 21+ Virtual Threads on a high-throughput Spring Boot service."
+      },
+      "purpose": "The mechanism: understand how Why Virtual Threads & Pinning Prevention Matter works from first principles."
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "Real-World Impact of Carrier-Thread Pinning",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "In Java 21, virtual threads are multiplexed onto a small pool of OS carrier threads (sized to CPU cores):",
+        "core": "1. **Carrier Pinning (`synchronized`)**: Blocking on JDBC/HTTP inside a `synchronized` block pins the virtual thread to its OS carrier thread—starving all other virtual threads.\n2. **Downstream Pool Exhaustion**: Spawning 10,000+ concurrent virtual threads without a bulkhead slams Postgres `max_connections`.\n3. **ThreadLocal Memory Bloat**: Legacy `ThreadLocal` buffers (`SimpleDateFormat`, byte arrays) duplicated across 100k virtual threads exhaust heap.",
+        "deepDive": "In production deployments of Migrate a Blocking Spring Boot Service to Java Virtual Threads Without Pinning, watch how real-world impact of carrier-thread pinning interacts with tail latency, retry amplification, and partial failures. Diagnose carrier-thread pinning, HikariCP connection exhaustion, and ThreadLocal memory bloat when enabling Java 21+ Virtual Threads on a high-throughput Spring Boot service."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Virtual Thread Carrier Scheduling",
+        "title": "synchronized Pinning vs. ReentrantLock Unmounting",
+        "actors": [
+          {
+            "id": "vt1",
+            "label": "VirtualThread #1"
+          },
+          {
+            "id": "car",
+            "label": "OS Carrier (Core 1)"
+          },
+          {
+            "id": "vt2",
+            "label": "VirtualThread #2"
+          },
+          {
+            "id": "db",
+            "label": "Postgres / REST"
+          }
+        ],
+        "events": [
+          {
+            "from": "vt1",
+            "to": "car",
+            "label": "Naive: synchronized { jdbc.query() }",
+            "status": "fail"
+          },
+          {
+            "from": "vt2",
+            "to": "car",
+            "label": "Pinned! VT#2 starved waiting for carrier",
+            "status": "fail"
+          },
+          {
+            "from": "vt1",
+            "to": "car",
+            "label": "Fixed: ReentrantLock.lock() + jdbc.query()",
+            "status": "ok"
+          },
+          {
+            "from": "car",
+            "to": "vt2",
+            "label": "VT#1 unmounts on I/O -> VT#2 runs on carrier!",
+            "status": "ok"
+          }
+        ],
+        "summary": "Replacing synchronized around blocking I/O with ReentrantLock lets virtual threads unmount cleanly from OS carriers."
+      },
+      "purpose": "The problem: see what breaks without Real-World Impact of Carrier-Thread Pinning under real concurrency or scale.",
+      "decisionFramework": {
+        "problem": "How to implement Migrate a Blocking Spring Boot Service to Java Virtual Threads Without Pinning without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "To keep the architecture evolvable without sacrificing reliability, enable spring.threads.virtual.enabled=true, swap synchronized I/O guards for ReentrantLock, bound downstream fan-out with Semaphores, and replace ThreadLocal caches with ScopedValue.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Migrate a Blocking Spring Boot Service to Java Virtual Threads Without Pinning experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Naive Solution (and Why It Breaks)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Think of **Naive Solution (and Why It Breaks)** as the intuition layer for Migrate a Blocking Spring Boot Service to Java Virtual Threads Without Pinning: The problem: see what breaks without Naive Solution under real concurrency or scale.",
+        "core": "Simply flipping `spring.threads.virtual.enabled=true` without auditing JDBC drivers, `synchronized` blocks, `ThreadLocal`s, and HikariCP pool sizes leaves `jdk.VirtualThreadPinned` stalls intact and causes HikariCP `connectionTimeout` storms when 10,000 virtual threads compete for 20 DB connections.",
+        "deepDive": "Under heavy load or partial failure, naive solution (and why it breaks) becomes a critical lever for predictable latency and correctness. Diagnose carrier-thread pinning, HikariCP connection exhaustion, and ThreadLocal memory bloat when enabling Java 21+ Virtual Threads on a high-throughput Spring Boot service."
+      },
+      "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Request & State Flow",
+        "title": "Naive Solution (and Why It Breaks)",
+        "actors": [
+          {
+            "id": "tx",
+            "label": "Client Tx"
+          },
+          {
+            "id": "plan",
+            "label": "Planner / Lock Mgr"
+          },
+          {
+            "id": "wal",
+            "label": "WAL / MemTable"
+          },
+          {
+            "id": "disk",
+            "label": "Heap / SSTable"
+          }
+        ],
+        "events": [
+          {
+            "from": "tx",
+            "to": "plan",
+            "label": "Acquire snapshot / index plan"
+          },
+          {
+            "from": "plan",
+            "to": "wal",
+            "label": "Append redo record + fsync WAL"
+          },
+          {
+            "from": "wal",
+            "to": "disk",
+            "label": "Flush dirty pages / compact SSTables"
+          },
+          {
+            "from": "plan",
+            "to": "tx",
+            "label": "Commit & release row locks"
+          }
+        ]
+      }
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise Solution: `ReentrantLock`, `Semaphore` Bulkheads & `ScopedValue`",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": {
+        "foundation": "Migrate Spring Boot imperative services safely to 10,000+ RPS on Java 21:",
+        "core": "- **Eliminate Pinning**: Enable `-Djdk.tracePinnedThreads=full` / JFR `jdk.VirtualThreadPinned` in staging; replace `synchronized` blocks guarding I/O (and upgrade older JDBC/logging libraries) with `ReentrantLock`.\n- **Bound Downstream Concurrency**: Never pool virtual threads (`newVirtualThreadPerTaskExecutor()`); use `Semaphore` bulkheads and `StructuredTaskScope.ShutdownOnFailure` for the 3-way REST + Postgres fan-out.\n- **Replace `ThreadLocal` with `ScopedValue`**: Pass request/trace context via immutable `ScopedValue`s instead of heavy per-thread `ThreadLocal` caches.",
+        "deepDive": "In production deployments of Migrate a Blocking Spring Boot Service to Java Virtual Threads Without Pinning, watch how enterprise solution: `reentrantlock`, `semaphore` bulkheads & `scopedvalue` interacts with tail latency, retry amplification, and partial failures. Diagnose carrier-thread pinning, HikariCP connection exhaustion, and ThreadLocal memory bloat when enabling Java 21+ Virtual Threads on a high-throughput Spring Boot service."
+      },
+      "sectionDiagram": {
+        "kind": "cache-tier",
+        "eyebrow": "Java 21 Virtual Thread Architecture",
+        "title": "Unmounted I/O Fan-Out with Structured Concurrency & Bulkheads",
+        "nodes": [
+          {
+            "label": "Tomcat (VT Enabled)",
+            "role": "10,000+ virtual threads"
+          },
+          {
+            "label": "ReentrantLock",
+            "role": "Zero carrier pinning"
+          },
+          {
+            "label": "Semaphore / Hikari",
+            "role": "Bounded DB & REST fan-out"
+          },
+          {
+            "label": "StructuredTaskScope",
+            "role": "3 REST + PG parallel"
+          }
+        ],
+        "edges": [
+          {
+            "label": "Unmounts on I/O"
+          },
+          {
+            "label": "Fail-fast cancel"
+          }
+        ],
+        "cards": [
+          {
+            "label": "ReentrantLock",
+            "detail": "Allows JVM to park/unmount virtual thread during I/O wait."
+          },
+          {
+            "label": "Structured Fan-Out",
+            "detail": "ShutdownOnFailure cancels remaining REST calls if one fails."
+          },
+          {
+            "label": "ScopedValue",
+            "detail": "Zero-copy immutable context inherited by child virtual threads."
+          },
+          {
+            "label": "JFR Audit",
+            "detail": "Monitor jdk.VirtualThreadPinned events in CI load tests."
+          }
+        ],
+        "summary": "ReentrantLock, Semaphore bulkheads, and StructuredTaskScope unlock 10k+ RPS imperative Java without carrier pinning."
+      },
+      "markdownContent": "```java\nimport java.util.concurrent.*;\nimport java.util.concurrent.locks.ReentrantLock;\n\npublic class OrderAggregationService {\n    private final ReentrantLock cacheLock = new ReentrantLock();\n    private final Semaphore dbBulkhead = new Semaphore(50);\n\n    public OrderView fetchOrder(String orderId) throws Exception {\n        try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {\n            var pricing = scope.fork(() -> callPricingApi(orderId));\n            var inventory = scope.fork(() -> callInventoryApi(orderId));\n            var ledger = scope.fork(() -> queryPostgresBounded(orderId));\n            scope.join().throwIfFailed();\n            return new OrderView(pricing.get(), inventory.get(), ledger.get());\n        }\n    }\n\n    private LedgerRow queryPostgresBounded(String id) throws InterruptedException {\n        dbBulkhead.acquire();\n        try {\n            return jdbcTemplate.queryForObject(\"SELECT * FROM orders WHERE id=?\", rowMapper, id);\n        } finally {\n            dbBulkhead.release();\n        }\n    }\n}\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where Virtual Threads Apply in System Design",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Virtual threads bridge imperative simplicity with reactive scalability:",
+        "core": "- **BFF & API Aggregators**: Fanning out to multiple REST/gRPC/DB backends concurrently with `StructuredTaskScope`.\n- **High-Concurrency Spring Boot Microservices**: Replaces complex WebFlux reactive chains when libraries are blocking.\n- **Legacy JDBC Services**: Scales connection-waiting concurrency without rewriting SQL layers.",
+        "deepDive": "In production deployments of Migrate a Blocking Spring Boot Service to Java Virtual Threads Without Pinning, watch how where virtual threads apply in system design interacts with tail latency, retry amplification, and partial failures. Diagnose carrier-thread pinning, HikariCP connection exhaustion, and ThreadLocal memory bloat when enabling Java 21+ Virtual Threads on a high-throughput Spring Boot service."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "java-virtual-threads",
+          "title": "Concept: Java Virtual Threads & Structured Concurrency",
+          "kind": "concept"
+        },
+        {
+          "slug": "bulkhead-fault-isolation",
+          "title": "Concept: Bulkhead & Fault Isolation",
+          "kind": "concept"
+        },
+        {
+          "slug": "connection-pool-tuning",
+          "title": "Concept: Connection Pool Tuning",
+          "kind": "concept"
+        },
+        {
+          "slug": "design-ai-agent",
+          "title": "System Design: AI Agent Task Orchestrator",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why does `synchronized` around a blocking JDBC call degrade throughput under Java 21 Virtual Threads?",
+      "options": [
+        {
+          "id": "a",
+          "text": "Entering a `synchronized` monitor pins the virtual thread to its OS carrier thread, preventing other virtual threads from using that core during I/O",
+          "correct": true,
+          "feedback": "Correct: replacing `synchronized` with `ReentrantLock` allows the virtual thread to unmount cleanly while waiting on I/O."
+        },
+        {
+          "id": "b",
+          "text": "Java 21 throws `UnsupportedOperationException` on `synchronized` inside virtual threads",
+          "correct": false,
+          "feedback": "It still executes, but pins the carrier thread."
+        },
+        {
+          "id": "c",
+          "text": "JDBC drivers automatically bypass `synchronized` blocks on virtual threads",
+          "correct": false,
+          "feedback": "JDBC drivers using `synchronized` internally (older versions) are a common source of pinning."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why does `synchronized` around a blocking JDBC call degrade throughput under Java 21 Virtual Threads?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Entering a `synchronized` monitor pins the virtual thread to its OS carrier thread, preventing other virtual threads from using that core during I/O",
+            "correct": true,
+            "feedback": "Correct: replacing `synchronized` with `ReentrantLock` allows the virtual thread to unmount cleanly while waiting on I/O."
+          },
+          {
+            "id": "b",
+            "text": "Java 21 throws `UnsupportedOperationException` on `synchronized` inside virtual threads",
+            "correct": false,
+            "feedback": "It still executes, but pins the carrier thread."
+          },
+          {
+            "id": "c",
+            "text": "JDBC drivers automatically bypass `synchronized` blocks on virtual threads",
+            "correct": false,
+            "feedback": "JDBC drivers using `synchronized` internally (older versions) are a common source of pinning."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why Virtual Threads & Pinning Prevention Matter', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "After enabling Java 21 Virtual Threads (spring.threads.virtual.enabled=true) in a Spring Boot API fanning out to **3 REST services and Postgres** at **10,000+ req/s**, p99…",
+            "correct": true,
+            "feedback": "Correct: After enabling Java 21 Virtual Threads (spring.threads.virtual.enabled=true) in a Spring Boot API fanning out to **3 REST services and Postgres** at **10,000+ req/s**, p99…"
+          },
+          {
+            "id": "b",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "c",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Real-World Impact of Carrier-Thread Pinning', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "b",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "c",
+            "text": "In Java 21, virtual threads are multiplexed onto a small pool of OS carrier threads (sized to CPU cores): 1.",
+            "correct": true,
+            "feedback": "Correct: In Java 21, virtual threads are multiplexed onto a small pool of OS carrier threads (sized to CPU cores): 1."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** After enabling Java 21 Virtual Threads (`spring.threads.virtual.enabled=true`) in a Spring Boot API fanning out to **3 REST services and Postgres** at **10,000+ req/s**, p99 latency spikes under load and JFR emits `jdk.VirtualThreadPinned` events.\n\n**How It Flows:** Think of Migrate a Blocking Spring Boot Service to Java Virtual Threads Without Pinning as a clear step-by-step chain: VirtualThread #1 -> OS Carrier (Core 1) -> VirtualThread #2 -> Postgres / REST -> Tomcat (VT Enabled).\n\n**Why Beginners Should Care:** Enable spring.threads.virtual.enabled=true, swap synchronized I/O guards for ReentrantLock, bound downstream fan-out with Semaphores, and replace ThreadLocal caches with ScopedValue.",
+      "spark": {
+        "summary": "After enabling Java 21 Virtual Threads (`spring.threads.virtual.enabled=true`) in a Spring Boot API fanning out to **3 REST services and Postgres** at **10,000+ req/s**, p99 latency spikes under load and JFR emits `jdk.VirtualThreadPinned` events.",
+        "keyTakeaway": "Enable spring.threads.virtual.enabled=true, swap synchronized I/O guards for ReentrantLock, bound downstream fan-out with Semaphores, and replace ThreadLocal caches with ScopedValue."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why Virtual Threads & Pinning Prevention Matter",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why Virtual Threads & Pinning Prevention Matter works from first principles.",
+          "explanation": "After enabling Java 21 Virtual Threads (`spring.threads.virtual.enabled=true`) in a Spring Boot API fanning out to **3 REST services and Postgres** at **10,000+ req/s**, p99 latency spikes under load and JFR emits `jdk.VirtualThreadPinned` events. While keeping imperative JDBC/`RestClient` code, we must eliminate carrier-thread pinning and bound downstream fan-out.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Real-World Impact of Carrier-Thread Pinning",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without Real-World Impact of Carrier-Thread Pinning under real concurrency or scale.",
+          "explanation": "In Java 21, virtual threads are multiplexed onto a small pool of OS carrier threads (sized to CPU cores): 1. **Carrier Pinning (`synchronized`)**: Blocking on JDBC/HTTP inside a `synchronized` block pins the virtual thread to its OS carrier thread—starving all other virtual threads. 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Virtual Thread Carrier Scheduling",
+            "title": "synchronized Pinning vs. ReentrantLock Unmounting",
+            "actors": [
+              {
+                "id": "vt1",
+                "label": "VirtualThread #1"
+              },
+              {
+                "id": "car",
+                "label": "OS Carrier (Core 1)"
+              },
+              {
+                "id": "vt2",
+                "label": "VirtualThread #2"
+              },
+              {
+                "id": "db",
+                "label": "Postgres / REST"
+              }
+            ],
+            "events": [
+              {
+                "from": "vt1",
+                "to": "car",
+                "label": "Naive: synchronized { jdbc.query() }",
+                "status": "fail"
+              },
+              {
+                "from": "vt2",
+                "to": "car",
+                "label": "Pinned! VT#2 starved waiting for carrier",
+                "status": "fail"
+              },
+              {
+                "from": "vt1",
+                "to": "car",
+                "label": "Fixed: ReentrantLock.lock() + jdbc.query()",
+                "status": "ok"
+              },
+              {
+                "from": "car",
+                "to": "vt2",
+                "label": "VT#1 unmounts on I/O -> VT#2 runs on carrier!",
+                "status": "ok"
+              }
+            ],
+            "summary": "Replacing synchronized around blocking I/O with ReentrantLock lets virtual threads unmount cleanly from OS carriers."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive Solution (and Why It Breaks)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+          "explanation": "Simply flipping `spring.threads.virtual.enabled=true` without auditing JDBC drivers, `synchronized` blocks, `ThreadLocal`s, and HikariCP pool sizes leaves `jdk.VirtualThreadPinned` stalls intact and causes HikariCP `connectionTimeout` storms when 10,000 virtual threads compete for 20 DB connections.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise Solution: `ReentrantLock`, `Semaphore` Bulkheads & `ScopedValue`",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Migrate Spring Boot imperative services safely to 10,000+ RPS on Java 21: **Eliminate Pinning**: Enable `-Djdk.tracePinnedThreads=full` / JFR `jdk.VirtualThreadPinned` in staging; replace `synchronized` blocks guarding I/O (and upgrade older JDBC/logging libraries) with `ReentrantLock`.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Java 21 Virtual Thread Architecture",
+            "title": "Unmounted I/O Fan-Out with Structured Concurrency & Bulkheads",
+            "nodes": [
+              {
+                "label": "Tomcat (VT Enabled)",
+                "role": "10,000+ virtual threads"
+              },
+              {
+                "label": "ReentrantLock",
+                "role": "Zero carrier pinning"
+              },
+              {
+                "label": "Semaphore / Hikari",
+                "role": "Bounded DB & REST fan-out"
+              },
+              {
+                "label": "StructuredTaskScope",
+                "role": "3 REST + PG parallel"
+              }
+            ],
+            "edges": [
+              {
+                "label": "Unmounts on I/O"
+              },
+              {
+                "label": "Fail-fast cancel"
+              }
+            ],
+            "cards": [
+              {
+                "label": "ReentrantLock",
+                "detail": "Allows JVM to park/unmount virtual thread during I/O wait."
+              },
+              {
+                "label": "Structured Fan-Out",
+                "detail": "ShutdownOnFailure cancels remaining REST calls if one fails."
+              },
+              {
+                "label": "ScopedValue",
+                "detail": "Zero-copy immutable context inherited by child virtual threads."
+              },
+              {
+                "label": "JFR Audit",
+                "detail": "Monitor jdk.VirtualThreadPinned events in CI load tests."
+              }
+            ],
+            "summary": "ReentrantLock, Semaphore bulkheads, and StructuredTaskScope unlock 10k+ RPS imperative Java without carrier pinning."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Enable spring.threads.virtual.enabled=true, swap synchronized I/O guards for ReentrantLock, bound downstream fan-out with Semaphores, and replace ThreadLocal caches with ScopedValue.",
+      "summary": "Diagnose carrier-thread pinning, HikariCP connection exhaustion, and ThreadLocal memory bloat when enabling Java 21+ Virtual Threads on a high-throughput Spring Boot service.",
+      "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, enable spring.threads.virtual.enabled=true, swap synchronized I/O guards for ReentrantLock, bound downstream fan-out with Semaphores, and replace ThreadLocal caches with ScopedValue."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** After enabling Java 21 Virtual Threads (`spring.threads.virtual.enabled=true`) in a Spring Boot API fanning out to **3 REST services and Postgres** at **10,000+ req/s**, p99 latency spikes under load and JFR emits `jdk.VirtualThreadPinned` events.\n\n**Visual & Structural Flow:** Depicts synchronized Pinning vs. ReentrantLock Unmounting (VirtualThread #1 -> OS Carrier (Core 1) -> VirtualThread #2 -> Postgres / REST); Unmounted I/O Fan-Out with Structured Concurrency & Bulkheads (Tomcat (VT Enabled) -> ReentrantLock -> Semaphore / Hikari -> StructuredTaskScope).\n\n**Trade-Offs & Production:** Simply flipping `spring.threads.virtual.enabled=true` without auditing JDBC drivers, `synchronized` blocks, `ThreadLocal`s, and HikariCP pool sizes leaves. Migrate Spring Boot imperative services safely to 10,000+ RPS on Java 21: **Eliminate Pinning**: Enable `-Djdk.tracePinnedThreads=full` / JFR `jdk.VirtualThreadPinned` in staging.\n\n**Failure Modes & Application:** Virtual threads bridge imperative simplicity with reactive scalability: **BFF & API Aggregators**: Fanning out to multiple REST/gRPC/DB backends concurrently with `StructuredTaskScope`.",
+      "spark": {
+        "summary": "Diagnose carrier-thread pinning, HikariCP connection exhaustion, and ThreadLocal memory bloat when enabling Java 21+ Virtual Threads on a high-throughput Spring Boot service.",
+        "keyTakeaway": "Enable spring.threads.virtual.enabled=true, swap synchronized I/O guards for ReentrantLock, bound downstream fan-out with Semaphores, and replace ThreadLocal caches with ScopedValue."
+      },
+      "summary": "Diagnose carrier-thread pinning, HikariCP connection exhaustion, and ThreadLocal memory bloat when enabling Java 21+ Virtual Threads on a high-throughput Spring Boot service.",
+      "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, enable spring.threads.virtual.enabled=true, swap synchronized I/O guards for ReentrantLock, bound downstream fan-out with Semaphores, and replace ThreadLocal caches with ScopedValue."
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** Diagnose carrier-thread pinning, HikariCP connection exhaustion, and ThreadLocal memory bloat when enabling Java 21+ Virtual Threads on a high-throughput Spring Boot service.\n\n**Production Trade-Offs:** Simply flipping `spring.threads.virtual.enabled=true` without auditing JDBC drivers, `synchronized` blocks, `ThreadLocal`s, and HikariCP pool sizes leaves `jdk.VirtualThreadPinned` stalls intact and causes HikariCP.\n\n**Failure Modes & Edge Cases:** Virtual threads bridge imperative simplicity with reactive scalability: **BFF & API Aggregators**: Fanning out to multiple REST/gRPC/DB backends concurrently with `StructuredTaskScope`.\n\n**Principal Takeaway:** Enable spring.threads.virtual.enabled=true, swap synchronized I/O guards for ReentrantLock, bound downstream fan-out with Semaphores, and replace ThreadLocal caches with ScopedValue.",
+      "spark": {
+        "summary": "Diagnose carrier-thread pinning, HikariCP connection exhaustion, and ThreadLocal memory bloat when enabling Java 21+ Virtual Threads on a high-throughput Spring Boot service.",
+        "keyTakeaway": "Enable spring.threads.virtual.enabled=true, swap synchronized I/O guards for ReentrantLock, bound downstream fan-out with Semaphores, and replace ThreadLocal caches with ScopedValue."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why Virtual Threads & Pinning Prevention Matter",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why Virtual Threads & Pinning Prevention Matter works from first principles.",
+          "explanation": "After enabling Java 21 Virtual Threads (`spring.threads.virtual.enabled=true`) in a Spring Boot API fanning out to **3 REST services and Postgres** at **10,000+ req/s**, p99 latency spikes under load and JFR emits `jdk.VirtualThreadPinned` events. While keeping imperative JDBC/`RestClient` code, we must eliminate carrier-thread pinning and bound downstream fan-out.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Real-World Impact of Carrier-Thread Pinning",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without Real-World Impact of Carrier-Thread Pinning under real concurrency or scale.",
+          "explanation": "In Java 21, virtual threads are multiplexed onto a small pool of OS carrier threads (sized to CPU cores):\n\n1. **Carrier Pinning (`synchronized`)**: Blocking on JDBC/HTTP inside a `synchronized` block pins the virtual thread to its OS carrier thread—starving all other virtual threads.\n2. **Downstream Pool Exhaustion**: Spawning 10,000+ concurrent virtual threads without a bulkhead slams Postgres `max_connections`.\n3. **ThreadLocal Memory Bloat**: Legacy `ThreadLocal` buffers (`SimpleDateFormat`, byte arrays) duplicated across 100k virtual threads exhaust heap.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Virtual Thread Carrier Scheduling",
+            "title": "synchronized Pinning vs. ReentrantLock Unmounting",
+            "actors": [
+              {
+                "id": "vt1",
+                "label": "VirtualThread #1"
+              },
+              {
+                "id": "car",
+                "label": "OS Carrier (Core 1)"
+              },
+              {
+                "id": "vt2",
+                "label": "VirtualThread #2"
+              },
+              {
+                "id": "db",
+                "label": "Postgres / REST"
+              }
+            ],
+            "events": [
+              {
+                "from": "vt1",
+                "to": "car",
+                "label": "Naive: synchronized { jdbc.query() }",
+                "status": "fail"
+              },
+              {
+                "from": "vt2",
+                "to": "car",
+                "label": "Pinned! VT#2 starved waiting for carrier",
+                "status": "fail"
+              },
+              {
+                "from": "vt1",
+                "to": "car",
+                "label": "Fixed: ReentrantLock.lock() + jdbc.query()",
+                "status": "ok"
+              },
+              {
+                "from": "car",
+                "to": "vt2",
+                "label": "VT#1 unmounts on I/O -> VT#2 runs on carrier!",
+                "status": "ok"
+              }
+            ],
+            "summary": "Replacing synchronized around blocking I/O with ReentrantLock lets virtual threads unmount cleanly from OS carriers."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive Solution (and Why It Breaks)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+          "explanation": "Simply flipping `spring.threads.virtual.enabled=true` without auditing JDBC drivers, `synchronized` blocks, `ThreadLocal`s, and HikariCP pool sizes leaves `jdk.VirtualThreadPinned` stalls intact and causes HikariCP `connectionTimeout` storms when 10,000 virtual threads compete for 20 DB connections.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise Solution: `ReentrantLock`, `Semaphore` Bulkheads & `ScopedValue`",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Migrate Spring Boot imperative services safely to 10,000+ RPS on Java 21:\n\n- **Eliminate Pinning**: Enable `-Djdk.tracePinnedThreads=full` / JFR `jdk.VirtualThreadPinned` in staging; replace `synchronized` blocks guarding I/O (and upgrade older JDBC/logging libraries) with `ReentrantLock`.\n- **Bound Downstream Concurrency**: Never pool virtual threads (`newVirtualThreadPerTaskExecutor()`); use `Semaphore` bulkheads and `StructuredTaskScope.ShutdownOnFailure` for the 3-way REST + Postgres fan-out.\n- **Replace `ThreadLocal` with `ScopedValue`**: Pass request/trace context via immutable `ScopedValue`s instead of heavy per-thread `ThreadLocal` caches.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Java 21 Virtual Thread Architecture",
+            "title": "Unmounted I/O Fan-Out with Structured Concurrency & Bulkheads",
+            "nodes": [
+              {
+                "label": "Tomcat (VT Enabled)",
+                "role": "10,000+ virtual threads"
+              },
+              {
+                "label": "ReentrantLock",
+                "role": "Zero carrier pinning"
+              },
+              {
+                "label": "Semaphore / Hikari",
+                "role": "Bounded DB & REST fan-out"
+              },
+              {
+                "label": "StructuredTaskScope",
+                "role": "3 REST + PG parallel"
+              }
+            ],
+            "edges": [
+              {
+                "label": "Unmounts on I/O"
+              },
+              {
+                "label": "Fail-fast cancel"
+              }
+            ],
+            "cards": [
+              {
+                "label": "ReentrantLock",
+                "detail": "Allows JVM to park/unmount virtual thread during I/O wait."
+              },
+              {
+                "label": "Structured Fan-Out",
+                "detail": "ShutdownOnFailure cancels remaining REST calls if one fails."
+              },
+              {
+                "label": "ScopedValue",
+                "detail": "Zero-copy immutable context inherited by child virtual threads."
+              },
+              {
+                "label": "JFR Audit",
+                "detail": "Monitor jdk.VirtualThreadPinned events in CI load tests."
+              }
+            ],
+            "summary": "ReentrantLock, Semaphore bulkheads, and StructuredTaskScope unlock 10k+ RPS imperative Java without carrier pinning."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where Virtual Threads Apply in System Design",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Virtual threads bridge imperative simplicity with reactive scalability:\n\n- **BFF & API Aggregators**: Fanning out to multiple REST/gRPC/DB backends concurrently with `StructuredTaskScope`.\n- **High-Concurrency Spring Boot Microservices**: Replaces complex WebFlux reactive chains when libraries are blocking.\n- **Legacy JDBC Services**: Scales connection-waiting concurrency without rewriting SQL layers.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Enable spring.threads.virtual.enabled=true, swap synchronized I/O guards for ReentrantLock, bound downstream fan-out with Semaphores, and replace ThreadLocal caches with ScopedValue.",
+      "summary": "Diagnose carrier-thread pinning, HikariCP connection exhaustion, and ThreadLocal memory bloat when enabling Java 21+ Virtual Threads on a high-throughput Spring Boot service.",
+      "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, enable spring.threads.virtual.enabled=true, swap synchronized I/O guards for ReentrantLock, bound downstream fan-out with Semaphores, and replace ThreadLocal caches with ScopedValue."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "prerequisites": [
+    {
+      "title": "Java Virtual Threads & Structured Concurrency",
+      "summary": "Java 21+ Virtual Threads (Project Loom) are lightweight, JVM-scheduled threads multiplexed onto a small ForkJoinPool of OS carrier threads. Blocking I/O unmounts the virtual thread instead of blocking an OS thread—unless pinned by synchronized blocks (fixed in..."
+    },
+    {
+      "title": "Modern Java (8 to 25): Records, Sealed Classes, Pattern Matching & Lambdas",
+      "summary": "Modern Java combines immutable `record` data carriers, `sealed` algebraic data hierarchies, and exhaustive `switch` pattern matching with Streams and Lambdas—turning verbose boilerplate into compiler-verified domain models."
+    }
+  ],
+  "simulation": {
+    "title": "Migrate a Blocking Spring Boot Service to Java Virtual Threads Without Pinning — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "tx",
+        "label": "Client Tx",
+        "role": "Snapshot Read/Write"
+      },
+      {
+        "id": "plan",
+        "label": "Query Planner",
+        "role": "Index & Lock Order"
+      },
+      {
+        "id": "wal",
+        "label": "WAL Buffer",
+        "role": "Group Commit"
+      },
+      {
+        "id": "disk",
+        "label": "Storage Pages",
+        "role": "MVCC / Vacuum"
+      }
+    ],
+    "edges": [
+      {
+        "from": "tx",
+        "to": "plan",
+        "label": "SQL query"
+      },
+      {
+        "from": "plan",
+        "to": "wal",
+        "label": "append redo"
+      },
+      {
+        "from": "wal",
+        "to": "disk",
+        "label": "checkpoint flush"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why Virtual Threads & Pinning Prevention Matter",
+        "actionLabel": "SQL query",
+        "status": "healthy",
+        "activeNodeIds": [
+          "tx",
+          "plan"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "SQL query",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Client Tx sends work to Query Planner (Why Virtual Threads & Pinning Prevention Matter)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Real-World Impact of Carrier-Thread Pinning",
+        "actionLabel": "append redo",
+        "status": "healthy",
+        "activeNodeIds": [
+          "plan",
+          "wal"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "append redo",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Query Planner coordinates with WAL Buffer while preserving the core invariant (Real-World Impact of Carrier-Thread Pinning)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Naive Solution (and Why It Breaks)",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "wal",
+          "disk"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, Storage Pages absorbs pressure without cascading (Naive Solution (and Why It Breaks))."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Where Virtual Threads Apply in System Design",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "tx",
+          "plan",
+          "wal",
+          "disk"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Where Virtual Threads Apply in System Design)."
+      }
+    ]
+  }
+}

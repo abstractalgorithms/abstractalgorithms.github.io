@@ -1,0 +1,799 @@
+{
+  "id": "mysql-innodb-gap",
+  "slug": "mysql-innodb-gap",
+  "title": "Eliminating MySQL InnoDB Gap-Lock Deadlocks",
+  "problemType": "system-design",
+  "difficulty": "medium",
+  "prompt": "Your payment service runs on MySQL 8.0 (`REPEATABLE READ` isolation). A background worker polls `SELECT id FROM ledger_entries WHERE status = 'PENDING' AND account_id = 42 FOR UPDATE`, and a cleanup job runs `DELETE FROM ledger_entries WHERE created_at < NOW() - INTERVAL 90 DAY` using a non-unique `idx_created_at` index. Concurrent `INSERT INTO ledger_entries` transactions for completely different accounts block for 50s (`Lock wait timeout exceeded`) and fail with `ER_LOCK_DEADLOCK` (1213). Fix the locking behavior without losing data integrity.",
+  "spark": {
+    "summary": "Switch transaction isolation to `READ COMMITTED` (with `binlog_format=ROW`) to disable InnoDB gap locks on non-unique range scans, replace `FOR UPDATE` worker polling with `FOR UPDATE SKIP LOCKED`, and batch range deletes by primary key.",
+    "keyTakeaway": "When a single bottleneck threatens end-to-end availability, under MySQL's default `REPEATABLE READ`, `SELECT ... FOR UPDATE` or `DELETE` on a non-unique index locks the gaps between records—including the open-ended supremum—blocking unrelated `INSERT`s.",
+    "byteSummary": "**Core Mechanics:** On **MySQL 8.0 (`REPEATABLE READ`, `binlog_format = ROW`)** handling **3,500 `INSERT`s/sec** into `ledger_entries`, a worker polling `SELECT id FROM ledger_entries WHERE status = 'PENDING' AND account_id = 42 FOR UPDATE` and a cleanup job running `DELETE FROM ledger_entries WHERE created_at < NOW() - INTERVAL 90 DAY` on non-unique `idx_created_at` trigger frequent `ERROR 1213 (40001): Deadlock found`.\n\n**Visual & Structural Flow:** Depicts REPEATABLE READ Next-Key Locking vs. READ COMMITTED + SKIP LOCKED (Worker (FOR UPDATE) -> InnoDB Lock Manager -> Cleanup DELETE -> 3.5k/s INSERTs); SKIP LOCKED + PK-Chunked Delete Under 3,500 TPS Inserts (3.5k/s Inserts -> Worker 1 -> Worker 2 -> PK Cleanup).\n\n**Trade-Offs & Production:** Retrying `Deadlock 1213` in application code masks the symptom while still burning lock waits and CPU under 3,500 TPS inserts. Eliminate InnoDB gap locks safely while guaranteeing zero duplicate worker processing: **Set `transaction_isolation = READ-COMMITTED`**: Since `binlog_format = ROW` is enabled.\n\n**Failure Modes & Application:** InnoDB lock contention is a classic bottleneck in high-write MySQL systems: **Transactional Outbox & Job Queues**: `FOR UPDATE SKIP LOCKED` turns MySQL/Postgres into a high-throughput concurrent work queue."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why MySQL InnoDB Gap-Lock Deadlocks Matter",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "Think of **Why MySQL InnoDB Gap-Lock Deadlocks Matter** as the intuition layer for Eliminating MySQL InnoDB Gap-Lock Deadlocks: The mechanism: understand how Why MySQL InnoDB Gap-Lock Deadlocks Matter works from first principles.",
+        "core": "On **MySQL 8.0 (`REPEATABLE READ`, `binlog_format = ROW`)** handling **3,500 `INSERT`s/sec** into `ledger_entries`, a worker polling `SELECT id FROM ledger_entries WHERE status = 'PENDING' AND account_id = 42 FOR UPDATE` and a cleanup job running `DELETE FROM ledger_entries WHERE created_at < NOW() - INTERVAL 90 DAY` on non-unique `idx_created_at` trigger frequent `ERROR 1213 (40001): Deadlock found`.",
+        "deepDive": "Under heavy load or partial failure, why mysql innodb gap-lock deadlocks matter becomes a critical lever for predictable latency and correctness. Switch transaction isolation to `READ COMMITTED` (with `binlog_format=ROW`) to disable InnoDB gap locks on non-unique range scans, replace `FOR UPDATE` worker polling with `FOR UPDATE SKIP LOCKED`, and batch range deletes by primary key."
+      },
+      "purpose": "The mechanism: understand how Why MySQL InnoDB Gap-Lock Deadlocks Matter works from first principles."
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "Real-World Impact of Next-Key & Gap-Lock Contention",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Under MySQL's default `REPEATABLE READ`, range scans acquire **Next-Key Locks** (record + preceding gap) and **Supremum Gap Locks**:",
+        "core": "1. **Phantom Insert Blocking**: A `FOR UPDATE` or `DELETE` on a non-unique index locks gaps—including the open-ended `+infinity` supremum—blocking unrelated `INSERT`s.\n2. **Insert-Intention Deadlocks**: Two transactions hold shared/exclusive gap locks and then request `LOCK_INSERT_INTENTION` on each other's gaps, triggering `Deadlock 1213`.\n3. **Throughput Collapse**: 3,500 TPS inserts stall behind 90-day batch deletes.",
+        "deepDive": "In production deployments of Eliminating MySQL InnoDB Gap-Lock Deadlocks, watch how real-world impact of next-key & gap-lock contention interacts with tail latency, retry amplification, and partial failures. Switch transaction isolation to `READ COMMITTED` (with `binlog_format=ROW`) to disable InnoDB gap locks on non-unique range scans, replace `FOR UPDATE` worker polling with `FOR UPDATE SKIP LOCKED`, and batch range deletes by primary key."
+      },
+      "sectionDiagram": {
+        "kind": "wal-mvcc",
+        "eyebrow": "InnoDB Gap & Insert-Intention Locks",
+        "title": "REPEATABLE READ Next-Key Locking vs. READ COMMITTED + SKIP LOCKED",
+        "nodes": [
+          {
+            "label": "Worker (FOR UPDATE)",
+            "role": "REPEATABLE READ: gap lock"
+          },
+          {
+            "label": "InnoDB Lock Manager",
+            "role": "Next-Key + Supremum"
+          },
+          {
+            "label": "Cleanup DELETE",
+            "role": "Locks idx_created_at gaps"
+          },
+          {
+            "label": "3.5k/s INSERTs",
+            "role": "Blocked on INSERT_INTENTION"
+          }
+        ],
+        "edges": [
+          {
+            "label": "Cyclic gap wait -> 1213"
+          },
+          {
+            "label": "SKIP LOCKED avoids wait"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Why Gap Locks Exist",
+            "detail": "InnoDB prevents phantom rows under REPEATABLE READ."
+          },
+          {
+            "label": "READ COMMITTED",
+            "detail": "Disables gap locks (safe with binlog_format=ROW); only locks matched rows."
+          },
+          {
+            "label": "SKIP LOCKED",
+            "detail": "SELECT ... FOR UPDATE SKIP LOCKED lets workers claim rows without waiting."
+          },
+          {
+            "label": "PK-Chunked Deletes",
+            "detail": "Delete by primary key batches (LIMIT 1000) instead of range scans."
+          }
+        ],
+        "summary": "Switching to READ COMMITTED (with ROW binlog), FOR UPDATE SKIP LOCKED, and PK-batched deletes eliminates gap-lock deadlocks."
+      },
+      "purpose": "The problem: see what breaks without Real-World Impact of Next-Key & Gap-Lock Contention under real concurrency or scale.",
+      "decisionFramework": {
+        "problem": "How to implement Eliminating MySQL InnoDB Gap-Lock Deadlocks without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "When a single bottleneck threatens end-to-end availability, under MySQL's default `REPEATABLE READ`, `SELECT ... FOR UPDATE` or `DELETE` on a non-unique index locks the gaps between records—including the open-ended supremum—blocking unrelated `INSERT`s.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Eliminating MySQL InnoDB Gap-Lock Deadlocks experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Naive Solution (and Why It Breaks)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Think of **Naive Solution (and Why It Breaks)** as the intuition layer for Eliminating MySQL InnoDB Gap-Lock Deadlocks: The problem: see what breaks without Naive Solution under real concurrency or scale.",
+        "core": "Retrying `Deadlock 1213` in application code masks the symptom while still burning lock waits and CPU under 3,500 TPS inserts. Adding `LOCK IN SHARE MODE` or widening indexes without changing `REPEATABLE READ` or query patterns still acquires gap locks on non-unique ranges.",
+        "deepDive": "Under heavy load or partial failure, naive solution (and why it breaks) becomes a critical lever for predictable latency and correctness. Switch transaction isolation to `READ COMMITTED` (with `binlog_format=ROW`) to disable InnoDB gap locks on non-unique range scans, replace `FOR UPDATE` worker polling with `FOR UPDATE SKIP LOCKED`, and batch range deletes by primary key."
+      },
+      "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+      "sectionDiagram": {
+        "kind": "behavior-transition",
+        "eyebrow": "Design Trade-Off",
+        "title": "Naive Solution (and Why It Breaks)",
+        "before": {
+          "label": "Seq Scan + Unbounded Bloat",
+          "metrics": [
+            "Implicit cast breaks B-Tree",
+            "Deadlock or XID wraparound risk",
+            "Long tx blocks VACUUM"
+          ]
+        },
+        "after": {
+          "label": "Indexed Plan + Bounded MVCC",
+          "metrics": [
+            "Index-only scan in <2 ms",
+            "Deterministic lock ordering",
+            "Autovacuum keeps bloat flat"
+          ]
+        }
+      }
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise Solution: `READ COMMITTED`, `SKIP LOCKED` & PK-Chunked Deletes",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": {
+        "foundation": "Eliminate InnoDB gap locks safely while guaranteeing zero duplicate worker processing:",
+        "core": "- **Set `transaction_isolation = READ-COMMITTED`**: Since `binlog_format = ROW` is enabled, `READ COMMITTED` is replication-safe and disables gap/next-key locks for regular queries (except foreign-key/duplicate-key checks).\n- **Worker Queueing with `FOR UPDATE SKIP LOCKED`**: Poll `SELECT id FROM ledger_entries WHERE status='PENDING' AND account_id=? ORDER BY id LIMIT 10 FOR UPDATE SKIP LOCKED` (backed by composite index `(status, account_id, id)`).\n- **PK-Batched Cleanup & Partitioning**: Fetch `id`s via `SELECT id ... LIMIT 1000` and `DELETE FROM ledger_entries WHERE id IN (...)`—or better yet, range-partition by `created_at` and `DROP PARTITION` in O(1).",
+        "deepDive": "In production deployments of Eliminating MySQL InnoDB Gap-Lock Deadlocks, watch how enterprise solution: `read committed`, `skip locked` & pk-chunked deletes interacts with tail latency, retry amplification, and partial failures. Switch transaction isolation to `READ COMMITTED` (with `binlog_format=ROW`) to disable InnoDB gap locks on non-unique range scans, replace `FOR UPDATE` worker polling with `FOR UPDATE SKIP LOCKED`, and batch range deletes by primary key."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Zero-Contention Worker & Cleanup Flow",
+        "title": "SKIP LOCKED + PK-Chunked Delete Under 3,500 TPS Inserts",
+        "actors": [
+          {
+            "id": "ins",
+            "label": "3.5k/s Inserts"
+          },
+          {
+            "id": "w1",
+            "label": "Worker 1"
+          },
+          {
+            "id": "w2",
+            "label": "Worker 2"
+          },
+          {
+            "id": "cln",
+            "label": "PK Cleanup"
+          }
+        ],
+        "events": [
+          {
+            "from": "w1",
+            "to": "w2",
+            "label": "SELECT ... FOR UPDATE SKIP LOCKED (rows 1..10)",
+            "status": "ok"
+          },
+          {
+            "from": "w2",
+            "to": "w1",
+            "label": "Skips locked rows, claims 11..20 immediately",
+            "status": "ok"
+          },
+          {
+            "from": "ins",
+            "to": "cln",
+            "label": "READ COMMITTED: no gap locks on inserts",
+            "status": "ok"
+          },
+          {
+            "from": "cln",
+            "to": "ins",
+            "label": "DELETE WHERE id IN (batch 1000) -> 0ms stall",
+            "status": "ok"
+          }
+        ],
+        "summary": "Workers never block each other, and 3,500 TPS inserts proceed without gap-lock interference."
+      },
+      "markdownContent": "```sql\n-- Inspect active InnoDB lock waits\nSELECT r.trx_id waiting_trx, r.trx_mysql_thread_id waiting_thread,\n       b.trx_id blocking_trx, l.lock_mode, l.lock_type, l.lock_data\nFROM performance_schema.data_lock_waits w\nJOIN information_schema.innodb_trx r ON r.trx_id = w.REQUESTING_ENGINE_TRANSACTION_ID\nJOIN information_schema.innodb_trx b ON b.trx_id = w.BLOCKING_ENGINE_TRANSACTION_ID\nJOIN performance_schema.data_locks l ON l.ENGINE_LOCK_ID = w.BLOCKING_ENGINE_LOCK_ID;\n\n-- Safe PK-chunked purge (run in loop incrementing @cur_id by 1000)\nDELETE FROM ledger_entries\nWHERE id BETWEEN @cur_id AND @cur_id + 999\n  AND created_at < NOW() - INTERVAL 90 DAY;\n```\n\n```java\n@Retryable(retryFor = CannotAcquireLockException.class, maxAttempts = 4,\n           backoff = @Backoff(delay = 25, maxDelay = 200, multiplier = 2, random = true))\n@Transactional(isolation = Isolation.READ_COMMITTED)\npublic List<Long> claimPendingBatch(long accountId, int limit) {\n  return jdbc.queryForList(\n    \"SELECT id FROM ledger_entries WHERE status = 'PENDING' AND account_id = ? ORDER BY id LIMIT ? FOR UPDATE SKIP LOCKED\",\n    Long.class, accountId, limit);\n}\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where Gap-Lock Avoidance Applies in System Design",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "InnoDB lock contention is a classic bottleneck in high-write MySQL systems:",
+        "core": "- **Transactional Outbox & Job Queues**: `FOR UPDATE SKIP LOCKED` turns MySQL/Postgres into a high-throughput concurrent work queue.\n- **Ledger & Payment Tables**: Time-based partitioning replaces expensive range `DELETE`s with instant `DROP PARTITION`.\n- **Multi-Worker Batch Processors**: Composite indexes + `READ COMMITTED` keep insert latency flat.",
+        "deepDive": "In production deployments of Eliminating MySQL InnoDB Gap-Lock Deadlocks, watch how where gap-lock avoidance applies in system design interacts with tail latency, retry amplification, and partial failures. Switch transaction isolation to `READ COMMITTED` (with `binlog_format=ROW`) to disable InnoDB gap locks on non-unique range scans, replace `FOR UPDATE` worker polling with `FOR UPDATE SKIP LOCKED`, and batch range deletes by primary key."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "database-isolation-levels",
+          "title": "Concept: Database Isolation Levels",
+          "kind": "concept"
+        },
+        {
+          "slug": "pessimistic-locking-strategies",
+          "title": "Concept: Pessimistic Locking Strategies",
+          "kind": "concept"
+        },
+        {
+          "slug": "deadlock-detection",
+          "title": "Concept: Deadlock Detection",
+          "kind": "concept"
+        },
+        {
+          "slug": "design-ticketmaster-flash",
+          "title": "System Design: Ticketmaster Flash Sale",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why is switching from `REPEATABLE READ` to `READ COMMITTED` safe in this MySQL 8.0 setup?",
+      "options": [
+        {
+          "id": "a",
+          "text": "`binlog_format = ROW` is enabled, so replication logs exact row changes rather than statements, and `READ COMMITTED` disables gap locks on range scans",
+          "correct": true,
+          "feedback": "Correct: gap locks are only needed for statement-based replication and phantom prevention under REPEATABLE READ."
+        },
+        {
+          "id": "b",
+          "text": "`READ COMMITTED` automatically converts all tables to MyISAM",
+          "correct": false,
+          "feedback": "Tables remain InnoDB with full ACID row-level locking."
+        },
+        {
+          "id": "c",
+          "text": "`READ COMMITTED` disables `FOR UPDATE` row locks completely",
+          "correct": false,
+          "feedback": "Matched rows are still exclusively locked; only the gaps between them are unlocked."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why is switching from `REPEATABLE READ` to `READ COMMITTED` safe in this MySQL 8.0 setup?",
+        "options": [
+          {
+            "id": "a",
+            "text": "`binlog_format = ROW` is enabled, so replication logs exact row changes rather than statements, and `READ COMMITTED` disables gap locks on range scans",
+            "correct": true,
+            "feedback": "Correct: gap locks are only needed for statement-based replication and phantom prevention under REPEATABLE READ."
+          },
+          {
+            "id": "b",
+            "text": "`READ COMMITTED` automatically converts all tables to MyISAM",
+            "correct": false,
+            "feedback": "Tables remain InnoDB with full ACID row-level locking."
+          },
+          {
+            "id": "c",
+            "text": "`READ COMMITTED` disables `FOR UPDATE` row locks completely",
+            "correct": false,
+            "feedback": "Matched rows are still exclusively locked; only the gaps between them are unlocked."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why MySQL InnoDB Gap-Lock Deadlocks Matter', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "On **MySQL 8.0 (REPEATABLE READ, binlog_format = ROW)** handling **3,500 INSERTs/sec** into ledger_entries, a worker polling SELECT id FROM ledger_entries WHERE status =…",
+            "correct": true,
+            "feedback": "Correct: On **MySQL 8.0 (REPEATABLE READ, binlog_format = ROW)** handling **3,500 INSERTs/sec** into ledger_entries, a worker polling SELECT id FROM ledger_entries WHERE status =…"
+          },
+          {
+            "id": "b",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "c",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Real-World Impact of Next-Key & Gap-Lock Contention', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "b",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "c",
+            "text": "Under MySQL's default REPEATABLE READ, range scans acquire **Next-Key Locks** (record + preceding gap) and **Supremum Gap Locks**: 1.",
+            "correct": true,
+            "feedback": "Correct: Under MySQL's default REPEATABLE READ, range scans acquire **Next-Key Locks** (record + preceding gap) and **Supremum Gap Locks**: 1."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** On **MySQL 8.0 (`REPEATABLE READ`, `binlog_format = ROW`)** handling **3,500 `INSERT`s/sec** into `ledger_entries`, a worker polling `SELECT id FROM ledger_entries WHERE status = 'PENDING' AND account_id = 42 FOR UPDATE`, and a cleanup job runs `DELETE FROM ledger_entries WHERE created_at < NOW() - INTERVAL 90 DAY` using a non-unique `idx_created_at` index.\n\n**How It Flows:** Think of Eliminating MySQL InnoDB Gap-Lock Deadlocks as a clear step-by-step chain: Worker (FOR UPDATE) -> InnoDB Lock Manager -> Cleanup DELETE -> 3.5k/s INSERTs -> 3.5k/s Inserts.\n\n**Why Beginners Should Care:** Under MySQL's default `REPEATABLE READ`, `SELECT ... FOR UPDATE` or `DELETE` on a non-unique index locks the gaps between records—including the open-ended supremum—blocking unrelated `INSERT`s.",
+      "spark": {
+        "summary": "On **MySQL 8.0 (`REPEATABLE READ`, `binlog_format = ROW`)** handling **3,500 `INSERT`s/sec** into `ledger_entries`, a worker polling `SELECT id FROM ledger_entries WHERE status = 'PENDING' AND account_id = 42 FOR.",
+        "keyTakeaway": "Under MySQL's default `REPEATABLE READ`, `SELECT ..."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why MySQL InnoDB Gap-Lock Deadlocks Matter",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why MySQL InnoDB Gap-Lock Deadlocks Matter works from first principles.",
+          "explanation": "On **MySQL 8.0 (`REPEATABLE READ`, `binlog_format = ROW`)** handling **3,500 `INSERT`s/sec** into `ledger_entries`, a worker polling `SELECT id FROM ledger_entries WHERE status = 'PENDING' AND account_id = 42 FOR UPDATE` and a cleanup job running `DELETE FROM ledger_entries WHERE created_at < NOW() - INTERVAL 90 DAY` on non-unique `idx_created_at` trigger frequent `ERROR 1213 (40001): Deadlock found`.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Real-World Impact of Next-Key & Gap-Lock Contention",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without Real-World Impact of Next-Key & Gap-Lock Contention under real concurrency or scale.",
+          "explanation": "Under MySQL's default `REPEATABLE READ`, range scans acquire **Next-Key Locks** (record + preceding gap) and **Supremum Gap Locks**: 1. **Phantom Insert Blocking**: A `FOR UPDATE` or `DELETE` on a non-unique index locks gaps—including the open-ended `+infinity` supremum—blocking unrelated `INSERT`s. 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "wal-mvcc",
+            "eyebrow": "InnoDB Gap & Insert-Intention Locks",
+            "title": "REPEATABLE READ Next-Key Locking vs. READ COMMITTED + SKIP LOCKED",
+            "nodes": [
+              {
+                "label": "Worker (FOR UPDATE)",
+                "role": "REPEATABLE READ: gap lock"
+              },
+              {
+                "label": "InnoDB Lock Manager",
+                "role": "Next-Key + Supremum"
+              },
+              {
+                "label": "Cleanup DELETE",
+                "role": "Locks idx_created_at gaps"
+              },
+              {
+                "label": "3.5k/s INSERTs",
+                "role": "Blocked on INSERT_INTENTION"
+              }
+            ],
+            "edges": [
+              {
+                "label": "Cyclic gap wait -> 1213"
+              },
+              {
+                "label": "SKIP LOCKED avoids wait"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Why Gap Locks Exist",
+                "detail": "InnoDB prevents phantom rows under REPEATABLE READ."
+              },
+              {
+                "label": "READ COMMITTED",
+                "detail": "Disables gap locks (safe with binlog_format=ROW); only locks matched rows."
+              },
+              {
+                "label": "SKIP LOCKED",
+                "detail": "SELECT ... FOR UPDATE SKIP LOCKED lets workers claim rows without waiting."
+              },
+              {
+                "label": "PK-Chunked Deletes",
+                "detail": "Delete by primary key batches (LIMIT 1000) instead of range scans."
+              }
+            ],
+            "summary": "Switching to READ COMMITTED (with ROW binlog), FOR UPDATE SKIP LOCKED, and PK-batched deletes eliminates gap-lock deadlocks."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive Solution (and Why It Breaks)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+          "explanation": "Retrying `Deadlock 1213` in application code masks the symptom while still burning lock waits and CPU under 3,500 TPS inserts. Adding `LOCK IN SHARE MODE` or widening indexes without changing `REPEATABLE READ` or query patterns still acquires gap locks on non-unique ranges.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise Solution: `READ COMMITTED`, `SKIP LOCKED` & PK-Chunked Deletes",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Eliminate InnoDB gap locks safely while guaranteeing zero duplicate worker processing: **Set `transaction_isolation = READ-COMMITTED`**: Since `binlog_format = ROW` is enabled, `READ COMMITTED` is replication-safe and disables gap/next-key locks for regular queries (except foreign-key/duplicate-key checks).",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Zero-Contention Worker & Cleanup Flow",
+            "title": "SKIP LOCKED + PK-Chunked Delete Under 3,500 TPS Inserts",
+            "actors": [
+              {
+                "id": "ins",
+                "label": "3.5k/s Inserts"
+              },
+              {
+                "id": "w1",
+                "label": "Worker 1"
+              },
+              {
+                "id": "w2",
+                "label": "Worker 2"
+              },
+              {
+                "id": "cln",
+                "label": "PK Cleanup"
+              }
+            ],
+            "events": [
+              {
+                "from": "w1",
+                "to": "w2",
+                "label": "SELECT ... FOR UPDATE SKIP LOCKED (rows 1..10)",
+                "status": "ok"
+              },
+              {
+                "from": "w2",
+                "to": "w1",
+                "label": "Skips locked rows, claims 11..20 immediately",
+                "status": "ok"
+              },
+              {
+                "from": "ins",
+                "to": "cln",
+                "label": "READ COMMITTED: no gap locks on inserts",
+                "status": "ok"
+              },
+              {
+                "from": "cln",
+                "to": "ins",
+                "label": "DELETE WHERE id IN (batch 1000) -> 0ms stall",
+                "status": "ok"
+              }
+            ],
+            "summary": "Workers never block each other, and 3,500 TPS inserts proceed without gap-lock interference."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Under MySQL's default `REPEATABLE READ`, `SELECT ...",
+      "summary": "Switch transaction isolation to `READ COMMITTED` (with `binlog_format=ROW`) to disable InnoDB gap locks on non-unique range scans, replace `FOR UPDATE` worker polling with `FOR UPDATE SKIP LOCKED`, and batch range deletes by primary key.",
+      "keyTakeaway": "When a single bottleneck threatens end-to-end availability, under MySQL's default `REPEATABLE READ`, `SELECT ... FOR UPDATE` or `DELETE` on a non-unique index locks the gaps between records—including the open-ended supremum—blocking unrelated `INSERT`s."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** On **MySQL 8.0 (`REPEATABLE READ`, `binlog_format = ROW`)** handling **3,500 `INSERT`s/sec** into `ledger_entries`, a worker polling `SELECT id FROM ledger_entries WHERE status = 'PENDING' AND account_id = 42 FOR UPDATE` and a cleanup job running `DELETE FROM ledger_entries WHERE created_at < NOW() - INTERVAL 90 DAY` on non-unique `idx_created_at` trigger frequent `ERROR 1213 (40001): Deadlock found`.\n\n**Visual & Structural Flow:** Depicts REPEATABLE READ Next-Key Locking vs. READ COMMITTED + SKIP LOCKED (Worker (FOR UPDATE) -> InnoDB Lock Manager -> Cleanup DELETE -> 3.5k/s INSERTs); SKIP LOCKED + PK-Chunked Delete Under 3,500 TPS Inserts (3.5k/s Inserts -> Worker 1 -> Worker 2 -> PK Cleanup).\n\n**Trade-Offs & Production:** Retrying `Deadlock 1213` in application code masks the symptom while still burning lock waits and CPU under 3,500 TPS inserts. Eliminate InnoDB gap locks safely while guaranteeing zero duplicate worker processing: **Set `transaction_isolation = READ-COMMITTED`**: Since `binlog_format = ROW` is enabled.\n\n**Failure Modes & Application:** InnoDB lock contention is a classic bottleneck in high-write MySQL systems: **Transactional Outbox & Job Queues**: `FOR UPDATE SKIP LOCKED` turns MySQL/Postgres into a high-throughput concurrent work queue.",
+      "spark": {
+        "summary": "Switch transaction isolation to `READ COMMITTED` (with `binlog_format=ROW`) to disable InnoDB gap locks on non-unique range scans, replace `FOR UPDATE` worker polling with `FOR UPDATE SKIP LOCKED`, and batch range deletes by primary key.",
+        "keyTakeaway": "Under MySQL's default `REPEATABLE READ`, `SELECT ... FOR UPDATE` or `DELETE` on a non-unique index locks the gaps between records—including the open-ended supremum—blocking unrelated `INSERT`s."
+      },
+      "summary": "Switch transaction isolation to `READ COMMITTED` (with `binlog_format=ROW`) to disable InnoDB gap locks on non-unique range scans, replace `FOR UPDATE` worker polling with `FOR UPDATE SKIP LOCKED`, and batch range deletes by primary key.",
+      "keyTakeaway": "When a single bottleneck threatens end-to-end availability, under MySQL's default `REPEATABLE READ`, `SELECT ... FOR UPDATE` or `DELETE` on a non-unique index locks the gaps between records—including the open-ended supremum—blocking unrelated `INSERT`s."
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** Switch transaction isolation to `READ COMMITTED` (with `binlog_format=ROW`) to disable InnoDB gap locks on non-unique range scans, replace `FOR UPDATE` worker polling with `FOR UPDATE SKIP LOCKED`, and batch range deletes by primary key.\n\n**Production Trade-Offs:** Retrying `Deadlock 1213` in application code masks the symptom while still burning lock waits and CPU under 3,500 TPS inserts.\n\n**Failure Modes & Edge Cases:** InnoDB lock contention is a classic bottleneck in high-write MySQL systems: **Transactional Outbox & Job Queues**: `FOR UPDATE SKIP LOCKED` turns MySQL/Postgres into a high-throughput concurrent work queue.\n\n**Principal Takeaway:** Under MySQL's default `REPEATABLE READ`, `SELECT ... FOR UPDATE` or `DELETE` on a non-unique index locks the gaps between records—including the open-ended supremum—blocking unrelated `INSERT`s.",
+      "spark": {
+        "summary": "Switch transaction isolation to `READ COMMITTED` (with `binlog_format=ROW`) to disable InnoDB gap locks on non-unique range scans, replace `FOR UPDATE` worker polling with `FOR UPDATE SKIP LOCKED`, and batch range deletes by primary key.",
+        "keyTakeaway": "Under MySQL's default `REPEATABLE READ`, `SELECT ..."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why MySQL InnoDB Gap-Lock Deadlocks Matter",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why MySQL InnoDB Gap-Lock Deadlocks Matter works from first principles.",
+          "explanation": "On **MySQL 8.0 (`REPEATABLE READ`, `binlog_format = ROW`)** handling **3,500 `INSERT`s/sec** into `ledger_entries`, a worker polling `SELECT id FROM ledger_entries WHERE status = 'PENDING' AND account_id = 42 FOR UPDATE` and a cleanup job running `DELETE FROM ledger_entries WHERE created_at < NOW() - INTERVAL 90 DAY` on non-unique `idx_created_at` trigger frequent `ERROR 1213 (40001): Deadlock found`.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Real-World Impact of Next-Key & Gap-Lock Contention",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without Real-World Impact of Next-Key & Gap-Lock Contention under real concurrency or scale.",
+          "explanation": "Under MySQL's default `REPEATABLE READ`, range scans acquire **Next-Key Locks** (record + preceding gap) and **Supremum Gap Locks**:\n\n1. **Phantom Insert Blocking**: A `FOR UPDATE` or `DELETE` on a non-unique index locks gaps—including the open-ended `+infinity` supremum—blocking unrelated `INSERT`s.\n2. **Insert-Intention Deadlocks**: Two transactions hold shared/exclusive gap locks and then request `LOCK_INSERT_INTENTION` on each other's gaps, triggering `Deadlock 1213`.\n3. **Throughput Collapse**: 3,500 TPS inserts stall behind 90-day batch deletes.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "wal-mvcc",
+            "eyebrow": "InnoDB Gap & Insert-Intention Locks",
+            "title": "REPEATABLE READ Next-Key Locking vs. READ COMMITTED + SKIP LOCKED",
+            "nodes": [
+              {
+                "label": "Worker (FOR UPDATE)",
+                "role": "REPEATABLE READ: gap lock"
+              },
+              {
+                "label": "InnoDB Lock Manager",
+                "role": "Next-Key + Supremum"
+              },
+              {
+                "label": "Cleanup DELETE",
+                "role": "Locks idx_created_at gaps"
+              },
+              {
+                "label": "3.5k/s INSERTs",
+                "role": "Blocked on INSERT_INTENTION"
+              }
+            ],
+            "edges": [
+              {
+                "label": "Cyclic gap wait -> 1213"
+              },
+              {
+                "label": "SKIP LOCKED avoids wait"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Why Gap Locks Exist",
+                "detail": "InnoDB prevents phantom rows under REPEATABLE READ."
+              },
+              {
+                "label": "READ COMMITTED",
+                "detail": "Disables gap locks (safe with binlog_format=ROW); only locks matched rows."
+              },
+              {
+                "label": "SKIP LOCKED",
+                "detail": "SELECT ... FOR UPDATE SKIP LOCKED lets workers claim rows without waiting."
+              },
+              {
+                "label": "PK-Chunked Deletes",
+                "detail": "Delete by primary key batches (LIMIT 1000) instead of range scans."
+              }
+            ],
+            "summary": "Switching to READ COMMITTED (with ROW binlog), FOR UPDATE SKIP LOCKED, and PK-batched deletes eliminates gap-lock deadlocks."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive Solution (and Why It Breaks)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+          "explanation": "Retrying `Deadlock 1213` in application code masks the symptom while still burning lock waits and CPU under 3,500 TPS inserts. Adding `LOCK IN SHARE MODE` or widening indexes without changing `REPEATABLE READ` or query patterns still acquires gap locks on non-unique ranges.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise Solution: `READ COMMITTED`, `SKIP LOCKED` & PK-Chunked Deletes",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Eliminate InnoDB gap locks safely while guaranteeing zero duplicate worker processing:\n\n- **Set `transaction_isolation = READ-COMMITTED`**: Since `binlog_format = ROW` is enabled, `READ COMMITTED` is replication-safe and disables gap/next-key locks for regular queries (except foreign-key/duplicate-key checks).\n- **Worker Queueing with `FOR UPDATE SKIP LOCKED`**: Poll `SELECT id FROM ledger_entries WHERE status='PENDING' AND account_id=? ORDER BY id LIMIT 10 FOR UPDATE SKIP LOCKED` (backed by composite index `(status, account_id, id)`).\n- **PK-Batched Cleanup & Partitioning**: Fetch `id`s via `SELECT id ... LIMIT 1000` and `DELETE FROM ledger_entries WHERE id IN (...)`—or better yet, range-partition by `created_at` and `DROP PARTITION` in O(1).",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Zero-Contention Worker & Cleanup Flow",
+            "title": "SKIP LOCKED + PK-Chunked Delete Under 3,500 TPS Inserts",
+            "actors": [
+              {
+                "id": "ins",
+                "label": "3.5k/s Inserts"
+              },
+              {
+                "id": "w1",
+                "label": "Worker 1"
+              },
+              {
+                "id": "w2",
+                "label": "Worker 2"
+              },
+              {
+                "id": "cln",
+                "label": "PK Cleanup"
+              }
+            ],
+            "events": [
+              {
+                "from": "w1",
+                "to": "w2",
+                "label": "SELECT ... FOR UPDATE SKIP LOCKED (rows 1..10)",
+                "status": "ok"
+              },
+              {
+                "from": "w2",
+                "to": "w1",
+                "label": "Skips locked rows, claims 11..20 immediately",
+                "status": "ok"
+              },
+              {
+                "from": "ins",
+                "to": "cln",
+                "label": "READ COMMITTED: no gap locks on inserts",
+                "status": "ok"
+              },
+              {
+                "from": "cln",
+                "to": "ins",
+                "label": "DELETE WHERE id IN (batch 1000) -> 0ms stall",
+                "status": "ok"
+              }
+            ],
+            "summary": "Workers never block each other, and 3,500 TPS inserts proceed without gap-lock interference."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where Gap-Lock Avoidance Applies in System Design",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "InnoDB lock contention is a classic bottleneck in high-write MySQL systems:\n\n- **Transactional Outbox & Job Queues**: `FOR UPDATE SKIP LOCKED` turns MySQL/Postgres into a high-throughput concurrent work queue.\n- **Ledger & Payment Tables**: Time-based partitioning replaces expensive range `DELETE`s with instant `DROP PARTITION`.\n- **Multi-Worker Batch Processors**: Composite indexes + `READ COMMITTED` keep insert latency flat.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Under MySQL's default `REPEATABLE READ`, `SELECT ...",
+      "summary": "Switch transaction isolation to `READ COMMITTED` (with `binlog_format=ROW`) to disable InnoDB gap locks on non-unique range scans, replace `FOR UPDATE` worker polling with `FOR UPDATE SKIP LOCKED`, and batch range deletes by primary key.",
+      "keyTakeaway": "When a single bottleneck threatens end-to-end availability, under MySQL's default `REPEATABLE READ`, `SELECT ... FOR UPDATE` or `DELETE` on a non-unique index locks the gaps between records—including the open-ended supremum—blocking unrelated `INSERT`s."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "simulation": {
+    "title": "Eliminating MySQL InnoDB Gap-Lock Deadlocks — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "tx",
+        "label": "Client Tx",
+        "role": "Snapshot Read/Write"
+      },
+      {
+        "id": "plan",
+        "label": "Query Planner",
+        "role": "Index & Lock Order"
+      },
+      {
+        "id": "wal",
+        "label": "WAL Buffer",
+        "role": "Group Commit"
+      },
+      {
+        "id": "disk",
+        "label": "Storage Pages",
+        "role": "MVCC / Vacuum"
+      }
+    ],
+    "edges": [
+      {
+        "from": "tx",
+        "to": "plan",
+        "label": "SQL query"
+      },
+      {
+        "from": "plan",
+        "to": "wal",
+        "label": "append redo"
+      },
+      {
+        "from": "wal",
+        "to": "disk",
+        "label": "checkpoint flush"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why MySQL InnoDB Gap-Lock Deadlocks Matter",
+        "actionLabel": "SQL query",
+        "status": "healthy",
+        "activeNodeIds": [
+          "tx",
+          "plan"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "SQL query",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Client Tx sends work to Query Planner (Why MySQL InnoDB Gap-Lock Deadlocks Matter)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Real-World Impact of Next-Key & Gap-Lock Contention",
+        "actionLabel": "append redo",
+        "status": "healthy",
+        "activeNodeIds": [
+          "plan",
+          "wal"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "append redo",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Query Planner coordinates with WAL Buffer while preserving the core invariant (Real-World Impact of Next-Key & Gap-Lock Contention)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Naive Solution (and Why It Breaks)",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "wal",
+          "disk"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, Storage Pages absorbs pressure without cascading (Naive Solution (and Why It Breaks))."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Where Gap-Lock Avoidance Applies in System Design",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "tx",
+          "plan",
+          "wal",
+          "disk"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Where Gap-Lock Avoidance Applies in System Design)."
+      }
+    ]
+  }
+}

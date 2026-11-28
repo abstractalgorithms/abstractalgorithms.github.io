@@ -1,0 +1,761 @@
+{
+  "id": "problem-dynamodb-write-sharding-hot-partitions",
+  "slug": "dynamodb-write-sharding-hot-partitions",
+  "title": "Eliminating DynamoDB Hot-Partition Throttling",
+  "problemType": "system-design",
+  "difficulty": "hard",
+  "prompt": "A real-time payment ledger table in DynamoDB is provisioned at 10,000 WCU and 20,000 RCU (`PK = MERCHANT#<merchant_id>`, `SK = TX#<timestamp>#<tx_id>`). During a flash sale, the table throws `ProvisionedThroughputExceededException` (HTTP 400) even though CloudWatch shows total `ConsumedWriteCapacityUnits` at only 1,200 WCU (12% of provisioned capacity). Investigation reveals one celebrity merchant is generating 3,500 writes/sec and 12,000 reads/sec. Redesign the key schema, client write/read path, and caching layer to sustain 5,000 writes/sec and 25,000 reads/sec for a single merchant.",
+  "spark": {
+    "summary": "To eliminate DynamoDB's 1,000 WCU/3,000 RCU per-partition ceiling for celebrity merchants, append a bounded shard suffix (MERCHANT#<id>#<0..N-1>) for high-volume writes, scatter-gather top-K reads, and cache hot reads in DAX/Redis.",
+    "keyTakeaway": "When traffic spikes expose hidden coupling, use adaptive write sharding (N shards only for celebrity merchants) to spread writes past 1,000 WCU/partition, and pair with scatter-gather reads + short-TTL caching.",
+    "byteSummary": "**Core Mechanics:** DynamoDB provisions capacity across physical partitions, but **each individual physical partition is hard-capped at `1,000 WCU/sec`, `3,000 RCU/sec`, and `10 GB`**.\n\n**Visual & Structural Flow:** Depicts Spreading 5,000 WCU & 25,000 RCU Across N=8 Physical Partitions (Shard #0-1 -> Shard #2-3 -> Shard #4-5 -> Shard #6-7 -> M1#0); Adaptive Suffix Writer + Redis/DAX Cache + N-Shard Scatter-Gather (Payment API -> DAX / Redis -> Scatter-Gather -> DynamoDB (N)).\n\n**Trade-Offs & Production:** Two common reactions fail to fix the bottleneck: **Raising Table WCU to 50,000**: Does nothing for a single hot key still capped at `1,000 WCU`. Production DynamoDB architectures combine three patterns: **Adaptive Write Sharding**: Lookup `shard_count` in a cached config (`N=1` for normal merchants, `N=8` or `16` for celebrity merchants).\n\n**Failure Modes & Application:** Write sharding with bounded scatter-gather is the standard remedy for single-key hotspots: **Payment Ledgers & Flash-Sale Counters**: Distributing celebrity merchant or viral SKU writes across `N` partitions."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why DynamoDB hot-partition throttling happens at 12% table utilization",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "Think of **Why DynamoDB hot-partition throttling happens at 12% table utilization** as the intuition layer for Eliminating DynamoDB Hot-Partition Throttling: The mechanism: understand how Why DynamoDB hot-partition throttling happens at 12% table utilization works from first principles.",
+        "core": "DynamoDB provisions capacity across physical partitions, but **each individual physical partition is hard-capped at `1,000 WCU/sec`, `3,000 RCU/sec`, and `10 GB`**. When `PK = MERCHANT#<merchant_id>` receives `3,500` writes/sec (`3,500 WCU`) and `12,000` reads/sec (`12,000 RCU`) for one celebrity merchant, that single partition throttles with `ProvisionedThroughputExceededException` even though the table's `10,000 WCU` total is only 12% utilized.",
+        "deepDive": "Under heavy load or partial failure, why dynamodb hot-partition throttling happens at 12% table utilization becomes a critical lever for predictable latency and correctness. To eliminate DynamoDB's 1,000 WCU/3,000 RCU per-partition ceiling for celebrity merchants, append a bounded shard suffix (MERCHANT#<id>#<0..N-1>) for high-volume writes, scatter-gather top-K reads, and cache hot reads in DAX/Redis."
+      },
+      "purpose": "The mechanism: understand how Why DynamoDB hot-partition throttling happens at 12% table utilization works from first principles.",
+      "sectionDiagram": {
+        "kind": "behavior-transition",
+        "eyebrow": "Stage 1 Trade-Off",
+        "title": "Why DynamoDB hot-partition throttling happens at 12% table...",
+        "before": {
+          "label": "Naive Unbounded Path",
+          "metrics": [
+            "Unbounded retries",
+            "Tail latency spikes",
+            "Silent state drift"
+          ]
+        },
+        "after": {
+          "label": "Bounded Engineering Path",
+          "metrics": [
+            "Explicit budgets",
+            "Predictable p99",
+            "Verifiable invariants"
+          ]
+        }
+      }
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "What happens without write sharding and read caching",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Leaving a skewed `PK = MERCHANT#<id>` unsharded triggers three cascading failures:",
+        "core": "1. **Hard Partition Throttling**: `3,500 WCU > 1,000 WCU` ceiling drops ~71% of writes.\n2. **SDK Retry Amplification**: Default exponential retries pile up on the same hot partition, turning a spike into a sustained outage.\n3. **Adaptive Capacity Limits**: Even DynamoDB adaptive capacity cannot exceed the `1,000 WCU` single-partition physical ceiling.",
+        "deepDive": "In production deployments of Eliminating DynamoDB Hot-Partition Throttling, watch how what happens without write sharding and read caching interacts with tail latency, retry amplification, and partial failures. To eliminate DynamoDB's 1,000 WCU/3,000 RCU per-partition ceiling for celebrity merchants, append a bounded shard suffix (MERCHANT#<id>#<0..N-1>) for high-volume writes, scatter-gather top-K reads, and cache hot reads in DAX/Redis."
+      },
+      "sectionDiagram": {
+        "kind": "ring",
+        "eyebrow": "Hot Partition vs. Sharded Keyspace",
+        "title": "Spreading 5,000 WCU & 25,000 RCU Across N=8 Physical Partitions",
+        "nodes": [
+          "Shard #0-1",
+          "Shard #2-3",
+          "Shard #4-5",
+          "Shard #6-7"
+        ],
+        "vnodes": [
+          "M1#0",
+          "M1#1",
+          "M1#2",
+          "M1#3",
+          "M1#4",
+          "M1#5",
+          "M1#6",
+          "M1#7"
+        ],
+        "ringLabel": "hash(PK # 0..7)",
+        "ringSub": "~625 WCU / shard",
+        "sampleKey": "M1#3",
+        "summary": "Appending a 0..7 suffix spreads 5,000 WCU across 8 partitions (~625 WCU each, safely under the 1,000 WCU physical limit)."
+      },
+      "purpose": "The problem: see what breaks without What happens without write sharding and read caching under real concurrency or scale.",
+      "decisionFramework": {
+        "problem": "How to implement Eliminating DynamoDB Hot-Partition Throttling without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "When traffic spikes expose hidden coupling, use adaptive write sharding (N shards only for celebrity merchants) to spread writes past 1,000 WCU/partition, and pair with scatter-gather reads + short-TTL caching.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Eliminating DynamoDB Hot-Partition Throttling experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Naive solution (and why over-provisioning table WCU or sharding everyone fails)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Two common reactions fail to fix the bottleneck:",
+        "core": "- **Raising Table WCU to 50,000**: Does nothing for a single hot key still capped at `1,000 WCU`.\n- **Fixed 20-Shard Suffix for All Merchants**: Forces `20` parallel `Query` calls for small merchants who only do `2 writes/sec`, wasting `20×` read overhead.",
+        "deepDive": "In production deployments of Eliminating DynamoDB Hot-Partition Throttling, watch how naive solution (and why over-provisioning table wcu or sharding everyone fails) interacts with tail latency, retry amplification, and partial failures. To eliminate DynamoDB's 1,000 WCU/3,000 RCU per-partition ceiling for celebrity merchants, append a bounded shard suffix (MERCHANT#<id>#<0..N-1>) for high-volume writes, scatter-gather top-K reads, and cache hot reads in DAX/Redis."
+      },
+      "purpose": "The problem: see what breaks without Naive solution under real concurrency or scale.",
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Stage 3 Interaction",
+        "title": "Naive solution (and why over-provisioning table WCU or sha...",
+        "actors": [
+          {
+            "id": "caller",
+            "label": "Client / Caller"
+          },
+          {
+            "id": "coord",
+            "label": "Coordinator"
+          },
+          {
+            "id": "store",
+            "label": "State / Engine"
+          }
+        ],
+        "steps": [
+          {
+            "from": "caller",
+            "to": "coord",
+            "label": "1. Dispatch request + bounds"
+          },
+          {
+            "from": "coord",
+            "to": "store",
+            "label": "2. Execute deterministic step"
+          },
+          {
+            "from": "store",
+            "to": "coord",
+            "label": "3. Return state & proof"
+          },
+          {
+            "from": "coord",
+            "to": "caller",
+            "label": "4. Ack with bounded latency"
+          }
+        ]
+      }
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise solution: Adaptive Write Sharding + Scatter-Gather Top-50 + Cache",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": {
+        "foundation": "Production DynamoDB architectures combine three patterns:",
+        "core": "- **Adaptive Write Sharding**: Lookup `shard_count` in a cached config (`N=1` for normal merchants, `N=8` or `16` for celebrity merchants). Writers pick `suffix = random(0, N-1)` -> `PK = MERCHANT#<id>#<suffix>`, keeping each partition around `~625 WCU` at `5,000 WCU` total.\n- **Parallel Scatter-Gather Top-50**: To fetch the latest 50 transactions (`SK = TX#<ts>#<tx_id>`), issue `N` async `Query(..., ScanIndexForward=False, Limit=50)` calls and k-way merge the top 50 in `< 25 ms` p95.\n- **Read Cache + Bounded Retries**: Serve `25,000` reads/sec from DAX/Redis (`5–10 s` TTL) and cap SDK retries with jitter + circuit breaker.",
+        "deepDive": "In production deployments of Eliminating DynamoDB Hot-Partition Throttling, watch how enterprise solution: adaptive write sharding + scatter-gather top-50 + cache interacts with tail latency, retry amplification, and partial failures. To eliminate DynamoDB's 1,000 WCU/3,000 RCU per-partition ceiling for celebrity merchants, append a bounded shard suffix (MERCHANT#<id>#<0..N-1>) for high-volume writes, scatter-gather top-K reads, and cache hot reads in DAX/Redis."
+      },
+      "sectionDiagram": {
+        "kind": "cache-tier",
+        "eyebrow": "Sharded Write & Cached Read Path",
+        "title": "Adaptive Suffix Writer + Redis/DAX Cache + N-Shard Scatter-Gather",
+        "nodes": [
+          {
+            "label": "Payment API",
+            "role": "Reads shard_count=N"
+          },
+          {
+            "label": "DAX / Redis",
+            "role": "25k/s read absorb"
+          },
+          {
+            "label": "Scatter-Gather",
+            "role": "N async Queries"
+          },
+          {
+            "label": "DynamoDB (N)",
+            "role": "625 WCU / partition"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Adaptive Suffix",
+            "detail": "Normal merchants use N=1; celebrity merchants scale to N=8..16."
+          },
+          {
+            "label": "Scatter-Gather",
+            "detail": "Queries N shards in parallel with Limit=50 and heap-merges top 50."
+          },
+          {
+            "label": "DAX / Redis",
+            "detail": "Absorbs 25,000 reads/sec well below the 3,000 RCU/partition ceiling."
+          },
+          {
+            "label": "Contributor Insights",
+            "detail": "Detects emerging hot keys early to bump N before throttling."
+          }
+        ],
+        "summary": "Adaptive sharding + DAX/Redis caching sustains 5k WCU and 25k RCU for a single merchant without over-sharding small tenants."
+      },
+      "markdownContent": "```python\nimport random, asyncio\nfrom heapq import merge\n\nSHARD_MAP = {\"celebrity_m1\": 8}  # loaded from dynamic config / Redis\n\ndef write_tx(ddb, merchant_id: str, ts_iso: str, tx_id: str, payload: dict):\n    n_shards = SHARD_MAP.get(merchant_id, 1)\n    suffix = random.randrange(n_shards)\n    pk = f\"MERCHANT#{merchant_id}#{suffix}\"\n    ddb.put_item(Item={\"PK\": pk, \"SK\": f\"TX#{ts_iso}#{tx_id}\", **payload})\n\nasync def get_recent_50(async_ddb, merchant_id: str):\n    n_shards = SHARD_MAP.get(merchant_id, 1)\n    tasks = [\n        async_ddb.query(\n            KeyConditionExpression=\"PK = :pk\",\n            ExpressionAttributeValues={\":pk\": f\"MERCHANT#{merchant_id}#{i}\"},\n            ScanIndexForward=False,\n            Limit=50,\n        )\n        for i in range(n_shards)\n    ]\n    pages = await asyncio.gather(*tasks)\n    merged = merge(*(p[\"Items\"] for p in pages), key=lambda x: x[\"SK\"], reverse=True)\n    return list(merged)[:50]\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where Write Sharding & Scatter-Gather apply in System Design",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Write sharding with bounded scatter-gather is the standard remedy for single-key hotspots:",
+        "core": "- **Payment Ledgers & Flash-Sale Counters**: Distributing celebrity merchant or viral SKU writes across `N` partitions.\n- **IoT & Telemetry Ingestion**: Sharding high-volume device/fleet IDs by `device_id#bucket`.\n- **Social Celebrity Timelines**: Splitting mega-influencer fanout or engagement counters across `K` shards.",
+        "deepDive": "In production deployments of Eliminating DynamoDB Hot-Partition Throttling, watch how where write sharding & scatter-gather apply in system design interacts with tail latency, retry amplification, and partial failures. To eliminate DynamoDB's 1,000 WCU/3,000 RCU per-partition ceiling for celebrity merchants, append a bounded shard suffix (MERCHANT#<id>#<0..N-1>) for high-volume writes, scatter-gather top-K reads, and cache hot reads in DAX/Redis."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "database-sharding",
+          "title": "Concept: Database Sharding",
+          "kind": "concept"
+        },
+        {
+          "slug": "wide-column-databases",
+          "title": "Concept: Wide-Column & Partitioned KV Stores",
+          "kind": "concept"
+        },
+        {
+          "slug": "consistent-hashing",
+          "title": "Concept: Consistent Hashing",
+          "kind": "concept"
+        },
+        {
+          "slug": "fixing-kafka-hot-partition-skew",
+          "title": "Problem: Fixing Kafka Hot-Partition Skew",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+      "sectionDiagram": {
+        "kind": "behavior-transition",
+        "eyebrow": "Stage 5 Trade-Off",
+        "title": "Where Write Sharding & Scatter-Gather apply in System Desi...",
+        "before": {
+          "label": "Naive Unbounded Path",
+          "metrics": [
+            "Unbounded retries",
+            "Tail latency spikes",
+            "Silent state drift"
+          ]
+        },
+        "after": {
+          "label": "Bounded Engineering Path",
+          "metrics": [
+            "Explicit budgets",
+            "Predictable p99",
+            "Verifiable invariants"
+          ]
+        }
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why does increasing a DynamoDB table's provisioned WCU from 10,000 to 50,000 NOT stop throttling on a single celebrity merchant at 3,500 writes/sec?",
+      "options": [
+        {
+          "id": "a",
+          "text": "Each individual physical partition is hard-capped at 1,000 WCU/sec regardless of total table capacity",
+          "correct": true,
+          "feedback": "Correct: all writes to the same unsharded PK hit one physical partition, which cannot exceed 1,000 WCU/sec."
+        },
+        {
+          "id": "b",
+          "text": "Because DynamoDB disables adaptive capacity above 10,000 WCU",
+          "correct": false,
+          "feedback": "Adaptive capacity cannot split a single hot partition key without write sharding."
+        },
+        {
+          "id": "c",
+          "text": "Because sort keys cannot exceed 1 KB",
+          "correct": false,
+          "feedback": "The bottleneck is the 1,000 WCU/sec per-partition throughput limit."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why does increasing a DynamoDB table's provisioned WCU from 10,000 to 50,000 NOT stop throttling on a single celebrity merchant at 3,500 writes/sec?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Each individual physical partition is hard-capped at 1,000 WCU/sec regardless of total table capacity",
+            "correct": true,
+            "feedback": "Correct: all writes to the same unsharded PK hit one physical partition, which cannot exceed 1,000 WCU/sec."
+          },
+          {
+            "id": "b",
+            "text": "Because DynamoDB disables adaptive capacity above 10,000 WCU",
+            "correct": false,
+            "feedback": "Adaptive capacity cannot split a single hot partition key without write sharding."
+          },
+          {
+            "id": "c",
+            "text": "Because sort keys cannot exceed 1 KB",
+            "correct": false,
+            "feedback": "The bottleneck is the 1,000 WCU/sec per-partition throughput limit."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why DynamoDB hot-partition throttling happens at 12% table utilization', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "b",
+            "text": "DynamoDB provisions capacity across physical partitions, but **each individual physical partition is hard-capped at 1,000 WCU/sec, 3,000 RCU/sec, and 10 GB**.",
+            "correct": true,
+            "feedback": "Correct: DynamoDB provisions capacity across physical partitions, but **each individual physical partition is hard-capped at 1,000 WCU/sec, 3,000 RCU/sec, and 10 GB**."
+          },
+          {
+            "id": "c",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'What happens without write sharding and read caching', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "b",
+            "text": "Leaving a skewed PK = MERCHANT#<id> unsharded triggers three cascading failures: 1.",
+            "correct": true,
+            "feedback": "Correct: Leaving a skewed PK = MERCHANT#<id> unsharded triggers three cascading failures: 1."
+          },
+          {
+            "id": "c",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** DynamoDB provisions capacity across physical partitions, but **each individual physical partition is hard-capped at `1,000 WCU/sec`, `3,000 RCU/sec`, and `10 GB`**.\n\n**How It Flows:** Think of Eliminating DynamoDB Hot-Partition Throttling as a clear step-by-step chain: Shard #0-1 -> Shard #2-3 -> Shard #4-5 -> Shard #6-7 -> Payment API.\n\n**Why Beginners Should Care:** Use adaptive write sharding (N shards only for celebrity merchants) to spread writes past 1,000 WCU/partition, and pair with scatter-gather reads + short-TTL caching.",
+      "spark": {
+        "summary": "DynamoDB provisions capacity across physical partitions, but **each individual physical partition is hard-capped at `1,000 WCU/sec`, `3,000 RCU/sec`, and `10 GB`**.",
+        "keyTakeaway": "Use adaptive write sharding (N shards only for celebrity merchants) to spread writes past 1,000 WCU/partition, and pair with scatter-gather reads + short-TTL caching."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why DynamoDB hot-partition throttling happens at 12% table utilization",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why DynamoDB hot-partition throttling happens at 12% table utilization works from first principles.",
+          "explanation": "DynamoDB provisions capacity across physical partitions, but **each individual physical partition is hard-capped at `1,000 WCU/sec`, `3,000 RCU/sec`, and `10 GB`**.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "What happens without write sharding and read caching",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without What happens without write sharding and read caching under real concurrency or scale.",
+          "explanation": "Leaving a skewed `PK = MERCHANT#<id>` unsharded triggers three cascading failures: 1. **Hard Partition Throttling**: `3,500 WCU > 1,000 WCU` ceiling drops ~71% of writes. 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "ring",
+            "eyebrow": "Hot Partition vs. Sharded Keyspace",
+            "title": "Spreading 5,000 WCU & 25,000 RCU Across N=8 Physical Partitions",
+            "nodes": [
+              "Shard #0-1",
+              "Shard #2-3",
+              "Shard #4-5",
+              "Shard #6-7"
+            ],
+            "vnodes": [
+              "M1#0",
+              "M1#1",
+              "M1#2",
+              "M1#3",
+              "M1#4",
+              "M1#5",
+              "M1#6",
+              "M1#7"
+            ],
+            "ringLabel": "hash(PK # 0..7)",
+            "ringSub": "~625 WCU / shard",
+            "sampleKey": "M1#3",
+            "summary": "Appending a 0..7 suffix spreads 5,000 WCU across 8 partitions (~625 WCU each, safely under the 1,000 WCU physical limit)."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive solution (and why over-provisioning table WCU or sharding everyone fails)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "The problem: see what breaks without Naive solution under real concurrency or scale.",
+          "explanation": "Two common reactions fail to fix the bottleneck: **Raising Table WCU to 50,000**: Does nothing for a single hot key still capped at `1,000 WCU`. **Fixed 20-Shard Suffix for All Merchants**: Forces `20` parallel `Query` calls for small merchants who only do `2 writes/sec`, wasting `20×` read overhead.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Adaptive Write Sharding + Scatter-Gather Top-50 + Cache",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Production DynamoDB architectures combine three patterns: **Adaptive Write Sharding**: Lookup `shard_count` in a cached config (`N=1` for normal merchants, `N=8` or `16` for celebrity merchants). Writers pick `suffix = random(0, N-1)` -> `PK = MERCHANT#<id>#<suffix>`, keeping each partition around `~625 WCU` at `5,000 WCU` total.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Sharded Write & Cached Read Path",
+            "title": "Adaptive Suffix Writer + Redis/DAX Cache + N-Shard Scatter-Gather",
+            "nodes": [
+              {
+                "label": "Payment API",
+                "role": "Reads shard_count=N"
+              },
+              {
+                "label": "DAX / Redis",
+                "role": "25k/s read absorb"
+              },
+              {
+                "label": "Scatter-Gather",
+                "role": "N async Queries"
+              },
+              {
+                "label": "DynamoDB (N)",
+                "role": "625 WCU / partition"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Adaptive Suffix",
+                "detail": "Normal merchants use N=1; celebrity merchants scale to N=8..16."
+              },
+              {
+                "label": "Scatter-Gather",
+                "detail": "Queries N shards in parallel with Limit=50 and heap-merges top 50."
+              },
+              {
+                "label": "DAX / Redis",
+                "detail": "Absorbs 25,000 reads/sec well below the 3,000 RCU/partition ceiling."
+              },
+              {
+                "label": "Contributor Insights",
+                "detail": "Detects emerging hot keys early to bump N before throttling."
+              }
+            ],
+            "summary": "Adaptive sharding + DAX/Redis caching sustains 5k WCU and 25k RCU for a single merchant without over-sharding small tenants."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Use adaptive write sharding (N shards only for celebrity merchants) to spread writes past 1,000 WCU/partition, and pair with scatter-gather reads + short-TTL caching.",
+      "summary": "To eliminate DynamoDB's 1,000 WCU/3,000 RCU per-partition ceiling for celebrity merchants, append a bounded shard suffix (MERCHANT#<id>#<0..N-1>) for high-volume writes, scatter-gather top-K reads, and cache hot reads in DAX/Redis.",
+      "keyTakeaway": "When traffic spikes expose hidden coupling, use adaptive write sharding (N shards only for celebrity merchants) to spread writes past 1,000 WCU/partition, and pair with scatter-gather reads + short-TTL caching."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** DynamoDB provisions capacity across physical partitions, but **each individual physical partition is hard-capped at `1,000 WCU/sec`, `3,000 RCU/sec`, and `10 GB`**.\n\n**Visual & Structural Flow:** Depicts Spreading 5,000 WCU & 25,000 RCU Across N=8 Physical Partitions (Shard #0-1 -> Shard #2-3 -> Shard #4-5 -> Shard #6-7 -> M1#0); Adaptive Suffix Writer + Redis/DAX Cache + N-Shard Scatter-Gather (Payment API -> DAX / Redis -> Scatter-Gather -> DynamoDB (N)).\n\n**Trade-Offs & Production:** Two common reactions fail to fix the bottleneck: **Raising Table WCU to 50,000**: Does nothing for a single hot key still capped at `1,000 WCU`. Production DynamoDB architectures combine three patterns: **Adaptive Write Sharding**: Lookup `shard_count` in a cached config (`N=1` for normal merchants, `N=8` or `16` for celebrity merchants).\n\n**Failure Modes & Application:** Write sharding with bounded scatter-gather is the standard remedy for single-key hotspots: **Payment Ledgers & Flash-Sale Counters**: Distributing celebrity merchant or viral SKU writes across `N` partitions.",
+      "spark": {
+        "summary": "To eliminate DynamoDB's 1,000 WCU/3,000 RCU per-partition ceiling for celebrity merchants, append a bounded shard suffix (MERCHANT#<id>#<0..N-1>) for high-volume writes, scatter-gather top-K reads, and cache hot reads in DAX/Redis.",
+        "keyTakeaway": "Use adaptive write sharding (N shards only for celebrity merchants) to spread writes past 1,000 WCU/partition, and pair with scatter-gather reads + short-TTL caching."
+      },
+      "summary": "To eliminate DynamoDB's 1,000 WCU/3,000 RCU per-partition ceiling for celebrity merchants, append a bounded shard suffix (MERCHANT#<id>#<0..N-1>) for high-volume writes, scatter-gather top-K reads, and cache hot reads in DAX/Redis.",
+      "keyTakeaway": "When traffic spikes expose hidden coupling, use adaptive write sharding (N shards only for celebrity merchants) to spread writes past 1,000 WCU/partition, and pair with scatter-gather reads + short-TTL caching."
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** To eliminate DynamoDB's 1,000 WCU/3,000 RCU per-partition ceiling for celebrity merchants, append a bounded shard suffix (MERCHANT#<id>#<0..N-1>) for high-volume writes, scatter-gather top-K reads, and cache hot reads in DAX/Redis.\n\n**Production Trade-Offs:** Two common reactions fail to fix the bottleneck: **Raising Table WCU to 50,000**: Does nothing for a single hot key still capped at `1,000 WCU`.\n\n**Failure Modes & Edge Cases:** Write sharding with bounded scatter-gather is the standard remedy for single-key hotspots: **Payment Ledgers & Flash-Sale Counters**: Distributing celebrity merchant or viral SKU writes across `N` partitions.\n\n**Principal Takeaway:** Use adaptive write sharding (N shards only for celebrity merchants) to spread writes past 1,000 WCU/partition, and pair with scatter-gather reads + short-TTL caching.",
+      "spark": {
+        "summary": "To eliminate DynamoDB's 1,000 WCU/3,000 RCU per-partition ceiling for celebrity merchants, append a bounded shard suffix (MERCHANT#<id>#<0..N-1>) for high-volume writes, scatter-gather top-K reads, and cache hot reads in DAX/Redis.",
+        "keyTakeaway": "Use adaptive write sharding (N shards only for celebrity merchants) to spread writes past 1,000 WCU/partition, and pair with scatter-gather reads + short-TTL caching."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why DynamoDB hot-partition throttling happens at 12% table utilization",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why DynamoDB hot-partition throttling happens at 12% table utilization works from first principles.",
+          "explanation": "DynamoDB provisions capacity across physical partitions, but **each individual physical partition is hard-capped at `1,000 WCU/sec`, `3,000 RCU/sec`, and `10 GB`**. When `PK = MERCHANT#<merchant_id>` receives `3,500` writes/sec (`3,500 WCU`) and `12,000` reads/sec (`12,000 RCU`) for one celebrity merchant, that single partition throttles with `ProvisionedThroughputExceededException` even though the table's `10,000 WCU` total is only 12% utilized.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "What happens without write sharding and read caching",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without What happens without write sharding and read caching under real concurrency or scale.",
+          "explanation": "Leaving a skewed `PK = MERCHANT#<id>` unsharded triggers three cascading failures:\n\n1. **Hard Partition Throttling**: `3,500 WCU > 1,000 WCU` ceiling drops ~71% of writes.\n2. **SDK Retry Amplification**: Default exponential retries pile up on the same hot partition, turning a spike into a sustained outage.\n3. **Adaptive Capacity Limits**: Even DynamoDB adaptive capacity cannot exceed the `1,000 WCU` single-partition physical ceiling.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "ring",
+            "eyebrow": "Hot Partition vs. Sharded Keyspace",
+            "title": "Spreading 5,000 WCU & 25,000 RCU Across N=8 Physical Partitions",
+            "nodes": [
+              "Shard #0-1",
+              "Shard #2-3",
+              "Shard #4-5",
+              "Shard #6-7"
+            ],
+            "vnodes": [
+              "M1#0",
+              "M1#1",
+              "M1#2",
+              "M1#3",
+              "M1#4",
+              "M1#5",
+              "M1#6",
+              "M1#7"
+            ],
+            "ringLabel": "hash(PK # 0..7)",
+            "ringSub": "~625 WCU / shard",
+            "sampleKey": "M1#3",
+            "summary": "Appending a 0..7 suffix spreads 5,000 WCU across 8 partitions (~625 WCU each, safely under the 1,000 WCU physical limit)."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive solution (and why over-provisioning table WCU or sharding everyone fails)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "The problem: see what breaks without Naive solution under real concurrency or scale.",
+          "explanation": "Two common reactions fail to fix the bottleneck:\n\n- **Raising Table WCU to 50,000**: Does nothing for a single hot key still capped at `1,000 WCU`.\n- **Fixed 20-Shard Suffix for All Merchants**: Forces `20` parallel `Query` calls for small merchants who only do `2 writes/sec`, wasting `20×` read overhead.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Adaptive Write Sharding + Scatter-Gather Top-50 + Cache",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Production DynamoDB architectures combine three patterns:\n\n- **Adaptive Write Sharding**: Lookup `shard_count` in a cached config (`N=1` for normal merchants, `N=8` or `16` for celebrity merchants). Writers pick `suffix = random(0, N-1)` -> `PK = MERCHANT#<id>#<suffix>`, keeping each partition around `~625 WCU` at `5,000 WCU` total.\n- **Parallel Scatter-Gather Top-50**: To fetch the latest 50 transactions (`SK = TX#<ts>#<tx_id>`), issue `N` async `Query(..., ScanIndexForward=False, Limit=50)` calls and k-way merge the top 50 in `< 25 ms` p95.\n- **Read Cache + Bounded Retries**: Serve `25,000` reads/sec from DAX/Redis (`5–10 s` TTL) and cap SDK retries with jitter + circuit breaker.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Sharded Write & Cached Read Path",
+            "title": "Adaptive Suffix Writer + Redis/DAX Cache + N-Shard Scatter-Gather",
+            "nodes": [
+              {
+                "label": "Payment API",
+                "role": "Reads shard_count=N"
+              },
+              {
+                "label": "DAX / Redis",
+                "role": "25k/s read absorb"
+              },
+              {
+                "label": "Scatter-Gather",
+                "role": "N async Queries"
+              },
+              {
+                "label": "DynamoDB (N)",
+                "role": "625 WCU / partition"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Adaptive Suffix",
+                "detail": "Normal merchants use N=1; celebrity merchants scale to N=8..16."
+              },
+              {
+                "label": "Scatter-Gather",
+                "detail": "Queries N shards in parallel with Limit=50 and heap-merges top 50."
+              },
+              {
+                "label": "DAX / Redis",
+                "detail": "Absorbs 25,000 reads/sec well below the 3,000 RCU/partition ceiling."
+              },
+              {
+                "label": "Contributor Insights",
+                "detail": "Detects emerging hot keys early to bump N before throttling."
+              }
+            ],
+            "summary": "Adaptive sharding + DAX/Redis caching sustains 5k WCU and 25k RCU for a single merchant without over-sharding small tenants."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where Write Sharding & Scatter-Gather apply in System Design",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Write sharding with bounded scatter-gather is the standard remedy for single-key hotspots:\n\n- **Payment Ledgers & Flash-Sale Counters**: Distributing celebrity merchant or viral SKU writes across `N` partitions.\n- **IoT & Telemetry Ingestion**: Sharding high-volume device/fleet IDs by `device_id#bucket`.\n- **Social Celebrity Timelines**: Splitting mega-influencer fanout or engagement counters across `K` shards.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Use adaptive write sharding (N shards only for celebrity merchants) to spread writes past 1,000 WCU/partition, and pair with scatter-gather reads + short-TTL caching.",
+      "summary": "To eliminate DynamoDB's 1,000 WCU/3,000 RCU per-partition ceiling for celebrity merchants, append a bounded shard suffix (MERCHANT#<id>#<0..N-1>) for high-volume writes, scatter-gather top-K reads, and cache hot reads in DAX/Redis.",
+      "keyTakeaway": "When traffic spikes expose hidden coupling, use adaptive write sharding (N shards only for celebrity merchants) to spread writes past 1,000 WCU/partition, and pair with scatter-gather reads + short-TTL caching."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "simulation": {
+    "title": "Eliminating DynamoDB Hot-Partition Throttling — Interactive Execution Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Workload & Budget"
+      },
+      {
+        "id": "router",
+        "label": "Gateway / Router",
+        "role": "Admission & Dispatch"
+      },
+      {
+        "id": "engine",
+        "label": "Core Engine",
+        "role": "Primary Execution"
+      },
+      {
+        "id": "replica",
+        "label": "Replica / Fallback",
+        "role": "Durability & Recovery"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "router",
+        "label": "request"
+      },
+      {
+        "from": "router",
+        "to": "engine",
+        "label": "route"
+      },
+      {
+        "from": "engine",
+        "to": "replica",
+        "label": "sync / fallback"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why DynamoDB hot-partition throttling happens at 12% table u",
+        "actionLabel": "Dispatch nominal request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "router"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "Ingress",
+          "p99_ms": 8,
+          "error_rate": "0.0%"
+        },
+        "explanation": "Caller sends work into the gateway with explicit timeout and concurrency bounds (Why DynamoDB hot-partition throttling happens at 12% table utilization)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "What happens without write sharding and read caching",
+        "actionLabel": "Execute core invariant",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "Core Path",
+          "p99_ms": 18,
+          "in_flight": 124
+        },
+        "explanation": "The core engine processes the hot path while keeping state transitions deterministic (What happens without write sharding and read caching)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Naive solution (and why over-provisioning table WCU or shard",
+        "actionLabel": "Detect skew or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Degraded",
+          "p99_ms": 64,
+          "retries_capped": "true"
+        },
+        "explanation": "Under load or replica lag, bounded backoff and isolation prevent cascading saturation (Naive solution (and why over-provisioning table WCU or sharding everyone fails))."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Where Write Sharding & Scatter-Gather apply in System Design",
+        "actionLabel": "Converge & restore SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 11,
+          "drift": 0
+        },
+        "explanation": "State converges cleanly and telemetry confirms the system returned within its SLO envelope (Where Write Sharding & Scatter-Gather apply in System Design)."
+      }
+    ]
+  }
+}

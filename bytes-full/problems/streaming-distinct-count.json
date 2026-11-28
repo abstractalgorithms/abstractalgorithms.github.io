@@ -1,0 +1,845 @@
+{
+  "id": "streaming-distinct-count",
+  "slug": "streaming-distinct-count",
+  "title": "1M Events/sec Streaming Distinct-Count & Top-K Without OOM",
+  "problemType": "architecture",
+  "difficulty": "hard",
+  "prompt": "Your real-time telemetry pipeline ingests 1,000,000 events/sec across 16 Kafka/Flink worker pods (4 GB RAM per pod) and tracks 50,000,000 unique `user_id`s and `endpoint`s per 1-hour sliding window across 200 tenants. Using per-pod `HashSet` and `HashMap` aggregations causes pods to exceed 12 GB and crash with `OOMKilled` (exit code 137) within 10 minutes, while shuffling raw `user_id`s across nodes saturates the network. Design a <1 MB/shard streaming analytics architecture.",
+  "spark": {
+    "summary": "Replace per-pod HashSets and HashMaps with 16 KB HyperLogLog sketches (for distinct users) and 256 KB Count-Min Sketch + size-K Min-Heaps (for Top-K endpoints), merged across workers in 1-minute tumbling sub-windows.",
+    "keyTakeaway": "When a single bottleneck threatens end-to-end availability, decompose 1-hour sliding windows into sixty 1-minute tumbling HLL + CMS sketches so workers merge fixed kilobyte arrays in <1 MB RAM.",
+    "byteSummary": "Tracking 50M distinct `user_id` strings in an in-memory `HashSet` across 200 tenants and 1-hour sliding windows blows past 4 GB pod limits in minutes (`OOMKilled` exit code 137). Even if pods had 64 GB RAM, shipping raw sets across the network to compute global cluster-wide `COUNT(DISTINCT)` saturates NICs.\n\nThe bounded-memory architecture replaces exact sets/maps with two mergeable sketches per `(tenant, 1-minute pane)`: a **HyperLogLog** (`p=14`, 16 KB) for `+-0.81%` distinct `user_id` counts, and a **Count-Min Sketch** (`d=5, w=12,800`, ~256 KB) paired with a **size-100 Min-Heap** for Top-K `endpoint` heavy hitters.\n\nTo support a **1-hour sliding window** without storing raw events, maintain a ring buffer of **60 one-minute tumbling panes** per tenant (`60 * 16 KB = 960 KB` for HLL, or ~16 MB total across panes if kept on-heap / offloaded to RocksDB state). Each minute, workers emit only the closed 1-minute sketch (~270 KB) to the aggregator, which merges across all 16 workers (`max` for HLL, `sum` for CMS) and slides the 60-pane window.\n\nThe core trade-off is ~0.8%–1% cardinality error and ~0.1% frequency error in exchange for deterministic, OOM-proof memory and 100x less cross-node network traffic—while supporting an optional exact-count fast path for low-cardinality (<1,000) tenants."
+  },
+  "learningJourney": [
+    {
+      "id": "stage-1-oom-root-cause",
+      "eyebrow": "Stage 1 • Triage",
+      "title": "Why 50M Unique Keys + Sliding Windows OOM 4 GB Pods",
+      "level": "foundation",
+      "purpose": "Calculate the exact RAM footprint of HashSets and sliding-window state duplication.",
+      "explanation": {
+        "foundation": "Think of **Why 50M Unique Keys + Sliding Windows OOM 4 GB Pods** as the intuition layer for 1M Events/sec Streaming Distinct-Count & Top-K Without OOM: Calculate the exact RAM footprint of HashSets and sliding-window state duplication.",
+        "core": "Even 3.1M unique `user_id`s per pod (`50M / 16` pods) in a `HashSet<String>` takes `~3.1M * 96 bytes ≈ 300 MB` for *one* window. With a 1-hour sliding window advancing every 1 minute, naive overlapping panes multiply memory by `60x` (`18 GB`!)—far above the 4 GB cgroup limit (`OOMKilled 137`).",
+        "deepDive": "Under heavy load or partial failure, why 50m unique keys + sliding windows oom 4 gb pods becomes a critical lever for predictable latency and correctness. Replace per-pod HashSets and HashMaps with 16 KB HyperLogLog sketches (for distinct users) and 256 KB Count-Min Sketch + size-K Min-Heaps (for Top-K endpoints), merged across workers in 1-minute tumbling sub-windows."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Memory Explosion",
+        "title": "50M Keys x 60 Sliding Panes -> 18 GB OOMKilled",
+        "nodes": [
+          {
+            "id": "inp",
+            "label": "1M Events/sec",
+            "sublabel": "50M unique user_ids"
+          },
+          {
+            "id": "hs",
+            "label": "HashSet + 60 Panes",
+            "sublabel": "18 GB RAM / pod"
+          },
+          {
+            "id": "oom",
+            "label": "OOMKilled (137)",
+            "sublabel": "4 GB cgroup exceeded"
+          }
+        ],
+        "edges": [
+          {
+            "from": "inp",
+            "to": "hs",
+            "label": "O(N * W) state"
+          },
+          {
+            "from": "hs",
+            "to": "oom",
+            "label": "Pod crash loop"
+          }
+        ],
+        "cards": [
+          {
+            "title": "Sliding Window Multiplier",
+            "body": "Naive sliding windows store each event in up to 60 overlapping buckets."
+          },
+          {
+            "title": "Network Shuffle",
+            "body": "Repartitioning 1M/s by user_id just to deduplicate burns massive cross-AZ bandwidth."
+          }
+        ],
+        "summary": "Caption: Storing exact HashSets across 60 overlapping 1-minute panes multiplies RAM past 18 GB per pod, triggering OOMKilled (exit 137)."
+      }
+    },
+    {
+      "id": "stage-2-tumbling-pane-decomposition",
+      "eyebrow": "Stage 2 • Window Architecture",
+      "title": "60x 1-Minute Tumbling Panes with Mergeable HLL + CMS",
+      "level": "foundation",
+      "purpose": "Eliminate event duplication across sliding windows using mergeable 1-minute sketch panes.",
+      "explanation": {
+        "foundation": "Instead of assigning every event to 60 overlapping windows, each worker maintains **1 active 1-minute tumbling sketch** (`HLL + CMS + TopK`):",
+        "core": "- **Zero Duplication**: Each incoming event updates exactly *one* active sketch in `O(1)` time.\n- **Sliding Window Evaluation**: At minute `T`, the central aggregator stores a 60-slot ring buffer of global 1-minute sketches `[T-59 .. T]` and merges them in `<2 ms` (`max` for HLL, `sum` for CMS) to answer the 1-hour sliding query.",
+        "deepDive": "In production deployments of 1M Events/sec Streaming Distinct-Count & Top-K Without OOM, watch how 60x 1-minute tumbling panes with mergeable hll + cms interacts with tail latency, retry amplification, and partial failures. Replace per-pod HashSets and HashMaps with 16 KB HyperLogLog sketches (for distinct users) and 256 KB Count-Min Sketch + size-K Min-Heaps (for Top-K endpoints), merged across workers in 1-minute tumbling sub-windows."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Pane Merging",
+        "title": "1 Active Pane/Worker -> 60-Slot Ring Buffer -> 1h Query",
+        "nodes": [
+          {
+            "id": "act",
+            "label": "Active 1m Sketch",
+            "sublabel": "O(1) single update"
+          },
+          {
+            "id": "agg",
+            "label": "16-Worker Merge",
+            "sublabel": "Max(HLL) / Sum(CMS)"
+          },
+          {
+            "id": "ring",
+            "label": "60-Pane Ring Buffer",
+            "sublabel": "1h sliding rollup"
+          }
+        ],
+        "edges": [
+          {
+            "from": "act",
+            "to": "agg",
+            "label": "Emit once/min"
+          },
+          {
+            "from": "agg",
+            "to": "ring",
+            "label": "Evict T-60 pane"
+          }
+        ],
+        "cards": [
+          {
+            "title": "60x Less Write Work",
+            "body": "Each event hits 1 sketch instead of 60 overlapping HashSets."
+          },
+          {
+            "title": "Sub-Millisecond Merge",
+            "body": "Merging 60 HLLs of 16 KB touches <1 MB of L2/L3 cache."
+          }
+        ],
+        "summary": "Caption: Decomposing a 1-hour sliding window into 60 tumbling 1-minute sketch panes cuts worker state by 60x and lets the aggregator merge global metrics in <2 ms."
+      },
+      "decisionFramework": {
+        "problem": "How to implement 1M Events/sec Streaming Distinct-Count & Top-K Without OOM without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "When a single bottleneck threatens end-to-end availability, decompose 1-hour sliding windows into sixty 1-minute tumbling HLL + CMS sketches so workers merge fixed kilobyte arrays in <1 MB RAM.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When 1M Events/sec Streaming Distinct-Count & Top-K Without OOM experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-3-sizing-ram-budget",
+      "eyebrow": "Stage 3 • Memory Math",
+      "title": "Exact RAM & Error Budgeting Across 200 Tenants",
+      "level": "intermediate",
+      "purpose": "Verify that HLL + CMS + Min-Heap fits safely inside 4 GB pods even with 200 active tenants.",
+      "explanation": {
+        "foundation": "Size each sketch explicitly before deployment:",
+        "core": "- **HyperLogLog (`p=12` per tenant, or `p=14` for top tenants)**: `p=12` uses **4 KB** (`+-1.6%` error); `200 tenants * 4 KB = 800 KB` per worker!\n- **Count-Min Sketch (`d=4, w=2,048` x 4B ints)**: `32 KB` per tenant (`200 * 32 KB = 6.4 MB` per worker; or **1 shared global CMS** keyed by `(tenant_id, endpoint)` using 256 KB total).\n- **Top-100 Min-Heap**: `100 * 128B ≈ 13 KB` per tenant (`2.6 MB` total).",
+        "deepDive": "In production deployments of 1M Events/sec Streaming Distinct-Count & Top-K Without OOM, watch how exact ram & error budgeting across 200 tenants interacts with tail latency, retry amplification, and partial failures. Replace per-pod HashSets and HashMaps with 16 KB HyperLogLog sketches (for distinct users) and 256 KB Count-Min Sketch + size-K Min-Heaps (for Top-K endpoints), merged across workers in 1-minute tumbling sub-windows."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Memory Budget",
+        "title": "Per-Tenant Sketch Footprint vs Shared CMS",
+        "nodes": [
+          {
+            "id": "pt",
+            "label": "200 Per-Tenant Sketches",
+            "sublabel": "~10 MB total/pod"
+          },
+          {
+            "id": "sh",
+            "label": "Shared Global CMS + HLL",
+            "sublabel": "<1 MB total/pod"
+          }
+        ],
+        "edges": [
+          {
+            "from": "pt",
+            "to": "sh",
+            "label": "Both well under 4 GB limit"
+          }
+        ],
+        "cards": [
+          {
+            "title": "Key Prefixing",
+            "body": "Prefixing keys as f'{tenant}:{endpoint}' lets one 256 KB CMS serve all 200 tenants."
+          },
+          {
+            "title": "Zero GC Pressure",
+            "body": "Reuse pre-allocated bytearray/int32 buffers across 1-minute panes."
+          }
+        ],
+        "summary": "Caption: Sizing HLL at p=12 (4 KB) and using a shared tenant-prefixed Count-Min Sketch (256 KB) keeps total per-pod memory under 1–10 MB."
+      }
+    },
+    {
+      "id": "stage-4-skew-hot-tenants",
+      "eyebrow": "Stage 4 • Skew & Hot Keys",
+      "title": "Handling Tenant Skew & High-Volume DDoS Bursts",
+      "level": "intermediate",
+      "purpose": "Prevent one massive tenant from polluting smaller tenants' Count-Min estimates.",
+      "explanation": {
+        "foundation": "If Tenant A generates 900K events/sec (`N_total = 54M/min`) while Tenant B generates 100 events/sec, a **single shared CMS** has error `epsilon * N_total = 0.001 * 54M = 54,000`—swamping Tenant B's true count of 100!",
+        "core": "- **Isolate Whale Tenants**: Route heavy-hitter tenants (`> 10K events/sec`) to dedicated per-tenant CMS instances, while small tenants share a pooled CMS (or use exact `dict` until cardinality > 1,000).\n- **Exact-to-Sketch Promotion**: Start new/small tenants in a tiny 1,000-entry `dict` and promote to HLL+CMS only when `len > 1,000`.",
+        "deepDive": "In production deployments of 1M Events/sec Streaming Distinct-Count & Top-K Without OOM, watch how handling tenant skew & high-volume ddos bursts interacts with tail latency, retry amplification, and partial failures. Replace per-pod HashSets and HashMaps with 16 KB HyperLogLog sketches (for distinct users) and 256 KB Count-Min Sketch + size-K Min-Heaps (for Top-K endpoints), merged across workers in 1-minute tumbling sub-windows."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Skew Isolation",
+        "title": "Shared CMS Pollution vs Whale-Isolated Sketches",
+        "nodes": [
+          {
+            "id": "pol",
+            "label": "Shared CMS Only",
+            "sublabel": "Whale noise swamps small tenants"
+          },
+          {
+            "id": "iso",
+            "label": "Exact <1K -> Isolated Sketch",
+            "sublabel": "Accurate for small & whale"
+          }
+        ],
+        "edges": [
+          {
+            "from": "pol",
+            "to": "iso",
+            "label": "Eliminates cross-tenant error"
+          }
+        ],
+        "cards": [
+          {
+            "title": "Exact Small-Tenant Mode",
+            "body": "100% exact counts for tenants with <1,000 distinct items in ~64 KB."
+          },
+          {
+            "title": "Dedicated Whale CMS",
+            "body": "Prevents 900K/s tenants from inflating epsilon*N for small customers."
+          }
+        ],
+        "summary": "Caption: Promoting small tenants from exact maps (>1,000 keys) and isolating high-volume whale tenants prevents cross-tenant Count-Min over-estimation."
+      }
+    },
+    {
+      "id": "stage-5-implementation",
+      "eyebrow": "Stage 5 • Implementation",
+      "title": "Streaming Pane Aggregator with CMS + Min-Heap & Bounded Flush Retry",
+      "level": "intermediate",
+      "purpose": "Implement a bounded-memory Count-Min + Top-K tracker with safe flush retries.",
+      "explanation": {
+        "foundation": "Below is a self-contained Python `TopKSketchPane` combining a `d x w` Count-Min Sketch, a size-K Min-Heap, and bounded retry when flushing closed 1-minute panes:",
+        "core": "```python\nimport hashlib, heapq, random, time\n\nclass TopKSketchPane:\n    def __init__(self, k: int = 10, d: int = 4, w: int = 2048):\n        self.k, self.d, self.w = k, d, w\n        self.table = [[0] * w for _ in range(d)]\n        self.topk_map: dict[str, int] = {}\n\ndef _hashes(self, key: str) -> list[int]:\n        digest = hashlib.blake2b(key.encode(), digest_size=16).digest()\n        h1 = int.from_bytes(digest[:8], 'big')\n        h2 = int.from_bytes(digest[8:], 'big') | 1\n        return [((h1 + i * h2) & 0xFFFFFFFFFFFFFFFF) % self.w for i in range(self.d)]\n\ndef add(self, key: str, count: int = 1) -> int:\n        est = None\n        for r, col in enumerate(self._hashes(key)):\n            self.table[r][col] += count\n            val = self.table[r][col]\n            est = val if est is None or val < est else est\n        assert est is not None\n        if key in self.topk_map or len(self.topk_map) < self.k:\n            self.topk_map[key] = est\n        else:\n            min_k, min_v = min(self.topk_map.items(), key=lambda kv: kv[1])\n            if est > min_v:\n                del self.topk_map[min_k]\n                self.topk_map[key] = est\n        return est",
+        "deepDive": "def flush_pane_with_retry(sink_fn, payload: bytes, max_retries: int = 3) -> None:\n    for attempt in range(max_retries):\n        try:\n            sink_fn(payload)\n            return\n        except OSError as exc:\n            if attempt == max_retries - 1:\n                raise RuntimeError(f'Pane flush failed: {exc}') from exc\n            time.sleep((0.2 * (2 ** attempt)) + random.uniform(0, 0.1))\n```"
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Pane Implementation",
+        "title": "Kirsch-Mitzenmacher Hashes -> CMS + Top-K -> Retried Flush",
+        "nodes": [
+          {
+            "id": "km",
+            "label": "blake2b (h1 + i*h2)",
+            "sublabel": "d independent rows"
+          },
+          {
+            "id": "tk",
+            "label": "Bounded Top-K Map",
+            "sublabel": "Capped at K entries"
+          },
+          {
+            "id": "fl",
+            "label": "Bounded Flush Retry",
+            "sublabel": "3x backoff + jitter"
+          }
+        ],
+        "edges": [
+          {
+            "from": "km",
+            "to": "tk",
+            "label": "Update min estimate"
+          },
+          {
+            "from": "tk",
+            "to": "fl",
+            "label": "Emit closed 1m pane"
+          }
+        ],
+        "cards": [
+          {
+            "title": "1 Hash Call",
+            "body": "Kirsch-Mitzenmacher derives d=4 hashes from one 16-byte blake2b digest."
+          },
+          {
+            "title": "Bounded Heap",
+            "body": "topk_map never exceeds K entries regardless of unique key volume."
+          }
+        ],
+        "summary": "Caption: Using one 16-byte blake2b digest with Kirsch-Mitzenmacher probing updates the Count-Min table and bounded Top-K map in O(d + K) time."
+      }
+    },
+    {
+      "id": "stage-6-checkpoint-durability",
+      "eyebrow": "Stage 6 • State Checkpointing",
+      "title": "Fast RocksDB/S3 Checkpointing of 16 KB Sketches",
+      "level": "advanced",
+      "purpose": "Show how fixed-size sketches speed up Flink/Kafka Streams failover checkpoints.",
+      "explanation": {
+        "foundation": "With exact `HashSet`s, Flink checkpoints took minutes and timed out during pod restarts. With fixed-size sketches:",
+        "core": "- **Sub-Second Checkpoints**: Serializing 200 tenants x `(4 KB HLL + 32 KB CMS)` is `< 8 MB` total—snapshotting to S3 in **<150 ms**.\n- **Exact-Once Replay**: On pod crash, Flink restores the last 1-minute sketch checkpoint and replays Kafka offsets from the last barrier with zero OOM risk.",
+        "deepDive": "In production deployments of 1M Events/sec Streaming Distinct-Count & Top-K Without OOM, watch how fast rocksdb/s3 checkpointing of 16 kb sketches interacts with tail latency, retry amplification, and partial failures. Replace per-pod HashSets and HashMaps with 16 KB HyperLogLog sketches (for distinct users) and 256 KB Count-Min Sketch + size-K Min-Heaps (for Top-K endpoints), merged across workers in 1-minute tumbling sub-windows."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Failover Recovery",
+        "title": "18 GB State Checkpoint vs <8 MB Sketch Checkpoint",
+        "nodes": [
+          {
+            "id": "old",
+            "label": "18 GB Exact State",
+            "sublabel": "Checkpoint timeouts & OOM"
+          },
+          {
+            "id": "new",
+            "label": "<8 MB Sketch State",
+            "sublabel": "<150ms S3 checkpoint"
+          }
+        ],
+        "edges": [
+          {
+            "from": "old",
+            "to": "new",
+            "label": "2,000x faster recovery"
+          }
+        ],
+        "cards": [
+          {
+            "title": "Fixed Snapshot Size",
+            "body": "Checkpoint duration stays constant even during 10x traffic spikes."
+          },
+          {
+            "title": "Zero Backpressure",
+            "body": "Fast checkpoints prevent Kafka consumer lag from building up."
+          }
+        ],
+        "summary": "Caption: Fixed-size sketch checkpoints shrink Flink/Kafka failover snapshots from gigabytes to under 8 MB, completing in <150 ms."
+      }
+    },
+    {
+      "id": "stage-7-slos-validation",
+      "eyebrow": "Stage 7 • Verification",
+      "title": "Validating Error Bounds, Memory Ceilings, and Skew Alerts",
+      "level": "advanced",
+      "purpose": "Verify sketch accuracy against a 1% sampled exact ground-truth stream and monitor heap/RSS.",
+      "explanation": {
+        "foundation": "Validate the pipeline continuously with three automated checks:",
+        "core": "- **Shadow 1% Ground-Truth Audit**: Route 1% of tenants to an offline batch exact `COUNT(DISTINCT)` job daily and assert `abs(hll - exact) / exact < 0.025`.\n- **Pod RSS Ceiling**: Assert worker RSS remains flat `< 512 MB` (under 15% of the 4 GB limit) across 50M+ unique keys.\n- **Whale-Tenant Promotion Alert**: Alert when any tenant crosses `10K/s` to verify dedicated CMS isolation.",
+        "deepDive": "In production deployments of 1M Events/sec Streaming Distinct-Count & Top-K Without OOM, watch how validating error bounds, memory ceilings, and skew alerts interacts with tail latency, retry amplification, and partial failures. Replace per-pod HashSets and HashMaps with 16 KB HyperLogLog sketches (for distinct users) and 256 KB Count-Min Sketch + size-K Min-Heaps (for Top-K endpoints), merged across workers in 1-minute tumbling sub-windows."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Post-Fix Telemetry",
+        "title": "OOMKilled 137 vs <512 MB Steady State",
+        "nodes": [
+          {
+            "id": "bad",
+            "label": "Before (HashSet)",
+            "sublabel": "12+ GB -> OOMKilled in 10m"
+          },
+          {
+            "id": "good",
+            "label": "After (HLL + CMS)",
+            "sublabel": "<512 MB RSS • <1% error"
+          }
+        ],
+        "edges": [
+          {
+            "from": "bad",
+            "to": "good",
+            "label": "Zero OOMs, 2000x smaller state"
+          }
+        ],
+        "cards": [
+          {
+            "title": "Constant Memory",
+            "body": "RSS stays flat whether 1M or 1B unique user_ids arrive."
+          },
+          {
+            "title": "Daily Accuracy Audit",
+            "body": "Offline Parquet/Spark ground-truth checks catch hash bugs early."
+          }
+        ],
+        "summary": "Caption: Daily 1% ground-truth audits and flat <512 MB RSS telemetry confirm <2% estimation error with zero OOMKilled crashes."
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why does decomposing a 1-hour sliding window into 60 one-minute tumbling HyperLogLog panes prevent OOMs and speed up merging?",
+      "options": [
+        "Each event updates only 1 active 16 KB sketch instead of 60 overlapping multi-GB HashSets, and the aggregator merges 60 panes via element-wise max in <2 ms",
+        "Tumbling panes delete all user_ids every second",
+        "HyperLogLog cannot count longer than 60 seconds without resetting",
+        "60 panes compress Kafka messages into PNGs"
+      ],
+      "correctIndex": 0,
+      "explanation": "Because HLL is mergeable via element-wise max(), keeping 60 1-minute tumbling panes avoids 60x event duplication while supporting 1-hour sliding queries."
+    },
+    "knowledgeChecks": [
+      {
+        "id": "kc-cms-whale",
+        "question": "Tenant A sends 900K events/sec while Tenant B sends 100 events/sec into a single shared Count-Min Sketch. Why does Tenant B's frequency estimate become wildly inaccurate?",
+        "options": [
+          {
+            "id": "a",
+            "text": "CMS collision error scales with total stream volume (epsilon * N_total), so Tenant A's massive volume adds ~54,000 collision noise onto Tenant B's tiny counters",
+            "correct": true,
+            "feedback": "Correct! CMS error is bounded by epsilon * N_total across the entire sketch; isolating whale tenants into dedicated CMS instances protects small tenants."
+          },
+          {
+            "id": "b",
+            "text": "HyperLogLog overwrites Tenant B's registers",
+            "correct": false,
+            "feedback": "CMS error is bounded by epsilon * N_total across the entire sketch; isolating whale tenants into dedicated CMS instances protects small tenants."
+          },
+          {
+            "id": "c",
+            "text": "Min-Heaps only store strings starting with 'A'",
+            "correct": false,
+            "feedback": "CMS error is bounded by epsilon * N_total across the entire sketch; isolating whale tenants into dedicated CMS instances protects small tenants."
+          },
+          {
+            "id": "d",
+            "text": "Kafka drops Tenant B's messages when Tenant A is active",
+            "correct": false,
+            "feedback": "CMS error is bounded by epsilon * N_total across the entire sketch; isolating whale tenants into dedicated CMS instances protects small tenants."
+          }
+        ],
+        "correctIndex": 0,
+        "explanation": "CMS error is bounded by epsilon * N_total across the entire sketch; isolating whale tenants into dedicated CMS instances protects small tenants."
+      },
+      {
+        "id": "kc-cms-merge",
+        "question": "How do the 16 Kafka/Flink worker pods combine their local 1-minute HyperLogLog and Count-Min sketches into one global view?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Element-wise max() for HyperLogLog registers and element-wise addition (+) for Count-Min matrices, using identical dimensions and hash seeds",
+            "correct": true,
+            "feedback": "Correct! Both HLL (max) and CMS (+) are mergeable monoids, requiring only fixed kilobyte transfers per minute instead of raw key shuffles."
+          },
+          {
+            "id": "b",
+            "text": "Shipping all 50M raw user_id strings to one coordinator pod",
+            "correct": false,
+            "feedback": "Both HLL (max) and CMS (+) are mergeable monoids, requiring only fixed kilobyte transfers per minute instead of raw key shuffles."
+          },
+          {
+            "id": "c",
+            "text": "Averaging each worker's Top-K list",
+            "correct": false,
+            "feedback": "Both HLL (max) and CMS (+) are mergeable monoids, requiring only fixed kilobyte transfers per minute instead of raw key shuffles."
+          },
+          {
+            "id": "d",
+            "text": "Running COUNT(DISTINCT) in PostgreSQL on every event",
+            "correct": false,
+            "feedback": "Both HLL (max) and CMS (+) are mergeable monoids, requiring only fixed kilobyte transfers per minute instead of raw key shuffles."
+          }
+        ],
+        "correctIndex": 0,
+        "explanation": "Both HLL (max) and CMS (+) are mergeable monoids, requiring only fixed kilobyte transfers per minute instead of raw key shuffles."
+      },
+      {
+        "id": "kc-exact-small",
+        "question": "How can you guarantee 100% exact counts for small tenants (<1,000 unique items) without risking OOM on large tenants?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Start each tenant in a small exact dict/set and promote to HyperLogLog + Count-Min Sketch only when cardinality exceeds 1,000",
+            "correct": true,
+            "feedback": "Correct! Exact-to-sketch promotion gives 0% error for small tenants in ~64 KB while bounding worst-case memory via automatic sketch promotion."
+          },
+          {
+            "id": "b",
+            "text": "Use a 128 GB HashSet for all tenants",
+            "correct": false,
+            "feedback": "Exact-to-sketch promotion gives 0% error for small tenants in ~64 KB while bounding worst-case memory via automatic sketch promotion."
+          },
+          {
+            "id": "c",
+            "text": "Disable monitoring for tenants under 1,000 items",
+            "correct": false,
+            "feedback": "Exact-to-sketch promotion gives 0% error for small tenants in ~64 KB while bounding worst-case memory via automatic sketch promotion."
+          },
+          {
+            "id": "d",
+            "text": "Run HLL with p=28 for small tenants",
+            "correct": false,
+            "feedback": "Exact-to-sketch promotion gives 0% error for small tenants in ~64 KB while bounding worst-case memory via automatic sketch promotion."
+          }
+        ],
+        "correctIndex": 0,
+        "explanation": "Exact-to-sketch promotion gives 0% error for small tenants in ~64 KB while bounding worst-case memory via automatic sketch promotion."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "Tracking 50M unique users in HashSets crashed 4 GB worker pods with OOMKilled. Fix it by replacing HashSets with 16 KB HyperLogLog sketches and 256 KB Count-Min Sketches per 1-minute window, merging 60 panes for 1-hour sliding stats in under 1 MB per shard.",
+      "spark": {
+        "summary": "Stop streaming OOMs by replacing giant HashSets/HashMaps with 1-minute HyperLogLog and Count-Min Sketch panes.",
+        "keyTakeaway": "Use HyperLogLog for unique counts, Count-Min Sketch + min-heap for Top-K, and merge 60 1-minute panes for 1-hour windows."
+      },
+      "learningJourney": [
+        {
+          "stageId": "stage-1-oom-root-cause",
+          "summary": "50M unique IDs across 60 sliding panes burn 18 GB RAM and crash pods.",
+          "id": "stage-1-oom-root-cause",
+          "title": "Why 50M Unique Keys + Sliding Windows OOM 4 GB Pods",
+          "eyebrow": "Stage 1 • Triage",
+          "explanation": "50M unique IDs across 60 sliding panes burn 18 GB RAM and crash pods."
+        },
+        {
+          "stageId": "stage-2-tumbling-pane-decomposition",
+          "summary": "Update one 1-minute sketch per event and merge 60 panes at query time.",
+          "id": "stage-2-tumbling-pane-decomposition",
+          "title": "60x 1-Minute Tumbling Panes with Mergeable HLL + CMS",
+          "eyebrow": "Stage 2 • Window Architecture",
+          "explanation": "Update one 1-minute sketch per event and merge 60 panes at query time."
+        },
+        {
+          "stageId": "stage-3-sizing-ram-budget",
+          "summary": "4 KB HLL + shared/isolated CMS keeps pod memory tiny.",
+          "id": "stage-3-sizing-ram-budget",
+          "title": "Exact RAM & Error Budgeting Across 200 Tenants",
+          "eyebrow": "Stage 3 • Memory Math",
+          "explanation": "4 KB HLL + shared/isolated CMS keeps pod memory tiny."
+        },
+        {
+          "stageId": "stage-4-skew-hot-tenants",
+          "summary": "Isolate huge tenants so they don't add noise to small tenants.",
+          "id": "stage-4-skew-hot-tenants",
+          "title": "Handling Tenant Skew & High-Volume DDoS Bursts",
+          "eyebrow": "Stage 4 • Skew & Hot Keys",
+          "explanation": "Isolate huge tenants so they don't add noise to small tenants."
+        },
+        {
+          "stageId": "stage-5-implementation",
+          "summary": "Python Count-Min + Top-K tracker with safe flush retries.",
+          "id": "stage-5-implementation",
+          "title": "Streaming Pane Aggregator with CMS + Min-Heap & Bounded Flush Retry",
+          "eyebrow": "Stage 5 • Implementation",
+          "explanation": "Python Count-Min + Top-K tracker with safe flush retries."
+        },
+        {
+          "stageId": "stage-6-checkpoint-durability",
+          "summary": "Checkpoint <8 MB sketches to S3 in under 150 ms.",
+          "id": "stage-6-checkpoint-durability",
+          "title": "Fast RocksDB/S3 Checkpointing of 16 KB Sketches",
+          "eyebrow": "Stage 6 • State Checkpointing",
+          "explanation": "Checkpoint <8 MB sketches to S3 in under 150 ms."
+        },
+        {
+          "stageId": "stage-7-slos-validation",
+          "summary": "Audit accuracy daily against a 1% exact batch sample.",
+          "id": "stage-7-slos-validation",
+          "title": "Validating Error Bounds, Memory Ceilings, and Skew Alerts",
+          "eyebrow": "Stage 7 • Verification",
+          "explanation": "Audit accuracy daily against a 1% exact batch sample."
+        }
+      ],
+      "finalSummary": "1-minute mergeable HLL and Count-Min Sketch panes eliminate OOMs and keep 1-hour sliding analytics under <1 MB/shard.",
+      "summary": "Replace per-pod HashSets and HashMaps with 16 KB HyperLogLog sketches (for distinct users) and 256 KB Count-Min Sketch + size-K Min-Heaps (for Top-K endpoints), merged across workers in 1-minute tumbling sub-windows.",
+      "keyTakeaway": "When a single bottleneck threatens end-to-end availability, decompose 1-hour sliding windows into sixty 1-minute tumbling HLL + CMS sketches so workers merge fixed kilobyte arrays in <1 MB RAM."
+    },
+    "intermediate": {
+      "byteSummary": "At 1M events/sec across 50M unique IDs, exact HashSets across 60 overlapping panes hit 18 GB/pod (OOMKilled 137). Decomposing the 1-hour window into 60 1-minute tumbling HLL (16 KB) and Count-Min + Min-Heap (256 KB) panes cuts state to <1 MB/shard, isolates whale tenants, and shrinks checkpoints to <150 ms.",
+      "spark": {
+        "summary": "Eliminate streaming OOMs via 60x 1-minute tumbling HLL + Count-Min Sketch panes, whale-tenant isolation, and <8 MB S3 checkpoints.",
+        "keyTakeaway": "Merge 1-minute HLL (max) and CMS (sum) panes across workers, and isolate >10K/s whale tenants from small-tenant sketches."
+      },
+      "learningJourney": [
+        {
+          "stageId": "stage-1-oom-root-cause",
+          "summary": "O(N * W) HashSet state hits 18 GB/pod and saturates network shuffles.",
+          "id": "stage-1-oom-root-cause",
+          "title": "Why 50M Unique Keys + Sliding Windows OOM 4 GB Pods",
+          "eyebrow": "Stage 1 • Triage",
+          "explanation": "O(N * W) HashSet state hits 18 GB/pod and saturates network shuffles."
+        },
+        {
+          "stageId": "stage-2-tumbling-pane-decomposition",
+          "summary": "Single-pane updates + 60-slot ring buffer for 1h sliding rollups.",
+          "id": "stage-2-tumbling-pane-decomposition",
+          "title": "60x 1-Minute Tumbling Panes with Mergeable HLL + CMS",
+          "eyebrow": "Stage 2 • Window Architecture",
+          "explanation": "Single-pane updates + 60-slot ring buffer for 1h sliding rollups."
+        },
+        {
+          "stageId": "stage-3-sizing-ram-budget",
+          "summary": "p=12/14 HLL + 256 KB CMS + size-100 Min-Heap RAM budgeting.",
+          "id": "stage-3-sizing-ram-budget",
+          "title": "Exact RAM & Error Budgeting Across 200 Tenants",
+          "eyebrow": "Stage 3 • Memory Math",
+          "explanation": "p=12/14 HLL + 256 KB CMS + size-100 Min-Heap RAM budgeting."
+        },
+        {
+          "stageId": "stage-4-skew-hot-tenants",
+          "summary": "Exact <1K promotion and dedicated whale-tenant CMS isolation.",
+          "id": "stage-4-skew-hot-tenants",
+          "title": "Handling Tenant Skew & High-Volume DDoS Bursts",
+          "eyebrow": "Stage 4 • Skew & Hot Keys",
+          "explanation": "Exact <1K promotion and dedicated whale-tenant CMS isolation."
+        },
+        {
+          "stageId": "stage-5-implementation",
+          "summary": "Kirsch-Mitzenmacher CMS + Top-K map and retried pane flush.",
+          "id": "stage-5-implementation",
+          "title": "Streaming Pane Aggregator with CMS + Min-Heap & Bounded Flush Retry",
+          "eyebrow": "Stage 5 • Implementation",
+          "explanation": "Kirsch-Mitzenmacher CMS + Top-K map and retried pane flush."
+        },
+        {
+          "stageId": "stage-6-checkpoint-durability",
+          "summary": "<8 MB sketch snapshots checkpoint to S3 in <150 ms.",
+          "id": "stage-6-checkpoint-durability",
+          "title": "Fast RocksDB/S3 Checkpointing of 16 KB Sketches",
+          "eyebrow": "Stage 6 • State Checkpointing",
+          "explanation": "<8 MB sketch snapshots checkpoint to S3 in <150 ms."
+        },
+        {
+          "stageId": "stage-7-slos-validation",
+          "summary": "1% shadow ground-truth audit and <512 MB RSS monitoring.",
+          "id": "stage-7-slos-validation",
+          "title": "Validating Error Bounds, Memory Ceilings, and Skew Alerts",
+          "eyebrow": "Stage 7 • Verification",
+          "explanation": "1% shadow ground-truth audit and <512 MB RSS monitoring."
+        }
+      ],
+      "finalSummary": "Tumbling HLL+CMS panes, whale isolation, and sub-second sketch checkpoints sustain 1M events/sec with zero OOMs.",
+      "summary": "Replace per-pod HashSets and HashMaps with 16 KB HyperLogLog sketches (for distinct users) and 256 KB Count-Min Sketch + size-K Min-Heaps (for Top-K endpoints), merged across workers in 1-minute tumbling sub-windows.",
+      "keyTakeaway": "When a single bottleneck threatens end-to-end availability, decompose 1-hour sliding windows into sixty 1-minute tumbling HLL + CMS sketches so workers merge fixed kilobyte arrays in <1 MB RAM."
+    },
+    "advanced": {
+      "byteSummary": "Preventing OOMKilled (137) at 1M events/sec across 50M unique keys and 200 tenants requires replacing O(N*W) HashSet/HashMap state with 60 tumbling 1-minute monoid panes (16 KB HLL + 256 KB CMS + size-K Min-Heap). Isolating >10K/s whale tenants bounds cross-tenant epsilon*N collision error while cutting Flink/Kafka checkpoints to <150 ms.",
+      "spark": {
+        "summary": "Bounded-memory 1M/s telemetry: 60-pane tumbling HLL+CMS monoids, whale-tenant isolation, Kirsch-Mitzenmacher probing, and <150ms checkpoints.",
+        "keyTakeaway": "Decompose sliding windows into 1-minute mergeable sketches, isolate whale tenants, and audit error daily against a 1% exact sample."
+      },
+      "learningJourney": [
+        {
+          "stageId": "stage-1-oom-root-cause",
+          "summary": "18 GB/pod sliding-window amplification and cross-AZ shuffle saturation.",
+          "id": "stage-1-oom-root-cause",
+          "title": "Why 50M Unique Keys + Sliding Windows OOM 4 GB Pods",
+          "eyebrow": "Stage 1 • Triage",
+          "explanation": "18 GB/pod sliding-window amplification and cross-AZ shuffle saturation."
+        },
+        {
+          "stageId": "stage-2-tumbling-pane-decomposition",
+          "summary": "60-pane monoid ring buffer avoiding 60x event duplication.",
+          "id": "stage-2-tumbling-pane-decomposition",
+          "title": "60x 1-Minute Tumbling Panes with Mergeable HLL + CMS",
+          "eyebrow": "Stage 2 • Window Architecture",
+          "explanation": "60-pane monoid ring buffer avoiding 60x event duplication."
+        },
+        {
+          "stageId": "stage-3-sizing-ram-budget",
+          "summary": "Register/matrix RAM budgeting and pre-allocated buffer reuse.",
+          "id": "stage-3-sizing-ram-budget",
+          "title": "Exact RAM & Error Budgeting Across 200 Tenants",
+          "eyebrow": "Stage 3 • Memory Math",
+          "explanation": "Register/matrix RAM budgeting and pre-allocated buffer reuse."
+        },
+        {
+          "stageId": "stage-4-skew-hot-tenants",
+          "summary": "Whale-tenant CMS isolation and <1K exact-to-sketch promotion.",
+          "id": "stage-4-skew-hot-tenants",
+          "title": "Handling Tenant Skew & High-Volume DDoS Bursts",
+          "eyebrow": "Stage 4 • Skew & Hot Keys",
+          "explanation": "Whale-tenant CMS isolation and <1K exact-to-sketch promotion."
+        },
+        {
+          "stageId": "stage-5-implementation",
+          "summary": "16B blake2b Kirsch-Mitzenmacher CMS + Top-K with flush backoff.",
+          "id": "stage-5-implementation",
+          "title": "Streaming Pane Aggregator with CMS + Min-Heap & Bounded Flush Retry",
+          "eyebrow": "Stage 5 • Implementation",
+          "explanation": "16B blake2b Kirsch-Mitzenmacher CMS + Top-K with flush backoff."
+        },
+        {
+          "stageId": "stage-6-checkpoint-durability",
+          "summary": "Constant <8 MB S3 checkpoints eliminating consumer lag.",
+          "id": "stage-6-checkpoint-durability",
+          "title": "Fast RocksDB/S3 Checkpointing of 16 KB Sketches",
+          "eyebrow": "Stage 6 • State Checkpointing",
+          "explanation": "Constant <8 MB S3 checkpoints eliminating consumer lag."
+        },
+        {
+          "stageId": "stage-7-slos-validation",
+          "summary": "Shadow 1% exact ground-truth audits (<2.5% error) and RSS SLOs.",
+          "id": "stage-7-slos-validation",
+          "title": "Validating Error Bounds, Memory Ceilings, and Skew Alerts",
+          "eyebrow": "Stage 7 • Verification",
+          "explanation": "Shadow 1% exact ground-truth audits (<2.5% error) and RSS SLOs."
+        }
+      ],
+      "finalSummary": "Monoid tumbling sketches, whale isolation, and constant-size checkpoints deliver OOM-proof 1M/s distinct and Top-K analytics.",
+      "summary": "Replace per-pod HashSets and HashMaps with 16 KB HyperLogLog sketches (for distinct users) and 256 KB Count-Min Sketch + size-K Min-Heaps (for Top-K endpoints), merged across workers in 1-minute tumbling sub-windows.",
+      "keyTakeaway": "When a single bottleneck threatens end-to-end availability, decompose 1-hour sliding windows into sixty 1-minute tumbling HLL + CMS sketches so workers merge fixed kilobyte arrays in <1 MB RAM."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "prerequisites": [
+    {
+      "title": "HyperLogLog & Count-Min Sketch (Streaming Sketches)",
+      "summary": "HyperLogLog tracks max leading-zero runs across m registers to estimate distinct counts in ~1.5–12 KB, while Count-Min Sketch uses d hash rows x w counters to bound item frequencies in sub-megabyte RAM."
+    },
+    {
+      "title": "Bloom Filters, Counting Bloom & Cuckoo Filters",
+      "summary": "Bloom filters answer set membership in O(k) bit probes using ~10 bits per key at a 1% false-positive rate with zero false negatives, while Cuckoo filters store compact fingerprints in 2-choice hash buckets to support safe item deletion and better CPU cache loc..."
+    },
+    {
+      "title": "Spark Structured Streaming & Watermarking",
+      "summary": "Spark Structured Streaming models unbounded streams as continuously appended tables. Event-time watermarks bound how long in-memory or RocksDB state is retained for late-arriving records, enabling fault-tolerant stateful aggregations and Kafka-to-Lakehouse pip..."
+    }
+  ],
+  "simulation": {
+    "title": "1M Events/sec Streaming Distinct-Count & Top-K Without OOM — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Input Workload"
+      },
+      {
+        "id": "entry",
+        "label": "Router / API",
+        "role": "Admission Control"
+      },
+      {
+        "id": "worker",
+        "label": "Processor",
+        "role": "Domain Logic"
+      },
+      {
+        "id": "store",
+        "label": "State Layer",
+        "role": "Durable Store"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "entry",
+        "label": "request"
+      },
+      {
+        "from": "entry",
+        "to": "worker",
+        "label": "dispatch"
+      },
+      {
+        "from": "worker",
+        "to": "store",
+        "label": "read/write"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why 50M Unique Keys + Sliding Windows OOM 4 GB Pods",
+        "actionLabel": "request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "entry"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "request",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Caller sends work to Router / API (Why 50M Unique Keys + Sliding Windows OOM 4 GB Pods)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "60x 1-Minute Tumbling Panes with Mergeable HLL + CMS",
+        "actionLabel": "dispatch",
+        "status": "healthy",
+        "activeNodeIds": [
+          "entry",
+          "worker"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "dispatch",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Router / API coordinates with Processor while preserving the core invariant (60x 1-Minute Tumbling Panes with Mergeable HLL + CMS)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Exact RAM & Error Budgeting Across 200 Tenants",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "worker",
+          "store"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, State Layer absorbs pressure without cascading (Exact RAM & Error Budgeting Across 200 Tenants)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Validating Error Bounds, Memory Ceilings, and Skew Alerts",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "entry",
+          "worker",
+          "store"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Validating Error Bounds, Memory Ceilings, and Skew Alerts)."
+      }
+    ]
+  }
+}

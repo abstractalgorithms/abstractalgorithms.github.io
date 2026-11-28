@@ -1,0 +1,840 @@
+{
+  "id": "problem-eliminating-full-table-scans-with-indexes",
+  "slug": "eliminating-full-table-scans-with-indexes",
+  "title": "Eliminating Full Table Scans Under Concurrency",
+  "problemType": "production-debugging",
+  "difficulty": "medium",
+  "prompt": "A payment settlement service queries a 180M-row PostgreSQL 16 `orders_ledger` table (240 GB heap) using `WHERE merchant_id = $1 AND status = 'PENDING_SETTLEMENT' ORDER BY created_at DESC LIMIT 50`. Only `PRIMARY KEY (order_id)` and an index on `(created_at)` exist. During peak payout windows (2,400 QPS), p99 latency jumps from 12 ms to 14.8 s, NVMe read IOPS hit the 16,000 IOPS ceiling, `shared_buffers` (32 GB) thrash, and all 500 HikariCP connections block. Design the remediation and long-term guardrails without causing table-write downtime.",
+  "spark": {
+    "summary": "A 180M-row Postgres settlement query scanning cold pages thrashes shared_buffers and hits 14.8s p99; creating a Partial Covering Index CONCURRENTLY for status='PENDING_SETTLEMENT' cuts p99 below 10 ms with zero write downtime.",
+    "keyTakeaway": "When a single bottleneck threatens end-to-end availability, build a Partial Covering Index (WHERE status='PENDING_SETTLEMENT' with INCLUDE) using CREATE INDEX CONCURRENTLY to shrink the index by 97%, enable Index-Only Scans, and avoid ACCESS EXCLUSIVE locks.",
+    "byteSummary": "**Core Mechanics:** On a `180M`-row (`240 GB`) PostgreSQL 16 `orders_ledger` table where only `3.2%` (`5.7M` rows) are `PENDING_SETTLEMENT`, an index solely on `(created_at)` forces Postgres to scan millions of historical `SETTLED` rows backward.\n\n**Visual & Structural Flow:** Depicts Partial Index (3.2% rows) + INCLUDE -> Index-Only Scan (<10ms) (merchant_id -> created_at DESC -> WHERE PENDING -> INCLUDE); Index-Only Scan in shared_buffers + Bulkhead HikariCP Pools (Settlement Svc -> shared_buffers -> Visibility Map -> 240GB Heap).\n\n**Trade-Offs & Production:** A naive fix runs `CREATE INDEX idx_merchant_status_created ON orders_ledger (merchant_id, status, created_at DESC);`: **Table Write Outage**: Without `CONCURRENTLY`, `CREATE. Production Postgres remediation combines online indexing with pool protection: **Partial Covering Index**: `CREATE INDEX CONCURRENTLY idx_orders_pending_merchant ON orders_ledger.\n\n**Failure Modes & Application:** Partial covering indexes are a high-leverage optimization across OLTP workloads: **Job Queues & Outbox Tables**: Indexing only `WHERE status = 'PENDING'` keeps queue polling `O(active)` instead of `O(history)`."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why full/backward index scans thrash buffer pools at 2,400 QPS",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "Think of **Why full/backward index scans thrash buffer pools at 2,400 QPS** as the intuition layer for Eliminating Full Table Scans Under Concurrency: The mechanism: understand how Why full/backward index scans thrash buffer pools at 2,400 QPS works from first principles.",
+        "core": "On a `180M`-row (`240 GB`) PostgreSQL 16 `orders_ledger` table where only `3.2%` (`5.7M` rows) are `PENDING_SETTLEMENT`, an index solely on `(created_at)` forces Postgres to scan millions of historical `SETTLED` rows backward, pulling cold heap pages into the `32 GB` `shared_buffers`. At `2,400 QPS`, NVMe read IOPS saturate at `16,000`, p99 jumps from `12 ms` to `14.8 s`, and all `500` HikariCP connections block.",
+        "deepDive": "Under heavy load or partial failure, why full/backward index scans thrash buffer pools at 2,400 qps becomes a critical lever for predictable latency and correctness. A 180M-row Postgres settlement query scanning cold pages thrashes shared_buffers and hits 14.8s p99; creating a Partial Covering Index CONCURRENTLY for status='PENDING_SETTLEMENT' cuts p99 below 10 ms with zero write downtime."
+      },
+      "purpose": "The mechanism: understand how Why full/backward index scans thrash buffer pools at 2,400 QPS works from first principles.",
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "Stage 1 Topology",
+        "title": "Why full/backward index scans thrash buffer pools at 2,400...",
+        "nodes": [
+          {
+            "id": "edge",
+            "label": "Edge Router",
+            "tier": "ingress"
+          },
+          {
+            "id": "worker",
+            "label": "Eliminating Full Tab Worker",
+            "tier": "compute"
+          },
+          {
+            "id": "state",
+            "label": "Primary State",
+            "tier": "storage"
+          },
+          {
+            "id": "obs",
+            "label": "Telemetry & Audit",
+            "tier": "control"
+          }
+        ],
+        "edges": [
+          {
+            "from": "edge",
+            "to": "worker",
+            "label": "route"
+          },
+          {
+            "from": "worker",
+            "to": "state",
+            "label": "read / mutate"
+          },
+          {
+            "from": "worker",
+            "to": "obs",
+            "label": "emit metrics"
+          }
+        ]
+      }
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "What happens without a partial covering index and lock-safe deployment",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Two compounding mistakes turn a missing index into a production outage:",
+        "core": "1. **Buffer Pool Thrashing**: Scanning cold heap rows evicts hot working-set pages, causing every concurrent checkout query to stall on disk I/O.\n2. **Blocking DDL**: Running plain `CREATE INDEX` acquires a `SHARE` lock that blocks all `1,200 writes/sec` (`INSERT`/`UPDATE`) for 20+ minutes.",
+        "deepDive": "In production deployments of Eliminating Full Table Scans Under Concurrency, watch how what happens without a partial covering index and lock-safe deployment interacts with tail latency, retry amplification, and partial failures. A 180M-row Postgres settlement query scanning cold pages thrashes shared_buffers and hits 14.8s p99; creating a Partial Covering Index CONCURRENTLY for status='PENDING_SETTLEMENT' cuts p99 below 10 ms with zero write downtime."
+      },
+      "sectionDiagram": {
+        "kind": "tree-index",
+        "eyebrow": "Partial Covering B-Tree",
+        "title": "Partial Index (3.2% rows) + INCLUDE -> Index-Only Scan (<10ms)",
+        "nodes": [
+          {
+            "label": "merchant_id",
+            "role": "Equality prefix"
+          },
+          {
+            "label": "created_at DESC",
+            "role": "Pre-sorted LIMIT 50"
+          },
+          {
+            "label": "WHERE PENDING",
+            "role": "Only 5.7M of 180M"
+          },
+          {
+            "label": "INCLUDE",
+            "role": "Index-Only Scan"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Partial Predicate",
+            "detail": "WHERE status='PENDING_SETTLEMENT' shrinks index size by ~97%."
+          },
+          {
+            "label": "Column Order",
+            "detail": "(merchant_id, created_at DESC) satisfies filter + sort with zero sort node."
+          },
+          {
+            "label": "INCLUDE Columns",
+            "detail": "Covers SELECT fields so Postgres skips random heap page fetches."
+          },
+          {
+            "label": "CONCURRENTLY",
+            "detail": "Builds online without blocking 1,200 writes/sec on orders_ledger."
+          }
+        ],
+        "summary": "A 5.7M-row partial covering index fits entirely in shared_buffers and serves 2,400 QPS via Index-Only Scans in < 10 ms."
+      },
+      "purpose": "The problem: see what breaks without What happens without a partial covering index and lock-safe deployment under real concurrency or scale.",
+      "decisionFramework": {
+        "problem": "How to implement Eliminating Full Table Scans Under Concurrency without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "When a single bottleneck threatens end-to-end availability, build a Partial Covering Index (WHERE status='PENDING_SETTLEMENT' with INCLUDE) using CREATE INDEX CONCURRENTLY to shrink the index by 97%, enable Index-Only Scans, and avoid ACCESS EXCLUSIVE locks.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Eliminating Full Table Scans Under Concurrency experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Naive solution (and why full composite indexes or plain CREATE INDEX fail)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "A naive fix runs `CREATE INDEX idx_merchant_status_created ON orders_ledger (merchant_id, status, created_at DESC);`:",
+        "core": "- **Table Write Outage**: Without `CONCURRENTLY`, `CREATE INDEX` blocks all `INSERT`/`UPDATE` traffic on the 240 GB table.\n- **Bloated Index**: Indexing all `180M` rows wastes tens of GBs of RAM and write amplification for `96.8%` historical rows.",
+        "deepDive": "In production deployments of Eliminating Full Table Scans Under Concurrency, watch how naive solution (and why full composite indexes or plain create index fail) interacts with tail latency, retry amplification, and partial failures. A 180M-row Postgres settlement query scanning cold pages thrashes shared_buffers and hits 14.8s p99; creating a Partial Covering Index CONCURRENTLY for status='PENDING_SETTLEMENT' cuts p99 below 10 ms with zero write downtime."
+      },
+      "purpose": "The problem: see what breaks without Naive solution under real concurrency or scale.",
+      "sectionDiagram": {
+        "kind": "behavior-transition",
+        "eyebrow": "Stage 3 Trade-Off",
+        "title": "Naive solution (and why full composite indexes or plain CR...",
+        "before": {
+          "label": "Naive Unbounded Path",
+          "metrics": [
+            "Unbounded retries",
+            "Tail latency spikes",
+            "Silent state drift"
+          ]
+        },
+        "after": {
+          "label": "Bounded Engineering Path",
+          "metrics": [
+            "Explicit budgets",
+            "Predictable p99",
+            "Verifiable invariants"
+          ]
+        }
+      }
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise solution: CREATE INDEX CONCURRENTLY + Partial Covering Index + Guardrails",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": {
+        "foundation": "Production Postgres remediation combines online indexing with pool protection:",
+        "core": "- **Partial Covering Index**: `CREATE INDEX CONCURRENTLY idx_orders_pending_merchant ON orders_ledger (merchant_id, created_at DESC) INCLUDE (order_id, amount_cents) WHERE status = 'PENDING_SETTLEMENT';` (with `lock_timeout = '2s'`).\n- **Query & Pool Guardrails**: Set `statement_timeout = '2000ms'` and isolate settlement reads onto a read replica or separate bulkhead HikariCP pool so checkout transactions are never starved.\n- **CI/CD Regression Check**: Enforce `EXPLAIN (ANALYZE, BUFFERS)` checks in CI against realistic stats.",
+        "deepDive": "In production deployments of Eliminating Full Table Scans Under Concurrency, watch how enterprise solution: create index concurrently + partial covering index + guardrails interacts with tail latency, retry amplification, and partial failures. A 180M-row Postgres settlement query scanning cold pages thrashes shared_buffers and hits 14.8s p99; creating a Partial Covering Index CONCURRENTLY for status='PENDING_SETTLEMENT' cuts p99 below 10 ms with zero write downtime."
+      },
+      "sectionDiagram": {
+        "kind": "cache-tier",
+        "eyebrow": "Buffer Pool & Pool Isolation",
+        "title": "Index-Only Scan in shared_buffers + Bulkhead HikariCP Pools",
+        "nodes": [
+          {
+            "label": "Settlement Svc",
+            "role": "Separate pool + timeout"
+          },
+          {
+            "label": "shared_buffers",
+            "role": "Hot 5.7M-row B-Tree"
+          },
+          {
+            "label": "Visibility Map",
+            "role": "Skips heap fetch"
+          },
+          {
+            "label": "240GB Heap",
+            "role": "Zero cold-page thrash"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Index-Only Scan",
+            "detail": "Visibility Map + INCLUDE columns avoid touching the 240 GB heap."
+          },
+          {
+            "label": "Statement Timeout",
+            "detail": "2s DB timeout prevents runaway queries from pinning HikariCP."
+          },
+          {
+            "label": "Pool Bulkhead",
+            "detail": "Separates settlement batch reads from checkout write connections."
+          },
+          {
+            "label": "pg_stat_statements",
+            "detail": "Alerts on mean_exec_time or shared_blks_read regressions."
+          }
+        ],
+        "summary": "Keeping the partial index hot in shared_buffers drops NVMe IOPS and brings p99 latency under 10 ms at 2,400 QPS."
+      },
+      "markdownContent": "```sql\n-- Zero-downtime Partial Covering Index on 180M-row Postgres 16 table\nSET lock_timeout = '2s';\nSET maintenance_work_mem = '2GB';\n\nCREATE INDEX CONCURRENTLY IF NOT EXISTS idx_orders_pending_merchant_created\nON orders_ledger (merchant_id, created_at DESC)\nINCLUDE (order_id, amount_cents, currency)\nWHERE status = 'PENDING_SETTLEMENT';\n\n-- Ensure Visibility Map stays all-visible for Index-Only Scans:\n-- ALTER TABLE orders_ledger SET (autovacuum_vacuum_scale_factor = 0.01);\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where Partial & Covering Indexes apply in System Design",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Partial covering indexes are a high-leverage optimization across OLTP workloads:",
+        "core": "- **Job Queues & Outbox Tables**: Indexing only `WHERE status = 'PENDING'` keeps queue polling `O(active)` instead of `O(history)`.\n- **Payment & Ledger Dashboards**: Serving `LIMIT 50` merchant views via Index-Only Scans.\n- **Zero-Downtime Migrations**: Using `CONCURRENTLY` + `lock_timeout` in automated migration pipelines.",
+        "deepDive": "In production deployments of Eliminating Full Table Scans Under Concurrency, watch how where partial & covering indexes apply in system design interacts with tail latency, retry amplification, and partial failures. A 180M-row Postgres settlement query scanning cold pages thrashes shared_buffers and hits 14.8s p99; creating a Partial Covering Index CONCURRENTLY for status='PENDING_SETTLEMENT' cuts p99 below 10 ms with zero write downtime."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "database-indexing",
+          "title": "Concept: Database Indexing",
+          "kind": "concept"
+        },
+        {
+          "slug": "sql-query-tuning-indexes",
+          "title": "Concept: SQL Query Tuning & Indexes",
+          "kind": "concept"
+        },
+        {
+          "slug": "postgresql-query-planner",
+          "title": "Concept: PostgreSQL Query Planner",
+          "kind": "concept"
+        },
+        {
+          "slug": "b-tree-index-invalidation-type-coercion",
+          "title": "Problem: B-Tree Index Invalidation",
+          "kind": "problem"
+        },
+        {
+          "slug": "online-ddl-large-table-migrations",
+          "title": "Problem: Online DDL Large Table Migrations",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Stage 5 Interaction",
+        "title": "Where Partial & Covering Indexes apply in System Design",
+        "actors": [
+          {
+            "id": "caller",
+            "label": "Client / Caller"
+          },
+          {
+            "id": "coord",
+            "label": "Coordinator"
+          },
+          {
+            "id": "store",
+            "label": "State / Engine"
+          }
+        ],
+        "steps": [
+          {
+            "from": "caller",
+            "to": "coord",
+            "label": "1. Dispatch request + bounds"
+          },
+          {
+            "from": "coord",
+            "to": "store",
+            "label": "2. Execute deterministic step"
+          },
+          {
+            "from": "store",
+            "to": "coord",
+            "label": "3. Return state & proof"
+          },
+          {
+            "from": "coord",
+            "to": "caller",
+            "label": "4. Ack with bounded latency"
+          }
+        ]
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why is a Partial Covering Index with CREATE INDEX CONCURRENTLY ideal for the 180M-row orders_ledger settlement query?",
+      "options": [
+        {
+          "id": "a",
+          "text": "It indexes only the 3.2% PENDING_SETTLEMENT rows, enables Index-Only Scans via INCLUDE, and builds without blocking concurrent writes",
+          "correct": true,
+          "feedback": "Correct: partial indexing cuts index size by ~97%, INCLUDE avoids heap reads, and CONCURRENTLY prevents write downtime."
+        },
+        {
+          "id": "b",
+          "text": "Because CREATE INDEX CONCURRENTLY automatically deletes old SETTLED rows",
+          "correct": false,
+          "feedback": "Partial indexes filter which rows are indexed; they never delete table rows."
+        },
+        {
+          "id": "c",
+          "text": "Because PostgreSQL disables shared_buffers for non-partial indexes",
+          "correct": false,
+          "feedback": "PostgreSQL uses shared_buffers for all indexes, but smaller partial indexes fit in RAM without thrashing."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why is a Partial Covering Index with CREATE INDEX CONCURRENTLY ideal for the 180M-row orders_ledger settlement query?",
+        "options": [
+          {
+            "id": "a",
+            "text": "It indexes only the 3.2% PENDING_SETTLEMENT rows, enables Index-Only Scans via INCLUDE, and builds without blocking concurrent writes",
+            "correct": true,
+            "feedback": "Correct: partial indexing cuts index size by ~97%, INCLUDE avoids heap reads, and CONCURRENTLY prevents write downtime."
+          },
+          {
+            "id": "b",
+            "text": "Because CREATE INDEX CONCURRENTLY automatically deletes old SETTLED rows",
+            "correct": false,
+            "feedback": "Partial indexes filter which rows are indexed; they never delete table rows."
+          },
+          {
+            "id": "c",
+            "text": "Because PostgreSQL disables shared_buffers for non-partial indexes",
+            "correct": false,
+            "feedback": "PostgreSQL uses shared_buffers for all indexes, but smaller partial indexes fit in RAM without thrashing."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why full/backward index scans thrash buffer pools at 2,400 QPS', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "On a 180M-row (240 GB) PostgreSQL 16 orders_ledger table where only 3.2% (5.7M rows) are PENDING_SETTLEMENT, an index solely on (created_at) forces Postgres to scan millions…",
+            "correct": true,
+            "feedback": "Correct: On a 180M-row (240 GB) PostgreSQL 16 orders_ledger table where only 3.2% (5.7M rows) are PENDING_SETTLEMENT, an index solely on (created_at) forces Postgres to scan millions…"
+          },
+          {
+            "id": "b",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "c",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'What happens without a partial covering index and lock-safe deployment', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "b",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "c",
+            "text": "Two compounding mistakes turn a missing index into a production outage: 1.",
+            "correct": true,
+            "feedback": "Correct: Two compounding mistakes turn a missing index into a production outage: 1."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** On a `180M`-row (`240 GB`) PostgreSQL 16 `orders_ledger` table where only `3.2%` (`5.7M` rows) are `PENDING_SETTLEMENT`, an index solely on `(created_at)` forces Postgres to scan millions of historical `SETTLED` rows.\n\n**How It Flows:** Think of Eliminating Full Table Scans Under Concurrency as a clear step-by-step chain: merchant_id -> created_at DESC -> WHERE PENDING -> INCLUDE -> Settlement Svc.\n\n**Why Beginners Should Care:** Build a Partial Covering Index (WHERE status='PENDING_SETTLEMENT' with INCLUDE) using CREATE INDEX CONCURRENTLY to shrink the index by 97%, enable Index-Only Scans, and avoid ACCESS EXCLUSIVE locks.",
+      "spark": {
+        "summary": "On a `180M`-row (`240 GB`) PostgreSQL 16 `orders_ledger` table where only `3.2%` (`5.7M` rows) are `PENDING_SETTLEMENT`, an index solely on `(created_at)` forces Postgres to scan millions of historical `SETTLED` rows.",
+        "keyTakeaway": "Build a Partial Covering Index (WHERE status='PENDING_SETTLEMENT' with INCLUDE) using CREATE INDEX CONCURRENTLY to shrink the index by 97%, enable Index-Only Scans, and avoid ACCESS EXCLUSIVE locks."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why full/backward index scans thrash buffer pools at 2,400 QPS",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why full/backward index scans thrash buffer pools at 2,400 QPS works from first principles.",
+          "explanation": "On a `180M`-row (`240 GB`) PostgreSQL 16 `orders_ledger` table where only `3.2%` (`5.7M` rows) are `PENDING_SETTLEMENT`, an index solely on `(created_at)` forces Postgres to scan millions of historical `SETTLED` rows backward, pulling cold heap pages into the `32 GB` `shared_buffers`. At `2,400 QPS`, NVMe read IOPS saturate at `16,000`, p99 jumps from `12 ms` to `14.8 s`, and all `500` HikariCP connections block.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "What happens without a partial covering index and lock-safe deployment",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without What happens without a partial covering index and lock-safe deployment under real concurrency or scale.",
+          "explanation": "Two compounding mistakes turn a missing index into a production outage: 1. **Buffer Pool Thrashing**: Scanning cold heap rows evicts hot working-set pages, causing every concurrent checkout query to stall on disk I/O. 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "tree-index",
+            "eyebrow": "Partial Covering B-Tree",
+            "title": "Partial Index (3.2% rows) + INCLUDE -> Index-Only Scan (<10ms)",
+            "nodes": [
+              {
+                "label": "merchant_id",
+                "role": "Equality prefix"
+              },
+              {
+                "label": "created_at DESC",
+                "role": "Pre-sorted LIMIT 50"
+              },
+              {
+                "label": "WHERE PENDING",
+                "role": "Only 5.7M of 180M"
+              },
+              {
+                "label": "INCLUDE",
+                "role": "Index-Only Scan"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Partial Predicate",
+                "detail": "WHERE status='PENDING_SETTLEMENT' shrinks index size by ~97%."
+              },
+              {
+                "label": "Column Order",
+                "detail": "(merchant_id, created_at DESC) satisfies filter + sort with zero sort node."
+              },
+              {
+                "label": "INCLUDE Columns",
+                "detail": "Covers SELECT fields so Postgres skips random heap page fetches."
+              },
+              {
+                "label": "CONCURRENTLY",
+                "detail": "Builds online without blocking 1,200 writes/sec on orders_ledger."
+              }
+            ],
+            "summary": "A 5.7M-row partial covering index fits entirely in shared_buffers and serves 2,400 QPS via Index-Only Scans in < 10 ms."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive solution (and why full composite indexes or plain CREATE INDEX fail)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "The problem: see what breaks without Naive solution under real concurrency or scale.",
+          "explanation": "A naive fix runs `CREATE INDEX idx_merchant_status_created ON orders_ledger (merchant_id, status, created_at DESC);`: **Table Write Outage**: Without `CONCURRENTLY`, `CREATE INDEX` blocks all `INSERT`/`UPDATE` traffic on the 240 GB table. **Bloated Index**: Indexing all `180M` rows wastes tens of GBs of RAM and write amplification for `96.8%` historical rows.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: CREATE INDEX CONCURRENTLY + Partial Covering Index + Guardrails",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Production Postgres remediation combines online indexing with pool protection: **Partial Covering Index**: `CREATE INDEX CONCURRENTLY idx_orders_pending_merchant ON orders_ledger (merchant_id, created_at DESC) INCLUDE (order_id, amount_cents) WHERE status = 'PENDING_SETTLEMENT';` (with `lock_timeout = '2s'`).",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Buffer Pool & Pool Isolation",
+            "title": "Index-Only Scan in shared_buffers + Bulkhead HikariCP Pools",
+            "nodes": [
+              {
+                "label": "Settlement Svc",
+                "role": "Separate pool + timeout"
+              },
+              {
+                "label": "shared_buffers",
+                "role": "Hot 5.7M-row B-Tree"
+              },
+              {
+                "label": "Visibility Map",
+                "role": "Skips heap fetch"
+              },
+              {
+                "label": "240GB Heap",
+                "role": "Zero cold-page thrash"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Index-Only Scan",
+                "detail": "Visibility Map + INCLUDE columns avoid touching the 240 GB heap."
+              },
+              {
+                "label": "Statement Timeout",
+                "detail": "2s DB timeout prevents runaway queries from pinning HikariCP."
+              },
+              {
+                "label": "Pool Bulkhead",
+                "detail": "Separates settlement batch reads from checkout write connections."
+              },
+              {
+                "label": "pg_stat_statements",
+                "detail": "Alerts on mean_exec_time or shared_blks_read regressions."
+              }
+            ],
+            "summary": "Keeping the partial index hot in shared_buffers drops NVMe IOPS and brings p99 latency under 10 ms at 2,400 QPS."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Build a Partial Covering Index (WHERE status='PENDING_SETTLEMENT' with INCLUDE) using CREATE INDEX CONCURRENTLY to shrink the index by 97%, enable Index-Only Scans, and avoid ACCESS EXCLUSIVE locks.",
+      "summary": "A 180M-row Postgres settlement query scanning cold pages thrashes shared_buffers and hits 14.8s p99; creating a Partial Covering Index CONCURRENTLY for status='PENDING_SETTLEMENT' cuts p99 below 10 ms with zero write downtime.",
+      "keyTakeaway": "When a single bottleneck threatens end-to-end availability, build a Partial Covering Index (WHERE status='PENDING_SETTLEMENT' with INCLUDE) using CREATE INDEX CONCURRENTLY to shrink the index by 97%, enable Index-Only Scans, and avoid ACCESS EXCLUSIVE locks."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** On a `180M`-row (`240 GB`) PostgreSQL 16 `orders_ledger` table where only `3.2%` (`5.7M` rows) are `PENDING_SETTLEMENT`, an index solely on `(created_at)` forces Postgres to scan millions of historical `SETTLED` rows backward.\n\n**Visual & Structural Flow:** Depicts Partial Index (3.2% rows) + INCLUDE -> Index-Only Scan (<10ms) (merchant_id -> created_at DESC -> WHERE PENDING -> INCLUDE); Index-Only Scan in shared_buffers + Bulkhead HikariCP Pools (Settlement Svc -> shared_buffers -> Visibility Map -> 240GB Heap).\n\n**Trade-Offs & Production:** A naive fix runs `CREATE INDEX idx_merchant_status_created ON orders_ledger (merchant_id, status, created_at DESC);`: **Table Write Outage**: Without `CONCURRENTLY`, `CREATE. Production Postgres remediation combines online indexing with pool protection: **Partial Covering Index**: `CREATE INDEX CONCURRENTLY idx_orders_pending_merchant ON orders_ledger.\n\n**Failure Modes & Application:** Partial covering indexes are a high-leverage optimization across OLTP workloads: **Job Queues & Outbox Tables**: Indexing only `WHERE status = 'PENDING'` keeps queue polling `O(active)` instead of `O(history)`.",
+      "spark": {
+        "summary": "A 180M-row Postgres settlement query scanning cold pages thrashes shared_buffers and hits 14.8s p99; creating a Partial Covering Index CONCURRENTLY for status='PENDING_SETTLEMENT' cuts p99 below 10 ms with zero write downtime.",
+        "keyTakeaway": "Build a Partial Covering Index (WHERE status='PENDING_SETTLEMENT' with INCLUDE) using CREATE INDEX CONCURRENTLY to shrink the index by 97%, enable Index-Only Scans, and avoid ACCESS EXCLUSIVE locks."
+      },
+      "summary": "A 180M-row Postgres settlement query scanning cold pages thrashes shared_buffers and hits 14.8s p99; creating a Partial Covering Index CONCURRENTLY for status='PENDING_SETTLEMENT' cuts p99 below 10 ms with zero write downtime.",
+      "keyTakeaway": "When a single bottleneck threatens end-to-end availability, build a Partial Covering Index (WHERE status='PENDING_SETTLEMENT' with INCLUDE) using CREATE INDEX CONCURRENTLY to shrink the index by 97%, enable Index-Only Scans, and avoid ACCESS EXCLUSIVE locks."
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** A 180M-row Postgres settlement query scanning cold pages thrashes shared_buffers and hits 14.8s p99; creating a Partial Covering Index CONCURRENTLY for status='PENDING_SETTLEMENT' cuts p99 below 10 ms with zero write downtime.\n\n**Production Trade-Offs:** A naive fix runs `CREATE INDEX idx_merchant_status_created ON orders_ledger (merchant_id, status, created_at DESC);`: **Table Write Outage**: Without `CONCURRENTLY`, `CREATE INDEX` blocks all `INSERT`/`UPDATE` traffic on the 240 GB table.\n\n**Failure Modes & Edge Cases:** Partial covering indexes are a high-leverage optimization across OLTP workloads: **Job Queues & Outbox Tables**: Indexing only `WHERE status = 'PENDING'` keeps queue polling `O(active)` instead of `O(history)`.\n\n**Principal Takeaway:** Build a Partial Covering Index (WHERE status='PENDING_SETTLEMENT' with INCLUDE) using CREATE INDEX CONCURRENTLY to shrink the index by 97%, enable Index-Only Scans, and avoid ACCESS EXCLUSIVE locks.",
+      "spark": {
+        "summary": "A 180M-row Postgres settlement query scanning cold pages thrashes shared_buffers and hits 14.8s p99; creating a Partial Covering Index CONCURRENTLY for status='PENDING_SETTLEMENT' cuts p99 below 10 ms with zero write downtime.",
+        "keyTakeaway": "Build a Partial Covering Index (WHERE status='PENDING_SETTLEMENT' with INCLUDE) using CREATE INDEX CONCURRENTLY to shrink the index by 97%, enable Index-Only Scans, and avoid ACCESS EXCLUSIVE locks."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why full/backward index scans thrash buffer pools at 2,400 QPS",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why full/backward index scans thrash buffer pools at 2,400 QPS works from first principles.",
+          "explanation": "On a `180M`-row (`240 GB`) PostgreSQL 16 `orders_ledger` table where only `3.2%` (`5.7M` rows) are `PENDING_SETTLEMENT`, an index solely on `(created_at)` forces Postgres to scan millions of historical `SETTLED` rows backward, pulling cold heap pages into the `32 GB` `shared_buffers`. At `2,400 QPS`, NVMe read IOPS saturate at `16,000`, p99 jumps from `12 ms` to `14.8 s`, and all `500` HikariCP connections block.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "What happens without a partial covering index and lock-safe deployment",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without What happens without a partial covering index and lock-safe deployment under real concurrency or scale.",
+          "explanation": "Two compounding mistakes turn a missing index into a production outage:\n\n1. **Buffer Pool Thrashing**: Scanning cold heap rows evicts hot working-set pages, causing every concurrent checkout query to stall on disk I/O.\n2. **Blocking DDL**: Running plain `CREATE INDEX` acquires a `SHARE` lock that blocks all `1,200 writes/sec` (`INSERT`/`UPDATE`) for 20+ minutes.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "tree-index",
+            "eyebrow": "Partial Covering B-Tree",
+            "title": "Partial Index (3.2% rows) + INCLUDE -> Index-Only Scan (<10ms)",
+            "nodes": [
+              {
+                "label": "merchant_id",
+                "role": "Equality prefix"
+              },
+              {
+                "label": "created_at DESC",
+                "role": "Pre-sorted LIMIT 50"
+              },
+              {
+                "label": "WHERE PENDING",
+                "role": "Only 5.7M of 180M"
+              },
+              {
+                "label": "INCLUDE",
+                "role": "Index-Only Scan"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Partial Predicate",
+                "detail": "WHERE status='PENDING_SETTLEMENT' shrinks index size by ~97%."
+              },
+              {
+                "label": "Column Order",
+                "detail": "(merchant_id, created_at DESC) satisfies filter + sort with zero sort node."
+              },
+              {
+                "label": "INCLUDE Columns",
+                "detail": "Covers SELECT fields so Postgres skips random heap page fetches."
+              },
+              {
+                "label": "CONCURRENTLY",
+                "detail": "Builds online without blocking 1,200 writes/sec on orders_ledger."
+              }
+            ],
+            "summary": "A 5.7M-row partial covering index fits entirely in shared_buffers and serves 2,400 QPS via Index-Only Scans in < 10 ms."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive solution (and why full composite indexes or plain CREATE INDEX fail)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "The problem: see what breaks without Naive solution under real concurrency or scale.",
+          "explanation": "A naive fix runs `CREATE INDEX idx_merchant_status_created ON orders_ledger (merchant_id, status, created_at DESC);`:\n\n- **Table Write Outage**: Without `CONCURRENTLY`, `CREATE INDEX` blocks all `INSERT`/`UPDATE` traffic on the 240 GB table.\n- **Bloated Index**: Indexing all `180M` rows wastes tens of GBs of RAM and write amplification for `96.8%` historical rows.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: CREATE INDEX CONCURRENTLY + Partial Covering Index + Guardrails",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Production Postgres remediation combines online indexing with pool protection:\n\n- **Partial Covering Index**: `CREATE INDEX CONCURRENTLY idx_orders_pending_merchant ON orders_ledger (merchant_id, created_at DESC) INCLUDE (order_id, amount_cents) WHERE status = 'PENDING_SETTLEMENT';` (with `lock_timeout = '2s'`).\n- **Query & Pool Guardrails**: Set `statement_timeout = '2000ms'` and isolate settlement reads onto a read replica or separate bulkhead HikariCP pool so checkout transactions are never starved.\n- **CI/CD Regression Check**: Enforce `EXPLAIN (ANALYZE, BUFFERS)` checks in CI against realistic stats.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Buffer Pool & Pool Isolation",
+            "title": "Index-Only Scan in shared_buffers + Bulkhead HikariCP Pools",
+            "nodes": [
+              {
+                "label": "Settlement Svc",
+                "role": "Separate pool + timeout"
+              },
+              {
+                "label": "shared_buffers",
+                "role": "Hot 5.7M-row B-Tree"
+              },
+              {
+                "label": "Visibility Map",
+                "role": "Skips heap fetch"
+              },
+              {
+                "label": "240GB Heap",
+                "role": "Zero cold-page thrash"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Index-Only Scan",
+                "detail": "Visibility Map + INCLUDE columns avoid touching the 240 GB heap."
+              },
+              {
+                "label": "Statement Timeout",
+                "detail": "2s DB timeout prevents runaway queries from pinning HikariCP."
+              },
+              {
+                "label": "Pool Bulkhead",
+                "detail": "Separates settlement batch reads from checkout write connections."
+              },
+              {
+                "label": "pg_stat_statements",
+                "detail": "Alerts on mean_exec_time or shared_blks_read regressions."
+              }
+            ],
+            "summary": "Keeping the partial index hot in shared_buffers drops NVMe IOPS and brings p99 latency under 10 ms at 2,400 QPS."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where Partial & Covering Indexes apply in System Design",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Partial covering indexes are a high-leverage optimization across OLTP workloads:\n\n- **Job Queues & Outbox Tables**: Indexing only `WHERE status = 'PENDING'` keeps queue polling `O(active)` instead of `O(history)`.\n- **Payment & Ledger Dashboards**: Serving `LIMIT 50` merchant views via Index-Only Scans.\n- **Zero-Downtime Migrations**: Using `CONCURRENTLY` + `lock_timeout` in automated migration pipelines.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Build a Partial Covering Index (WHERE status='PENDING_SETTLEMENT' with INCLUDE) using CREATE INDEX CONCURRENTLY to shrink the index by 97%, enable Index-Only Scans, and avoid ACCESS EXCLUSIVE locks.",
+      "summary": "A 180M-row Postgres settlement query scanning cold pages thrashes shared_buffers and hits 14.8s p99; creating a Partial Covering Index CONCURRENTLY for status='PENDING_SETTLEMENT' cuts p99 below 10 ms with zero write downtime.",
+      "keyTakeaway": "When a single bottleneck threatens end-to-end availability, build a Partial Covering Index (WHERE status='PENDING_SETTLEMENT' with INCLUDE) using CREATE INDEX CONCURRENTLY to shrink the index by 97%, enable Index-Only Scans, and avoid ACCESS EXCLUSIVE locks."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "simulation": {
+    "title": "Eliminating Full Table Scans Under Concurrency — Interactive Execution Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Workload & Budget"
+      },
+      {
+        "id": "router",
+        "label": "Gateway / Router",
+        "role": "Admission & Dispatch"
+      },
+      {
+        "id": "engine",
+        "label": "Core Engine",
+        "role": "Primary Execution"
+      },
+      {
+        "id": "replica",
+        "label": "Replica / Fallback",
+        "role": "Durability & Recovery"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "router",
+        "label": "request"
+      },
+      {
+        "from": "router",
+        "to": "engine",
+        "label": "route"
+      },
+      {
+        "from": "engine",
+        "to": "replica",
+        "label": "sync / fallback"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why full/backward index scans thrash buffer pools at 2,400 Q",
+        "actionLabel": "Dispatch nominal request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "router"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "Ingress",
+          "p99_ms": 8,
+          "error_rate": "0.0%"
+        },
+        "explanation": "Caller sends work into the gateway with explicit timeout and concurrency bounds (Why full/backward index scans thrash buffer pools at 2,400 QPS)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "What happens without a partial covering index and lock-safe ",
+        "actionLabel": "Execute core invariant",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "Core Path",
+          "p99_ms": 18,
+          "in_flight": 124
+        },
+        "explanation": "The core engine processes the hot path while keeping state transitions deterministic (What happens without a partial covering index and lock-safe deployment)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Naive solution (and why full composite indexes or plain CREA",
+        "actionLabel": "Detect skew or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Degraded",
+          "p99_ms": 64,
+          "retries_capped": "true"
+        },
+        "explanation": "Under load or replica lag, bounded backoff and isolation prevent cascading saturation (Naive solution (and why full composite indexes or plain CREATE INDEX fail))."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Where Partial & Covering Indexes apply in System Design",
+        "actionLabel": "Converge & restore SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 11,
+          "drift": 0
+        },
+        "explanation": "State converges cleanly and telemetry confirms the system returned within its SLO envelope (Where Partial & Covering Indexes apply in System Design)."
+      }
+    ]
+  }
+}

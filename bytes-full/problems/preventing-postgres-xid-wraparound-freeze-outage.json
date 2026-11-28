@@ -1,0 +1,603 @@
+{
+  "id": "preventing-postgres-xid-wraparound-freeze-outage",
+  "slug": "preventing-postgres-xid-wraparound-freeze-outage",
+  "title": "Preventing PostgreSQL XID Wraparound Outages & Autovacuum Starvation",
+  "domain": "sql",
+  "spark": {
+    "summary": "Harden a 400 GB PostgreSQL ledger handling 30,000 updates/sec against 5x MVCC table bloat and emergency 2B XID wraparound write freezes.",
+    "keyTakeaway": "Eliminate xmin pinners with 30s idle-in-transaction timeouts and max_slot_keep_wal_size, enable fillfactor=70 HOT updates, and raise autovacuum_vacuum_cost_limit to 2000.",
+    "byteSummary": "In Production Scenario #28, a 400 GB PostgreSQL ledger sustaining 30,000 updates/sec suffered 5x table bloat followed by an emergency 2B XID wraparound write shutdown. Root-cause analysis revealed two compounding failures: an idle `BEGIN; SELECT` reporting transaction pinning the global `xmin` horizon, and default `autovacuum_vacuum_cost_limit=200` throttling freeze workers far below the XID burn rate.\n\nAt 30,000 write XIDs/sec, a cluster burns through 2 billion XIDs in under 19 hours if freezing stalls. Every non-HOT update also amplified B-tree index writes, saturating disk I/O.\n\nThe hardened production architecture enforces `fillfactor=70` for page-local HOT updates, `idle_in_transaction_session_timeout=30s`, `max_slot_keep_wal_size` to drop dead replication slots, `autovacuum_vacuum_cost_limit=2000` across parallel freeze workers, and tiered XID-age alerting—holding table bloat below 5% with zero write freezes."
+  },
+  "learningJourney": [
+    {
+      "level": "foundation",
+      "title": "Stage 1: Incident Anatomy — 30K/s Ledger & Emergency Write Freeze",
+      "purpose": "Trace how 30,000 updates/sec combined with pinned xmin and throttled autovacuum drives a 400 GB ledger to a read-only halt.",
+      "explanation": "At 30,000 write XIDs/sec, PostgreSQL consumes ~108M XIDs per hour and hits the 2B wraparound limit in ~18.5 hours if `relfrozenxid` cannot advance. Meanwhile, unreclaimed dead tuples inflate a 400 GB table to 2 TB (5x bloat), degrading buffer-cache hit ratios and slowing every sequential/index scan until the emergency shutdown triggers.",
+      "codeExample": "def hours_to_xid_wraparound(writes_per_sec: int, current_age: int = 0) -> float:\n    if writes_per_sec <= 0:\n        raise ValueError('writes_per_sec must be positive')\n    remaining = max(0, 2_000_000_000 - current_age)\n    return round(remaining / (writes_per_sec * 3600.0), 2)\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "FOUNDATION · INCIDENT TIMELINE",
+        "title": "How 30,000 Updates/Sec Hits the 2B XID Wall in < 19 Hours",
+        "nodes": [
+          {
+            "id": "burn",
+            "label": "30,000 Write XIDs/sec",
+            "sub": "400 GB ledger (~108M/hr)",
+            "role": "XID Burn Rate"
+          },
+          {
+            "id": "pin",
+            "label": "Pinned Global xmin",
+            "sub": "Idle reporting TX + dead slot",
+            "role": "Blocker"
+          },
+          {
+            "id": "bloat",
+            "label": "5x Heap & Index Bloat",
+            "sub": "400 GB -> 2 TB dead tuples",
+            "role": "I/O Collapse"
+          },
+          {
+            "id": "halt",
+            "label": "2B Emergency Write Freeze",
+            "sub": "Cluster forced read-only",
+            "role": "Outage"
+          }
+        ],
+        "edges": [
+          {
+            "from": "burn",
+            "to": "pin",
+            "label": "Accumulate dead versions"
+          },
+          {
+            "from": "pin",
+            "to": "bloat",
+            "label": "Block vacuum reclamation"
+          },
+          {
+            "from": "bloat",
+            "to": "halt",
+            "label": "XID age nears 2B"
+          }
+        ],
+        "cards": [
+          {
+            "label": "18.5-Hour Runway",
+            "detail": "At 30K XIDs/sec, even a half-day autovacuum stall pushes a table close to the 2B limit."
+          },
+          {
+            "label": "Compounding Slowdown",
+            "detail": "5x bloat makes any eventual VACUUM scan 5x slower to complete."
+          }
+        ],
+        "summary": "At 30,000 updates/sec, pinned xmin and throttled vacuum bloat tables 5x and exhaust the 2B XID runway in under 19 hours.",
+        "caption": "30K/s writes plus pinned xmin bloat a 400 GB ledger 5x and hit the 2B emergency write freeze in < 19 hours."
+      },
+      "id": "stage-1-stage-1-incident-anatomy-30k-s-ledger-emergency-"
+    },
+    {
+      "level": "foundation",
+      "title": "Stage 2: Live Triage Queries (pg_stat_activity & pg_class)",
+      "purpose": "Identify the exact oldest relfrozenxid tables, idle-in-transaction blockers, and inactive replication slots during an incident.",
+      "explanation": "During an active XID-age spike, operators must immediately rank tables by `age(relfrozenxid)` in `pg_class` and cross-reference `pg_stat_activity` for `backend_xmin` holders and `pg_replication_slots` for inactive `xmin`/`catalog_xmin` pins. Terminating a single zombie PID via `pg_terminate_backend(pid)` unblocks autovacuum within seconds.",
+      "codeExample": "TRIAGE_SQL = {\n    'oldest_tables': \"SELECT relname, age(relfrozenxid) AS xid_age FROM pg_class WHERE relkind = 'r' ORDER BY xid_age DESC LIMIT 10;\",\n    'xmin_blockers': \"SELECT pid, state, age(backend_xmin) AS xmin_age, query FROM pg_stat_activity WHERE backend_xmin IS NOT NULL ORDER BY xmin_age DESC;\",\n    'dead_slots': \"SELECT slot_name, active, age(xmin) AS slot_xmin_age FROM pg_replication_slots WHERE NOT active;\"\n}\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "FOUNDATION · LIVE TRIAGE",
+        "title": "Three-Query Incident Triage to Unpin Global xmin",
+        "nodes": [
+          {
+            "id": "pgc",
+            "label": "pg_class.relfrozenxid",
+            "sub": "Rank top-10 aged tables",
+            "role": "Target Finder"
+          },
+          {
+            "id": "psa",
+            "label": "pg_stat_activity",
+            "sub": "Find oldest backend_xmin",
+            "role": "Session Audit"
+          },
+          {
+            "id": "prs",
+            "label": "pg_replication_slots",
+            "sub": "Find active=false pins",
+            "role": "Slot Audit"
+          },
+          {
+            "id": "term",
+            "label": "pg_terminate_backend()",
+            "sub": "Release xmin & unblock",
+            "role": "Mitigation"
+          }
+        ],
+        "edges": [
+          {
+            "from": "pgc",
+            "to": "psa",
+            "label": "Confirm XID age spike"
+          },
+          {
+            "from": "psa",
+            "to": "term",
+            "label": "Kill idle-in-tx PID"
+          },
+          {
+            "from": "prs",
+            "to": "term",
+            "label": "Drop orphaned slot"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Check Subtransactions",
+            "detail": "Monitor pg_stat_activity wait events for SubtransSLRU contention alongside backend_xmin."
+          },
+          {
+            "label": "Safe Slot Drop",
+            "detail": "Verify consumer replica is decommissioned before calling pg_drop_replication_slot()."
+          }
+        ],
+        "summary": "Inspecting pg_class, pg_stat_activity, and pg_replication_slots pinpoints the exact blocker holding back relfrozenxid.",
+        "caption": "Operators query pg_class, pg_stat_activity, and pg_replication_slots to locate and terminate xmin blockers."
+      },
+      "id": "stage-2-stage-2-live-triage-queries-pg-stat-activity-pg-"
+    },
+    {
+      "level": "intermediate",
+      "title": "Stage 3: Enforcing Session Timeouts & Replication WAL Caps",
+      "purpose": "Prevent future xmin pinning automatically using 30s idle-in-transaction timeouts and max_slot_keep_wal_size.",
+      "explanation": "Manual triage is too slow at 30K XIDs/sec. Setting `idle_in_transaction_session_timeout = '30s'` and `statement_timeout = '15s'` on OLTP/reporting roles automatically aborts forgotten `BEGIN; SELECT` sessions. Setting `max_slot_keep_wal_size = '20GB'` invalidates disconnected replication slots before they pin xmin or fill pg_wal.",
+      "codeExample": "HARDENED_SESSION_GUCS = {\n    'idle_in_transaction_session_timeout': '30s',\n    'statement_timeout': '15s',\n    'max_slot_keep_wal_size': '20GB',\n}\n\ndef validate_guc_timeouts(idle_tx_sec: int, stmt_sec: int) -> None:\n    if idle_tx_sec <= 0 or idle_tx_sec > 60:\n        raise ValueError('idle_in_transaction_session_timeout should be between 1s and 60s for OLTP')\n    if stmt_sec <= 0:\n        raise ValueError('statement_timeout must be positive')\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "INTERMEDIATE · BLOCKER PREVENTION",
+        "title": "Automated Guardrails Against Zombie Sessions & Dead Slots",
+        "nodes": [
+          {
+            "id": "oltp",
+            "label": "OLTP / BI Connections",
+            "sub": "Pooled via PgBouncer",
+            "role": "Client Traffic"
+          },
+          {
+            "id": "idle",
+            "label": "idle_in_tx_timeout = 30s",
+            "sub": "Auto-abort zombie TXs",
+            "role": "Session Guard"
+          },
+          {
+            "id": "slot",
+            "label": "max_slot_keep_wal = 20GB",
+            "sub": "Invalidate dead replicas",
+            "role": "Slot Guard"
+          },
+          {
+            "id": "xmin",
+            "label": "Unpinned Global xmin",
+            "sub": "Vacuum reclaims freely",
+            "role": "Healthy Horizon"
+          }
+        ],
+        "edges": [
+          {
+            "from": "oltp",
+            "to": "idle",
+            "label": "Enforce per-role GUC"
+          },
+          {
+            "from": "idle",
+            "to": "xmin",
+            "label": "Free backend_xmin"
+          },
+          {
+            "from": "slot",
+            "to": "xmin",
+            "label": "Free catalog_xmin"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Replica Read Isolation",
+            "detail": "Route long-running BI analytics to a dedicated read replica without hot_standby_feedback."
+          },
+          {
+            "label": "PgBouncer Transaction Pooling",
+            "detail": "Transaction-mode pooling returns connections immediately after COMMIT, reducing idle-in-tx risk."
+          }
+        ],
+        "summary": "30-second idle-in-transaction timeouts and max_slot_keep_wal_size prevent zombie sessions and dead slots from pinning xmin.",
+        "caption": "30s idle-in-transaction timeouts and 20 GB max_slot_keep_wal_size keep the global xmin horizon unpinned."
+      },
+      "id": "stage-3-stage-3-enforcing-session-timeouts-replication-w"
+    },
+    {
+      "level": "intermediate",
+      "title": "Stage 4: HOT Updates with fillfactor=70 on Update-Heavy Tables",
+      "purpose": "Keep 30,000 updates/sec page-local and hold table bloat under 5% using fillfactor=70.",
+      "explanation": "On the 400 GB ledger, setting `ALTER TABLE ledger SET (fillfactor = 70);` reserves 30% free space on every 8 KB heap page. Non-indexed column updates stay on the same heap page as Heap-Only Tuples (HOT), eliminating secondary B-tree index writes and allowing inline page pruning to keep steady-state bloat under 5%.",
+      "codeExample": "def hot_headroom_bytes(page_size: int = 8192, fillfactor: int = 70) -> int:\n    if not (10 <= fillfactor <= 100):\n        raise ValueError('fillfactor must be in [10, 100]')\n    return int(page_size * (100 - fillfactor) / 100)\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "INTERMEDIATE · BLOAT CONTROL",
+        "title": "fillfactor=70 + Inline Page Pruning for < 5% Bloat",
+        "nodes": [
+          {
+            "id": "ff",
+            "label": "ALTER TABLE fillfactor=70",
+            "sub": "2,457 bytes free / 8 KB page",
+            "role": "Page Config"
+          },
+          {
+            "id": "hot",
+            "label": "Same-Page HOT Update",
+            "sub": "Zero index pointer writes",
+            "role": "Write Optimization"
+          },
+          {
+            "id": "prune",
+            "label": "Inline Page Pruning",
+            "sub": "Reclaim dead HOT tuples",
+            "role": "Fast Reuse"
+          },
+          {
+            "id": "steady",
+            "label": "Bloat < 5% Steady State",
+            "sub": "400 GB stays ~420 GB",
+            "role": "Storage Target"
+          }
+        ],
+        "edges": [
+          {
+            "from": "ff",
+            "to": "hot",
+            "label": "Reserve 30% page space"
+          },
+          {
+            "from": "hot",
+            "to": "prune",
+            "label": "Prune dead chains inline"
+          },
+          {
+            "from": "prune",
+            "to": "steady",
+            "label": "Prevent 5x table growth"
+          }
+        ],
+        "cards": [
+          {
+            "label": "REPACK / pg_repack",
+            "detail": "Existing 5x-bloated tables require online pg_repack (or VACUUM FULL) after setting fillfactor=70 to rewrite dense pages."
+          },
+          {
+            "label": "Index Column Hygiene",
+            "detail": "Avoid indexing monotonically updated timestamp/counter columns that would disqualify HOT updates."
+          }
+        ],
+        "summary": "Reserving 30% free space per page with fillfactor=70 enables HOT updates and inline pruning, holding bloat under 5%.",
+        "caption": "fillfactor=70 reserves 2,457 bytes per 8 KB page for HOT updates and inline pruning, capping bloat below 5%."
+      },
+      "id": "stage-4-stage-4-hot-updates-with-fillfactor-70-on-update"
+    },
+    {
+      "level": "intermediate",
+      "title": "Stage 5: Autovacuum Cost-Limit & Worker Scaling",
+      "purpose": "Configure autovacuum_vacuum_cost_limit=2000 and multi-worker parallelism so freezing outpaces XID burn.",
+      "explanation": "Default `autovacuum_vacuum_cost_limit=200` caps vacuum at ~8 MB/s per worker—far too slow for a 400 GB table at 30K updates/sec. Increasing `autovacuum_vacuum_cost_limit=2000` (with `cost_delay=2ms`), lowering `autovacuum_vacuum_scale_factor=0.01`, and setting `autovacuum_max_workers=6` gives freeze workers 10x I/O throughput without starving OLTP queries.",
+      "codeExample": "AUTOVACUUM_TUNING = {\n    'autovacuum_max_workers': 6,\n    'autovacuum_vacuum_cost_limit': 2000,\n    'autovacuum_vacuum_cost_delay': '2ms',\n    'autovacuum_vacuum_scale_factor': 0.01,\n    'autovacuum_freeze_max_age': 200_000_000,\n}\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "INTERMEDIATE · VACUUM THROUGHPUT",
+        "title": "10x Autovacuum I/O Budget & Scale-Factor Tuning",
+        "nodes": [
+          {
+            "id": "sf",
+            "label": "scale_factor = 0.01",
+            "sub": "Trigger early on 400 GB",
+            "role": "Trigger Policy"
+          },
+          {
+            "id": "cl",
+            "label": "cost_limit = 2000 / 2ms",
+            "sub": "10x default I/O budget",
+            "role": "Rate Limiter"
+          },
+          {
+            "id": "mw",
+            "label": "max_workers = 6",
+            "sub": "Parallel table freezing",
+            "role": "Worker Pool"
+          },
+          {
+            "id": "frz",
+            "label": "relfrozenxid < 200M",
+            "sub": "Continuous XID headroom",
+            "role": "SLO Met"
+          }
+        ],
+        "edges": [
+          {
+            "from": "sf",
+            "to": "mw",
+            "label": "Enqueue dirty tables early"
+          },
+          {
+            "from": "cl",
+            "to": "mw",
+            "label": "Allocate 2000 cost credits"
+          },
+          {
+            "from": "mw",
+            "to": "frz",
+            "label": "Freeze & advance horizon"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Shared Cost Balance",
+            "detail": "Remember autovacuum_vacuum_cost_limit is shared across active workers unless overridden per table."
+          },
+          {
+            "label": "maintenance_work_mem",
+            "detail": "Set maintenance_work_mem=1GB..2GB so VACUUM stores dead-tuple TIDs in 1 pass instead of multiple index scans."
+          }
+        ],
+        "summary": "Tuning cost_limit=2000, scale_factor=0.01, and maintenance_work_mem=1GB lets autovacuum keep pace with 30K updates/sec.",
+        "caption": "Early 0.01 scale_factor triggers, cost_limit=2000, and 6 workers maintain relfrozenxid < 200M."
+      },
+      "id": "stage-5-stage-5-autovacuum-cost-limit-worker-scaling"
+    },
+    {
+      "level": "advanced",
+      "title": "Stage 6: Partitioning & Subtransaction Avoidance at 30K/s",
+      "purpose": "Bound freeze scan blast radius via time-based partitioning and avoid SubtransSLRU XID amplification.",
+      "explanation": "Vacuuming a monolithic 400 GB table takes hours even with tuned I/O; range-partitioning by day or week limits active vacuuming to ~20 GB hot partitions while cold partitions stay 100% all-frozen in the Visibility Map. Additionally, eliminating nested `SAVEPOINT` / PL/pgSQL `EXCEPTION` blocks avoids subtransaction XID burn and SubtransSLRU lock contention.",
+      "codeExample": "def partition_freeze_minutes(partition_gb: float, vacuum_mb_s: float = 80.0) -> float:\n    if partition_gb <= 0 or vacuum_mb_s <= 0:\n        raise ValueError('Partition size and vacuum speed must be positive')\n    return round((partition_gb * 1024.0) / (vacuum_mb_s * 60.0), 2)\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "ADVANCED · PARTITIONING & SUBTX",
+        "title": "Bounding Freeze Blast Radius with Partitioned Hot Tables",
+        "nodes": [
+          {
+            "id": "part",
+            "label": "Weekly Ledger Partitions",
+            "sub": "20 GB hot vs 380 GB cold",
+            "role": "Table Layout"
+          },
+          {
+            "id": "cold",
+            "label": "Cold Partitions (VM Frozen)",
+            "sub": "0% I/O on freeze sweeps",
+            "role": "Skipped Data"
+          },
+          {
+            "id": "sub",
+            "label": "Zero-SAVEPOINT Policy",
+            "sub": "Prevent SubtransSLRU stalls",
+            "role": "XID Hygiene"
+          },
+          {
+            "id": "fast",
+            "label": "4-Minute Hot Freeze",
+            "sub": "20 GB @ 80 MB/s = 4.3 min",
+            "role": "Bounded Recovery"
+          }
+        ],
+        "edges": [
+          {
+            "from": "part",
+            "to": "cold",
+            "label": "Freeze once on rotation"
+          },
+          {
+            "from": "part",
+            "to": "fast",
+            "label": "Vacuum only hot partition"
+          },
+          {
+            "from": "sub",
+            "to": "fast",
+            "label": "Keep 1 XID per TX"
+          }
+        ],
+        "cards": [
+          {
+            "label": "95% I/O Reduction",
+            "detail": "Partitioning shrinks active freeze scans from 400 GB to a 20 GB hot partition (~4.3 minutes)."
+          },
+          {
+            "label": "Subtransaction Trap",
+            "detail": "A single transaction with 1,000 SAVEPOINTs burns 1,000 XIDs and can trigger SubtransSLRU stalls."
+          }
+        ],
+        "summary": "Range partitioning shrinks freeze scans from 400 GB to 20 GB hot partitions while avoiding SAVEPOINT XID amplification.",
+        "caption": "Weekly partitioning isolates 20 GB hot writes from 380 GB all-frozen cold partitions, cutting freeze time to ~4 minutes."
+      },
+      "id": "stage-6-stage-6-partitioning-subtransaction-avoidance-at"
+    },
+    {
+      "level": "advanced",
+      "title": "Stage 7: Tiered XID-Age Alerting & Single-User Emergency Runbook",
+      "purpose": "Catch wraparound risk 10+ hours early via Prometheus telemetry and document safe single-user VACUUM FREEZE recovery.",
+      "explanation": "Export `max(age(relfrozenxid))` and `max(age(datfrozenxid))` every 60 seconds with alerts at 150M (info), 500M (page on-call), and 1.5B (critical). If a cluster ever reaches the 2B read-only wall, stop application pools, start `postgres --single -D $PGDATA <db>`, execute `VACUUM FREEZE;`, and restart normal multi-user service.",
+      "codeExample": "def runbook_action(max_datfrozenxid_age: int) -> str:\n    if max_datfrozenxid_age >= 1_997_000_000:\n        return 'STOP_POOLS -> START_POSTGRES_SINGLE -> VACUUM_FREEZE'\n    if max_datfrozenxid_age >= 500_000_000:\n        return 'TERMINATE_XMIN_BLOCKERS -> RUN_MANUAL_VACUUM_FREEZE'\n    return 'MONITOR_NORMAL_AUTOVACUUM'\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "ADVANCED · TELEMETRY & RECOVERY",
+        "title": "Tiered XID-Age Alerting & Single-User Emergency Thaw",
+        "nodes": [
+          {
+            "id": "exp",
+            "label": "pg_exporter (60s Scrape)",
+            "sub": "datfrozenxid & relfrozenxid",
+            "role": "Telemetry"
+          },
+          {
+            "id": "warn",
+            "label": "500M XID Page Alert",
+            "sub": "Kill blockers + manual freeze",
+            "role": "On-Call Gate"
+          },
+          {
+            "id": "crit",
+            "label": "1.997B Read-Only Wall",
+            "sub": "Refuse new write XIDs",
+            "role": "Safety Halt"
+          },
+          {
+            "id": "su",
+            "label": "postgres --single Mode",
+            "sub": "Run VACUUM FREEZE -> restart",
+            "role": "Emergency Thaw"
+          }
+        ],
+        "edges": [
+          {
+            "from": "exp",
+            "to": "warn",
+            "label": "Age >= 500M"
+          },
+          {
+            "from": "warn",
+            "to": "crit",
+            "label": "If unmitigated"
+          },
+          {
+            "from": "crit",
+            "to": "su",
+            "label": "Execute offline freeze"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Database-Wide datfrozenxid",
+            "detail": "Remember pg_database.datfrozenxid tracks the oldest relfrozenxid across all tables—even unused template0/postgres DBs."
+          },
+          {
+            "label": "Pre-Freeze Verification",
+            "detail": "Confirm disk space headroom before running VACUUM FREEZE so WAL generation does not fill $PGDATA."
+          }
+        ],
+        "summary": "60-second XID-age telemetry catches wraparound hours early, while single-user VACUUM FREEZE provides deterministic recovery.",
+        "caption": "60s telemetry alerts at 500M XIDs to prevent hitting the 1.997B read-only wall requiring single-user VACUUM FREEZE."
+      },
+      "id": "stage-7-stage-7-tiered-xid-age-alerting-single-user-emer"
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "prob-pg-1",
+        "question": "In Production Scenario #28, which two factors combined to push the 400 GB ledger into an XID wraparound write freeze?",
+        "options": [
+          {
+            "id": "a",
+            "text": "An idle `BEGIN; SELECT` transaction pinning `xmin` and default `autovacuum_vacuum_cost_limit=200` throttling vacuum behind 30K updates/sec.",
+            "correct": true,
+            "feedback": "Correct. Pinned xmin blocked dead-tuple cleanup (5x bloat) while default cost_limit=200 couldn't keep pace with 30K XIDs/sec."
+          },
+          {
+            "id": "b",
+            "text": "Enabling fillfactor=70 and setting idle_in_transaction_session_timeout=30s.",
+            "correct": false,
+            "feedback": "Incorrect. Those are the hardened fixes, not the cause."
+          },
+          {
+            "id": "c",
+            "text": "Using weekly range partitions on the ledger table.",
+            "correct": false,
+            "feedback": "Incorrect. Weekly partitioning reduces vacuum blast radius."
+          },
+          {
+            "id": "d",
+            "text": "Setting maintenance_work_mem=2GB.",
+            "correct": false,
+            "feedback": "Incorrect. Larger maintenance_work_mem speeds up VACUUM index passes."
+          }
+        ],
+        "explanation": "A pinned xmin horizon from an idle reporting transaction plus throttled default autovacuum (cost_limit=200) caused 5x bloat and XID wraparound."
+      },
+      {
+        "id": "prob-pg-2",
+        "question": "What happens if an orphaned replication slot stays `active=false` with `hot_standby_feedback=on` and no `max_slot_keep_wal_size`?",
+        "options": [
+          {
+            "id": "a",
+            "text": "PostgreSQL automatically drops the slot after 30 seconds.",
+            "correct": false,
+            "feedback": "Incorrect. Without max_slot_keep_wal_size, PostgreSQL retains WAL and xmin indefinitely."
+          },
+          {
+            "id": "b",
+            "text": "The dead slot pins `xmin`/`catalog_xmin` and retains WAL on disk until autovacuum starves or the disk fills.",
+            "correct": true,
+            "feedback": "Correct. Setting max_slot_keep_wal_size bounds WAL retention and invalidates dead slots before they cause an outage."
+          },
+          {
+            "id": "c",
+            "text": "HOT updates convert into sequential scans.",
+            "correct": false,
+            "feedback": "Incorrect. Dead slots affect WAL retention and xmin horizon, not query planner scans directly."
+          },
+          {
+            "id": "d",
+            "text": "pg_class.relfrozenxid resets to 0.",
+            "correct": false,
+            "feedback": "Incorrect. relfrozenxid only advances when VACUUM freezes old tuples."
+          }
+        ],
+        "explanation": "An inactive replication slot with hot_standby_feedback pins xmin and retains WAL until max_slot_keep_wal_size invalidates it."
+      },
+      {
+        "id": "prob-pg-3",
+        "question": "If a PostgreSQL cluster has already hit the emergency read-only XID wraparound shutdown, what is the standard recovery procedure?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Increase `fillfactor` to 100 and restart normally.",
+            "correct": false,
+            "feedback": "Incorrect. Normal multi-user mode refuses writes until XIDs are frozen."
+          },
+          {
+            "id": "b",
+            "text": "Stop client pools, launch `postgres --single` mode, run `VACUUM FREEZE;` on the affected database, and restart.",
+            "correct": true,
+            "feedback": "Correct. Single-user mode bypasses the multi-user write lock solely to run VACUUM FREEZE and advance datfrozenxid."
+          },
+          {
+            "id": "c",
+            "text": "Delete `pg_wal` files manually to reset the XID counter.",
+            "correct": false,
+            "feedback": "Incorrect. Deleting pg_wal corrupts the database and causes data loss."
+          },
+          {
+            "id": "d",
+            "text": "Run `REINDEX DATABASE` from a read-only replica.",
+            "correct": false,
+            "feedback": "Incorrect. REINDEX does not freeze heap tuple XIDs."
+          }
+        ],
+        "explanation": "Recovery from a wraparound shutdown requires starting PostgreSQL in single-user mode (`postgres --single`) and executing `VACUUM FREEZE`."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Stop PostgreSQL write freezes by killing idle transactions after 30 seconds, leaving 30% free space on data pages, and letting autovacuum run faster.",
+      "keyTakeaway": "Short idle-transaction timeouts and faster autovacuum prevent table bloat and emergency database shutdowns.",
+      "byteSummary": "When a busy database updates 30,000 rows per second, autovacuum needs to clean up old row versions continuously. If an idle query blocks cleanup, the table grows 5x larger and the database eventually stops writes to protect data.\n\nAdding a 30-second timeout on idle transactions and boosting autovacuum speed keeps the database healthy."
+    },
+    "intermediate": {
+      "summary": "Combine fillfactor=70 HOT updates, idle_in_transaction_session_timeout=30s, max_slot_keep_wal_size, and autovacuum_vacuum_cost_limit=2000 to hold bloat < 5%.",
+      "keyTakeaway": "Unpinning xmin and raising autovacuum I/O budget 10x prevents wraparound outages on 30K updates/sec ledgers.",
+      "byteSummary": "To protect a 400 GB ledger at 30,000 updates/sec, enforce `idle_in_transaction_session_timeout=30s` and `max_slot_keep_wal_size` so no session or dead replica pins `xmin`.\n\nUse `fillfactor=70` for page-local HOT updates and raise `autovacuum_vacuum_cost_limit=2000` so freeze workers outpace XID consumption."
+    },
+    "advanced": {
+      "summary": "Production hardening pairs HOT fillfactor=70, 30s idle-in-tx timeouts, cost_limit=2000, weekly range partitioning, zero-SAVEPOINT hygiene, and 60s XID-age alerting.",
+      "keyTakeaway": "Weekly partitioning shrinks freeze scans from 400 GB to 20 GB (~4.3 min), while 500M XID alerts leave hours of runway before single-user VACUUM FREEZE.",
+      "byteSummary": "Beyond `fillfactor=70`, `idle_in_transaction_session_timeout=30s`, and `autovacuum_vacuum_cost_limit=2000`, weekly range partitioning isolates 20 GB hot writes from 380 GB all-frozen cold partitions (4.3-minute freeze sweeps) and eliminating `SAVEPOINT` loops prevents SubtransSLRU XID amplification.\n\nContinuous 60s `datfrozenxid` telemetry alerts at 150M/500M/1.5B XIDs long before `postgres --single` `VACUUM FREEZE` is ever needed."
+    }
+  }
+}

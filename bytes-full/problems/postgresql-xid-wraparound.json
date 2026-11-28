@@ -1,0 +1,742 @@
+{
+  "id": "postgresql-xid-wraparound",
+  "slug": "postgresql-xid-wraparound",
+  "title": "Preventing PostgreSQL XID Wraparound Shutdowns",
+  "problemType": "system-design",
+  "difficulty": "hard",
+  "prompt": "At 03:15 UTC, your primary PostgreSQL 15 database suddenly refuses all writes with `ERROR: database is not accepting commands to avoid wraparound data loss in database \"orders\"` and instructs you to run `VACUUM` in single-user mode. Logs show `WARNING: database \"orders\" must be vacuumed within 9,840,211 transactions` started 6 days ago, while autovacuum on the 800 GB `ledger_entries` table repeatedly aborted or fell behind due to a 14-hour analytical query and an abandoned Debezium replication slot.",
+  "spark": {
+    "summary": "An un-vacuumed 800 GB table blocked by an orphaned replication slot and long-running reporting queries hits PostgreSQL's 2-billion XID limit, forcing an emergency read-only shutdown to prevent silent data loss.",
+    "keyTakeaway": "When traffic spikes expose hidden coupling, monitor `age(datfrozenxid)` continuously, eliminate long-running `idle in transaction` sessions and orphaned replication slots that pin `xmin`, and tune aggressive per-table `autovacuum_freeze_max_age` + cost limits.",
+    "byteSummary": "**Core Mechanics:** At 03:15 UTC, a **3,500 TPS (~300M XIDs/day)** PostgreSQL 15 primary refuses all writes with `ERROR: database is not accepting commands to avoid wraparound data loss`.\n\n**Visual & Structural Flow:** Depicts Healthy Freezing vs. Wraparound Warning & Shutdown (HEALTHY (<200M) -> ANTI-WRAP (>200M) -> SHUTDOWN (2.1B)); Skipping Index Scans During Emergency FREEZE + Preventive Config (Check Blocker -> VACUUM FREEZE -> Tuple Header -> Prometheus Alert).\n\n**Trade-Offs & Production:** Running `VACUUM FREEZE` in single-user mode *with* index cleanup on an 800 GB table wastes hours scanning B-tree indexes when you only need to freeze heap XIDs to restore writes. Recover fast during an emergency and prevent future wraparound: **Fast Emergency Recovery**: Clear any blocking `idle in transaction` / orphaned slot, then run `VACUUM (FREEZE.\n\n**Failure Modes & Application:** Transaction ID lifecycle management is critical in high-TPS PostgreSQL systems: **300M+ XID/day OLTP Clusters**: Continuous monitoring of `age(datfrozenxid)` and replication slot `xmin`."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why PostgreSQL XID Wraparound Prevention Matters",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "Think of **Why PostgreSQL XID Wraparound Prevention Matters** as the intuition layer for Preventing PostgreSQL XID Wraparound Shutdowns: The mechanism: understand how Why PostgreSQL XID Wraparound Prevention Matters works from first principles.",
+        "core": "At 03:15 UTC, a **3,500 TPS (~300M XIDs/day)** PostgreSQL 15 primary refuses all writes with `ERROR: database is not accepting commands to avoid wraparound data loss`. PostgreSQL's 32-bit transaction IDs (`XID`, ~2.1B forward horizon) wrap around modulo $2^{32}$; if `age(datfrozenxid)` hits 2B, Postgres shuts down writes to prevent historical rows from looking like future invisible transactions.",
+        "deepDive": "Under heavy load or partial failure, why postgresql xid wraparound prevention matters becomes a critical lever for predictable latency and correctness. An un-vacuumed 800 GB table blocked by an orphaned replication slot and long-running reporting queries hits PostgreSQL's 2-billion XID limit, forcing an emergency read-only shutdown to prevent silent data loss."
+      },
+      "purpose": "The mechanism: understand how Why PostgreSQL XID Wraparound Prevention Matters works from first principles."
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "Real-World Impact of XID Wraparound Shutdown",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Hitting the XID wraparound safety stop causes a total write outage:",
+        "core": "1. **Complete Write Rejection**: Every `INSERT`/`UPDATE`/`DELETE` fails immediately across the application.\n2. **Hours-Long Single-User Recovery**: Running `VACUUM FREEZE` naively on an 800 GB table with large indexes can take hours in single-user mode.\n3. **Cascade Triggers**: Often caused by `autovacuum` failing to advance `relfrozenxid` due to a pinned `xmin` (orphaned slot / `idle in transaction`) or slow anti-wraparound I/O throttling.",
+        "deepDive": "In production deployments of Preventing PostgreSQL XID Wraparound Shutdowns, watch how real-world impact of xid wraparound shutdown interacts with tail latency, retry amplification, and partial failures. An un-vacuumed 800 GB table blocked by an orphaned replication slot and long-running reporting queries hits PostgreSQL's 2-billion XID limit, forcing an emergency read-only shutdown to prevent silent data loss."
+      },
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "32-Bit XID Age Progression",
+        "title": "Healthy Freezing vs. Wraparound Warning & Shutdown",
+        "states": [
+          {
+            "id": "ok",
+            "label": "HEALTHY (<200M)",
+            "sublabel": "autovacuum freezes XIDs",
+            "tone": "green"
+          },
+          {
+            "id": "warn",
+            "label": "ANTI-WRAP (>200M)",
+            "sublabel": "aggressive vacuum_freeze",
+            "tone": "amber"
+          },
+          {
+            "id": "stop",
+            "label": "SHUTDOWN (2.1B)",
+            "sublabel": "Writes refused! Emergency",
+            "tone": "red"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "ok",
+            "to": "warn",
+            "label": "age > autovacuum_freeze_max_age"
+          },
+          {
+            "from": "warn",
+            "to": "stop",
+            "label": "xmin pinned / I/O throttled"
+          }
+        ],
+        "summary": "Aggressive anti-wraparound autovacuum freezes old tuples before age(datfrozenxid) approaches the 2.1B shutdown limit."
+      },
+      "purpose": "The problem: see what breaks without Real-World Impact of XID Wraparound Shutdown under real concurrency or scale.",
+      "decisionFramework": {
+        "problem": "How to implement Preventing PostgreSQL XID Wraparound Shutdowns without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "When traffic spikes expose hidden coupling, monitor `age(datfrozenxid)` continuously, eliminate long-running `idle in transaction` sessions and orphaned replication slots that pin `xmin`, and tune aggressive per-table `autovacuum_freeze_max_age` + cost limits.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Preventing PostgreSQL XID Wraparound Shutdowns experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Naive Solution (and Why It Breaks)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Think of **Naive Solution (and Why It Breaks)** as the intuition layer for Preventing PostgreSQL XID Wraparound Shutdowns: The problem: see what breaks without Naive Solution under real concurrency or scale.",
+        "core": "Running `VACUUM FREEZE` in single-user mode *with* index cleanup on an 800 GB table wastes hours scanning B-tree indexes when you only need to freeze heap XIDs to restore writes. Dropping active production replication slots breaks HA replicas, and ignoring `age(datfrozenxid)` alerts until 2.1B guarantees an outage.",
+        "deepDive": "Under heavy load or partial failure, naive solution (and why it breaks) becomes a critical lever for predictable latency and correctness. An un-vacuumed 800 GB table blocked by an orphaned replication slot and long-running reporting queries hits PostgreSQL's 2-billion XID limit, forcing an emergency read-only shutdown to prevent silent data loss."
+      },
+      "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale."
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise Solution: Fast `INDEX_CLEANUP OFF` Recovery + Continuous XID Hygiene",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": {
+        "foundation": "Recover fast during an emergency and prevent future wraparound:",
+        "core": "- **Fast Emergency Recovery**: Clear any blocking `idle in transaction` / orphaned slot, then run `VACUUM (FREEZE, INDEX_CLEANUP OFF, VERBOSE) <table_name>;` (PostgreSQL 12+) to freeze heap pages without scanning giant indexes—cutting downtime from hours to minutes.\n- **Reduce XID Burn**: Batch small writes and avoid unnecessary `UPDATE`s or subtransactions (`SAVEPOINT`s) at 3,500 TPS.\n- **Proactive Tuning & Alerting**: Lower `autovacuum_freeze_max_age` (e.g., `200000000`), increase `autovacuum_vacuum_cost_limit` (`2000`) and `maintenance_work_mem` (`1GB`), and page on-call when `age(datfrozenxid) > 500M`.",
+        "deepDive": "In production deployments of Preventing PostgreSQL XID Wraparound Shutdowns, watch how enterprise solution: fast `index_cleanup off` recovery + continuous xid hygiene interacts with tail latency, retry amplification, and partial failures. An un-vacuumed 800 GB table blocked by an orphaned replication slot and long-running reporting queries hits PostgreSQL's 2-billion XID limit, forcing an emergency read-only shutdown to prevent silent data loss."
+      },
+      "sectionDiagram": {
+        "kind": "wal-mvcc",
+        "eyebrow": "Emergency & Preventive XID Freezing",
+        "title": "Skipping Index Scans During Emergency FREEZE + Preventive Config",
+        "nodes": [
+          {
+            "label": "Check Blocker",
+            "role": "Kill idle-in-tx / dead slot"
+          },
+          {
+            "label": "VACUUM FREEZE",
+            "role": "INDEX_CLEANUP OFF (heap only)"
+          },
+          {
+            "label": "Tuple Header",
+            "role": "Mark HEAP_XMIN_FROZEN"
+          },
+          {
+            "label": "Prometheus Alert",
+            "role": "Page at age > 500M XIDs"
+          }
+        ],
+        "edges": [
+          {
+            "label": "Minutes vs hours"
+          },
+          {
+            "label": "Writes restored"
+          }
+        ],
+        "cards": [
+          {
+            "label": "INDEX_CLEANUP OFF",
+            "detail": "Skips B-tree index passes during emergency XID freeze."
+          },
+          {
+            "label": "Subtransaction Trap",
+            "detail": "Avoid SAVEPOINT/EXCEPTION blocks in high-TPS loops (burns XIDs)."
+          },
+          {
+            "label": "Cost Limit Tuning",
+            "detail": "Raise autovacuum_vacuum_cost_limit so anti-wraparound finishes fast."
+          },
+          {
+            "label": "Early Warning",
+            "detail": "Alert on max(age(datfrozenxid)) > 500M (~1.5 days at 300M/day)."
+          }
+        ],
+        "summary": "VACUUM (FREEZE, INDEX_CLEANUP OFF) restores writes in minutes, while 500M XID alerts prevent future shutdowns."
+      },
+      "markdownContent": "```sql\nSELECT datname, age(datfrozenxid) FROM pg_database ORDER BY 2 DESC;\nSELECT slot_name, active, xmin, catalog_xmin FROM pg_replication_slots;\n\nSET vacuum_cost_limit = 10000;\nVACUUM (FREEZE, INDEX_CLEANUP OFF) ledger_entries;\n\nALTER TABLE ledger_entries SET (autovacuum_vacuum_cost_limit = 4000, autovacuum_vacuum_cost_delay = 2);\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where XID Wraparound Prevention Applies in System Design",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Transaction ID lifecycle management is critical in high-TPS PostgreSQL systems:",
+        "core": "- **300M+ XID/day OLTP Clusters**: Continuous monitoring of `age(datfrozenxid)` and replication slot `xmin`.\n- **Partitioned Event & Ledger Tables**: Dropping old partitions removes un-frozen historical XIDs instantly.\n- **Disaster Recovery Runbooks**: `INDEX_CLEANUP OFF` is a standard SRE emergency lever.",
+        "deepDive": "In production deployments of Preventing PostgreSQL XID Wraparound Shutdowns, watch how where xid wraparound prevention applies in system design interacts with tail latency, retry amplification, and partial failures. An un-vacuumed 800 GB table blocked by an orphaned replication slot and long-running reporting queries hits PostgreSQL's 2-billion XID limit, forcing an emergency read-only shutdown to prevent silent data loss."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "acid-transaction-fundamentals",
+          "title": "Concept: ACID Transaction Fundamentals",
+          "kind": "concept"
+        },
+        {
+          "slug": "point-time-recovery",
+          "title": "Concept: Point-in-Time Recovery",
+          "kind": "concept"
+        },
+        {
+          "slug": "observability-golden-signals",
+          "title": "Concept: Observability Golden Signals",
+          "kind": "concept"
+        },
+        {
+          "slug": "postgresql-vacuum-table",
+          "title": "Problem: PostgreSQL VACUUM & Table Bloat",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why does `VACUUM (FREEZE, INDEX_CLEANUP OFF)` dramatically speed up recovery from a PostgreSQL XID wraparound shutdown?",
+      "options": [
+        {
+          "id": "a",
+          "text": "It freezes old tuple XIDs directly in the heap pages without spending hours scanning and vacuuming multi-hundred-GB indexes",
+          "correct": true,
+          "feedback": "Correct: freezing heap XIDs advances `relfrozenxid` immediately so the database can accept writes again."
+        },
+        {
+          "id": "b",
+          "text": "It drops all secondary indexes permanently to free disk space",
+          "correct": false,
+          "feedback": "Indexes remain intact; dead-tuple index cleanup is simply deferred to a later normal vacuum."
+        },
+        {
+          "id": "c",
+          "text": "It converts PostgreSQL from 32-bit XIDs to 64-bit XIDs online",
+          "correct": false,
+          "feedback": "PostgreSQL still uses 32-bit XIDs; `FREEZE` marks old tuples as permanently visible."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why does `VACUUM (FREEZE, INDEX_CLEANUP OFF)` dramatically speed up recovery from a PostgreSQL XID wraparound shutdown?",
+        "options": [
+          {
+            "id": "a",
+            "text": "It freezes old tuple XIDs directly in the heap pages without spending hours scanning and vacuuming multi-hundred-GB indexes",
+            "correct": true,
+            "feedback": "Correct: freezing heap XIDs advances `relfrozenxid` immediately so the database can accept writes again."
+          },
+          {
+            "id": "b",
+            "text": "It drops all secondary indexes permanently to free disk space",
+            "correct": false,
+            "feedback": "Indexes remain intact; dead-tuple index cleanup is simply deferred to a later normal vacuum."
+          },
+          {
+            "id": "c",
+            "text": "It converts PostgreSQL from 32-bit XIDs to 64-bit XIDs online",
+            "correct": false,
+            "feedback": "PostgreSQL still uses 32-bit XIDs; `FREEZE` marks old tuples as permanently visible."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why PostgreSQL XID Wraparound Prevention Matters', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "b",
+            "text": "At 03:15 UTC, a **3,500 TPS (~300M XIDs/day)** PostgreSQL 15 primary refuses all writes with ERROR: database is not accepting commands to avoid wraparound data loss.",
+            "correct": true,
+            "feedback": "Correct: At 03:15 UTC, a **3,500 TPS (~300M XIDs/day)** PostgreSQL 15 primary refuses all writes with ERROR: database is not accepting commands to avoid wraparound data loss."
+          },
+          {
+            "id": "c",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Real-World Impact of XID Wraparound Shutdown', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Hitting the XID wraparound safety stop causes a total write outage: 1.",
+            "correct": true,
+            "feedback": "Correct: Hitting the XID wraparound safety stop causes a total write outage: 1."
+          },
+          {
+            "id": "b",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "c",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** At 03:15 UTC, a **3,500 TPS (~300M XIDs/day)** PostgreSQL 15 primary refuses all writes with `ERROR: database is not accepting commands to avoid wraparound data loss`.\n\n**How It Flows:** Think of Preventing PostgreSQL XID Wraparound Shutdowns as a clear step-by-step chain: HEALTHY (<200M) -> ANTI-WRAP (>200M) -> SHUTDOWN (2.1B) -> Check Blocker -> VACUUM FREEZE.\n\n**Why Beginners Should Care:** Monitor `age(datfrozenxid)` continuously, eliminate long-running `idle in transaction` sessions and orphaned replication slots that pin `xmin`, and tune aggressive per-table `autovacuum_freeze_max_age` + cost limits.",
+      "spark": {
+        "summary": "At 03:15 UTC, a **3,500 TPS (~300M XIDs/day)** PostgreSQL 15 primary refuses all writes with `ERROR: database is not accepting commands to avoid wraparound data loss`.",
+        "keyTakeaway": "Monitor `age(datfrozenxid)` continuously, eliminate long-running `idle in transaction` sessions and orphaned replication slots that pin `xmin`, and tune aggressive per-table `autovacuum_freeze_max_age` + cost limits."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why PostgreSQL XID Wraparound Prevention Matters",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why PostgreSQL XID Wraparound Prevention Matters works from first principles.",
+          "explanation": "At 03:15 UTC, a **3,500 TPS (~300M XIDs/day)** PostgreSQL 15 primary refuses all writes with `ERROR: database is not accepting commands to avoid wraparound data loss`. PostgreSQL's 32-bit transaction IDs (`XID`, ~2.1B forward horizon) wrap around modulo $2^{32}$; if `age(datfrozenxid)` hits 2B, Postgres shuts down writes to prevent historical rows from looking like future invisible transactions.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Real-World Impact of XID Wraparound Shutdown",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without Real-World Impact of XID Wraparound Shutdown under real concurrency or scale.",
+          "explanation": "Hitting the XID wraparound safety stop causes a total write outage: 1. **Complete Write Rejection**: Every `INSERT`/`UPDATE`/`DELETE` fails immediately across the application. 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "state-machine",
+            "eyebrow": "32-Bit XID Age Progression",
+            "title": "Healthy Freezing vs. Wraparound Warning & Shutdown",
+            "states": [
+              {
+                "id": "ok",
+                "label": "HEALTHY (<200M)",
+                "sublabel": "autovacuum freezes XIDs",
+                "tone": "green"
+              },
+              {
+                "id": "warn",
+                "label": "ANTI-WRAP (>200M)",
+                "sublabel": "aggressive vacuum_freeze",
+                "tone": "amber"
+              },
+              {
+                "id": "stop",
+                "label": "SHUTDOWN (2.1B)",
+                "sublabel": "Writes refused! Emergency",
+                "tone": "red"
+              }
+            ],
+            "transitions": [
+              {
+                "from": "ok",
+                "to": "warn",
+                "label": "age > autovacuum_freeze_max_age"
+              },
+              {
+                "from": "warn",
+                "to": "stop",
+                "label": "xmin pinned / I/O throttled"
+              }
+            ],
+            "summary": "Aggressive anti-wraparound autovacuum freezes old tuples before age(datfrozenxid) approaches the 2.1B shutdown limit."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive Solution (and Why It Breaks)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+          "explanation": "Running `VACUUM FREEZE` in single-user mode *with* index cleanup on an 800 GB table wastes hours scanning B-tree indexes when you only need to freeze heap XIDs to restore writes. Dropping active production replication slots breaks HA replicas, and ignoring `age(datfrozenxid)` alerts until 2.1B guarantees an outage.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise Solution: Fast `INDEX_CLEANUP OFF` Recovery + Continuous XID Hygiene",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Recover fast during an emergency and prevent future wraparound: **Fast Emergency Recovery**: Clear any blocking `idle in transaction` / orphaned slot, then run `VACUUM (FREEZE, INDEX_CLEANUP OFF, VERBOSE) <table_name>;` (PostgreSQL 12+) to freeze heap pages without scanning giant indexes—cutting downtime from hours to minutes.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "wal-mvcc",
+            "eyebrow": "Emergency & Preventive XID Freezing",
+            "title": "Skipping Index Scans During Emergency FREEZE + Preventive Config",
+            "nodes": [
+              {
+                "label": "Check Blocker",
+                "role": "Kill idle-in-tx / dead slot"
+              },
+              {
+                "label": "VACUUM FREEZE",
+                "role": "INDEX_CLEANUP OFF (heap only)"
+              },
+              {
+                "label": "Tuple Header",
+                "role": "Mark HEAP_XMIN_FROZEN"
+              },
+              {
+                "label": "Prometheus Alert",
+                "role": "Page at age > 500M XIDs"
+              }
+            ],
+            "edges": [
+              {
+                "label": "Minutes vs hours"
+              },
+              {
+                "label": "Writes restored"
+              }
+            ],
+            "cards": [
+              {
+                "label": "INDEX_CLEANUP OFF",
+                "detail": "Skips B-tree index passes during emergency XID freeze."
+              },
+              {
+                "label": "Subtransaction Trap",
+                "detail": "Avoid SAVEPOINT/EXCEPTION blocks in high-TPS loops (burns XIDs)."
+              },
+              {
+                "label": "Cost Limit Tuning",
+                "detail": "Raise autovacuum_vacuum_cost_limit so anti-wraparound finishes fast."
+              },
+              {
+                "label": "Early Warning",
+                "detail": "Alert on max(age(datfrozenxid)) > 500M (~1.5 days at 300M/day)."
+              }
+            ],
+            "summary": "VACUUM (FREEZE, INDEX_CLEANUP OFF) restores writes in minutes, while 500M XID alerts prevent future shutdowns."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Monitor `age(datfrozenxid)` continuously, eliminate long-running `idle in transaction` sessions and orphaned replication slots that pin `xmin`, and tune aggressive per-table `autovacuum_freeze_max_age` + cost limits.",
+      "summary": "An un-vacuumed 800 GB table blocked by an orphaned replication slot and long-running reporting queries hits PostgreSQL's 2-billion XID limit, forcing an emergency read-only shutdown to prevent silent data loss.",
+      "keyTakeaway": "When traffic spikes expose hidden coupling, monitor `age(datfrozenxid)` continuously, eliminate long-running `idle in transaction` sessions and orphaned replication slots that pin `xmin`, and tune aggressive per-table `autovacuum_freeze_max_age` + cost limits."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** At 03:15 UTC, a **3,500 TPS (~300M XIDs/day)** PostgreSQL 15 primary refuses all writes with `ERROR: database is not accepting commands to avoid wraparound data loss`.\n\n**Visual & Structural Flow:** Depicts Healthy Freezing vs. Wraparound Warning & Shutdown (HEALTHY (<200M) -> ANTI-WRAP (>200M) -> SHUTDOWN (2.1B)); Skipping Index Scans During Emergency FREEZE + Preventive Config (Check Blocker -> VACUUM FREEZE -> Tuple Header -> Prometheus Alert).\n\n**Trade-Offs & Production:** Running `VACUUM FREEZE` in single-user mode *with* index cleanup on an 800 GB table wastes hours scanning B-tree indexes when you only need to freeze heap XIDs to restore writes. Recover fast during an emergency and prevent future wraparound: **Fast Emergency Recovery**: Clear any blocking `idle in transaction` / orphaned slot, then run `VACUUM (FREEZE.\n\n**Failure Modes & Application:** Transaction ID lifecycle management is critical in high-TPS PostgreSQL systems: **300M+ XID/day OLTP Clusters**: Continuous monitoring of `age(datfrozenxid)` and replication slot `xmin`.",
+      "spark": {
+        "summary": "An un-vacuumed 800 GB table blocked by an orphaned replication slot and long-running reporting queries hits PostgreSQL's 2-billion XID limit, forcing an emergency read-only shutdown to prevent silent data loss.",
+        "keyTakeaway": "Monitor `age(datfrozenxid)` continuously, eliminate long-running `idle in transaction` sessions and orphaned replication slots that pin `xmin`, and tune aggressive per-table `autovacuum_freeze_max_age` + cost limits."
+      },
+      "summary": "An un-vacuumed 800 GB table blocked by an orphaned replication slot and long-running reporting queries hits PostgreSQL's 2-billion XID limit, forcing an emergency read-only shutdown to prevent silent data loss.",
+      "keyTakeaway": "When traffic spikes expose hidden coupling, monitor `age(datfrozenxid)` continuously, eliminate long-running `idle in transaction` sessions and orphaned replication slots that pin `xmin`, and tune aggressive per-table `autovacuum_freeze_max_age` + cost limits."
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** An un-vacuumed 800 GB table blocked by an orphaned replication slot and long-running reporting queries hits PostgreSQL's 2-billion XID limit, forcing an emergency read-only shutdown to prevent silent data loss.\n\n**Production Trade-Offs:** Running `VACUUM FREEZE` in single-user mode *with* index cleanup on an 800 GB table wastes hours scanning B-tree indexes when you only need to freeze heap XIDs to restore writes.\n\n**Failure Modes & Edge Cases:** Transaction ID lifecycle management is critical in high-TPS PostgreSQL systems: **300M+ XID/day OLTP Clusters**: Continuous monitoring of `age(datfrozenxid)` and replication slot `xmin`.\n\n**Principal Takeaway:** Monitor `age(datfrozenxid)` continuously, eliminate long-running `idle in transaction` sessions and orphaned replication slots that pin `xmin`, and tune aggressive per-table `autovacuum_freeze_max_age` + cost limits.",
+      "spark": {
+        "summary": "An un-vacuumed 800 GB table blocked by an orphaned replication slot and long-running reporting queries hits PostgreSQL's 2-billion XID limit, forcing an emergency read-only shutdown to prevent silent data loss.",
+        "keyTakeaway": "Monitor `age(datfrozenxid)` continuously, eliminate long-running `idle in transaction` sessions and orphaned replication slots that pin `xmin`, and tune aggressive per-table `autovacuum_freeze_max_age` + cost limits."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why PostgreSQL XID Wraparound Prevention Matters",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why PostgreSQL XID Wraparound Prevention Matters works from first principles.",
+          "explanation": "At 03:15 UTC, a **3,500 TPS (~300M XIDs/day)** PostgreSQL 15 primary refuses all writes with `ERROR: database is not accepting commands to avoid wraparound data loss`. PostgreSQL's 32-bit transaction IDs (`XID`, ~2.1B forward horizon) wrap around modulo $2^{32}$; if `age(datfrozenxid)` hits 2B, Postgres shuts down writes to prevent historical rows from looking like future invisible transactions.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Real-World Impact of XID Wraparound Shutdown",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without Real-World Impact of XID Wraparound Shutdown under real concurrency or scale.",
+          "explanation": "Hitting the XID wraparound safety stop causes a total write outage:\n\n1. **Complete Write Rejection**: Every `INSERT`/`UPDATE`/`DELETE` fails immediately across the application.\n2. **Hours-Long Single-User Recovery**: Running `VACUUM FREEZE` naively on an 800 GB table with large indexes can take hours in single-user mode.\n3. **Cascade Triggers**: Often caused by `autovacuum` failing to advance `relfrozenxid` due to a pinned `xmin` (orphaned slot / `idle in transaction`) or slow anti-wraparound I/O throttling.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "state-machine",
+            "eyebrow": "32-Bit XID Age Progression",
+            "title": "Healthy Freezing vs. Wraparound Warning & Shutdown",
+            "states": [
+              {
+                "id": "ok",
+                "label": "HEALTHY (<200M)",
+                "sublabel": "autovacuum freezes XIDs",
+                "tone": "green"
+              },
+              {
+                "id": "warn",
+                "label": "ANTI-WRAP (>200M)",
+                "sublabel": "aggressive vacuum_freeze",
+                "tone": "amber"
+              },
+              {
+                "id": "stop",
+                "label": "SHUTDOWN (2.1B)",
+                "sublabel": "Writes refused! Emergency",
+                "tone": "red"
+              }
+            ],
+            "transitions": [
+              {
+                "from": "ok",
+                "to": "warn",
+                "label": "age > autovacuum_freeze_max_age"
+              },
+              {
+                "from": "warn",
+                "to": "stop",
+                "label": "xmin pinned / I/O throttled"
+              }
+            ],
+            "summary": "Aggressive anti-wraparound autovacuum freezes old tuples before age(datfrozenxid) approaches the 2.1B shutdown limit."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive Solution (and Why It Breaks)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+          "explanation": "Running `VACUUM FREEZE` in single-user mode *with* index cleanup on an 800 GB table wastes hours scanning B-tree indexes when you only need to freeze heap XIDs to restore writes. Dropping active production replication slots breaks HA replicas, and ignoring `age(datfrozenxid)` alerts until 2.1B guarantees an outage.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise Solution: Fast `INDEX_CLEANUP OFF` Recovery + Continuous XID Hygiene",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Recover fast during an emergency and prevent future wraparound:\n\n- **Fast Emergency Recovery**: Clear any blocking `idle in transaction` / orphaned slot, then run `VACUUM (FREEZE, INDEX_CLEANUP OFF, VERBOSE) <table_name>;` (PostgreSQL 12+) to freeze heap pages without scanning giant indexes—cutting downtime from hours to minutes.\n- **Reduce XID Burn**: Batch small writes and avoid unnecessary `UPDATE`s or subtransactions (`SAVEPOINT`s) at 3,500 TPS.\n- **Proactive Tuning & Alerting**: Lower `autovacuum_freeze_max_age` (e.g., `200000000`), increase `autovacuum_vacuum_cost_limit` (`2000`) and `maintenance_work_mem` (`1GB`), and page on-call when `age(datfrozenxid) > 500M`.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "wal-mvcc",
+            "eyebrow": "Emergency & Preventive XID Freezing",
+            "title": "Skipping Index Scans During Emergency FREEZE + Preventive Config",
+            "nodes": [
+              {
+                "label": "Check Blocker",
+                "role": "Kill idle-in-tx / dead slot"
+              },
+              {
+                "label": "VACUUM FREEZE",
+                "role": "INDEX_CLEANUP OFF (heap only)"
+              },
+              {
+                "label": "Tuple Header",
+                "role": "Mark HEAP_XMIN_FROZEN"
+              },
+              {
+                "label": "Prometheus Alert",
+                "role": "Page at age > 500M XIDs"
+              }
+            ],
+            "edges": [
+              {
+                "label": "Minutes vs hours"
+              },
+              {
+                "label": "Writes restored"
+              }
+            ],
+            "cards": [
+              {
+                "label": "INDEX_CLEANUP OFF",
+                "detail": "Skips B-tree index passes during emergency XID freeze."
+              },
+              {
+                "label": "Subtransaction Trap",
+                "detail": "Avoid SAVEPOINT/EXCEPTION blocks in high-TPS loops (burns XIDs)."
+              },
+              {
+                "label": "Cost Limit Tuning",
+                "detail": "Raise autovacuum_vacuum_cost_limit so anti-wraparound finishes fast."
+              },
+              {
+                "label": "Early Warning",
+                "detail": "Alert on max(age(datfrozenxid)) > 500M (~1.5 days at 300M/day)."
+              }
+            ],
+            "summary": "VACUUM (FREEZE, INDEX_CLEANUP OFF) restores writes in minutes, while 500M XID alerts prevent future shutdowns."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where XID Wraparound Prevention Applies in System Design",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Transaction ID lifecycle management is critical in high-TPS PostgreSQL systems:\n\n- **300M+ XID/day OLTP Clusters**: Continuous monitoring of `age(datfrozenxid)` and replication slot `xmin`.\n- **Partitioned Event & Ledger Tables**: Dropping old partitions removes un-frozen historical XIDs instantly.\n- **Disaster Recovery Runbooks**: `INDEX_CLEANUP OFF` is a standard SRE emergency lever.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Monitor `age(datfrozenxid)` continuously, eliminate long-running `idle in transaction` sessions and orphaned replication slots that pin `xmin`, and tune aggressive per-table `autovacuum_freeze_max_age` + cost limits.",
+      "summary": "An un-vacuumed 800 GB table blocked by an orphaned replication slot and long-running reporting queries hits PostgreSQL's 2-billion XID limit, forcing an emergency read-only shutdown to prevent silent data loss.",
+      "keyTakeaway": "When traffic spikes expose hidden coupling, monitor `age(datfrozenxid)` continuously, eliminate long-running `idle in transaction` sessions and orphaned replication slots that pin `xmin`, and tune aggressive per-table `autovacuum_freeze_max_age` + cost limits."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "simulation": {
+    "title": "Preventing PostgreSQL XID Wraparound Shutdowns — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "tx",
+        "label": "Client Tx",
+        "role": "Snapshot Read/Write"
+      },
+      {
+        "id": "plan",
+        "label": "Query Planner",
+        "role": "Index & Lock Order"
+      },
+      {
+        "id": "wal",
+        "label": "WAL Buffer",
+        "role": "Group Commit"
+      },
+      {
+        "id": "disk",
+        "label": "Storage Pages",
+        "role": "MVCC / Vacuum"
+      }
+    ],
+    "edges": [
+      {
+        "from": "tx",
+        "to": "plan",
+        "label": "SQL query"
+      },
+      {
+        "from": "plan",
+        "to": "wal",
+        "label": "append redo"
+      },
+      {
+        "from": "wal",
+        "to": "disk",
+        "label": "checkpoint flush"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why PostgreSQL XID Wraparound Prevention Matters",
+        "actionLabel": "SQL query",
+        "status": "healthy",
+        "activeNodeIds": [
+          "tx",
+          "plan"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "SQL query",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Client Tx sends work to Query Planner (Why PostgreSQL XID Wraparound Prevention Matters)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Real-World Impact of XID Wraparound Shutdown",
+        "actionLabel": "append redo",
+        "status": "healthy",
+        "activeNodeIds": [
+          "plan",
+          "wal"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "append redo",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Query Planner coordinates with WAL Buffer while preserving the core invariant (Real-World Impact of XID Wraparound Shutdown)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Naive Solution (and Why It Breaks)",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "wal",
+          "disk"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, Storage Pages absorbs pressure without cascading (Naive Solution (and Why It Breaks))."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Where XID Wraparound Prevention Applies in System Design",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "tx",
+          "plan",
+          "wal",
+          "disk"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Where XID Wraparound Prevention Applies in System Design)."
+      }
+    ]
+  }
+}

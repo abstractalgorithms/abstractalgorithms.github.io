@@ -1,0 +1,814 @@
+{
+  "id": "prob-design-distributed-delay-queue-scheduler",
+  "slug": "design-distributed-delay-queue-scheduler",
+  "title": "Design a Distributed Delay Queue & Retry Timer Service with Hierarchical Time Wheels",
+  "problemType": "system-design",
+  "difficulty": "hard",
+  "prompt": "Design a multi-tenant distributed delay queue and webhook/payment retry timer service supporting 100M pending delayed jobs (delays from 1 second to 30 days), 50K schedules/sec, < 500 ms firing jitter, at-least-once idempotent dispatch, and zero job loss on node failure.",
+  "spark": {
+    "summary": "Partition jobs by `hash(job_id)` into Raft/replicated RocksDB WAL shards, load only the next 15-minute window into a leader-elected Hierarchical Time Wheel, and dispatch via an idempotent worker queue.",
+    "keyTakeaway": "When traffic spikes expose hidden coupling, keeping 100M 30-day jobs in RAM is prohibitively expensive; storing time-indexed keys in RocksDB shards while loading only the 15-minute lookahead horizon into a RAM Time Wheel gives O(1) firing at < 500 ms jitter.",
+    "byteSummary": "A distributed delay queue powering payment retries, order auto-cancellations, and webhook backoffs must juggle two opposing constraints: massive long-horizon storage (100M pending jobs up to 30 days out) and tight real-time firing precision (< 500 ms jitter at 50K/sec).\n\nStoring 100M full job payloads in RAM would consume ~100 GB+ of volatile memory and take minutes to recover on restart. Instead, partition the service into N consistent-hash shards backed by replicated RocksDB instances (or Kafka + time-bucketed WALs) keyed by `(fire_at_bucket, job_id)`. Each shard's leader runs an in-memory Hierarchical Time Wheel that only loads the next 15 minutes of jobs (~45M worst-case or ~1–2 GB RAM across shards) via a sequential RocksDB range scan.\n\nWhen the Time Wheel triggers a job, it pushes an idempotent dispatch event to the worker queue and marks the job `DISPATCHED` only after worker ACK—guaranteeing at-least-once delivery with exponential backoff and Dead-Letter Queue (DLQ) routing."
+  },
+  "learningJourney": [
+    {
+      "id": "01-storage-and-ram-math",
+      "eyebrow": "STAGE 01 · STORAGE & RAM SIZING",
+      "title": "Separating 30-Day Disk Storage from 15-Minute RAM Wheels",
+      "level": "foundation",
+      "purpose": "Size 100M pending 30-day jobs (100 GB disk) vs. a 15-minute RAM Time Wheel (1.4 GB) at 50K schedules/sec.",
+      "explanation": {
+        "foundation": "Assume 1 KB average job payload: `100M * 1 KB = 100 GB` total pending state. At 50K schedules/sec, 15 minutes of near-term jobs is `50K * 900s = 45M` lightweight `(fire_at_ms, job_id)` pointers (~1.4 GB across 16 shards = ~90 MB/shard).",
+        "core": "Distant jobs stay compressed on SSD in RocksDB keyed by `fire_at_bucket || job_id`.",
+        "deepDive": "In production deployments of Design a Distributed Delay Queue & Retry Timer Service with Hierarchical Time Wheels, watch how separating 30-day disk storage from 15-minute ram wheels interacts with tail latency, retry amplification, and partial failures. Production distributed delay queues pair Raft-leased Time Wheels with per-tenant dispatch shapers, lookahead watermarks, and synthetic jitter canaries."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 01 · STORAGE & RAM SIZING",
+        "title": "Separating 30-Day Disk Storage from 15-Minute RAM Wheels",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "50K Schedules / Sec",
+            "sub": "100M Pending (100 GB)",
+            "role": "Workload Scale"
+          },
+          {
+            "id": "n2",
+            "label": "30-Day RocksDB Store",
+            "sub": "Durable Cold Horizon",
+            "role": "Disk Tier"
+          },
+          {
+            "id": "n3",
+            "label": "15-Min RAM Time Wheel",
+            "sub": "45M Pointers (~1.4 GB)",
+            "role": "Hot Execution"
+          },
+          {
+            "id": "n4",
+            "label": "p99 Jitter < 500 ms",
+            "sub": "At-Least-Once + Idem",
+            "role": "Latency SLA"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "persists all"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "streams 15m"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "dispatches"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Memory Math",
+            "detail": "45M (fire_at_ms, job_id) pointers across 16 shards fit in ~1.4 GB RAM instead of 100 GB."
+          },
+          {
+            "label": "30-Day Horizon",
+            "detail": "Distant schedules never bloat RAM or garbage collectors."
+          },
+          {
+            "label": "p99 Firing Jitter",
+            "detail": "Combining O(1) Time Wheel buckets with non-empty DelayQueue wakeups holds jitter <500 ms."
+          }
+        ],
+        "summary": "Separating 100 GB of 30-day RocksDB state from a 1.4 GB 15-minute RAM Time Wheel sustains 50K schedules/sec.",
+        "caption": "Separating 100 GB of 30-day RocksDB state from a 1.4 GB 15-minute RAM Time Wheel sustains 50K schedules/sec."
+      }
+    },
+    {
+      "id": "02-sharding-and-replication",
+      "eyebrow": "STAGE 02 · SHARDING & LEADER ELECTION",
+      "title": "Partitioned RocksDB Shards with Raft Leader Leases",
+      "level": "foundation",
+      "purpose": "Partition state into 32 Raft-replicated RocksDB shards where only the active shard leader runs the RAM wheel.",
+      "explanation": {
+        "foundation": "Partition into 32 virtual shards replicated across 3 nodes via Raft (or Kafka + standby). Only the active Raft leader for a shard runs the RAM Time Wheel and dispatches timers.",
+        "core": "On leader failure, the newly elected leader scans `[last_acked_cursor, now + 15m]` from RocksDB into a fresh Time Wheel in < 2 seconds.",
+        "deepDive": "In production deployments of Design a Distributed Delay Queue & Retry Timer Service with Hierarchical Time Wheels, watch how partitioned rocksdb shards with raft leader leases interacts with tail latency, retry amplification, and partial failures. Production distributed delay queues pair Raft-leased Time Wheels with per-tenant dispatch shapers, lookahead watermarks, and synthetic jitter canaries."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 02 · SHARDING & LEADER ELECTION",
+        "title": "Partitioned RocksDB Shards with Raft Leader Leases",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "Consistent Hash Router",
+            "sub": "job_id -> 32 Shards",
+            "role": "Shard Routing"
+          },
+          {
+            "id": "n2",
+            "label": "3-Node Raft Group",
+            "sub": "Durable RocksDB WAL",
+            "role": "Quorum Storage"
+          },
+          {
+            "id": "n3",
+            "label": "Active Shard Leader",
+            "sub": "Owns RAM Time Wheel",
+            "role": "Single Dispatcher"
+          },
+          {
+            "id": "n4",
+            "label": "Leader Failover",
+            "sub": "Reload 15m Lookahead",
+            "role": "Fast Recovery"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "writes quorum"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "drives"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "recovers on"
+          }
+        ],
+        "cards": [
+          {
+            "label": "32 Virtual Shards",
+            "detail": "Sharding keeps per-node RAM wheels small and spreads write IOPS across the cluster."
+          },
+          {
+            "label": "Single-Leader Dispatch",
+            "detail": "Only the Raft leader fires timers for its shard, preventing duplicate dispatches."
+          },
+          {
+            "label": "Standby Replicas",
+            "detail": "Followers replicate the RocksDB WAL synchronously and rebuild the 15m RAM wheel on promotion."
+          }
+        ],
+        "summary": "32 Raft-replicated RocksDB shards ensure durable writes and clean single-leader Time Wheel ownership.",
+        "caption": "32 Raft-replicated RocksDB shards ensure durable writes and clean single-leader Time Wheel ownership."
+      },
+      "decisionFramework": {
+        "problem": "How to implement Design a Distributed Delay Queue & Retry Timer Service with Hierarchical Time Wheels without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "When traffic spikes expose hidden coupling, keeping 100M 30-day jobs in RAM is prohibitively expensive; storing time-indexed keys in RocksDB shards while loading only the 15-minute lookahead horizon into a RAM Time Wheel gives O(1) firing at < 500 ms jitter.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Design a Distributed Delay Queue & Retry Timer Service with Hierarchical Time Wheels experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-time-wheel-lookahead-loader",
+      "eyebrow": "STAGE 03 · LOOKAHEAD ENGINE",
+      "title": "Streaming Near-Term Buckets into the Hierarchical Time Wheel",
+      "level": "intermediate",
+      "purpose": "Stream near-term buckets into the Time Wheel using a 15-minute lookahead watermark.",
+      "explanation": {
+        "foundation": "Maintain a `loaded_horizon_ms` watermark. Every 5 seconds, a background loader scans RocksDB `[loaded_horizon_ms, now + 15m]` and inserts pointers into the Time Wheel. Jobs arriving with `fire_at <= now + 15m` insert into BOTH RocksDB and the RAM Time Wheel immediately.",
+        "core": "```python\nclass ShardScheduler:\n    def __init__(self, wal_store, time_wheel, dispatch_queue) -> None:\n        self.wal = wal_store\n        self.wheel = time_wheel\n        self.dispatch_queue = dispatch_queue\n        self.horizon_ms = 0\n\ndef schedule(self, job_id: str, fire_at_ms: int, payload: bytes, now_ms: int) -> None:\n        if not job_id:\n            raise ValueError('job_id is required')\n        self.wal.put_idempotent(fire_at_ms, job_id, payload)\n        if fire_at_ms <= self.horizon_ms or fire_at_ms <= now_ms + 900_000:\n            self.wheel.add_task(fire_at_ms, job_id)",
+        "deepDive": "def cancel(self, job_id: str, fire_at_ms: int) -> bool:\n        removed = self.wal.mark_cancelled(fire_at_ms, job_id)\n        self.wheel.cancel_task(job_id)\n        return removed\n```"
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 03 · LOOKAHEAD ENGINE",
+        "title": "Streaming Near-Term Buckets into the Hierarchical Time Wheel",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "loaded_horizon_ms",
+            "sub": "5-Second Scan Tick",
+            "role": "Lookahead Cursor"
+          },
+          {
+            "id": "n2",
+            "label": "Range Scan [wm, now+15m]",
+            "sub": "Fetch Near-Term Keys",
+            "role": "RocksDB Read"
+          },
+          {
+            "id": "n3",
+            "label": "Insert RAM Time Wheel",
+            "sub": "O(1) Bucket Push",
+            "role": "Hot Load"
+          },
+          {
+            "id": "n4",
+            "label": "Immediate <= now+15m",
+            "sub": "Dual-Write Disk + RAM",
+            "role": "Low-Latency Path"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "triggers"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "populates"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "paired with"
+          }
+        ],
+        "cards": [
+          {
+            "label": "No Missed Short Jobs",
+            "detail": "New jobs due within 15 minutes write to RocksDB AND insert directly into the RAM Time Wheel."
+          },
+          {
+            "label": "Duplicate Guard",
+            "detail": "Track a per-job state (PENDING -> LOADED -> IN_FLIGHT) to avoid double-loading at boundary edges."
+          },
+          {
+            "label": "Bounded Scan IOPS",
+            "detail": "Keying RocksDB by (fire_at_ms, job_id) makes lookahead scans sequential O(1) disk reads."
+          }
+        ],
+        "summary": "A time-ordered RocksDB keyspace and 5-second lookahead scans stream near-term jobs into RAM with zero missed short timers.",
+        "caption": "A time-ordered RocksDB keyspace and 5-second lookahead scans stream near-term jobs into RAM with zero missed short timers."
+      }
+    },
+    {
+      "id": "04-at-least-once-dispatch",
+      "eyebrow": "STAGE 04 · IDEMPOTENT DISPATCH",
+      "title": "Two-Phase ACK, Lease Timeouts & Idempotency Keys",
+      "level": "intermediate",
+      "purpose": "Guarantee at-least-once delivery with 30s visibility leases, two-phase ACKs, and downstream Idempotency-Keys.",
+      "explanation": {
+        "foundation": "When a bucket fires, move jobs to `IN_FLIGHT` with a 30-second visibility lease and push `(job_id, attempt_no, idempotency_key)` to the Worker Pool. Workers call the downstream webhook/payment API with `Idempotency-Key`.",
+        "core": "If the worker ACKs, tombstone the job in RocksDB; if the 30s lease expires, reschedule with exponential backoff + jitter.",
+        "deepDive": "In production deployments of Design a Distributed Delay Queue & Retry Timer Service with Hierarchical Time Wheels, watch how two-phase ack, lease timeouts & idempotency keys interacts with tail latency, retry amplification, and partial failures. Production distributed delay queues pair Raft-leased Time Wheels with per-tenant dispatch shapers, lookahead watermarks, and synthetic jitter canaries."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 04 · IDEMPOTENT DISPATCH",
+        "title": "Two-Phase ACK, Lease Timeouts & Idempotency Keys",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "Bucket Fires",
+            "sub": "State -> IN_FLIGHT",
+            "role": "30s Visibility Lease"
+          },
+          {
+            "id": "n2",
+            "label": "Worker Pool Dispatch",
+            "sub": "(job_id, attempt, idem)",
+            "role": "Async Execution"
+          },
+          {
+            "id": "n3",
+            "label": "Downstream Webhook",
+            "sub": "Idempotency-Key Header",
+            "role": "Safe Side-Effect"
+          },
+          {
+            "id": "n4",
+            "label": "Two-Phase ACK",
+            "sub": "Delete / Mark DONE",
+            "role": "Clean Commit"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "pushes"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "calls with"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "on 2xx"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Visibility Lease",
+            "detail": "If a worker crashes mid-HTTP call, the 30s lease expires and another worker retries safely."
+          },
+          {
+            "label": "Two-Phase ACK",
+            "detail": "Never delete a timer when it fires from the wheel—only after the worker ACKs completion."
+          },
+          {
+            "label": "End-to-End Idempotency",
+            "detail": "Passing a deterministic Idempotency-Key prevents duplicate charges on rare lease expirations."
+          }
+        ],
+        "summary": "30s visibility leases, two-phase ACKs, and Idempotency-Key headers deliver reliable at-least-once job execution.",
+        "caption": "30s visibility leases, two-phase ACKs, and Idempotency-Key headers deliver reliable at-least-once job execution."
+      }
+    },
+    {
+      "id": "05-retry-backoff-and-dlq",
+      "eyebrow": "STAGE 05 · RETRIES & DLQ",
+      "title": "Self-Scheduling Exponential Backoff & Dead-Letter Queues",
+      "level": "advanced",
+      "purpose": "Handle transient 5xx/429 failures via self-scheduling exponential backoff and dead-letter queues.",
+      "explanation": {
+        "foundation": "Think of **Self-Scheduling Exponential Backoff & Dead-Letter Queues** as the intuition layer for Design a Distributed Delay Queue & Retry Timer Service with Hierarchical Time Wheels: Handle transient 5xx/429 failures via self-scheduling exponential backoff and dead-letter queues.",
+        "core": "When attempt `k` fails with a retryable 5xx/429, the worker re-enqueues `job_id` into the same Delay Queue with `delay = min(max_delay, base * 2^k) + uniform_jitter`. After `max_retries` (e.g., 8 attempts) or a permanent 4xx error, route the payload + failure trace to a **Dead-Letter Queue (DLQ)** for operator replay.",
+        "deepDive": "Under heavy load or partial failure, self-scheduling exponential backoff & dead-letter queues becomes a critical lever for predictable latency and correctness. Production distributed delay queues pair Raft-leased Time Wheels with per-tenant dispatch shapers, lookahead watermarks, and synthetic jitter canaries."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 05 · RETRIES & DLQ",
+        "title": "Self-Scheduling Exponential Backoff & Dead-Letter Queues",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "5xx / 429 Failure",
+            "sub": "Attempt k < max_retries",
+            "role": "Retryable Fault"
+          },
+          {
+            "id": "n2",
+            "label": "min(cap, base*2^k)+jit",
+            "sub": "Re-Enqueue in Delay Q",
+            "role": "Self-Scheduled"
+          },
+          {
+            "id": "n3",
+            "label": "Attempt >= 8 or 4xx",
+            "sub": "Permanent Failure",
+            "role": "Terminal State"
+          },
+          {
+            "id": "n4",
+            "label": "Move to Tenant DLQ",
+            "sub": "Alert + Manual Replay",
+            "role": "Quarantine"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "computes delay"
+          },
+          {
+            "from": "n1",
+            "to": "n3",
+            "label": "if exhausted"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "routes to"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Dogfooding the Wheel",
+            "detail": "Using the same Delay Queue for exponential retries requires zero extra retry infrastructure."
+          },
+          {
+            "label": "Full Jitter",
+            "detail": "Randomizing backoff prevents synchronized retry waves from hammering recovering downstream APIs."
+          },
+          {
+            "label": "DLQ Replay API",
+            "detail": "Expose a replay endpoint so operators can re-drive quarantined jobs after fixing bugs."
+          }
+        ],
+        "summary": "Self-scheduled exponential backoff with jitter and tenant DLQs handle transient and permanent failures cleanly.",
+        "caption": "Self-scheduled exponential backoff with jitter and tenant DLQs handle transient and permanent failures cleanly."
+      }
+    },
+    {
+      "id": "06-hot-bucket-smoothing",
+      "eyebrow": "STAGE 06 · THUNDERING HERD CONTROL",
+      "title": "Handling Midnight-UTC Cron Spikes & Hot Tenant Shards",
+      "level": "advanced",
+      "purpose": "Smooth 00:00:00 UTC midnight cron spikes using deterministic jitter and per-tenant dispatch token buckets.",
+      "explanation": {
+        "foundation": "Think of **Handling Midnight-UTC Cron Spikes & Hot Tenant Shards** as the intuition layer for Design a Distributed Delay Queue & Retry Timer Service with Hierarchical Time Wheels: Smooth 00:00:00 UTC midnight cron spikes using deterministic jitter and per-tenant dispatch token buckets.",
+        "core": "If 5M billing jobs all schedule for `00:00:00 UTC`, a single second bucket will spike. Mitigate by (1) adding deterministic sub-second/minute jitter on non-strict schedules, (2) enforcing per-tenant token-bucket dispatch limits so one noisy tenant cannot starve others, and (3) capping per-tick worker queue depth.",
+        "deepDive": "Under heavy load or partial failure, handling midnight-utc cron spikes & hot tenant shards becomes a critical lever for predictable latency and correctness. Production distributed delay queues pair Raft-leased Time Wheels with per-tenant dispatch shapers, lookahead watermarks, and synthetic jitter canaries."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 06 · THUNDERING HERD CONTROL",
+        "title": "Handling Midnight-UTC Cron Spikes & Hot Tenant Shards",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "5M Midnight Cron Jobs",
+            "sub": "00:00:00 UTC Spike",
+            "role": "Thundering Herd"
+          },
+          {
+            "id": "n2",
+            "label": "Deterministic Jitter",
+            "sub": "Spread Across 0..60s",
+            "role": "Bucket Smoothing"
+          },
+          {
+            "id": "n3",
+            "label": "Per-Tenant Token Bucket",
+            "sub": "Cap Dispatch QPS",
+            "role": "Fairness Gate"
+          },
+          {
+            "id": "n4",
+            "label": "Flat Worker Utilization",
+            "sub": "No Shard Overload",
+            "role": "Smooth Drain"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "spreads"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "throttled by"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "achieves"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Hash-Based Jitter",
+            "detail": "Adding hash(job_id) % 60s to non-strict cron jobs eliminates 5M-job single-second spikes."
+          },
+          {
+            "label": "Tenant Fairness",
+            "detail": "Per-tenant dispatch rate limits stop one customer's 1M-job burst from delaying everyone else."
+          },
+          {
+            "label": "Separate Cron Shards",
+            "detail": "Hash cron jobs by job_id rather than tenant_id so bursts spread across all 32 shards."
+          }
+        ],
+        "summary": "Deterministic cron jitter and per-tenant token buckets flatten midnight-UTC spikes across all 32 shards.",
+        "caption": "Deterministic cron jitter and per-tenant token buckets flatten midnight-UTC spikes across all 32 shards."
+      }
+    },
+    {
+      "id": "07-observability-and-slos",
+      "eyebrow": "STAGE 07 · OBSERVABILITY",
+      "title": "Measuring Firing Jitter, Lookahead Lag & Zombie Leases",
+      "level": "advanced",
+      "purpose": "Track firing_jitter_ms, lookahead watermark lag, zombie lease expirations, and synthetic canary timers.",
+      "explanation": {
+        "foundation": "Think of **Measuring Firing Jitter, Lookahead Lag & Zombie Leases** as the intuition layer for Design a Distributed Delay Queue & Retry Timer Service with Hierarchical Time Wheels: Track firing_jitter_ms, lookahead watermark lag, zombie lease expirations, and synthetic canary timers.",
+        "core": "Track `firing_jitter_ms = actual_dispatch_ms - fire_at_ms` (p99 < 500 ms), `lookahead_watermark_lag`, `dlq_ingress_rate`, and `raft_commit_latency`. Run synthetic canary timers every second per shard to verify end-to-end firing SLA.",
+        "deepDive": "Under heavy load or partial failure, measuring firing jitter, lookahead lag & zombie leases becomes a critical lever for predictable latency and correctness. Production distributed delay queues pair Raft-leased Time Wheels with per-tenant dispatch shapers, lookahead watermarks, and synthetic jitter canaries."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 07 · OBSERVABILITY",
+        "title": "Measuring Firing Jitter, Lookahead Lag & Zombie Leases",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "1s Canary Timers",
+            "sub": "Every Shard Monitored",
+            "role": "Live Probe"
+          },
+          {
+            "id": "n2",
+            "label": "firing_jitter_ms p99",
+            "sub": "Target < 500 ms",
+            "role": "Latency KPI"
+          },
+          {
+            "id": "n3",
+            "label": "Lookahead Lag > 10s",
+            "sub": "Disk Scan Bottleneck",
+            "role": "Capacity Alert"
+          },
+          {
+            "id": "n4",
+            "label": "dlq_ingress_rate",
+            "sub": "Downstream Outage",
+            "role": "Health Signal"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "measures"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "correlates"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "alerts"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Synthetic Canaries",
+            "detail": "Scheduling a 1-second canary timer per shard verifies end-to-end wheel + worker health continuously."
+          },
+          {
+            "label": "Lookahead Lag Alert",
+            "detail": "If loaded_horizon_ms falls behind now + 15m, disk I/O is saturating before jobs actually miss."
+          },
+          {
+            "label": "Lease-Expiry Spike",
+            "detail": "Rising zombie lease expirations point to hung workers or downstream webhook timeouts."
+          }
+        ],
+        "summary": "Per-shard 1s canary timers, firing_jitter_ms p99, and lookahead watermark lag catch scheduler stalls early.",
+        "caption": "Per-shard 1s canary timers, firing_jitter_ms p99, and lookahead watermark lag catch scheduler stalls early."
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-1",
+        "question": "Why does the scheduler keep only a 15-minute lookahead window in the RAM Time Wheel instead of all 100M 30-day jobs?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Raft cannot replicate RAM structures.",
+            "correct": false,
+            "feedback": "Incorrect: Disk-backed RocksDB holds the 30-day tail cheaply while the RAM Time Wheel gives O(1) firing for imminent jobs."
+          },
+          {
+            "id": "b",
+            "text": "Keeping 100M full payloads in RAM would require ~100 GB+ and slow crash recovery, whereas 15-minute pointers fit in ~90 MB/shard.",
+            "correct": true,
+            "feedback": "Correct: Disk-backed RocksDB holds the 30-day tail cheaply while the RAM Time Wheel gives O(1) firing for imminent jobs."
+          },
+          {
+            "id": "c",
+            "text": "Hierarchical Time Wheels cannot represent delays longer than 15 minutes.",
+            "correct": false,
+            "feedback": "Incorrect: Disk-backed RocksDB holds the 30-day tail cheaply while the RAM Time Wheel gives O(1) firing for imminent jobs."
+          },
+          {
+            "id": "d",
+            "text": "RocksDB deletes jobs older than 15 minutes.",
+            "correct": false,
+            "feedback": "Incorrect: Disk-backed RocksDB holds the 30-day tail cheaply while the RAM Time Wheel gives O(1) firing for imminent jobs."
+          }
+        ],
+        "explanation": "Disk-backed RocksDB holds the 30-day tail cheaply while the RAM Time Wheel gives O(1) firing for imminent jobs."
+      },
+      {
+        "id": "kc-2",
+        "question": "What happens if a worker crashes while processing a fired timer?",
+        "options": [
+          {
+            "id": "a",
+            "text": "The Raft leader panics and stops all shards.",
+            "correct": false,
+            "feedback": "Incorrect: Tombstoning only happens after worker ACK; lease expiry guarantees at-least-once retry."
+          },
+          {
+            "id": "b",
+            "text": "The job is immediately sent to the DLQ after 1 crash.",
+            "correct": false,
+            "feedback": "Incorrect: Tombstoning only happens after worker ACK; lease expiry guarantees at-least-once retry."
+          },
+          {
+            "id": "c",
+            "text": "The 30-second IN_FLIGHT visibility lease expires and the scheduler re-dispatches the job with an idempotency key.",
+            "correct": true,
+            "feedback": "Correct: Tombstoning only happens after worker ACK; lease expiry guarantees at-least-once retry."
+          },
+          {
+            "id": "d",
+            "text": "The job is permanently lost because it was popped from the Time Wheel.",
+            "correct": false,
+            "feedback": "Incorrect: Tombstoning only happens after worker ACK; lease expiry guarantees at-least-once retry."
+          }
+        ],
+        "explanation": "Tombstoning only happens after worker ACK; lease expiry guarantees at-least-once retry."
+      },
+      {
+        "id": "kc-3",
+        "question": "How do you prevent 5 million jobs scheduled for `00:00:00 UTC` from crashing downstream webhook targets?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Disable the Time Wheel at midnight.",
+            "correct": false,
+            "feedback": "Incorrect: Jitter + per-tenant dispatch shaping smooths bursts without dropping or starving other tenants."
+          },
+          {
+            "id": "b",
+            "text": "Drop jobs exceeding 1,000 per second.",
+            "correct": false,
+            "feedback": "Incorrect: Jitter + per-tenant dispatch shaping smooths bursts without dropping or starving other tenants."
+          },
+          {
+            "id": "c",
+            "text": "Merge all 5M jobs into one HTTP request.",
+            "correct": false,
+            "feedback": "Incorrect: Jitter + per-tenant dispatch shaping smooths bursts without dropping or starving other tenants."
+          },
+          {
+            "id": "d",
+            "text": "Apply jitter on non-strict schedules and enforce per-tenant token-bucket dispatch rate limits.",
+            "correct": true,
+            "feedback": "Correct: Jitter + per-tenant dispatch shaping smooths bursts without dropping or starving other tenants."
+          }
+        ],
+        "explanation": "Jitter + per-tenant dispatch shaping smooths bursts without dropping or starving other tenants."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Store 30-day delayed jobs safely on disk, load only the next 15 minutes into an in-memory Time Wheel, and retry failed deliveries automatically.",
+      "keyTakeaway": "When traffic spikes expose hidden coupling, keeping 100M 30-day jobs in RAM is prohibitively expensive; storing time-indexed keys in RocksDB shards while loading only the 15-minute lookahead horizon into a RAM Time Wheel gives O(1) firing at < 500 ms jitter.",
+      "byteSummary": "Holding 100 million 30-day jobs in memory is too expensive. Instead, save them in a fast disk database sorted by due time, and load only the next 15 minutes into a Time Wheel in RAM.\n\nWhen a timer fires, a worker runs it with a retry safety net and a Dead-Letter Queue for permanent failures."
+    },
+    "intermediate": {
+      "summary": "Combine Raft-replicated RocksDB shards, a 15-minute Hierarchical Time Wheel lookahead, and 30s-lease idempotent worker dispatch.",
+      "keyTakeaway": "When traffic spikes expose hidden coupling, keeping 100M 30-day jobs in RAM is prohibitively expensive; storing time-indexed keys in RocksDB shards while loading only the 15-minute lookahead horizon into a RAM Time Wheel gives O(1) firing at < 500 ms jitter.",
+      "byteSummary": "Each shard's Raft leader maintains a RAM Time Wheel fed by a 15-minute RocksDB lookahead scanner. Near-term writes dual-write to WAL and RAM.\n\nVisibility leases and idempotency keys ensure at-least-once delivery, while failed jobs self-schedule with exponential backoff + jitter."
+    },
+    "advanced": {
+      "summary": "Production distributed delay queues pair Raft-leased Time Wheels with per-tenant dispatch shapers, lookahead watermarks, and synthetic jitter canaries.",
+      "keyTakeaway": "When traffic spikes expose hidden coupling, keeping 100M 30-day jobs in RAM is prohibitively expensive; storing time-indexed keys in RocksDB shards while loading only the 15-minute lookahead horizon into a RAM Time Wheel gives O(1) firing at < 500 ms jitter.",
+      "byteSummary": "At 50K schedules/sec, operational stability depends on isolating noisy tenants and surviving leader failovers cleanly. Per-tenant dispatch token buckets prevent midnight-UTC spikes from starving other workloads.\n\nContinuous 1s canary timers per shard verify end-to-end firing jitter stays below 500 ms."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "prerequisites": [
+    {
+      "title": "Hierarchical Time-Wheel Scheduler & Delay Queues",
+      "summary": "A Hierarchical Time Wheel stacks multiple circular ring buffers at increasing time granularities (ms -> s -> m -> h) to achieve O(1) timer insertion and cancellation."
+    },
+    {
+      "title": "Dead Letter Queues",
+      "summary": "A secondary quarantine queue that captures messages a consumer repeatedly fails to process after a bounded number of retries, preventing poison pills from blocking healthy traffic."
+    },
+    {
+      "title": "Distributed Cron & Scheduling",
+      "summary": "Distributed cron and scheduling systems execute time-based and delayed jobs reliably across a fleet of stateless workers without single-point-of-failure downtime or duplicate runs."
+    }
+  ],
+  "simulation": {
+    "title": "Design a Distributed Delay Queue & Retry Timer Service with Hierarchical Time Wheels — Interactive Execution Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Workload & Budget"
+      },
+      {
+        "id": "router",
+        "label": "Gateway / Router",
+        "role": "Admission & Dispatch"
+      },
+      {
+        "id": "engine",
+        "label": "Core Engine",
+        "role": "Primary Execution"
+      },
+      {
+        "id": "replica",
+        "label": "Replica / Fallback",
+        "role": "Durability & Recovery"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "router",
+        "label": "request"
+      },
+      {
+        "from": "router",
+        "to": "engine",
+        "label": "route"
+      },
+      {
+        "from": "engine",
+        "to": "replica",
+        "label": "sync / fallback"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Separating 30-Day Disk Storage from 15-Minute RAM Wheels",
+        "actionLabel": "Dispatch nominal request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "router"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "Ingress",
+          "p99_ms": 8,
+          "error_rate": "0.0%"
+        },
+        "explanation": "Caller sends work into the gateway with explicit timeout and concurrency bounds (Separating 30-Day Disk Storage from 15-Minute RAM Wheels)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Partitioned RocksDB Shards with Raft Leader Leases",
+        "actionLabel": "Execute core invariant",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "Core Path",
+          "p99_ms": 18,
+          "in_flight": 124
+        },
+        "explanation": "The core engine processes the hot path while keeping state transitions deterministic (Partitioned RocksDB Shards with Raft Leader Leases)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Streaming Near-Term Buckets into the Hierarchical Time Wheel",
+        "actionLabel": "Detect skew or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Degraded",
+          "p99_ms": 64,
+          "retries_capped": "true"
+        },
+        "explanation": "Under load or replica lag, bounded backoff and isolation prevent cascading saturation (Streaming Near-Term Buckets into the Hierarchical Time Wheel)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Measuring Firing Jitter, Lookahead Lag & Zombie Leases",
+        "actionLabel": "Converge & restore SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 11,
+          "drift": 0
+        },
+        "explanation": "State converges cleanly and telemetry confirms the system returned within its SLO envelope (Measuring Firing Jitter, Lookahead Lag & Zombie Leases)."
+      }
+    ]
+  }
+}

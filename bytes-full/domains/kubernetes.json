@@ -1,0 +1,671 @@
+{
+  "id": "kubernetes",
+  "slug": "kubernetes",
+  "title": "Kubernetes",
+  "pedagogicalFramework": "SCOPE",
+  "spark": {
+    "summary": "Treating Kubernetes like a magic self-healing platform\u2014while misconfiguring liveness probes, omitting `preStop` connection draining, setting `minAvailable: 100%` on PodDisruptionBudgets, or ignoring Linux CFS CPU throttling\u2014causes rolling deployments to drop live traffic and freeze cluster upgrades. Production Kubernetes mastery means understanding the reconciliation loop (`API Server -> etcd -> Scheduler -> Kubelet`), decoupling readiness from liveness, right-sizing CPU/memory cgroups, and coordinating graceful pod termination.",
+    "keyTakeaway": "When operating production workloads on Kubernetes, keep liveness probes lightweight and dependency-free, pair `preStop` sleep hooks with graceful socket draining, cap PodDisruptionBudgets below 100% availability, and omit hard CPU limits on latency-sensitive services to avoid Linux CFS throttling.",
+    "byteSummary": "Kubernetes is a declarative control loop: controllers continuously watch desired state in etcd via the API server and reconcile actual node state via kubelet and containerd.\n\nMost production Kubernetes outages are self-inflicted configuration bugs: (1) pointing a `livenessProbe` at a downstream database so a DB blip restarts every pod simultaneously, (2) setting `PodDisruptionBudget` `minAvailable: 100%` which blocks node drains forever, (3) omitting `preStop` sleep windows so pods close sockets before kube-proxy/xDS removes their IP, and (4) setting tight CPU limits that trigger 100 ms Linux CFS quota throttling on multi-threaded runtimes.\n\nStructuring rollouts with `maxUnavailable: 0`, anti-affinity across Availability Zones, and `ndots: 2` DNS tuning keeps deployments and autoscaling resilient."
+  },
+  "domain": {
+    "purpose": "Architect, tune, and troubleshoot production Kubernetes clusters and zero-downtime microservice workloads across control-plane reconciliation, cgroup physics, networking, and traffic draining.",
+    "audience": [
+      "Platform & DevOps Engineers",
+      "Backend Architects",
+      "Staff/Principal Systems Engineers"
+    ]
+  },
+  "prerequisites": [
+    {
+      "title": "Declarative Control Plane & Reconciliation Loops",
+      "summary": "kube-apiserver persists state in etcd; controllers watch resource versions and reconcile desired spec against observed status asynchronously."
+    },
+    {
+      "title": "Linux cgroups v2, Namespaces & Probe Lifecycles",
+      "summary": "Pods share network/IPC namespaces while Linux cgroups enforce memory OOM-kill ceilings and CFS CPU period quotas."
+    }
+  ],
+  "learningJourney": [
+    {
+      "id": "01-control-plane-reconciliation",
+      "eyebrow": "STAGE 01 \u00b7 SHIFT IN MINDSET & CONTROL PLANE",
+      "title": "API Server, etcd Raft Quorum, Scheduler & Kubelet Watch Loops",
+      "level": "foundation",
+      "purpose": "Trace how a Deployment rollout moves asynchronously through watch streams without synchronous orchestration.",
+      "explanation": {
+        "foundation": "Kubernetes never executes imperative commands like 'start pod X on node Y'. Every component talks exclusively to `kube-apiserver`, which validates RBAC/admission webhooks and writes objects into **etcd** (Raft consensus).",
+        "core": "1. **Deployment Controller** sees `replicas: 6` vs. 0 existing and creates a `ReplicaSet`.\n2. **ReplicaSet Controller** creates 6 `Pod` objects with `spec.nodeName = \"\"`.\n3. **kube-scheduler** filters nodes (taints, resource requests, topology spread constraints) and scores candidates, binding `spec.nodeName`.\n4. **kubelet** on that node receives the watch event, invokes CRI (`containerd`) to pull images, CNI to attach pod IP, and starts probes.",
+        "deepDive": "**etcd Watch & List Pagination**: Unbounded `LIST` calls with `resourceVersion=0` or large custom resources (`> 1.5 MB` etcd object limit) saturate `kube-apiserver` memory and etcd Raft disk fsync latency. Always use informers with `resourceVersion` bookmarks and keep etcd on dedicated low-latency NVMe drives. [INSERT YOUR BENCHMARK / PROD NOTE]"
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "ASYNCHRONOUS RECONCILIATION FLOW",
+        "title": "How Controllers Reconcile Desired Pod State via API Server Watch Streams",
+        "actors": [
+          "kube-apiserver + etcd",
+          "ReplicaSet Controller",
+          "kube-scheduler",
+          "kubelet (Worker Node)"
+        ],
+        "events": [
+          {
+            "from": "ReplicaSet Controller",
+            "to": "kube-apiserver + etcd",
+            "label": "1. Create Pod spec (nodeName empty)"
+          },
+          {
+            "from": "kube-scheduler",
+            "to": "kube-apiserver + etcd",
+            "label": "2. Filter/Score nodes -> bind nodeName=node-04"
+          },
+          {
+            "from": "kube-apiserver + etcd",
+            "to": "kubelet (Worker Node)",
+            "label": "3. Watch event triggers CRI + CNI pod startup"
+          },
+          {
+            "from": "kubelet (Worker Node)",
+            "to": "kube-apiserver + etcd",
+            "label": "4. Update Pod status=Ready after readinessProbe"
+          }
+        ],
+        "summary": "Every Kubernetes component communicates solely through watchable API resources stored in etcd."
+      }
+    },
+    {
+      "id": "02-probes-and-graceful-shutdown",
+      "eyebrow": "STAGE 02 \u00b7 LIFECYCLE & ZERO-DOWNTIME DRAINS",
+      "title": "Startup, Readiness & Liveness Probes + Zero-502 Termination Sequence",
+      "level": "core",
+      "purpose": "Prevent cascading probe restart storms and eliminate connection resets during pod termination.",
+      "explanation": {
+        "foundation": "- **startupProbe**: Protects slow-starting JVMs/ML models during boot before liveness checks activate.\n- **readinessProbe**: Controls whether the pod's IP is included in `EndpointSlices` (receiving live traffic). Fails safely when warm-up or critical downstream circuit breakers open.\n- **livenessProbe**: Restarts the container (`SIGKILL` after grace period) when the process is deadlocked. **Never check external databases or Redis inside `livenessProbe`**\u2014a transient DB stall will cause kubelet to kill your entire healthy app fleet simultaneously.",
+        "core": "**The Race Condition During Pod Termination**: When a pod is deleted, kubelet sends `SIGTERM` to the container *at the exact same moment* the EndpointSlice controller notifies `kube-proxy`/Envoy to remove the pod's IP. For 1\u20133 seconds, ingress proxies still send new requests to a pod that already closed its HTTP server.\n\n**Fix**: Add a `lifecycle.preStop` `sleep 5` hook and set `terminationGracePeriodSeconds: 45` so the pod keeps accepting in-flight requests until iptables/xDS rules propagate, then drains cleanly.",
+        "deepDive": "Pair `preStop` with HTTP `Connection: close` headers or gRPC `GOAWAY` frames on SIGTERM so persistent HTTP/2 clients rebalance streams immediately."
+      },
+      "sectionDiagram": {
+        "kind": "behavior-transition",
+        "eyebrow": "NAIVE TERMINATION VS. COORDINATED DRAIN",
+        "title": "Eliminating Rolling-Deploy 502s With preStop Propagation Buffers",
+        "before": {
+          "label": "Immediate SIGTERM Socket Close",
+          "metrics": [
+            "502 Bad Gateway spikes",
+            "In-flight RPCs reset",
+            "EndpointSlice race window"
+          ],
+          "steps": [
+            "Pod marked Terminating -> SIGTERM sent immediately",
+            "App closes port 8080 in 50 ms",
+            "kube-proxy still routes traffic for 2s -> Connection Refused"
+          ]
+        },
+        "after": {
+          "label": "preStop Buffer + Graceful Server Drain",
+          "metrics": [
+            "Zero dropped requests",
+            "Clean HTTP/2 GOAWAY",
+            "45s graceful drain budget"
+          ],
+          "steps": [
+            "Pod marked Terminating -> EndpointSlice removal starts",
+            "preStop sleeps 5s while server still serves arrivals",
+            "SIGTERM fires after endpoints drain -> finish in-flight & exit 0"
+          ]
+        }
+      }
+    },
+    {
+      "id": "03-cgroups-cfs-throttling-and-dns",
+      "eyebrow": "STAGE 03 \u00b7 KERNEL PHYSICS, CFS QUOTAS & DNS NDOTS",
+      "title": "Linux CFS CPU Throttling, Memory OOMKill & The ndots:5 DNS Storm",
+      "level": "core",
+      "purpose": "Eliminate artificial p99 tail latency caused by CFS CPU limits and Kubernetes DNS search path amplification.",
+      "explanation": {
+        "foundation": "In Kubernetes, `resources.requests` reserves guaranteed capacity for scheduling, whereas `resources.limits` enforces hard Linux cgroup ceilings:\n- **Memory Limit (`memory.max`)**: Exceeding it triggers an immediate kernel **OOMKill** (`Exit Code 137`). Always set `memory.requests == memory.limits` for predictable QoS.\n- **CPU Limit (`cpu.cfs_quota_us`)**: Linux enforces CPU limits over 100 ms periods. An 8-thread Java/Python service with `limits.cpu: 1` (100 ms quota per 100 ms wall time) consumes its entire 100 ms quota in **12.5 ms** across 8 cores, then gets **frozen by the kernel for the remaining 87.5 ms**\u2014injecting 87 ms tail stalls even when the host node is 70% idle.",
+        "core": "**Production Best Practice**: Set accurate `requests.cpu` (for scheduling and HPA) and omit `limits.cpu` (or set generous burst headroom) on latency-critical services while relying on `Guaranteed` memory bounds.\n\n**The `ndots:5` DNS Multiplier**: Kubernetes `/etc/resolv.conf` defaults to `options ndots:5`. Any external hostname with fewer than 5 dots (e.g., `api.stripe.com`, 2 dots) triggers **4 failed search-domain lookups** (`api.stripe.com.default.svc.cluster.local`, etc.) before resolving externally\u2014multiplying CoreDNS UDP traffic 5x and exhausting `nf_conntrack` tables. Set `dnsConfig.options: [{name: ndots, value: \"2\"}]` or use trailing dots (`api.stripe.com.`).",
+        "deepDive": "Enabling NodeLocal DNSCache further eliminates conntrack UDP races on high-QPS nodes."
+      },
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "NODE-LEVEL RUNTIME & DNS PATH",
+        "title": "Preventing CFS Throttling & CoreDNS Conntrack Exhaustion",
+        "graphNodes": [
+          {
+            "id": "pod",
+            "label": "App Pod (No CPU Limit, Equal Mem Req/Lim)"
+          },
+          {
+            "id": "cfs",
+            "label": "Linux cgroups v2 (Guaranteed Shares)"
+          },
+          {
+            "id": "nlocal",
+            "label": "NodeLocal DNSCache (ndots:2)"
+          },
+          {
+            "id": "cdns",
+            "label": "CoreDNS Cluster Pool"
+          }
+        ],
+        "graphEdges": [
+          {
+            "from": "pod",
+            "to": "cfs",
+            "label": "Bursts freely onto idle cores"
+          },
+          {
+            "from": "pod",
+            "to": "nlocal",
+            "label": "TCP/UDP local cache (1 lookup)"
+          },
+          {
+            "from": "nlocal",
+            "to": "cdns",
+            "label": "Cache misses only"
+          }
+        ]
+      }
+    },
+    {
+      "id": "04-pdb-topology-and-python-validator",
+      "eyebrow": "STAGE 04 \u00b7 HIGH AVAILABILITY & MANIFEST AUDIT GUARD",
+      "title": "PodDisruptionBudgets, Topology Spread & Automated Manifest Linter",
+      "level": "core",
+      "purpose": "Prevent cluster upgrade deadlocks and single-AZ outages with automated manifest policy checks in Python.",
+      "explanation": {
+        "foundation": "A `PodDisruptionBudget` (PDB) with `minAvailable: 100%` (or `maxUnavailable: 0` on a 1-replica Deployment) blocks `kubectl drain` and cluster autoscaler node consolidation indefinitely, halting security patching.",
+        "core": "```python\ndef validate_production_pod_spec(spec: dict) -> list[str]:\n    violations: list[str] = []\n    replicas = spec.get(\"replicas\", 1)\n    if replicas < 2:\n        violations.append(\"Production services require replicas >= 2 across Availability Zones\")\n\n    pdb = spec.get(\"pdb\", {})\n    if pdb.get(\"maxUnavailable\") == 0 or pdb.get(\"minAvailable\") == \"100%\":\n        violations.append(\"PDB blocks voluntary node drains; set maxUnavailable >= 1 or <= 25%\")\n\n    for container in spec.get(\"containers\", []):\n        name = container.get(\"name\", \"unknown\")\n        res = container.get(\"resources\", {})\n        req_mem = res.get(\"requests\", {}).get(\"memory\")\n        lim_mem = res.get(\"limits\", {}).get(\"memory\")\n        if not req_mem or req_mem != lim_mem:\n            violations.append(f\"Container '{name}': set requests.memory == limits.memory to prevent OOM evictions\")\n        if \"cpu\" in res.get(\"limits\", {}):\n            violations.append(f\"Container '{name}': remove hard limits.cpu to prevent Linux CFS 100ms throttling\")\n\n    if not spec.get(\"hasPreStopDrain\", False):\n        violations.append(\"Missing preStop drain hook; rolling deploys will drop in-flight traffic\")\n    return violations\n```",
+        "deepDive": "Combine `topologySpreadConstraints` (`topologyKey: topology.kubernetes.io/zone`, `maxSkew: 1`) with HPA autoscaling so an entire AWS/GCP Availability Zone outage leaves >= 66% capacity serving immediately."
+      },
+      "decisionFramework": {
+        "problem": "How to prevent rolling deployments and cluster node upgrades from dropping user requests or deadlocking node drains.",
+        "naiveSolution": "Use default Kubernetes probe/termination settings and set `PodDisruptionBudget` `minAvailable: 100%` to 'guarantee uptime'.",
+        "whyItFails": "Default termination closes sockets before EndpointSlices propagate, while `minAvailable: 100%` prevents Kubernetes from ever draining a node.",
+        "alternatives": "Compare default deployment settings, `minAvailable: 100%` PDBs, and rolling updates (`maxUnavailable: 0, maxSurge: 25%`) + `preStop` sleep + `maxUnavailable: 1` PDB.",
+        "decision": "Configure `maxUnavailable: 0, maxSurge: 25%` on Deployments, add a 5s `preStop` sleep hook, spread pods across AZs (`maxSkew: 1`), and set PDB `maxUnavailable: 1` (or `25%`).",
+        "tradeOffs": "Adds ~5 seconds per pod during rollouts in exchange for zero dropped connections and safe automated node upgrades."
+      },
+      "decisionExercise": {
+        "prompt": "Your multi-threaded Java service on Kubernetes shows average CPU usage at only 25% of its 2-vCPU limit, yet p99 latency spikes by 80\u201395 ms every few seconds and cgroup `nr_throttled` metrics are high. What is causing the stalls?",
+        "options": [
+          {
+            "id": "cfs-quota-throttling",
+            "label": "Linux CFS CPU quota throttling: parallel GC and worker threads burn the 200 ms per-period CPU quota in ~25 ms across 8 host cores, freezing the container for the rest of the 100 ms period.",
+            "isCorrect": true,
+            "explanation": "Correct: removing hard `limits.cpu` (while keeping `requests.cpu` for scheduling) eliminates artificial CFS throttling spikes."
+          },
+          {
+            "id": "etcd-quorum-loss",
+            "label": "etcd lost Raft quorum on the control plane.",
+            "isCorrect": false,
+            "explanation": "Control-plane etcd quorum stalls API writes, not packet/thread execution inside an already-running pod."
+          },
+          {
+            "id": "swap-thrashing",
+            "label": "Kubernetes is swapping JVM heap pages to disk.",
+            "isCorrect": false,
+            "explanation": "Kubernetes disables swap by default and OOM-kills containers exceeding memory limits rather than swapping."
+          }
+        ]
+      },
+      "sectionDiagram": {
+        "kind": "quorum-cluster",
+        "eyebrow": "MULTI-AZ TOPOLOGY SPREAD",
+        "title": "Balancing Pods Across Availability Zones With Safe Disruption Budgets",
+        "nodes": [
+          {
+            "id": "ing",
+            "label": "Ingress / Gateway",
+            "role": "Zone-Aware Routing"
+          },
+          {
+            "id": "az1",
+            "label": "AZ-1 Nodes (2 Pods)",
+            "role": "topologySpread maxSkew=1"
+          },
+          {
+            "id": "az2",
+            "label": "AZ-2 Nodes (2 Pods)",
+            "role": "topologySpread maxSkew=1"
+          },
+          {
+            "id": "az3",
+            "label": "AZ-3 Nodes (2 Pods)",
+            "role": "PDB maxUnavailable=1"
+          }
+        ],
+        "edges": [
+          {
+            "from": "ing",
+            "to": "az1",
+            "label": "Healthy traffic"
+          },
+          {
+            "from": "ing",
+            "to": "az2",
+            "label": "Healthy traffic"
+          },
+          {
+            "from": "ing",
+            "to": "az3",
+            "label": "Survives 1 AZ or 1 node drain"
+          }
+        ],
+        "cards": [
+          {
+            "title": "AZ Outage Resilience",
+            "body": "Losing 1 full AZ retains 4/6 pods (67% capacity) instantaneously."
+          },
+          {
+            "title": "Safe Node Upgrades",
+            "body": "PDB maxUnavailable=1 allows rolling node drains without stalling upgrades."
+          }
+        ],
+        "summary": "Zone topology spreads and bounded PDBs protect both availability and cluster maintainability."
+      }
+    },
+    {
+      "id": "05-statefulsets-operators-and-when-not-to-use",
+      "eyebrow": "STAGE 05 \u00b7 PRODUCTION BOUNDARIES & WHEN NOT TO USE KUBERNETES",
+      "title": "StatefulSets, Storage Operators & When Managed Serverless Wins",
+      "level": "deepDive",
+      "purpose": "Evaluate stateful workloads on Kubernetes and identify teams/workloads where Kubernetes adds unnecessary toil.",
+      "explanation": {
+        "foundation": "**StatefulSets** provide stable network identities (`db-0`, `db-1`), ordered rollout/scaling, and sticky `PersistentVolumeClaims` (PVCs). However, running high-IOPS primary databases on Kubernetes requires mature Operators (CloudNativePG, Strimzi) and local NVMe CSI drivers\u2014because network-attached EBS volumes add 1\u20133 ms per WAL fsync.",
+        "core": "**When NOT to Use Kubernetes**: Do not adopt self-managed Kubernetes for a 5-person engineering team running 4 CRUD services and a PostgreSQL database. Managed container platforms (AWS ECS Fargate, Google Cloud Run) or PaaS platforms eliminate CNI upgrades, kube-apiserver certificate rotations, etcd backups, and ingress controller toil so engineers ship product features instead of YAML.",
+        "deepDive": "**Assumptions & Glossary**: **CRI**: Container Runtime Interface (`containerd`). **CNI**: Container Network Interface (Cilium, Calico). **EndpointSlices**: Scalable Kubernetes API objects tracking healthy backend pod IPs for a Service. **PDB**: PodDisruptionBudget."
+      },
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "POD LIFECYCLE STATE MACHINE",
+        "title": "Coordinated Pod Startup, Readiness & Graceful Termination States",
+        "states": [
+          {
+            "id": "pending",
+            "label": "PENDING_SCHEDULING"
+          },
+          {
+            "id": "starting",
+            "label": "STARTUP_PROBE_WARMUP"
+          },
+          {
+            "id": "ready",
+            "label": "READY_SERVING_TRAFFIC"
+          },
+          {
+            "id": "draining",
+            "label": "TERMINATING_PRESTOP_DRAIN"
+          },
+          {
+            "id": "terminated",
+            "label": "EXITED_CLEANLY"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "pending",
+            "to": "starting",
+            "label": "Scheduler binds nodeName & CRI starts"
+          },
+          {
+            "from": "starting",
+            "to": "ready",
+            "label": "startupProbe + readinessProbe pass"
+          },
+          {
+            "from": "ready",
+            "to": "draining",
+            "label": "Deletion timestamp -> preStop sleep 5s"
+          },
+          {
+            "from": "draining",
+            "to": "terminated",
+            "label": "SIGTERM -> finish in-flight -> exit 0"
+          }
+        ]
+      }
+    }
+  ],
+  "endToEndExample": {
+    "title": "Zero-Downtime High-Throughput Payment API on Multi-AZ Kubernetes",
+    "scenario": "A payment gateway runs 18 replicas across 3 Availability Zones handling 12,000 RPS with < 25 ms p99 latency, zero dropped connections during daily deploys, and automated node security patching.",
+    "architecture": "Pods run with `requests.memory == limits.memory`, no hard `limits.cpu`, `ndots: 2` + NodeLocal DNSCache, dependency-free `/healthz/live` probes, `preStop: sleep 5` graceful socket draining, AZ `topologySpreadConstraints`, and `PDB maxUnavailable: 2`."
+  },
+  "decisionFramework": [
+    {
+      "question": "Should you check external database connectivity inside a Kubernetes `livenessProbe`?",
+      "reason": "Never\u2014a transient database blip will fail liveness across every pod simultaneously, triggering a self-inflicted fleet restart storm."
+    },
+    {
+      "question": "Should you set hard `limits.cpu` on latency-sensitive multi-threaded pods?",
+      "reason": "Omit hard `limits.cpu` (while setting accurate `requests.cpu`) so Linux CFS quota enforcement does not freeze multi-threaded runtimes mid-request."
+    }
+  ],
+  "simulation": {
+    "title": "Zero-Downtime Rolling Deploy & preStop Drain Simulator",
+    "nodes": [
+      {
+        "id": "ep",
+        "label": "EndpointSlice + Envoy",
+        "role": "Traffic Router"
+      },
+      {
+        "id": "old",
+        "label": "Old Pod (Terminating)",
+        "role": "preStop 5s + Drain"
+      },
+      {
+        "id": "new",
+        "label": "New Pod (v2)",
+        "role": "Startup + Readiness Gate"
+      }
+    ],
+    "edges": [
+      {
+        "from": "ep",
+        "to": "new",
+        "label": "Shift new requests after readinessProbe"
+      },
+      {
+        "from": "ep",
+        "to": "old",
+        "label": "Remove IP during preStop 5s window"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "New Pod Passes Readiness",
+        "actionLabel": "v2 added to EndpointSlice; old pod marked Terminating",
+        "status": "healthy",
+        "activeNodeIds": [
+          "ep",
+          "new",
+          "old"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "v2_ready": true,
+          "old_state": "preStop_sleep_5s",
+          "dropped_requests": 0
+        },
+        "explanation": "Old pod stays alive for 5s during preStop while EndpointSlice removal propagates to all proxies."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Clean Socket Shutdown",
+        "actionLabel": "0 active connections -> SIGTERM exits 0",
+        "status": "healthy",
+        "activeNodeIds": [
+          "ep",
+          "new"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "v2_traffic_pct": 100,
+          "http_502_errors": 0
+        },
+        "explanation": "All traffic flows to v2 with zero connection resets."
+      }
+    ]
+  },
+  "practice": {
+    "knowledgeCheck": {
+      "id": "kc-k8s-1",
+      "question": "Why is checking external database availability inside a Kubernetes `livenessProbe` a dangerous anti-pattern?",
+      "options": [
+        {
+          "id": "a",
+          "text": "Because kubelet cannot make TCP connections.",
+          "correct": false,
+          "feedback": "kubelet supports HTTP and TCP probes natively."
+        },
+        {
+          "id": "b",
+          "text": "A temporary database slowdown causes every pod's liveness probe to fail simultaneously, triggering mass container restarts and amplifying recovery time.",
+          "correct": true,
+          "feedback": "Correct: liveness probes must verify only internal process deadlock; use `readinessProbe` if traffic should temporarily pause."
+        },
+        {
+          "id": "c",
+          "text": "Because `livenessProbe` failures delete PersistentVolumeClaims.",
+          "correct": false,
+          "feedback": "PVCs persist across container restarts, but fleet-wide pod restarts cause severe downtime."
+        },
+        {
+          "id": "d",
+          "text": "Because `livenessProbe` runs only once at pod startup.",
+          "correct": false,
+          "feedback": "`startupProbe` runs at startup; `livenessProbe` runs continuously throughout the pod's life."
+        }
+      ],
+      "explanation": "Keep liveness probes strictly local to process health so external outages never trigger fleet-wide restart storms."
+    },
+    "knowledgeChecks": [
+      {
+        "id": "kc-k8s-1",
+        "question": "Why is checking external database availability inside a Kubernetes `livenessProbe` a dangerous anti-pattern?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Because kubelet cannot make TCP connections.",
+            "correct": false,
+            "feedback": "kubelet supports HTTP and TCP probes natively."
+          },
+          {
+            "id": "b",
+            "text": "A temporary database slowdown causes every pod's liveness probe to fail simultaneously, triggering mass container restarts and amplifying recovery time.",
+            "correct": true,
+            "feedback": "Correct: liveness probes must verify only internal process deadlock; use `readinessProbe` if traffic should temporarily pause."
+          },
+          {
+            "id": "c",
+            "text": "Because `livenessProbe` failures delete PersistentVolumeClaims.",
+            "correct": false,
+            "feedback": "PVCs persist across container restarts, but fleet-wide pod restarts cause severe downtime."
+          },
+          {
+            "id": "d",
+            "text": "Because `livenessProbe` runs only once at pod startup.",
+            "correct": false,
+            "feedback": "`startupProbe` runs at startup; `livenessProbe` runs continuously throughout the pod's life."
+          }
+        ],
+        "explanation": "Keep liveness probes strictly local to process health so external outages never trigger fleet-wide restart storms."
+      },
+      {
+        "id": "kc-k8s-2",
+        "question": "How can setting a tight `resources.limits.cpu` (e.g., `1000m`) on a multi-threaded JVM or Python service degrade p99 latency even when average CPU usage is 30%?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Linux CFS enforces CPU limits per 100 ms period; parallel threads consume the 100 ms quota in ~15 ms and get throttled by the kernel for the remaining 85 ms.",
+            "correct": true,
+            "feedback": "Correct: CFS quota throttling injects ~85 ms pauses into multi-threaded applications even when host CPU cores are idle."
+          },
+          {
+            "id": "b",
+            "text": "Kubernetes reduces network NIC bandwidth proportionally to `limits.cpu`.",
+            "correct": false,
+            "feedback": "CPU cgroup quotas do not throttle NIC link speed."
+          },
+          {
+            "id": "c",
+            "text": "The Linux OOM killer terminates the process whenever `limits.cpu` is reached.",
+            "correct": false,
+            "feedback": "CPU is compressible (throttled), whereas memory is incompressible (OOM-killed)."
+          },
+          {
+            "id": "d",
+            "text": "Setting `limits.cpu` disables horizontal pod autoscaling.",
+            "correct": false,
+            "feedback": "HPA scales based on `requests.cpu` utilization, not `limits.cpu`."
+          }
+        ],
+        "explanation": "Set accurate `requests.cpu` for scheduling and HPA, and omit hard `limits.cpu` on latency-sensitive multi-threaded services."
+      },
+      {
+        "id": "kc-k8s-3",
+        "question": "What happens during cluster upgrades if an engineer creates a `PodDisruptionBudget` with `minAvailable: 100%` (or `maxUnavailable: 0`)?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Kubernetes automatically doubles the pod replica count before draining nodes.",
+            "correct": false,
+            "feedback": "PDBs block evictions; they do not trigger scale-outs."
+          },
+          {
+            "id": "b",
+            "text": "Voluntary node drains (`kubectl drain` / cluster autoscaler upgrades) block indefinitely because zero pods are permitted to be evicted.",
+            "correct": true,
+            "feedback": "Correct: always allow at least `maxUnavailable: 1` (or `20-25%`) with `replicas >= 2` so voluntary maintenance can proceed safely."
+          },
+          {
+            "id": "c",
+            "text": "Pods ignore `SIGTERM` and force immediate `SIGKILL`.",
+            "correct": false,
+            "feedback": "PDBs control the Eviction API, not grace period signals."
+          },
+          {
+            "id": "d",
+            "text": "Ingress traffic bypasses the PDB and routes to unscheduled nodes.",
+            "correct": false,
+            "feedback": "PDBs govern voluntary pod evictions, not ingress routing."
+          }
+        ],
+        "explanation": "A PDB with zero allowed disruptions deadlocks automated node upgrades and cluster autoscaling."
+      },
+      {
+        "id": "kc-k8s-4",
+        "question": "Why does Kubernetes' default `ndots: 5` DNS configuration cause high CoreDNS load when calling external domains like `api.github.com`?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Because `api.github.com` has fewer than 5 dots, glibc appends 4 cluster search domains first (generating 5 DNS queries instead of 1).",
+            "correct": true,
+            "feedback": "Correct: lowering `ndots` to `2` or deploying NodeLocal DNSCache eliminates unnecessary search-domain lookups."
+          },
+          {
+            "id": "b",
+            "text": "Because CoreDNS blocks all external domains unless `ndots` is set to 10.",
+            "correct": false,
+            "feedback": "CoreDNS forwards external domains, but only after checking search suffixes."
+          },
+          {
+            "id": "c",
+            "text": "Because `ndots: 5` forces DNS over TLS on every packet.",
+            "correct": false,
+            "feedback": "`ndots` controls search-domain suffix expansion, not TLS."
+          },
+          {
+            "id": "d",
+            "text": "Because Linux kernels reject DNS responses larger than 5 bytes.",
+            "correct": false,
+            "feedback": "Standard UDP DNS packets are up to 512 bytes (4096 with EDNS0)."
+          }
+        ],
+        "explanation": "Tuning `ndots: 2` cuts external DNS query amplification by up to 5x and relieves `nf_conntrack` pressure."
+      }
+    ]
+  },
+  "relatedConcepts": [
+    {
+      "slug": "kubernetes-workloads",
+      "title": "Kubernetes Workloads (Deployments, StatefulSets, Jobs)"
+    },
+    {
+      "slug": "k8s-dns-ndots-trap",
+      "title": "Kubernetes DNS & ndots:5 Amplification Trap"
+    },
+    {
+      "slug": "graceful-shutdown-draining",
+      "title": "Graceful Shutdown & Connection Draining"
+    }
+  ],
+  "courseCurriculum": [
+    {
+      "moduleNumber": 1,
+      "id": "01-control-plane-reconciliation",
+      "title": "Control Plane & Reconciliation Loops",
+      "description": "API server, etcd Raft quorum, scheduler binding, and kubelet watches.",
+      "conceptSlugs": [
+        "kubernetes-workloads"
+      ]
+    },
+    {
+      "moduleNumber": 2,
+      "id": "02-probes-and-graceful-shutdown",
+      "title": "Probes & Zero-Downtime Pod Termination",
+      "description": "Startup/readiness/liveness separation and preStop EndpointSlice drain buffers.",
+      "conceptSlugs": [
+        "graceful-shutdown-draining"
+      ]
+    },
+    {
+      "moduleNumber": 3,
+      "id": "03-cgroups-cfs-throttling-and-dns",
+      "title": "Linux cgroups v2, CFS Quotas & DNS ndots",
+      "description": "Eliminating CPU throttling tail spikes and CoreDNS query storms.",
+      "conceptSlugs": [
+        "k8s-dns-ndots-trap"
+      ]
+    },
+    {
+      "moduleNumber": 4,
+      "id": "04-pdb-topology-and-python-validator",
+      "title": "PDBs, AZ Topology Spread & Manifest Guardrails",
+      "description": "Safe voluntary disruption budgets and automated manifest linting.",
+      "conceptSlugs": [
+        "availability-patterns-nines"
+      ]
+    },
+    {
+      "moduleNumber": 5,
+      "id": "05-statefulsets-operators-and-when-not-to-use",
+      "title": "StatefulSets, Operators & Platform Trade-Offs",
+      "description": "NVMe PVC physics and when managed serverless beats self-hosted K8s.",
+      "conceptSlugs": [
+        "immutable-infrastructure"
+      ]
+    }
+  ],
+  "appliedCaseStudies": [
+    {
+      "source": "problem",
+      "slug": "coredns-conntrack-storms",
+      "title": "Eliminating CoreDNS & Linux Conntrack Drops Under Burst Traffic",
+      "summary": "Diagnosing ndots:5 amplification and UDP conntrack race conditions on high-density worker nodes."
+    },
+    {
+      "source": "concept",
+      "slug": "blue-green-and-canary",
+      "title": "Progressive Canary & Blue-Green Rollouts",
+      "summary": "Coordinating automated metric gates and traffic shifting across Kubernetes deployments."
+    }
+  ],
+  "tipsAndTricks": [
+    "Always set `requests.memory == limits.memory` (`Guaranteed` memory) while omitting `limits.cpu` on latency-critical multi-threaded pods.",
+    "Pair `preStop: sleep 5` with `terminationGracePeriodSeconds: 45` so EndpointSlice removal propagates before your server closes its listening port.",
+    "Never point `livenessProbe` at downstream databases or external APIs."
+  ],
+  "finalSummary": "Reliable Kubernetes operations come from respecting asynchronous control-plane timing and Linux kernel cgroup physics: isolate liveness probes from external dependencies, drain connections with `preStop` buffers, eliminate CFS throttling by omitting hard CPU limits, and enforce multi-AZ topology spreads with non-blocking PDBs.",
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Kubernetes runs containers across a cluster of machines by watching desired configuration files and automatically restarting crashed pods or scaling replicas up and down.",
+      "keyTakeaway": "When deploying apps on Kubernetes, run at least 2 replicas across Availability Zones and configure readiness probes plus graceful shutdown hooks so deployments never drop user requests.",
+      "byteSummary": "Kubernetes acts like an automated cluster manager: you declare how many copies of your app you want, and controllers schedule pods onto healthy nodes, route traffic to ready pods, and replace failed instances automatically."
+    },
+    "intermediate": {
+      "summary": "Master control-plane watch reconciliation, separate `startupProbe`/`readinessProbe`/`livenessProbe` responsibilities, prevent rolling-deploy 502s via `preStop` sleep hooks, and avoid CFS CPU throttling and `ndots:5` DNS storms.",
+      "keyTakeaway": "When operating production workloads on Kubernetes, keep liveness probes lightweight and dependency-free, pair `preStop` sleep hooks with graceful socket draining, cap PodDisruptionBudgets below 100% availability, and omit hard CPU limits on latency-sensitive services to avoid Linux CFS throttling.",
+      "byteSummary": "Production Kubernetes reliability depends on aligning pod lifecycles with asynchronous EndpointSlice updates and Linux cgroups: `preStop` hooks eliminate connection resets during deploys, while omitting hard CPU limits avoids 100 ms CFS throttling stalls."
+    },
+    "advanced": {
+      "summary": "Tune `kube-apiserver` informer bookmarks and etcd NVMe fsync budgets, deploy NodeLocal DNSCache with `ndots:2` to prevent `nf_conntrack` UDP table exhaustion, and enforce admission policies validating memory QoS, AZ `maxSkew: 1`, and non-deadlocking PDBs.",
+      "keyTakeaway": "When operating high-density multi-AZ Kubernetes clusters, eliminate kernel conntrack and CFS bottlenecks via NodeLocal DNSCache (`ndots:2`) and uncapped CPU burst, and enforce automated admission checks on PDBs and memory QoS.",
+      "byteSummary": "At high pod density, Linux kernel internals\u2014CFS 100 ms quota periods, `nf_conntrack` UDP race conditions under `ndots:5`, and etcd watch fan-out\u2014become the primary tail-latency drivers. Addressing cgroup and DNS physics directly keeps p99 flat."
+    }
+  }
+}

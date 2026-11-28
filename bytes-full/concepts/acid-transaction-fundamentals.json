@@ -1,0 +1,1213 @@
+{
+  "id": "concept-acid-transaction-fundamentals",
+  "slug": "acid-transaction-fundamentals",
+  "name": "ACID Transaction Fundamentals",
+  "domain": "Databases & Storage",
+  "tagline": "All-or-nothing execution and tunable concurrency isolation using Write-Ahead Logging (WAL), Multi-Version Concurrency Control (MVCC), and deterministic locking.",
+  "purpose": "Build a precise mental model of ACID transactions—separating general database principles from engine-specific mechanics—so you can choose isolation levels by invariant and write safe retry logic.",
+  "spark": {
+    "summary": "ACID groups four guarantees for a database transaction: Atomicity (all-or-nothing), Consistency (enforced rules stay valid), Isolation (concurrent work does not expose partial state), and Durability (committed changes survive a crash under configured disk-flush settings).",
+    "keyTakeaway": "When concurrent writes contend on shared state, ACID is not a single on/off switch: durability depends on WAL flush configuration and storage reliability, while isolation is chosen by the invariant your application must protect—not by habit.",
+    "byteSummary": "**Core Mechanics:** In plain terms, ACID ensures a group of database operations either finishes completely or leaves no visible trace (Atomicity), keeps enforced schema rules intact (Consistency), shields concurrent readers from partial work (Isolation), and survives process crashes once flushed to non-volatile storage (Durability).\n\n**Visual & Structural Flow:** Covers the Write-Ahead Log (WAL) + Multi-Version Concurrency Control (MVCC) commit and recovery pipeline (`SQL Client` -> `Buffer Pool + MVCC` -> `WAL fsync` -> `CLOG + Heap Pages`), the Write Skew sequence under Snapshot Isolation (`Tx 1 Dr. Alice` & `Tx 2 Dr. Bob`), and the `ACTIVE -> COMMITTED / ABORTED (40001)` retry state machine.\n\n**Trade-Offs & Production:** Choose `READ COMMITTED` for independent single-row updates, `REPEATABLE READ` for multi-query snapshot consistency, and `SERIALIZABLE` (or a shared guard-row lock followed by every writer) when invariants span multiple rows. Local WAL `fsync` protects against single-node power loss—not disk corruption or site-wide outages.\n\n**Failure Modes & Application:** On serialization (`40001`) or deadlock (`40P01`) errors, roll back explicitly, apply jittered backoff, retry the entire transaction from `BEGIN`, and keep external HTTP or webhook calls outside the transaction."
+  },
+  "learningJourney": [
+    {
+      "id": "01-what-it-is",
+      "eyebrow": "STAGE 01 · THE MECHANISM",
+      "title": "What are ACID Transactions",
+      "level": "L4 · FUNDAMENTALS",
+      "purpose": "The mechanism: understand what each ACID letter actually guarantees—and where engine configuration or application logic is required.",
+      "explanation": {
+        "foundation": "In plain terms, a **transaction** groups one or more database reads and writes into a single logical unit of work. **ACID** defines four properties that keep data reliable when crashes or concurrent requests happen:",
+        "core": "- **Atomicity (All-or-Nothing):** Either every change in the transaction takes effect, or none of them become visible. How engines achieve this varies. **PostgreSQL** uses **MVCC (Multi-Version Concurrency Control)** tuple headers (`xmin` and `xmax`), the **CLOG (Commit Log**, stored in `pg_xact`), and the **WAL (Write-Ahead Log**, stored in `pg_wal`). Uncommitted row versions are never marked committed in the CLOG, so readers ignore them and background `VACUUM` reclaims them later. By contrast, undo-based engines like **MySQL InnoDB** modify pages in place and actively roll back uncommitted changes using undo logs.\n- **Consistency (Enforced Rules Stay Valid):** A transaction moves the database from one valid state to another—*for the constraints the database actually defines and enforces* (`CHECK`, `UNIQUE`, `FOREIGN KEY`, `NOT NULL`). ACID does **not** automatically enforce every business rule. Rules spanning multiple rows or tables still require explicit transaction boundaries, constraints, locking, or `SERIALIZABLE` isolation.\n- **Isolation (Shielded Concurrency):** Concurrent transactions should not expose half-finished updates or corrupt each other's invariants. Engines enforce this using MVCC snapshots, row locks, or dependency tracking.\n- **Durability (Crash Survival Under Configured Flush Rules):** Once `COMMIT` succeeds, committed changes survive a process crash or power loss *assuming* durable settings are enabled (in PostgreSQL, `fsync = on`, `synchronous_commit = on`, and `full_page_writes = on`) on non-volatile storage. Local WAL flushing does **not** by itself protect against silent disk corruption, asynchronous replica lag, or site-level disasters—those require checksums, synchronous replication, and multi-region backups.",
+        "deepDive": "In production deployments of ACID Transaction Fundamentals, watch how what are acid transactions interacts with tail latency, retry amplification, and partial failures. ACID groups four guarantees for a database transaction: Atomicity (all-or-nothing), Consistency (enforced rules stay valid), Isolation (concurrent work does not expose partial state), and Durability (committed changes survive a crash under configured disk-flush settings)."
+      },
+      "sectionDiagram": {
+        "kind": "wal-mvcc",
+        "eyebrow": "Storage Engine Mechanics",
+        "title": "WAL + MVCC Commit & Crash-Recovery Architecture",
+        "nodes": [
+          {
+            "label": "SQL Client (txid=8421)",
+            "role": "BEGIN; UPDATE; COMMIT"
+          },
+          {
+            "label": "Buffer Pool + MVCC",
+            "role": "xmin=8421 / xmax=8421"
+          },
+          {
+            "label": "WAL (pg_wal Sequential)",
+            "role": "WAL fsync before commit ack"
+          },
+          {
+            "label": "CLOG (pg_xact) + Heap",
+            "role": "Commit status + lazy flush"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Write-Ahead Rule",
+            "detail": "WAL records are flushed to disk via fsync before modified heap pages are written or COMMIT returns success."
+          },
+          {
+            "label": "MVCC Visibility",
+            "detail": "The old row keeps xmax=8421 and the new row gets xmin=8421; readers check CLOG (pg_xact) to see only committed versions."
+          },
+          {
+            "label": "Crash Recovery",
+            "detail": "On restart, REDO replays WAL records to restore pages, while transactions without a committed CLOG status remain invisible to MVCC readers."
+          }
+        ],
+        "summary": "Caption: A commit is acknowledged only after WAL records are flushed to disk; on crash recovery, WAL REDO restores logged changes while CLOG + MVCC ensure only committed transactions are visible."
+      }
+    },
+    {
+      "id": "02-why-we-need-it",
+      "eyebrow": "STAGE 02 · THE PROBLEM",
+      "title": "Why we need ACID (and how Write Skew breaks weak isolation)",
+      "level": "L4 · FUNDAMENTALS",
+      "purpose": "The problem: see how crashes and concurrent reads break multi-step invariants, and trace Write Skew step by step.",
+      "explanation": {
+        "foundation": "Without atomicity, a crash between debiting `acct_A` and crediting `acct_B` destroys money permanently. Without isolation, two concurrent withdrawals can both read the same balance, pass validation, and overdraw the account.",
+        "core": "Even with transactions enabled, **isolation-level names can behave differently across databases**. For example, PostgreSQL aliases `READ UNCOMMITTED` to `READ COMMITTED` (so dirty reads never occur) and implements `REPEATABLE READ` using **Snapshot Isolation** (which prevents phantom reads in PostgreSQL, unlike the minimum ANSI SQL standard).\n\nHowever, Snapshot Isolation still permits **Write Skew** when an invariant spans multiple rows:\n\n1. **Invariant:** At least **1 doctor** must remain on call (`count(on_call = true) >= 1`). Initially, both Dr. Alice and Dr. Bob are on call (`count = 2`).\n2. **Tx 1 Read (Dr. Alice):** Reads `SELECT count(*) FROM doctors WHERE on_call = true` under its snapshot and sees `2`.\n3. **Tx 2 Read (Dr. Bob):** Concurrently reads the same snapshot and also sees `2`.\n4. **Tx 1 Update:** Updates **Alice's row** (`on_call = false`) and commits.\n5. **Tx 2 Update:** Updates **Bob's row** (`on_call = false`) and commits.\n6. **Violation:** Because Tx 1 and Tx 2 modified **disjoint rows**, Snapshot Isolation detects no write-write conflict. Both commit—leaving **0 doctors on call**.",
+        "deepDive": "To prevent Write Skew, either use `SERIALIZABLE` (**SSI**, Serializable Snapshot Isolation, which detects read-write dependency cycles) or take an explicit lock (`SELECT ... FOR UPDATE`) on a shared guard/parent row. Note that a shared-row lock works **only if every transaction that modifies on-call status follows the exact same locking protocol**."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Concurrency Anomaly",
+        "title": "Write Skew Sequence Under Snapshot Isolation",
+        "actors": [
+          {
+            "id": "t1",
+            "label": "Tx 1 (Dr. Alice)"
+          },
+          {
+            "id": "db",
+            "label": "MVCC Snapshot"
+          },
+          {
+            "id": "t2",
+            "label": "Tx 2 (Dr. Bob)"
+          }
+        ],
+        "events": [
+          {
+            "from": "t1",
+            "to": "db",
+            "label": "1. Read on_call count -> 2",
+            "status": "ok"
+          },
+          {
+            "from": "t2",
+            "to": "db",
+            "label": "2. Read on_call count -> 2",
+            "status": "ok"
+          },
+          {
+            "from": "t1",
+            "to": "db",
+            "label": "3. UPDATE Alice on_call=false",
+            "status": "ok"
+          },
+          {
+            "from": "t2",
+            "to": "db",
+            "label": "4. UPDATE Bob on_call=false",
+            "status": "warn"
+          },
+          {
+            "from": "t1",
+            "to": "db",
+            "label": "5. COMMIT Alice (OK)",
+            "status": "ok"
+          },
+          {
+            "from": "t2",
+            "to": "db",
+            "label": "6. COMMIT Bob -> 0 on call!",
+            "status": "fail"
+          }
+        ],
+        "summary": "Caption: Snapshot Isolation allows disjoint-row updates to commit concurrently; SSI (SERIALIZABLE) or a shared guard-row lock enforced by all writers prevents the invariant violation."
+      },
+      "ideas": [
+        {
+          "title": "Engine-Specific Isolation Names",
+          "description": "Always check your engine's implementation: PostgreSQL REPEATABLE READ uses Snapshot Isolation (no phantoms), whereas MySQL InnoDB REPEATABLE READ uses MVCC reads with next-key gap locks for locking reads."
+        },
+        {
+          "title": "Shared-Row Lock Protocol",
+          "description": "Locking a shared parent row with SELECT ... FOR UPDATE prevents write skew only if every code path mutating that invariant acquires the same lock first."
+        }
+      ],
+      "decisionFramework": {
+        "problem": "How to implement ACID Transaction Fundamentals without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "When concurrent writes contend on shared state, ACID is not a single on/off switch: durability depends on WAL flush configuration and storage reliability, while isolation is chosen by the invariant your application must protect—not by habit.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When ACID Transaction Fundamentals experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-where-it-is-used",
+      "eyebrow": "STAGE 03 · WHERE IT IS USED",
+      "title": "Where ACID Transactions belong (and where to avoid them)",
+      "level": "L5 · APPLIED DESIGN",
+      "purpose": "Scope boundary: match single-database ACID commits to local invariants and keep external network I/O outside transaction locks.",
+      "explanation": {
+        "foundation": "Think of **Where ACID Transactions belong (and where to avoid them)** as the intuition layer for ACID Transaction Fundamentals: Scope boundary: match single-database ACID commits to local invariants and keep external network I/O outside transaction locks.",
+        "core": "ACID transactions excel for **single-database financial ledgers, inventory reservations, and multi-table state transitions**. By contrast, holding a database transaction open across external HTTP calls or message-broker publishes creates lock queues and exhausts connection pools.",
+        "deepDive": "Under heavy load or partial failure, where acid transactions belong (and where to avoid them) becomes a critical lever for predictable latency and correctness. ACID groups four guarantees for a database transaction: Atomicity (all-or-nothing), Consistency (enforced rules stay valid), Isolation (concurrent work does not expose partial state), and Durability (committed changes survive a crash under configured disk-flush settings)."
+      },
+      "comparison": [
+        {
+          "choice": "Financial Ledgers & Double-Entry Transfers",
+          "benefits": [
+            "Atomic debit and credit with SERIALIZABLE or canonical row locking prevents double-spend."
+          ],
+          "costs": [
+            "Hot accounts serialize writes and require app-level retry loops on 40001/40P01."
+          ]
+        },
+        {
+          "choice": "Transactional Outbox (DB + Event Publishing)",
+          "benefits": [
+            "Writes domain state and an outbox row in one local ACID commit, avoiding dual-write drift."
+          ],
+          "costs": [
+            "Needs a CDC (Change Data Capture) relay such as Debezium or a poller to publish events."
+          ]
+        },
+        {
+          "choice": "Avoid: Long-Running Workflows Across External APIs",
+          "benefits": [
+            "Use Saga orchestration with idempotent steps instead of holding DB locks over HTTP."
+          ],
+          "costs": [
+            "A 200 ms external API call inside a transaction stalls connection pools and causes lock timeouts."
+          ]
+        }
+      ]
+    },
+    {
+      "id": "04-how-it-is-managed",
+      "eyebrow": "STAGE 04 · HOW IT IS MANAGED",
+      "title": "How ACID Transactions are tuned, locked, and retried",
+      "level": "L5 · APPLIED DESIGN",
+      "purpose": "Operational control: configure safe durability guardrails, canonical lock ordering, explicit rollbacks, and idempotent retries.",
+      "explanation": {
+        "foundation": "Production tuning pairs durable storage settings with bounded lock waits and safe application retries:",
+        "core": "1. **Durability Guardrails:** Keep `fsync = on`, `synchronous_commit = on`, and `full_page_writes = on` in PostgreSQL (or `innodb_doublewrite = ON` in MySQL InnoDB) to prevent torn pages on power loss.\n2. **Fail-Fast Timeouts:** Set `idle_in_transaction_session_timeout = '30s'` and `lock_timeout = '2s'` so stalled clients abort before blocking `VACUUM` or piling up lock waiters.\n3. **Canonical Lock Ordering:** Lock multi-row targets in ascending primary-key order (`min(fromId, toId)`, then `max(fromId, toId)`) so concurrent transfers cannot form `AB-BA` deadlock cycles (`40P01`).\n4. **Safe Whole-Transaction Retries:** In the Java JDBC example below, assume both accounts live in one PostgreSQL database and that no external side effects (emails, webhooks, payment-gateway HTTP calls) run inside the transaction. On serialization failure (`40001`) or deadlock (`40P01`), the code **explicitly calls `conn.rollback()`**, waits with **jittered exponential backoff**, and retries the **entire transaction from `BEGIN`** on a fresh snapshot.",
+        "deepDive": "In production deployments of ACID Transaction Fundamentals, watch how how acid transactions are tuned, locked, and retried interacts with tail latency, retry amplification, and partial failures. ACID groups four guarantees for a database transaction: Atomicity (all-or-nothing), Consistency (enforced rules stay valid), Isolation (concurrent work does not expose partial state), and Durability (committed changes survive a crash under configured disk-flush settings)."
+      },
+      "markdownContent": "```java\n// Safe double-entry transfer: canonical lock order, explicit rollback, jittered backoff, no external I/O inside TX\npublic void transferFunds(DataSource ds, long fromId, long toId, long amountCents) throws SQLException {\n    long firstLock = Math.min(fromId, toId);\n    long secondLock = Math.max(fromId, toId);\n    int maxAttempts = 4;\n\n    for (int attempt = 0; attempt < maxAttempts; attempt++) {\n        try (Connection conn = ds.getConnection()) {\n            conn.setAutoCommit(false);\n            conn.setTransactionIsolation(Connection.TRANSACTION_SERIALIZABLE);\n\n            try {\n                try (PreparedStatement lockStmt = conn.prepareStatement(\n                        \"SELECT id, balance_cents FROM accounts WHERE id IN (?, ?) ORDER BY id FOR UPDATE\")) {\n                    lockStmt.setLong(1, firstLock);\n                    lockStmt.setLong(2, secondLock);\n                    lockStmt.executeQuery();\n                }\n\n                try (PreparedStatement debit = conn.prepareStatement(\n                        \"UPDATE accounts SET balance_cents = balance_cents - ? WHERE id = ? AND balance_cents >= ?\")) {\n                    debit.setLong(1, amountCents);\n                    debit.setLong(2, fromId);\n                    debit.setLong(3, amountCents);\n                    if (debit.executeUpdate() != 1) {\n                        throw new IllegalStateException(\"Insufficient funds\");\n                    }\n                }\n\n                try (PreparedStatement credit = conn.prepareStatement(\n                        \"UPDATE accounts SET balance_cents = balance_cents + ? WHERE id = ?\")) {\n                    credit.setLong(1, amountCents);\n                    credit.setLong(2, toId);\n                    credit.executeUpdate();\n                }\n\n                conn.commit();\n                return;\n            } catch (SQLException | RuntimeException ex) {\n                try { conn.rollback(); } catch (SQLException suppressed) { ex.addSuppressed(suppressed); }\n                throw ex;\n            }\n        } catch (SQLException ex) {\n            String state = ex.getSQLState();\n            boolean retryable = \"40001\".equals(state) || \"40P01\".equals(state);\n            if (retryable && attempt < maxAttempts - 1) {\n                long backoffMs = (20L << attempt) + ThreadLocalRandom.current().nextLong(25L);\n                try { Thread.sleep(backoffMs); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); throw ex; }\n                continue;\n            }\n            throw ex;\n        }\n    }\n}\n```",
+      "sectionDiagram": {
+        "kind": "behavior-transition",
+        "eyebrow": "Design Trade-Off",
+        "title": "How ACID Transactions are tuned, locked, and retried",
+        "before": {
+          "label": "Seq Scan + Unbounded Bloat",
+          "metrics": [
+            "Implicit cast breaks B-Tree",
+            "Deadlock or XID wraparound risk",
+            "Long tx blocks VACUUM"
+          ]
+        },
+        "after": {
+          "label": "Indexed Plan + Bounded MVCC",
+          "metrics": [
+            "Index-only scan in <2 ms",
+            "Deterministic lock ordering",
+            "Autovacuum keeps bloat flat"
+          ]
+        }
+      }
+    },
+    {
+      "id": "05-alternatives",
+      "eyebrow": "STAGE 05 · THE TRADE-OFF",
+      "title": "Choosing Isolation Levels by Application Invariant",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "purpose": "The production trade-off: select READ COMMITTED, REPEATABLE READ, or SERIALIZABLE based on the invariant you must preserve.",
+      "explanation": {
+        "foundation": "Pick the weakest isolation level that still protects your application's invariant. In **PostgreSQL**:",
+        "core": "- **Choose `READ COMMITTED`** (PostgreSQL default) when statements mutate independent single rows or use atomic `UPDATE ... WHERE balance >= amount` checks that do not depend on earlier reads in the same transaction.\n- **Choose `REPEATABLE READ`** (Snapshot Isolation in PostgreSQL) when a transaction runs multiple `SELECT` queries—such as financial reports or multi-table exports—that must observe one consistent point-in-time snapshot.\n- **Choose `SERIALIZABLE`** (SSI in PostgreSQL) when correctness depends on a **multi-row invariant** where concurrent transactions read overlapping sets and update disjoint rows (such as on-call scheduling or unique quota budgets), and you cannot route all writers through a shared guard-row lock.",
+        "deepDive": "Keep in mind that isolation-level guarantees differ in other engines (for example, MySQL InnoDB's `REPEATABLE READ` uses MVCC for plain `SELECT`s and gap/next-key locks for `FOR UPDATE`)."
+      },
+      "comparison": [
+        {
+          "choice": "READ COMMITTED (PostgreSQL Default)",
+          "benefits": [
+            "Best for independent single-row writes and atomic conditional UPDATEs; minimal abort overhead."
+          ],
+          "costs": [
+            "Each statement sees a new snapshot, allowing non-repeatable reads and write skew."
+          ]
+        },
+        {
+          "choice": "REPEATABLE READ (PostgreSQL Snapshot Isolation)",
+          "benefits": [
+            "Best for multi-query analytical reads and consistent snapshots; prevents phantoms in PostgreSQL."
+          ],
+          "costs": [
+            "Allows write skew on disjoint rows; concurrent updates to the same row abort with 40001."
+          ]
+        },
+        {
+          "choice": "SERIALIZABLE (PostgreSQL SSI)",
+          "benefits": [
+            "Best for multi-row invariants (write skew, read-only anomalies) without coarse table locks."
+          ],
+          "costs": [
+            "Higher 40001 abort rate under contention; requires full-transaction retry loops."
+          ]
+        }
+      ],
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "Lifecycle & Failure Recovery",
+        "title": "Choosing Isolation Levels by Application Invariant",
+        "states": [
+          {
+            "id": "active",
+            "label": "Tx Active (Snapshot)",
+            "tone": "info"
+          },
+          {
+            "id": "locked",
+            "label": "Row Lock Held",
+            "tone": "info"
+          },
+          {
+            "id": "committed",
+            "label": "WAL Flushed",
+            "tone": "good"
+          },
+          {
+            "id": "conflict",
+            "label": "Serialization Retry",
+            "tone": "warn"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "active",
+            "to": "locked",
+            "label": "index scan"
+          },
+          {
+            "from": "locked",
+            "to": "committed",
+            "label": "fsync WAL"
+          },
+          {
+            "from": "locked",
+            "to": "conflict",
+            "label": "deadlock / skew"
+          }
+        ]
+      }
+    },
+    {
+      "id": "06-production-architecture",
+      "eyebrow": "STAGE 06 · PRODUCTION ARCHITECTURE",
+      "title": "Production example: Group Commit WAL + Transactional Outbox",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "purpose": "Production architecture: scale durable commits with WAL group commit and bridge external events safely via CDC.",
+      "explanation": {
+        "foundation": "High-throughput payment and order systems pair **NVMe-backed WAL group commit** (`commit_delay` batching concurrent `COMMIT` flushes into one `fsync`) with the **Transactional Outbox** pattern.",
+        "core": "Domain state and an `outbox_events` row commit atomically in one local transaction.",
+        "deepDive": "Afterward, a **CDC (Change Data Capture)** relay such as Debezium tails `pg_wal` asynchronously and publishes events to Kafka—keeping slow network I/O completely outside database locks."
+      },
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "Transaction Lifecycle",
+        "title": "ACID Transaction & Retry State Machine",
+        "states": [
+          {
+            "id": "active",
+            "label": "ACTIVE",
+            "sublabel": "MVCC snapshot + locks",
+            "tone": "blue"
+          },
+          {
+            "id": "committed",
+            "label": "COMMITTED",
+            "sublabel": "WAL fsync + CLOG ack",
+            "tone": "green"
+          },
+          {
+            "id": "aborted",
+            "label": "ABORTED (40001)",
+            "sublabel": "Rollback + clean state",
+            "tone": "amber"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "active",
+            "to": "committed",
+            "label": "WAL flushed OK"
+          },
+          {
+            "from": "active",
+            "to": "aborted",
+            "label": "40001 / 40P01 / crash"
+          },
+          {
+            "from": "aborted",
+            "to": "active",
+            "label": "Rollback + jittered retry"
+          }
+        ],
+        "summary": "Caption: Transactions either commit atomically after WAL fsync or roll back cleanly with zero partial writes, enabling safe full-transaction retries."
+      }
+    },
+    {
+      "id": "07-problems-and-further-reading",
+      "eyebrow": "STAGE 07 · PROBLEMS SOLVED & FURTHER DEEP DIVE",
+      "title": "Problems solved by ACID Transactions & System Design Deep Dives",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "purpose": "Apply ACID internals to concrete production incidents and distributed design problems.",
+      "explanation": {
+        "foundation": "Think of **Problems solved by ACID Transactions & System Design Deep Dives** as the intuition layer for ACID Transaction Fundamentals: Apply ACID internals to concrete production incidents and distributed design problems.",
+        "core": "Explore how ACID internals—MVCC snapshots, InnoDB gap locks, transaction ID wraparound, and CDC transactional outboxes—manifest in real production incidents.",
+        "deepDive": "Under heavy load or partial failure, problems solved by acid transactions & system design deep dives becomes a critical lever for predictable latency and correctness. ACID groups four guarantees for a database transaction: Atomicity (all-or-nothing), Consistency (enforced rules stay valid), Isolation (concurrent work does not expose partial state), and Durability (committed changes survive a crash under configured disk-flush settings)."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "sql-isolation-levels",
+          "title": "Problem: SQL Isolation Levels & Phantom Reads",
+          "kind": "problem"
+        },
+        {
+          "slug": "mysql-innodb-gap",
+          "title": "Problem: MySQL InnoDB Gap Lock Deadlocks",
+          "kind": "problem"
+        },
+        {
+          "slug": "ab-ba-lock",
+          "title": "Problem: Preventing AB-BA Lock Deadlocks",
+          "kind": "problem"
+        },
+        {
+          "slug": "transactional-outbox-cdc",
+          "title": "Problem: Transactional Outbox with CDC",
+          "kind": "problem"
+        },
+        {
+          "slug": "database-isolation-levels",
+          "title": "Concept: Database Isolation Levels & Anomalies",
+          "kind": "concept"
+        }
+      ],
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Request & State Flow",
+        "title": "Problems solved by ACID Transactions & System Design Deep Dives",
+        "actors": [
+          {
+            "id": "tx",
+            "label": "Client Tx"
+          },
+          {
+            "id": "plan",
+            "label": "Planner / Lock Mgr"
+          },
+          {
+            "id": "wal",
+            "label": "WAL / MemTable"
+          },
+          {
+            "id": "disk",
+            "label": "Heap / SSTable"
+          }
+        ],
+        "events": [
+          {
+            "from": "tx",
+            "to": "plan",
+            "label": "Acquire snapshot / index plan"
+          },
+          {
+            "from": "plan",
+            "to": "wal",
+            "label": "Append redo record + fsync WAL"
+          },
+          {
+            "from": "wal",
+            "to": "disk",
+            "label": "Flush dirty pages / compact SSTables"
+          },
+          {
+            "from": "plan",
+            "to": "tx",
+            "label": "Commit & release row locks"
+          }
+        ]
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Two doctors concurrently read `SELECT count(*) FROM doctors WHERE on_call = true` (getting 2) under PostgreSQL REPEATABLE READ, and each sets their own row to `on_call = false`. Both commit, leaving 0 doctors on call. What anomaly occurred and what fixes it?",
+      "options": [
+        {
+          "id": "a",
+          "text": "Dirty Read; switch to READ COMMITTED",
+          "correct": false,
+          "feedback": "PostgreSQL never allows dirty reads, and READ COMMITTED is weaker than REPEATABLE READ."
+        },
+        {
+          "id": "b",
+          "text": "Write Skew; use SERIALIZABLE (SSI) or require all writers to lock a shared guard row with FOR UPDATE",
+          "correct": true,
+          "feedback": "Correct: Snapshot Isolation (REPEATABLE READ in PostgreSQL) allows write skew on disjoint rows; SERIALIZABLE (SSI) or a shared guard-row lock followed by every writer preserves the invariant."
+        },
+        {
+          "id": "c",
+          "text": "Phantom Read; add a B-Tree index on on_call",
+          "correct": false,
+          "feedback": "PostgreSQL Snapshot Isolation already prevents phantoms, and an index alone does not serialize disjoint-row invariants."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Two doctors concurrently read `SELECT count(*) FROM doctors WHERE on_call = true` (getting 2) under PostgreSQL REPEATABLE READ, and each sets their own row to `on_call = false`. Both commit, leaving 0 doctors on call. What anomaly occurred and what fixes it?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Dirty Read; switch to READ COMMITTED",
+            "correct": false,
+            "feedback": "PostgreSQL never allows dirty reads, and READ COMMITTED is weaker than REPEATABLE READ."
+          },
+          {
+            "id": "b",
+            "text": "Write Skew; use SERIALIZABLE (SSI) or require all writers to lock a shared guard row with FOR UPDATE",
+            "correct": true,
+            "feedback": "Correct: Snapshot Isolation (REPEATABLE READ in PostgreSQL) allows write skew on disjoint rows; SERIALIZABLE (SSI) or a shared guard-row lock followed by every writer preserves the invariant."
+          },
+          {
+            "id": "c",
+            "text": "Phantom Read; add a B-Tree index on on_call",
+            "correct": false,
+            "feedback": "PostgreSQL Snapshot Isolation already prevents phantoms, and an index alone does not serialize disjoint-row invariants."
+          }
+        ]
+      },
+      {
+        "question": "When is PostgreSQL READ COMMITTED sufficient instead of REPEATABLE READ or SERIALIZABLE?",
+        "options": [
+          {
+            "id": "a",
+            "text": "When transactions must run multiple SELECTs that observe one frozen point-in-time snapshot",
+            "correct": false,
+            "feedback": "Not quite: multi-query snapshot consistency requires REPEATABLE READ (Snapshot Isolation) because READ COMMITTED takes a fresh snapshot per statement."
+          },
+          {
+            "id": "b",
+            "text": "When updates touch independent single rows or enforce invariants in one atomic UPDATE ... WHERE statement",
+            "correct": true,
+            "feedback": "Correct: single-row atomic updates (like UPDATE accounts SET balance = balance - $1 WHERE id = $2 AND balance >= $1) do not depend on earlier reads in the transaction, so READ COMMITTED is safe and minimizes aborts."
+          },
+          {
+            "id": "c",
+            "text": "Whenever a business rule spans multiple rows across different tables",
+            "correct": false,
+            "feedback": "Incorrect: multi-row invariants can suffer write skew under READ COMMITTED and REPEATABLE READ, requiring SERIALIZABLE or explicit shared locking."
+          }
+        ]
+      },
+      {
+        "question": "Your application catches PostgreSQL serialization failure SQLSTATE 40001 mid-transaction after already sending a confirmation webhook. What is wrong with simply retrying the failed SQL statement?",
+        "options": [
+          {
+            "id": "a",
+            "text": "You must roll back and retry the entire transaction from BEGIN on a fresh snapshot, and external webhooks must never run inside a retryable transaction",
+            "correct": true,
+            "feedback": "Correct: a 40001 abort invalidates the whole transaction snapshot, so you must roll back, sleep with jittered backoff, and restart from BEGIN—and keep external side effects (like webhooks) outbox-driven after commit."
+          },
+          {
+            "id": "b",
+            "text": "You can ignore 40001 and call COMMIT anyway because WAL already logged the earlier statements",
+            "correct": false,
+            "feedback": "Incorrect: after a 40001 error, the transaction is aborted and cannot commit; any subsequent statements fail until ROLLBACK."
+          },
+          {
+            "id": "c",
+            "text": "Setting fsync = off eliminates 40001 serialization failures",
+            "correct": false,
+            "feedback": "Incorrect: fsync controls disk durability, whereas 40001 comes from concurrency conflicts under REPEATABLE READ or SERIALIZABLE."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** ACID ensures a transaction is all-or-nothing (Atomicity), preserves enforced constraints (Consistency), shields concurrent users from partial edits (Isolation), and survives crashes once WAL records are flushed to disk (Durability).\n\n**How It Flows:** `SQL Client` -> `Buffer Pool + MVCC` -> `WAL (fsync)` -> `CLOG + Heap Pages`. On conflict (`40001`/`40P01`), the transaction rolls back cleanly and restarts from `BEGIN`.\n\n**Why Beginners Should Care:** Even with transactions on, Snapshot Isolation allows **Write Skew** on disjoint rows (e.g., two doctors both going off-call) unless you use `SERIALIZABLE` or a shared guard-row lock followed by every writer.",
+      "spark": {
+        "summary": "ACID groups database operations into an all-or-nothing unit, keeps enforced constraints valid, isolates concurrent work, and survives crashes when WAL disk flushing is enabled.",
+        "keyTakeaway": "Choose isolation levels by the invariant you must protect, and always roll back and retry the full transaction from BEGIN on 40001/40P01 errors."
+      },
+      "learningJourney": [
+        {
+          "id": "01-what-it-is",
+          "title": "What are ACID Transactions",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: learn the plain-English meaning of Atomicity, Consistency, Isolation, and Durability.",
+          "explanation": "A **transaction** groups database reads and writes into one all-or-nothing unit. **Atomicity** guarantees every step succeeds or none become visible. **Consistency** ensures enforced database constraints (`CHECK`, `UNIQUE`, `FOREIGN KEY`) stay valid—though multi-row business rules still need proper transaction logic. **Isolation** hides half-finished work from other users. **Durability** keeps committed data safe after a crash when WAL (Write-Ahead Log) disk flushing (`fsync`) is enabled.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [
+            "Why does ACID not automatically enforce every cross-row business rule without constraints or isolation?"
+          ],
+          "sectionDiagram": {
+            "kind": "wal-mvcc",
+            "eyebrow": "Storage Engine Mechanics",
+            "title": "WAL + MVCC Commit & Crash-Recovery Architecture",
+            "nodes": [
+              {
+                "label": "SQL Client (txid=8421)",
+                "role": "BEGIN; UPDATE; COMMIT"
+              },
+              {
+                "label": "Buffer Pool + MVCC",
+                "role": "xmin=8421 / xmax=8421"
+              },
+              {
+                "label": "WAL (pg_wal Sequential)",
+                "role": "WAL fsync before commit ack"
+              },
+              {
+                "label": "CLOG (pg_xact) + Heap",
+                "role": "Commit status + lazy flush"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Write-Ahead Rule",
+                "detail": "WAL records are flushed to disk via fsync before modified heap pages are written or COMMIT returns success."
+              },
+              {
+                "label": "MVCC Visibility",
+                "detail": "The old row keeps xmax=8421 and the new row gets xmin=8421; readers check CLOG (pg_xact) to see only committed versions."
+              },
+              {
+                "label": "Crash Recovery",
+                "detail": "On restart, REDO replays WAL records to restore pages, while transactions without a committed CLOG status remain invisible to MVCC readers."
+              }
+            ],
+            "summary": "Caption: A commit is acknowledged only after WAL records are flushed to disk; on crash recovery, WAL REDO restores logged changes while CLOG + MVCC ensure only committed transactions are visible."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-why-we-need-it",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see how concurrent transactions can break a multi-row rule (Write Skew).",
+          "explanation": "Suppose a hospital rule says **at least 1 doctor must remain on call**. Currently Dr. Alice and Dr. Bob are both on call (`count = 2`). Both check the count at the same time (both see `2`), then Alice updates *her* row to off-call and Bob updates *his* row to off-call. Because they edited different rows, Snapshot Isolation lets both commit—leaving `0` doctors on call (**Write Skew**). Using `SERIALIZABLE` isolation or locking a shared guard row (by every writer) prevents this.",
+          "ideas": [
+            {
+              "title": "Engine-Specific Isolation Names",
+              "description": "Always check your engine's implementation: PostgreSQL REPEATABLE READ uses Snapshot Isolation (no phantoms), whereas MySQL InnoDB REPEATABLE READ uses MVCC reads with next-key gap locks for locking reads."
+            },
+            {
+              "title": "Shared-Row Lock Protocol",
+              "description": "Locking a shared parent row with SELECT ... FOR UPDATE prevents write skew only if every code path mutating that invariant acquires the same lock first."
+            }
+          ],
+          "example": null,
+          "reflectionQuestions": [
+            "Why did Snapshot Isolation allow both Dr. Alice and Dr. Bob to commit?"
+          ],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Concurrency Anomaly",
+            "title": "Write Skew Sequence Under Snapshot Isolation",
+            "actors": [
+              {
+                "id": "t1",
+                "label": "Tx 1 (Dr. Alice)"
+              },
+              {
+                "id": "db",
+                "label": "MVCC Snapshot"
+              },
+              {
+                "id": "t2",
+                "label": "Tx 2 (Dr. Bob)"
+              }
+            ],
+            "events": [
+              {
+                "from": "t1",
+                "to": "db",
+                "label": "1. Read on_call count -> 2",
+                "status": "ok"
+              },
+              {
+                "from": "t2",
+                "to": "db",
+                "label": "2. Read on_call count -> 2",
+                "status": "ok"
+              },
+              {
+                "from": "t1",
+                "to": "db",
+                "label": "3. UPDATE Alice on_call=false",
+                "status": "ok"
+              },
+              {
+                "from": "t2",
+                "to": "db",
+                "label": "4. UPDATE Bob on_call=false",
+                "status": "warn"
+              },
+              {
+                "from": "t1",
+                "to": "db",
+                "label": "5. COMMIT Alice (OK)",
+                "status": "ok"
+              },
+              {
+                "from": "t2",
+                "to": "db",
+                "label": "6. COMMIT Bob -> 0 on call!",
+                "status": "fail"
+              }
+            ],
+            "summary": "Caption: Snapshot Isolation allows disjoint-row updates to commit concurrently; SSI (SERIALIZABLE) or a shared guard-row lock enforced by all writers prevents the invariant violation."
+          },
+          "level": "L3 · FOUNDATIONS",
+          "title": "Why we need ACID (and how Write Skew breaks weak isolation)"
+        },
+        {
+          "id": "03-where-it-is-used",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "Scope boundary: know when to use local ACID transactions vs. asynchronous Sagas/Outbox.",
+          "explanation": "Use local ACID transactions for single-database money transfers and inventory holds. Avoid holding a database transaction open while calling slow external HTTP APIs—instead, commit state + an outbox event locally and publish asynchronously.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [
+            "What happens to database connection pools if a transaction waits on a 200 ms HTTP call?"
+          ],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS",
+          "title": "Where ACID Transactions belong (and where to avoid them)"
+        },
+        {
+          "id": "06-production-architecture",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Safe retries: roll back cleanly on conflict and retry the full transaction.",
+          "explanation": "When two transactions collide (`40001` serialization failure or `40P01` deadlock), the database aborts one cleanly. Your app should call `rollback()`, wait briefly with jittered backoff, and retry the entire transaction from `BEGIN`—keeping external side effects like emails outside the transaction.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [
+            "Why must you retry from BEGIN instead of re-running only the last SQL statement?"
+          ],
+          "sectionDiagram": {
+            "kind": "state-machine",
+            "eyebrow": "Transaction Lifecycle",
+            "title": "ACID Transaction & Retry State Machine",
+            "states": [
+              {
+                "id": "active",
+                "label": "ACTIVE",
+                "sublabel": "MVCC snapshot + locks",
+                "tone": "blue"
+              },
+              {
+                "id": "committed",
+                "label": "COMMITTED",
+                "sublabel": "WAL fsync + CLOG ack",
+                "tone": "green"
+              },
+              {
+                "id": "aborted",
+                "label": "ABORTED (40001)",
+                "sublabel": "Rollback + clean state",
+                "tone": "amber"
+              }
+            ],
+            "transitions": [
+              {
+                "from": "active",
+                "to": "committed",
+                "label": "WAL flushed OK"
+              },
+              {
+                "from": "active",
+                "to": "aborted",
+                "label": "40001 / 40P01 / crash"
+              },
+              {
+                "from": "aborted",
+                "to": "active",
+                "label": "Rollback + jittered retry"
+              }
+            ],
+            "summary": "Caption: Transactions either commit atomically after WAL fsync or roll back cleanly with zero partial writes, enabling safe full-transaction retries."
+          },
+          "level": "L3 · FOUNDATIONS",
+          "title": "Production example: Group Commit WAL + Transactional Outbox"
+        }
+      ],
+      "finalSummary": "Start with plain ACID boundaries, keep external HTTP calls out of transactions, and use SERIALIZABLE or shared locking when invariants span multiple rows.",
+      "summary": "ACID groups four guarantees for a database transaction: Atomicity (all-or-nothing), Consistency (enforced rules stay valid), Isolation (concurrent work does not expose partial state), and Durability (committed changes survive a crash under configured disk-flush settings).",
+      "keyTakeaway": "When concurrent writes contend on shared state, ACID is not a single on/off switch: durability depends on WAL flush configuration and storage reliability, while isolation is chosen by the invariant your application must protect—not by habit."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** In plain terms, ACID ensures a group of database operations either finishes completely or leaves no visible trace (Atomicity), keeps enforced schema rules intact (Consistency), shields concurrent readers from partial work (Isolation), and survives process crashes once flushed to non-volatile storage (Durability).\n\n**Visual & Structural Flow:** Covers the Write-Ahead Log (WAL) + Multi-Version Concurrency Control (MVCC) commit and recovery pipeline (`SQL Client` -> `Buffer Pool + MVCC` -> `WAL fsync` -> `CLOG + Heap Pages`), the Write Skew sequence under Snapshot Isolation (`Tx 1 Dr. Alice` & `Tx 2 Dr. Bob`), and the `ACTIVE -> COMMITTED / ABORTED (40001)` retry state machine.\n\n**Trade-Offs & Production:** Choose `READ COMMITTED` for independent single-row updates, `REPEATABLE READ` for multi-query snapshot consistency, and `SERIALIZABLE` (or a shared guard-row lock followed by every writer) when invariants span multiple rows. Local WAL `fsync` protects against single-node power loss—not disk corruption or site-wide outages.\n\n**Failure Modes & Application:** On serialization (`40001`) or deadlock (`40P01`) errors, roll back explicitly, apply jittered backoff, retry the entire transaction from `BEGIN`, and keep external HTTP or webhook calls outside the transaction.",
+      "spark": {
+        "summary": "ACID groups four guarantees for a database transaction: Atomicity (all-or-nothing), Consistency (enforced rules stay valid), Isolation (concurrent work does not expose partial state), and Durability (committed changes survive a crash under configured disk-flush settings).",
+        "keyTakeaway": "ACID is not a single on/off switch: durability depends on WAL flush configuration and storage reliability, while isolation is chosen by the invariant your application must protect—not by habit."
+      },
+      "summary": "ACID groups four guarantees for a database transaction: Atomicity (all-or-nothing), Consistency (enforced rules stay valid), Isolation (concurrent work does not expose partial state), and Durability (committed changes survive a crash under configured disk-flush settings).",
+      "keyTakeaway": "When concurrent writes contend on shared state, ACID is not a single on/off switch: durability depends on WAL flush configuration and storage reliability, while isolation is chosen by the invariant your application must protect—not by habit."
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** PostgreSQL pairs MVCC tuple headers (`xmin`/`xmax`), `pg_xact` (CLOG) commit status, and sequential `pg_wal` `fsync` (`full_page_writes = on`) for crash-safe atomic visibility—distinct from MySQL InnoDB's in-place undo-log rollback.\n\n**Isolation & Write Skew:** Isolation names are engine-specific: PostgreSQL `REPEATABLE READ` is Snapshot Isolation (prevents phantoms, allows Write Skew on disjoint rows). Prevent Write Skew via `SERIALIZABLE` (SSI dependency-cycle detection) or a shared guard-row `FOR UPDATE` protocol followed by all writers.\n\n**Durability & Failure Boundaries:** Local WAL `fsync` protects against single-node power loss under `synchronous_commit = on`, not silent disk corruption, async replica lag, or site outages.\n\n**Safe Retries & Outbox:** Enforce canonical lock ordering (`min(id), max(id)`), `lock_timeout`/`idle_in_transaction_session_timeout`, explicit `conn.rollback()` + jittered backoff on `40001`/`40P01`, and CDC Transactional Outbox so external side effects never execute inside retryable transactions.",
+      "spark": {
+        "summary": "PostgreSQL enforces atomic visibility via MVCC tuple headers + CLOG (`pg_xact`) + `pg_wal` fsync, while SSI (`SERIALIZABLE`) or universal guard-row locking closes Write Skew under Snapshot Isolation.",
+        "keyTakeaway": "Separate general ACID guarantees from engine-specific behavior, qualify durability against replication/site failures, and keep external I/O outbox-driven outside retryable transactions."
+      },
+      "learningJourney": [
+        {
+          "id": "01-what-it-is",
+          "eyebrow": "STAGE 01 · THE MECHANISM",
+          "title": "What are ACID Transactions",
+          "level": "L4 · FUNDAMENTALS",
+          "purpose": "The mechanism: understand what each ACID letter actually guarantees—and where engine configuration or application logic is required.",
+          "explanation": "In plain terms, a **transaction** groups one or more database reads and writes into a single logical unit of work. **ACID** defines four properties that keep data reliable when crashes or concurrent requests happen:\n\n- **Atomicity (All-or-Nothing):** Either every change in the transaction takes effect, or none of them become visible. How engines achieve this varies. **PostgreSQL** uses **MVCC (Multi-Version Concurrency Control)** tuple headers (`xmin` and `xmax`), the **CLOG (Commit Log**, stored in `pg_xact`), and the **WAL (Write-Ahead Log**, stored in `pg_wal`). Uncommitted row versions are never marked committed in the CLOG, so readers ignore them and background `VACUUM` reclaims them later. By contrast, undo-based engines like **MySQL InnoDB** modify pages in place and actively roll back uncommitted changes using undo logs.\n- **Consistency (Enforced Rules Stay Valid):** A transaction moves the database from one valid state to another—*for the constraints the database actually defines and enforces* (`CHECK`, `UNIQUE`, `FOREIGN KEY`, `NOT NULL`). ACID does **not** automatically enforce every business rule. Rules spanning multiple rows or tables still require explicit transaction boundaries, constraints, locking, or `SERIALIZABLE` isolation.\n- **Isolation (Shielded Concurrency):** Concurrent transactions should not expose half-finished updates or corrupt each other's invariants. Engines enforce this using MVCC snapshots, row locks, or dependency tracking.\n- **Durability (Crash Survival Under Configured Flush Rules):** Once `COMMIT` succeeds, committed changes survive a process crash or power loss *assuming* durable settings are enabled (in PostgreSQL, `fsync = on`, `synchronous_commit = on`, and `full_page_writes = on`) on non-volatile storage. Local WAL flushing does **not** by itself protect against silent disk corruption, asynchronous replica lag, or site-level disasters—those require checksums, synchronous replication, and multi-region backups.",
+          "sectionDiagram": {
+            "kind": "wal-mvcc",
+            "eyebrow": "Storage Engine Mechanics",
+            "title": "WAL + MVCC Commit & Crash-Recovery Architecture",
+            "nodes": [
+              {
+                "label": "SQL Client (txid=8421)",
+                "role": "BEGIN; UPDATE; COMMIT"
+              },
+              {
+                "label": "Buffer Pool + MVCC",
+                "role": "xmin=8421 / xmax=8421"
+              },
+              {
+                "label": "WAL (pg_wal Sequential)",
+                "role": "WAL fsync before commit ack"
+              },
+              {
+                "label": "CLOG (pg_xact) + Heap",
+                "role": "Commit status + lazy flush"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Write-Ahead Rule",
+                "detail": "WAL records are flushed to disk via fsync before modified heap pages are written or COMMIT returns success."
+              },
+              {
+                "label": "MVCC Visibility",
+                "detail": "The old row keeps xmax=8421 and the new row gets xmin=8421; readers check CLOG (pg_xact) to see only committed versions."
+              },
+              {
+                "label": "Crash Recovery",
+                "detail": "On restart, REDO replays WAL records to restore pages, while transactions without a committed CLOG status remain invisible to MVCC readers."
+              }
+            ],
+            "summary": "Caption: A commit is acknowledged only after WAL records are flushed to disk; on crash recovery, WAL REDO restores logged changes while CLOG + MVCC ensure only committed transactions are visible."
+          }
+        },
+        {
+          "id": "02-why-we-need-it",
+          "eyebrow": "STAGE 02 · THE PROBLEM",
+          "title": "Why we need ACID (and how Write Skew breaks weak isolation)",
+          "level": "L4 · FUNDAMENTALS",
+          "purpose": "The problem: see how crashes and concurrent reads break multi-step invariants, and trace Write Skew step by step.",
+          "explanation": "Without atomicity, a crash between debiting `acct_A` and crediting `acct_B` destroys money permanently. Without isolation, two concurrent withdrawals can both read the same balance, pass validation, and overdraw the account.\n\nEven with transactions enabled, **isolation-level names can behave differently across databases**. For example, PostgreSQL aliases `READ UNCOMMITTED` to `READ COMMITTED` (so dirty reads never occur) and implements `REPEATABLE READ` using **Snapshot Isolation** (which prevents phantom reads in PostgreSQL, unlike the minimum ANSI SQL standard).\n\nHowever, Snapshot Isolation still permits **Write Skew** when an invariant spans multiple rows:\n\n1. **Invariant:** At least **1 doctor** must remain on call (`count(on_call = true) >= 1`). Initially, both Dr. Alice and Dr. Bob are on call (`count = 2`).\n2. **Tx 1 Read (Dr. Alice):** Reads `SELECT count(*) FROM doctors WHERE on_call = true` under its snapshot and sees `2`.\n3. **Tx 2 Read (Dr. Bob):** Concurrently reads the same snapshot and also sees `2`.\n4. **Tx 1 Update:** Updates **Alice's row** (`on_call = false`) and commits.\n5. **Tx 2 Update:** Updates **Bob's row** (`on_call = false`) and commits.\n6. **Violation:** Because Tx 1 and Tx 2 modified **disjoint rows**, Snapshot Isolation detects no write-write conflict. Both commit—leaving **0 doctors on call**.\n\nTo prevent Write Skew, either use `SERIALIZABLE` (**SSI**, Serializable Snapshot Isolation, which detects read-write dependency cycles) or take an explicit lock (`SELECT ... FOR UPDATE`) on a shared guard/parent row. Note that a shared-row lock works **only if every transaction that modifies on-call status follows the exact same locking protocol**.",
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Concurrency Anomaly",
+            "title": "Write Skew Sequence Under Snapshot Isolation",
+            "actors": [
+              {
+                "id": "t1",
+                "label": "Tx 1 (Dr. Alice)"
+              },
+              {
+                "id": "db",
+                "label": "MVCC Snapshot"
+              },
+              {
+                "id": "t2",
+                "label": "Tx 2 (Dr. Bob)"
+              }
+            ],
+            "events": [
+              {
+                "from": "t1",
+                "to": "db",
+                "label": "1. Read on_call count -> 2",
+                "status": "ok"
+              },
+              {
+                "from": "t2",
+                "to": "db",
+                "label": "2. Read on_call count -> 2",
+                "status": "ok"
+              },
+              {
+                "from": "t1",
+                "to": "db",
+                "label": "3. UPDATE Alice on_call=false",
+                "status": "ok"
+              },
+              {
+                "from": "t2",
+                "to": "db",
+                "label": "4. UPDATE Bob on_call=false",
+                "status": "warn"
+              },
+              {
+                "from": "t1",
+                "to": "db",
+                "label": "5. COMMIT Alice (OK)",
+                "status": "ok"
+              },
+              {
+                "from": "t2",
+                "to": "db",
+                "label": "6. COMMIT Bob -> 0 on call!",
+                "status": "fail"
+              }
+            ],
+            "summary": "Caption: Snapshot Isolation allows disjoint-row updates to commit concurrently; SSI (SERIALIZABLE) or a shared guard-row lock enforced by all writers prevents the invariant violation."
+          },
+          "ideas": [
+            {
+              "title": "Engine-Specific Isolation Names",
+              "description": "Always check your engine's implementation: PostgreSQL REPEATABLE READ uses Snapshot Isolation (no phantoms), whereas MySQL InnoDB REPEATABLE READ uses MVCC reads with next-key gap locks for locking reads."
+            },
+            {
+              "title": "Shared-Row Lock Protocol",
+              "description": "Locking a shared parent row with SELECT ... FOR UPDATE prevents write skew only if every code path mutating that invariant acquires the same lock first."
+            }
+          ]
+        },
+        {
+          "id": "03-where-it-is-used",
+          "eyebrow": "STAGE 03 · WHERE IT IS USED",
+          "title": "Where ACID Transactions belong (and where to avoid them)",
+          "level": "L5 · APPLIED DESIGN",
+          "purpose": "Scope boundary: match single-database ACID commits to local invariants and keep external network I/O outside transaction locks.",
+          "explanation": "ACID transactions excel for **single-database financial ledgers, inventory reservations, and multi-table state transitions**. By contrast, holding a database transaction open across external HTTP calls or message-broker publishes creates lock queues and exhausts connection pools.",
+          "comparison": [
+            {
+              "choice": "Financial Ledgers & Double-Entry Transfers",
+              "benefits": [
+                "Atomic debit and credit with SERIALIZABLE or canonical row locking prevents double-spend."
+              ],
+              "costs": [
+                "Hot accounts serialize writes and require app-level retry loops on 40001/40P01."
+              ]
+            },
+            {
+              "choice": "Transactional Outbox (DB + Event Publishing)",
+              "benefits": [
+                "Writes domain state and an outbox row in one local ACID commit, avoiding dual-write drift."
+              ],
+              "costs": [
+                "Needs a CDC (Change Data Capture) relay such as Debezium or a poller to publish events."
+              ]
+            },
+            {
+              "choice": "Avoid: Long-Running Workflows Across External APIs",
+              "benefits": [
+                "Use Saga orchestration with idempotent steps instead of holding DB locks over HTTP."
+              ],
+              "costs": [
+                "A 200 ms external API call inside a transaction stalls connection pools and causes lock timeouts."
+              ]
+            }
+          ]
+        },
+        {
+          "id": "04-how-it-is-managed",
+          "eyebrow": "STAGE 04 · HOW IT IS MANAGED",
+          "title": "How ACID Transactions are tuned, locked, and retried",
+          "level": "L5 · APPLIED DESIGN",
+          "purpose": "Operational control: configure safe durability guardrails, canonical lock ordering, explicit rollbacks, and idempotent retries.",
+          "explanation": "Production tuning pairs durable storage settings with bounded lock waits and safe application retries:\n\n1. **Durability Guardrails:** Keep `fsync = on`, `synchronous_commit = on`, and `full_page_writes = on` in PostgreSQL (or `innodb_doublewrite = ON` in MySQL InnoDB) to prevent torn pages on power loss.\n2. **Fail-Fast Timeouts:** Set `idle_in_transaction_session_timeout = '30s'` and `lock_timeout = '2s'` so stalled clients abort before blocking `VACUUM` or piling up lock waiters.\n3. **Canonical Lock Ordering:** Lock multi-row targets in ascending primary-key order (`min(fromId, toId)`, then `max(fromId, toId)`) so concurrent transfers cannot form `AB-BA` deadlock cycles (`40P01`).\n4. **Safe Whole-Transaction Retries:** In the Java JDBC example below, assume both accounts live in one PostgreSQL database and that no external side effects (emails, webhooks, payment-gateway HTTP calls) run inside the transaction. On serialization failure (`40001`) or deadlock (`40P01`), the code **explicitly calls `conn.rollback()`**, waits with **jittered exponential backoff**, and retries the **entire transaction from `BEGIN`** on a fresh snapshot.",
+          "markdownContent": "```java\n// Safe double-entry transfer: canonical lock order, explicit rollback, jittered backoff, no external I/O inside TX\npublic void transferFunds(DataSource ds, long fromId, long toId, long amountCents) throws SQLException {\n    long firstLock = Math.min(fromId, toId);\n    long secondLock = Math.max(fromId, toId);\n    int maxAttempts = 4;\n\n    for (int attempt = 0; attempt < maxAttempts; attempt++) {\n        try (Connection conn = ds.getConnection()) {\n            conn.setAutoCommit(false);\n            conn.setTransactionIsolation(Connection.TRANSACTION_SERIALIZABLE);\n\n            try {\n                try (PreparedStatement lockStmt = conn.prepareStatement(\n                        \"SELECT id, balance_cents FROM accounts WHERE id IN (?, ?) ORDER BY id FOR UPDATE\")) {\n                    lockStmt.setLong(1, firstLock);\n                    lockStmt.setLong(2, secondLock);\n                    lockStmt.executeQuery();\n                }\n\n                try (PreparedStatement debit = conn.prepareStatement(\n                        \"UPDATE accounts SET balance_cents = balance_cents - ? WHERE id = ? AND balance_cents >= ?\")) {\n                    debit.setLong(1, amountCents);\n                    debit.setLong(2, fromId);\n                    debit.setLong(3, amountCents);\n                    if (debit.executeUpdate() != 1) {\n                        throw new IllegalStateException(\"Insufficient funds\");\n                    }\n                }\n\n                try (PreparedStatement credit = conn.prepareStatement(\n                        \"UPDATE accounts SET balance_cents = balance_cents + ? WHERE id = ?\")) {\n                    credit.setLong(1, amountCents);\n                    credit.setLong(2, toId);\n                    credit.executeUpdate();\n                }\n\n                conn.commit();\n                return;\n            } catch (SQLException | RuntimeException ex) {\n                try { conn.rollback(); } catch (SQLException suppressed) { ex.addSuppressed(suppressed); }\n                throw ex;\n            }\n        } catch (SQLException ex) {\n            String state = ex.getSQLState();\n            boolean retryable = \"40001\".equals(state) || \"40P01\".equals(state);\n            if (retryable && attempt < maxAttempts - 1) {\n                long backoffMs = (20L << attempt) + ThreadLocalRandom.current().nextLong(25L);\n                try { Thread.sleep(backoffMs); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); throw ex; }\n                continue;\n            }\n            throw ex;\n        }\n    }\n}\n```"
+        },
+        {
+          "id": "05-alternatives",
+          "eyebrow": "STAGE 05 · THE TRADE-OFF",
+          "title": "Choosing Isolation Levels by Application Invariant",
+          "level": "L6 · SCALE & TRADE-OFFS",
+          "purpose": "The production trade-off: select READ COMMITTED, REPEATABLE READ, or SERIALIZABLE based on the invariant you must preserve.",
+          "explanation": "Pick the weakest isolation level that still protects your application's invariant. In **PostgreSQL**:\n\n- **Choose `READ COMMITTED`** (PostgreSQL default) when statements mutate independent single rows or use atomic `UPDATE ... WHERE balance >= amount` checks that do not depend on earlier reads in the same transaction.\n- **Choose `REPEATABLE READ`** (Snapshot Isolation in PostgreSQL) when a transaction runs multiple `SELECT` queries—such as financial reports or multi-table exports—that must observe one consistent point-in-time snapshot.\n- **Choose `SERIALIZABLE`** (SSI in PostgreSQL) when correctness depends on a **multi-row invariant** where concurrent transactions read overlapping sets and update disjoint rows (such as on-call scheduling or unique quota budgets), and you cannot route all writers through a shared guard-row lock.\n\nKeep in mind that isolation-level guarantees differ in other engines (for example, MySQL InnoDB's `REPEATABLE READ` uses MVCC for plain `SELECT`s and gap/next-key locks for `FOR UPDATE`).",
+          "comparison": [
+            {
+              "choice": "READ COMMITTED (PostgreSQL Default)",
+              "benefits": [
+                "Best for independent single-row writes and atomic conditional UPDATEs; minimal abort overhead."
+              ],
+              "costs": [
+                "Each statement sees a new snapshot, allowing non-repeatable reads and write skew."
+              ]
+            },
+            {
+              "choice": "REPEATABLE READ (PostgreSQL Snapshot Isolation)",
+              "benefits": [
+                "Best for multi-query analytical reads and consistent snapshots; prevents phantoms in PostgreSQL."
+              ],
+              "costs": [
+                "Allows write skew on disjoint rows; concurrent updates to the same row abort with 40001."
+              ]
+            },
+            {
+              "choice": "SERIALIZABLE (PostgreSQL SSI)",
+              "benefits": [
+                "Best for multi-row invariants (write skew, read-only anomalies) without coarse table locks."
+              ],
+              "costs": [
+                "Higher 40001 abort rate under contention; requires full-transaction retry loops."
+              ]
+            }
+          ]
+        },
+        {
+          "id": "06-production-architecture",
+          "eyebrow": "STAGE 06 · PRODUCTION ARCHITECTURE",
+          "title": "Production example: Group Commit WAL + Transactional Outbox",
+          "level": "L7 · STAFF / PRINCIPAL",
+          "purpose": "Production architecture: scale durable commits with WAL group commit and bridge external events safely via CDC.",
+          "explanation": "High-throughput payment and order systems pair **NVMe-backed WAL group commit** (`commit_delay` batching concurrent `COMMIT` flushes into one `fsync`) with the **Transactional Outbox** pattern. Domain state and an `outbox_events` row commit atomically in one local transaction. Afterward, a **CDC (Change Data Capture)** relay such as Debezium tails `pg_wal` asynchronously and publishes events to Kafka—keeping slow network I/O completely outside database locks.",
+          "sectionDiagram": {
+            "kind": "state-machine",
+            "eyebrow": "Transaction Lifecycle",
+            "title": "ACID Transaction & Retry State Machine",
+            "states": [
+              {
+                "id": "active",
+                "label": "ACTIVE",
+                "sublabel": "MVCC snapshot + locks",
+                "tone": "blue"
+              },
+              {
+                "id": "committed",
+                "label": "COMMITTED",
+                "sublabel": "WAL fsync + CLOG ack",
+                "tone": "green"
+              },
+              {
+                "id": "aborted",
+                "label": "ABORTED (40001)",
+                "sublabel": "Rollback + clean state",
+                "tone": "amber"
+              }
+            ],
+            "transitions": [
+              {
+                "from": "active",
+                "to": "committed",
+                "label": "WAL flushed OK"
+              },
+              {
+                "from": "active",
+                "to": "aborted",
+                "label": "40001 / 40P01 / crash"
+              },
+              {
+                "from": "aborted",
+                "to": "active",
+                "label": "Rollback + jittered retry"
+              }
+            ],
+            "summary": "Caption: Transactions either commit atomically after WAL fsync or roll back cleanly with zero partial writes, enabling safe full-transaction retries."
+          }
+        },
+        {
+          "id": "07-problems-and-further-reading",
+          "eyebrow": "STAGE 07 · PROBLEMS SOLVED & FURTHER DEEP DIVE",
+          "title": "Problems solved by ACID Transactions & System Design Deep Dives",
+          "level": "L7 · STAFF / PRINCIPAL",
+          "purpose": "Apply ACID internals to concrete production incidents and distributed design problems.",
+          "explanation": "Explore how ACID internals—MVCC snapshots, InnoDB gap locks, transaction ID wraparound, and CDC transactional outboxes—manifest in real production incidents.",
+          "supportingConcepts": [
+            {
+              "slug": "sql-isolation-levels",
+              "title": "Problem: SQL Isolation Levels & Phantom Reads",
+              "kind": "problem"
+            },
+            {
+              "slug": "mysql-innodb-gap",
+              "title": "Problem: MySQL InnoDB Gap Lock Deadlocks",
+              "kind": "problem"
+            },
+            {
+              "slug": "ab-ba-lock",
+              "title": "Problem: Preventing AB-BA Lock Deadlocks",
+              "kind": "problem"
+            },
+            {
+              "slug": "transactional-outbox-cdc",
+              "title": "Problem: Transactional Outbox with CDC",
+              "kind": "problem"
+            },
+            {
+              "slug": "database-isolation-levels",
+              "title": "Concept: Database Isolation Levels & Anomalies",
+              "kind": "concept"
+            }
+          ]
+        }
+      ],
+      "finalSummary": "Combine durable WAL group commit, invariant-driven isolation (SSI or universal lock ordering), explicit rollback/backoff retries, and CDC Outbox publishing.",
+      "summary": "ACID groups four guarantees for a database transaction: Atomicity (all-or-nothing), Consistency (enforced rules stay valid), Isolation (concurrent work does not expose partial state), and Durability (committed changes survive a crash under configured disk-flush settings).",
+      "keyTakeaway": "When concurrent writes contend on shared state, ACID is not a single on/off switch: durability depends on WAL flush configuration and storage reliability, while isolation is chosen by the invariant your application must protect—not by habit."
+    }
+  },
+  "pedagogicalFramework": "PRIME",
+  "prerequisites": [
+    {
+      "title": "Database Indexing: B-Trees vs LSM-Trees",
+      "summary": "B-Trees organize sorted keys into fixed-size mutable pages optimized for fast, predictable point and range reads, whereas LSM-Trees buffer writes in memory and flush immutable sorted runs to disk for high write throughput."
+    }
+  ],
+  "simulation": {
+    "title": "ACID Transaction Fundamentals — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "tx",
+        "label": "Client Tx",
+        "role": "Snapshot Read/Write"
+      },
+      {
+        "id": "plan",
+        "label": "Query Planner",
+        "role": "Index & Lock Order"
+      },
+      {
+        "id": "wal",
+        "label": "WAL Buffer",
+        "role": "Group Commit"
+      },
+      {
+        "id": "disk",
+        "label": "Storage Pages",
+        "role": "MVCC / Vacuum"
+      }
+    ],
+    "edges": [
+      {
+        "from": "tx",
+        "to": "plan",
+        "label": "SQL query"
+      },
+      {
+        "from": "plan",
+        "to": "wal",
+        "label": "append redo"
+      },
+      {
+        "from": "wal",
+        "to": "disk",
+        "label": "checkpoint flush"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "What are ACID Transactions",
+        "actionLabel": "SQL query",
+        "status": "healthy",
+        "activeNodeIds": [
+          "tx",
+          "plan"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "SQL query",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Client Tx sends work to Query Planner (What are ACID Transactions)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Why we need ACID (and how Write Skew breaks weak isolation)",
+        "actionLabel": "append redo",
+        "status": "healthy",
+        "activeNodeIds": [
+          "plan",
+          "wal"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "append redo",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Query Planner coordinates with WAL Buffer while preserving the core invariant (Why we need ACID (and how Write Skew breaks weak isolation))."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Where ACID Transactions belong (and where to avoid them)",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "wal",
+          "disk"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, Storage Pages absorbs pressure without cascading (Where ACID Transactions belong (and where to avoid them))."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Problems solved by ACID Transactions & System Design Deep Dives",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "tx",
+          "plan",
+          "wal",
+          "disk"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Problems solved by ACID Transactions & System Design Deep Dives)."
+      }
+    ]
+  }
+}

@@ -1,0 +1,769 @@
+{
+  "slug": "design-conversational-ai-serving-chatgpt",
+  "title": "Design a Conversational AI Serving Platform (ChatGPT Scale)",
+  "domain": "ai-machine-learning",
+  "diagram": "diagram.png",
+  "spark": {
+    "summary": "Design a globally distributed conversational AI platform supporting 100M DAU, <300ms TTFT, <30ms ITL, branching chat histories, and real-time SSE token streaming.",
+    "keyTakeaway": "To keep serving pipelines predictable under bursty prompts, use Anycast Edge POPs for SSE termination, sharded Postgres + Redis for branching conversation trees, consistent-hash KV-prefix routing, and disaggregated Prefill/Decode GPU pools.",
+    "byteSummary": "Designing a ChatGPT-scale conversational AI platform requires balancing ultra-low streaming latency (<300ms Time-to-First-Token, <30ms Inter-Token Latency) with massive GPU compute efficiency across 100M+ daily active users. Unlike stateless web apps, every inference request holds gigabytes of KV-cache state in GPU HBM for several seconds while streaming tokens over persistent HTTP/2 SSE connections.\n\nThe architecture separates into four planes: (1) Geo-DNS Edge POPs and Session-Affine SSE Gateways that terminate TLS and manage backpressure; (2) a Context Hydration & Rolling Summarization service backed by Redis and sharded PostgreSQL conversation trees; (3) Disaggregated Prefill and Decode GPU pools linked via RDMA/RoCEv2 with RadixAttention prefix caching; and (4) an async Kafka-to-S3 telemetry, moderation audit, and billing pipeline.\n\nKey design trade-offs include choosing SSE over WebSockets for simpler HTTP/2 multiplexing, bounded-load consistent hashing to maximize multi-turn KV-cache hits without overloading hot GPUs, and graceful degradation (model tier fallback or speculative decoding) during regional GPU capacity spikes."
+  },
+  "learningJourney": [
+    {
+      "stage": 1,
+      "level": "foundation",
+      "title": "Capacity Estimation & SLO Targets",
+      "purpose": "Quantify QPS, concurrent SSE connections, GPU HBM capacity, and network egress for 100M DAU.",
+      "explanation": {
+        "foundation": "Assume 100M DAU averaging 10 turns/day = 1B turns/day (~11,500 avg QPS, ~35,000 peak QPS).",
+        "core": "With an average response of 400 tokens at 40 tok/s (10s stream duration), peak concurrent open SSE streams reach 350,000.",
+        "deepDive": "Each 70B FP8 model instance needs ~70GB weights plus ~100KB/token KV cache; at 4K avg context, 350K concurrent streams require ~140TB of aggregate KV HBM across thousands of H100/B200 GPUs."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 1 - Back-of-Envelope Sizing",
+        "title": "100M DAU Capacity Model",
+        "nodes": [
+          {
+            "id": "dau",
+            "label": "100M DAU Traffic",
+            "sub": "35K peak QPS",
+            "role": "source"
+          },
+          {
+            "id": "sse_cap",
+            "label": "350K Concurrent SSE",
+            "sub": "10s avg stream",
+            "role": "processor"
+          },
+          {
+            "id": "kv_mem",
+            "label": "140 TB KV HBM",
+            "sub": "4K avg context",
+            "role": "storage"
+          },
+          {
+            "id": "slo_gate",
+            "label": "SLOs: <300ms TTFT",
+            "sub": "<30ms ITL, 99.95%",
+            "role": "sink"
+          }
+        ],
+        "edges": [
+          {
+            "from": "dau",
+            "to": "sse_cap",
+            "label": "10s stream window"
+          },
+          {
+            "from": "sse_cap",
+            "to": "kv_mem",
+            "label": "400MB/stream KV"
+          },
+          {
+            "from": "kv_mem",
+            "to": "slo_gate",
+            "label": "Size GPU cluster"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Peak Multiplier",
+            "detail": "Use 3x peak-to-average ratio for global diurnal traffic waves."
+          },
+          {
+            "label": "Egress Bandwidth",
+            "detail": "350K streams * 40 tok/s * 50B SSE frame = ~700 MB/s (5.6 Gbps) edge egress."
+          }
+        ],
+        "summary": "Capacity math drives 350K concurrent SSE sockets and 140TB of GPU KV-cache memory.",
+        "caption": "Explicit QPS and HBM sizing anchors every downstream caching and routing decision."
+      }
+    },
+    {
+      "stage": 2,
+      "level": "foundation",
+      "title": "Edge Ingress, Anycast POPs & SSE Connection Management",
+      "purpose": "Terminate TLS close to users and maintain 350K+ long-lived SSE streams without exhausting gateway memory.",
+      "explanation": {
+        "foundation": "Geo-DNS routes users to the nearest Anycast Edge POP running Envoy.",
+        "core": "Envoy terminates HTTP/3/TLS and proxies `/v1/chat/completions` over persistent gRPC streams to regional Go/Rust SSE Gateways.",
+        "deepDive": "Each gateway handles 50K+ concurrent goroutines/tasks (~2KB stack each) with `X-Accel-Buffering: no`, heartbeats every 15s (`: ping\\n\\n`) to prevent NAT timeouts, and `Last-Event-ID` resume tokens."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 2 - Edge Termination",
+        "title": "Anycast POP to SSE Gateway Bridge",
+        "nodes": [
+          {
+            "id": "geo_dns",
+            "label": "Geo-DNS + Anycast",
+            "sub": "Nearest Edge POP",
+            "role": "source"
+          },
+          {
+            "id": "envoy_pop",
+            "label": "Envoy TLS Edge",
+            "sub": "HTTP/2 + HTTP/3",
+            "role": "router"
+          },
+          {
+            "id": "go_gw",
+            "label": "Go/Rust SSE Gateway",
+            "sub": "50K streams / pod",
+            "role": "processor"
+          },
+          {
+            "id": "hb",
+            "label": "15s Keepalive + Resume",
+            "sub": "Last-Event-ID",
+            "role": "cache"
+          }
+        ],
+        "edges": [
+          {
+            "from": "geo_dns",
+            "to": "envoy_pop",
+            "label": "Route to POP"
+          },
+          {
+            "from": "envoy_pop",
+            "to": "go_gw",
+            "label": "gRPC stream"
+          },
+          {
+            "from": "go_gw",
+            "to": "hb",
+            "label": "Prevent NAT drop"
+          }
+        ],
+        "cards": [
+          {
+            "label": "SSE vs WebSocket",
+            "detail": "SSE works natively over HTTP/2 multiplexing without custom upgrade handshakes."
+          },
+          {
+            "label": "Resumable Streams",
+            "detail": "Buffer last 60s of tokens in Redis Streams so mobile reconnects resume cleanly."
+          }
+        ],
+        "summary": "Edge POPs decouple global TLS termination from regional streaming gateways.",
+        "caption": "Keepalive heartbeats and Redis Stream buffers make mobile SSE streams resilient to drops."
+      },
+      "decisionFramework": {
+        "problem": "How to implement Design a Conversational AI Serving Platform (ChatGPT Scale) without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "To keep serving pipelines predictable under bursty prompts, use Anycast Edge POPs for SSE termination, sharded Postgres + Redis for branching conversation trees, consistent-hash KV-prefix routing, and disaggregated Prefill/Decode GPU pools.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Design a Conversational AI Serving Platform (ChatGPT Scale) experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "stage": 3,
+      "level": "intermediate",
+      "title": "Branching Conversation Store & Async Context Hydration",
+      "purpose": "Model editable/regenerable chat trees and hydrate context windows under 20ms p99.",
+      "explanation": {
+        "foundation": "Users frequently edit prompts or regenerate replies, forming a tree rather than a flat list.",
+        "core": "PostgreSQL (sharded by `user_id`) stores `conversations` and `messages(id, parent_id, role, token_count, content_ref)` with large attachments in S3. Active conversations are cached in Redis Cluster (hash of recent turns + precomputed rolling summary).",
+        "deepDive": "On each turn, a single Redis pipeline fetches the branch in <5ms; PostgreSQL is queried only on cold cache misses."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 3 - Conversation State",
+        "title": "Sharded Postgres + Redis Turn Hydrator",
+        "nodes": [
+          {
+            "id": "client_turn",
+            "label": "New User Turn",
+            "sub": "parent_msg_id",
+            "role": "source"
+          },
+          {
+            "id": "redis_c",
+            "label": "Redis Cluster",
+            "sub": "<5ms hot branch",
+            "role": "cache"
+          },
+          {
+            "id": "pg_shard",
+            "label": "Sharded PostgreSQL",
+            "sub": "Hash(user_id)",
+            "role": "storage"
+          },
+          {
+            "id": "summarizer",
+            "label": "Async Summarizer",
+            "sub": "Compresses >16K turns",
+            "role": "processor"
+          }
+        ],
+        "edges": [
+          {
+            "from": "client_turn",
+            "to": "redis_c",
+            "label": "Fetch active branch"
+          },
+          {
+            "from": "redis_c",
+            "to": "pg_shard",
+            "label": "Fallback on miss"
+          },
+          {
+            "from": "pg_shard",
+            "to": "summarizer",
+            "label": "Trigger background summary"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Tree Schema",
+            "detail": "Adjacency list with parent_id enables O(depth) branch traversal and instant edits."
+          },
+          {
+            "label": "Async Compaction",
+            "detail": "Summarize older turns asynchronously after response completion, never on the hot path."
+          }
+        ],
+        "summary": "Sharded PostgreSQL and Redis keep context hydration under 20ms even for branching chats.",
+        "caption": "Asynchronous summarization prevents long chat histories from inflating TTFT."
+      }
+    },
+    {
+      "stage": 4,
+      "level": "intermediate",
+      "title": "KV-Prefix Affine Routing & Bounded-Load Consistent Hashing",
+      "purpose": "Maximize RadixAttention prefix cache hits while preventing hot GPUs during viral workloads.",
+      "explanation": {
+        "foundation": "The Inference Router hashes `conversation_id` onto a consistent-hash ring of Decode/Prefill pods (e.g., Maglev or Ketama with virtual nodes).",
+        "core": "To prevent a single power user or retry storm from overloading one GPU, each node has a bounded-load ceiling (1.25x cluster average active tokens).",
+        "deepDive": "If the primary node exceeds the cap, the router spills to the next healthy node on the ring."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 4 - Smart Inference Routing",
+        "title": "Bounded-Load Consistent Hash Ring",
+        "nodes": [
+          {
+            "id": "router",
+            "label": "Inference Router",
+            "sub": "Maglev hash ring",
+            "role": "router"
+          },
+          {
+            "id": "primary",
+            "label": "Primary GPU Pod",
+            "sub": "Warm KV prefix hit",
+            "role": "processor"
+          },
+          {
+            "id": "spill",
+            "label": "Secondary GPU Pod",
+            "sub": "1.25x load spillover",
+            "role": "processor"
+          },
+          {
+            "id": "health",
+            "label": "EWMA Load Probe",
+            "sub": "Active KV % + queue",
+            "role": "cache"
+          }
+        ],
+        "edges": [
+          {
+            "from": "router",
+            "to": "primary",
+            "label": "Route if load < 1.25x"
+          },
+          {
+            "from": "router",
+            "to": "spill",
+            "label": "Spill if overloaded"
+          },
+          {
+            "from": "health",
+            "to": "router",
+            "label": "Report HBM & queue"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Hit Rate Impact",
+            "detail": "Sticky routing achieves >85% KV-prefix cache hit rate on multi-turn sessions."
+          },
+          {
+            "label": "Graceful Spillover",
+            "detail": "Spilling at 1.25x load trades a one-time prefill for cluster-wide tail-latency stability."
+          }
+        ],
+        "summary": "Bounded-load consistent hashing balances KV-cache locality against GPU saturation.",
+        "caption": "Real-time HBM and queue-depth probes prevent cascading tail-latency spikes."
+      }
+    },
+    {
+      "stage": 5,
+      "level": "intermediate",
+      "title": "Disaggregated Prefill/Decode & Speculative Decoding",
+      "purpose": "Hit <300ms TTFT and <30ms ITL simultaneously using disaggregated pools and draft verification.",
+      "explanation": {
+        "foundation": "Think of **Disaggregated Prefill/Decode & Speculative Decoding** as the intuition layer for Design a Conversational AI Serving Platform (ChatGPT Scale): Hit <300ms TTFT and <30ms ITL simultaneously using disaggregated pools and draft verification.",
+        "core": "Prefill workers process input prompts in chunked passes and push KV-cache blocks over InfiniBand/RoCEv2 RDMA to Decode workers. To accelerate Decode ITL beyond memory-bandwidth limits, small draft models (or Medusa/EAGLE heads) propose 4-5 candidate tokens verified in a single parallel target-model forward pass, boosting effective decode speed by 2x-2.5x without changing output distribution.",
+        "deepDive": "Under heavy load or partial failure, disaggregated prefill/decode & speculative decoding becomes a critical lever for predictable latency and correctness. Optimize tail latency and resilience with RDMA disaggregated Prefill/Decode pools, speculative decoding, and priority load shedding."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 5 - Inference Engine",
+        "title": "Disaggregated Prefill + Speculative Decode",
+        "nodes": [
+          {
+            "id": "pre_pool",
+            "label": "Prefill Pool",
+            "sub": "Chunked attention",
+            "role": "processor"
+          },
+          {
+            "id": "rdma_bus",
+            "label": "RDMA KV Transfer",
+            "sub": "InfiniBand / RoCEv2",
+            "role": "cache"
+          },
+          {
+            "id": "dec_pool",
+            "label": "Decode Pool",
+            "sub": "EAGLE speculative",
+            "role": "processor"
+          },
+          {
+            "id": "kv_store",
+            "label": "NVMe Offload Tier",
+            "sub": "L2 KV prefix cache",
+            "role": "storage"
+          }
+        ],
+        "edges": [
+          {
+            "from": "pre_pool",
+            "to": "rdma_bus",
+            "label": "Write KV pages"
+          },
+          {
+            "from": "rdma_bus",
+            "to": "dec_pool",
+            "label": "Verify 4-5 draft tokens"
+          },
+          {
+            "from": "dec_pool",
+            "to": "kv_store",
+            "label": "Evict cold prefixes"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Speculative Speedup",
+            "detail": "Lossless speculative verification doubles tok/s on memory-bound decode batches."
+          },
+          {
+            "label": "NVMe Offload",
+            "detail": "Offloading evicted KV prefixes to local NVMe extends prefix retention to hours."
+          }
+        ],
+        "summary": "Disaggregation plus speculative decoding hits both TTFT and ITL SLOs at high batch sizes.",
+        "caption": "NVMe L2 KV offloading preserves multi-hour prefix locality across idle gaps."
+      }
+    },
+    {
+      "stage": 6,
+      "level": "advanced",
+      "title": "Multi-Region Failover, Model Tier Fallback & Load Shedding",
+      "purpose": "Maintain availability during regional GPU outages or sudden viral traffic surges.",
+      "explanation": {
+        "foundation": "Think of **Multi-Region Failover, Model Tier Fallback & Load Shedding** as the intuition layer for Design a Conversational AI Serving Platform (ChatGPT Scale): Maintain availability during regional GPU outages or sudden viral traffic surges.",
+        "core": "Each region runs active-active stateless gateways and replicated Redis/Postgres metadata. If a region's GPU pool hits >90% HBM saturation, the router performs priority-based load shedding: paid/interactive requests stay on primary frontier models, free-tier or background tasks degrade gracefully to a distilled fast model, and excess traffic overflows cross-region via Geo-DNS weighted shifting.",
+        "deepDive": "Under heavy load or partial failure, multi-region failover, model tier fallback & load shedding becomes a critical lever for predictable latency and correctness. Optimize tail latency and resilience with RDMA disaggregated Prefill/Decode pools, speculative decoding, and priority load shedding."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 6 - Resilience & Degradation",
+        "title": "Priority Load Shedder & Cross-Region Failover",
+        "nodes": [
+          {
+            "id": "monitor",
+            "label": "Regional GPU Monitor",
+            "sub": "HBM > 90% trigger",
+            "role": "router"
+          },
+          {
+            "id": "shedder",
+            "label": "Priority Load Shedder",
+            "sub": "Tiered SLA classes",
+            "role": "processor"
+          },
+          {
+            "id": "fast_tier",
+            "label": "Distilled Fast Pool",
+            "sub": "Graceful fallback",
+            "role": "cache"
+          },
+          {
+            "id": "x_region",
+            "label": "Cross-Region Spill",
+            "sub": "Weighted Geo-DNS",
+            "role": "sink"
+          }
+        ],
+        "edges": [
+          {
+            "from": "monitor",
+            "to": "shedder",
+            "label": "Trigger overload policy"
+          },
+          {
+            "from": "shedder",
+            "to": "fast_tier",
+            "label": "Route free/batch tier"
+          },
+          {
+            "from": "shedder",
+            "to": "x_region",
+            "label": "Overflow excess QPS"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Zero Retry Storms",
+            "detail": "Return 429 with Retry-After jitter rather than letting clients hammer saturated GPUs."
+          },
+          {
+            "label": "Circuit Breakers",
+            "detail": "Trip cross-region failover if regional TTFT p99 exceeds 1.5s for 30s."
+          }
+        ],
+        "summary": "Priority load shedding and model-tier fallback keep interactive chat responsive under overload.",
+        "caption": "Jittered 429 backpressure and cross-region spillover prevent cascading GPU collapse."
+      }
+    },
+    {
+      "stage": 7,
+      "level": "advanced",
+      "title": "Async Telemetry, Token Billing & Moderation Audit Pipeline",
+      "purpose": "Track exact token usage, latency percentiles, and compliance logs off the critical path.",
+      "explanation": {
+        "foundation": "Think of **Async Telemetry, Token Billing & Moderation Audit Pipeline** as the intuition layer for Design a Conversational AI Serving Platform (ChatGPT Scale): Track exact token usage, latency percentiles, and compliance logs off the critical path.",
+        "core": "Once a stream finishes or aborts, the SSE Gateway emits a single `CompletionAuditEvent` (user_id, prompt_tokens, cached_tokens, completion_tokens, TTFT, ITL, safety_flags) to Kafka with idempotent producer keys. Flink aggregates real-time FinOps cost and quota counters into Redis/ClickHouse, while encrypted audit transcripts land in S3 Parquet for compliance.",
+        "deepDive": "Under heavy load or partial failure, async telemetry, token billing & moderation audit pipeline becomes a critical lever for predictable latency and correctness. Optimize tail latency and resilience with RDMA disaggregated Prefill/Decode pools, speculative decoding, and priority load shedding."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 7 - Async Observability",
+        "title": "Kafka-Flink Metering & Audit Pipeline",
+        "nodes": [
+          {
+            "id": "gw_emit",
+            "label": "SSE Gateway Emitter",
+            "sub": "Idempotent Kafka event",
+            "role": "source"
+          },
+          {
+            "id": "kafka",
+            "label": "Kafka Audit Topic",
+            "sub": "Partitioned by user_id",
+            "role": "processor"
+          },
+          {
+            "id": "flink",
+            "label": "Flink Metering Job",
+            "sub": "Quota & FinOps agg",
+            "role": "cache"
+          },
+          {
+            "id": "s3_lake",
+            "label": "S3 Parquet + ClickHouse",
+            "sub": "Cold audit & analytics",
+            "role": "sink"
+          }
+        ],
+        "edges": [
+          {
+            "from": "gw_emit",
+            "to": "kafka",
+            "label": "Async fire-and-forget"
+          },
+          {
+            "from": "kafka",
+            "to": "flink",
+            "label": "Update token quotas"
+          },
+          {
+            "from": "kafka",
+            "to": "s3_lake",
+            "label": "Sink encrypted logs"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Zero Hot-Path Cost",
+            "detail": "Metering and S3 persistence never add latency to the user's SSE stream."
+          },
+          {
+            "label": "Cached Token Billing",
+            "detail": "Track cached_prefix_tokens separately to pass KV-cache savings to tenants."
+          }
+        ],
+        "summary": "Asynchronous Kafka pipelines decouple billing, FinOps, and compliance from token streaming.",
+        "caption": "Idempotent event keys prevent double-charging during gateway retries."
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-1",
+        "question": "Why is consistent hashing with bounded load preferred over pure round-robin when routing multi-turn ChatGPT requests to GPU replicas?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Consistent hashing eliminates the need for TLS termination at the edge.",
+            "correct": false,
+            "feedback": "TLS termination happens at the Edge POP regardless of inference routing."
+          },
+          {
+            "id": "b",
+            "text": "It preserves warm KV-cache prefix locality on the same replica while spilling over before any single GPU saturates.",
+            "correct": true,
+            "feedback": "Correct! Sticky routing maximizes RadixAttention prefix hits, and bounded load (e.g., 1.25x cap) prevents hot-spot overload."
+          },
+          {
+            "id": "c",
+            "text": "Round-robin cannot support HTTP/2 Server-Sent Events.",
+            "correct": false,
+            "feedback": "Round-robin supports SSE fine, but it destroys multi-turn KV-cache locality."
+          },
+          {
+            "id": "d",
+            "text": "Consistent hashing compresses the conversation history in PostgreSQL.",
+            "correct": false,
+            "feedback": "Database storage and summarization are independent of inference replica routing."
+          }
+        ],
+        "explanation": "Routing follow-up turns to the same GPU replica reuses 90%+ of the conversation's KV cache, slashing TTFT, while bounded-load spillover protects tail latency."
+      },
+      {
+        "id": "kc-2",
+        "question": "How should a ChatGPT-scale platform store and hydrate editable, regenerable conversation histories without slowing down TTFT?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Store messages as a branching parent_id tree in sharded Postgres, cache the active branch in Redis, and run rolling summarization asynchronously.",
+            "correct": true,
+            "feedback": "Correct! Branching parent_id trees support edits/regenerations, Redis gives <5ms reads, and async summarization keeps the hot path fast."
+          },
+          {
+            "id": "b",
+            "text": "Run an LLM summarization call synchronously on every turn before prefill.",
+            "correct": false,
+            "feedback": "Synchronous summarization on every turn would double TTFT."
+          },
+          {
+            "id": "c",
+            "text": "Store all conversation text inside browser cookies.",
+            "correct": false,
+            "feedback": "Cookies have a 4KB limit and cannot sync across devices."
+          },
+          {
+            "id": "d",
+            "text": "Re-scan all S3 Parquet audit logs on every user message.",
+            "correct": false,
+            "feedback": "Scanning cold S3 Parquet logs would take seconds per request."
+          }
+        ],
+        "explanation": "An adjacency-list tree in sharded PostgreSQL paired with a hot Redis branch cache and background summarization keeps context hydration under 20ms."
+      },
+      {
+        "id": "kc-3",
+        "question": "When a mobile user's network drops mid-stream and reconnects 10 seconds later, how can the platform resume cleanly without re-running the entire GPU inference?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Force the user to start a brand-new conversation.",
+            "correct": false,
+            "feedback": "That creates a poor user experience when the response is already partially generated."
+          },
+          {
+            "id": "b",
+            "text": "Disable SSE and use 5-second HTTP polling.",
+            "correct": false,
+            "feedback": "Polling increases latency and server overhead."
+          },
+          {
+            "id": "c",
+            "text": "Assign monotonic token sequence IDs, buffer recent chunks in a short-TTL Redis Stream, and replay from Last-Event-ID on reconnect.",
+            "correct": true,
+            "feedback": "Correct! Standard SSE Last-Event-ID paired with a short-TTL Redis Stream lets the client catch up seamlessly."
+          },
+          {
+            "id": "d",
+            "text": "Keep the dead TCP socket open for 24 hours on the GPU worker.",
+            "correct": false,
+            "feedback": "GPU workers should never hold client TCP sockets."
+          }
+        ],
+        "explanation": "SSE natively supports `Last-Event-ID`. Pairing it with a short-lived Redis Stream in the gateway tier allows seamless resume without re-running GPU prefill."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Design a large-scale ChatGPT backend that streams answers fast, remembers chat branches, and handles millions of users.",
+      "keyTakeaway": "To keep serving pipelines predictable under bursty prompts, use Anycast Edge POPs for SSE termination, sharded Postgres + Redis for branching conversation trees, consistent-hash KV-prefix routing, and disaggregated Prefill/Decode GPU pools.",
+      "byteSummary": "At ChatGPT scale, 100 million users send billions of messages daily. To keep answers feeling instant, edge servers stream tokens over SSE as soon as GPUs produce them.\n\nChat histories are stored as trees in PostgreSQL so users can edit or retry messages, with active chats cached in Redis for speed. Smart routers send follow-up messages back to the same GPU so it doesn't have to re-read the whole chat."
+    },
+    "intermediate": {
+      "summary": "Architect 100M-DAU conversational AI serving with Anycast SSE gateways, branching tree storage, and bounded-load KV routing.",
+      "keyTakeaway": "To keep serving pipelines predictable under bursty prompts, use Anycast Edge POPs for SSE termination, sharded Postgres + Redis for branching conversation trees, consistent-hash KV-prefix routing, and disaggregated Prefill/Decode GPU pools.",
+      "byteSummary": "Serving 35K peak QPS with 350K concurrent SSE streams requires separating edge termination, context hydration, GPU inference, and observability. Envoy Edge POPs proxy to Go/Rust SSE gateways with 15s keepalives and Last-Event-ID Redis Stream replay.\n\nSharded PostgreSQL + Redis store branching message trees, while bounded-load consistent hashing routes turns to warm RadixAttention GPU replicas. Metering and moderation logs flow asynchronously via Kafka to ClickHouse and S3."
+    },
+    "advanced": {
+      "summary": "Optimize tail latency and resilience with RDMA disaggregated Prefill/Decode pools, speculative decoding, and priority load shedding.",
+      "keyTakeaway": "To keep serving pipelines predictable under bursty prompts, use Anycast Edge POPs for SSE termination, sharded Postgres + Redis for branching conversation trees, consistent-hash KV-prefix routing, and disaggregated Prefill/Decode GPU pools.",
+      "byteSummary": "At extreme scale, long-context prefill bursts destroy decode ITL unless Prefill and Decode run on disaggregated GPU pools linked by InfiniBand/RoCEv2 RDMA. Decode workers use speculative verification (EAGLE/Medusa) to double token throughput while offloading cold KV prefixes to local NVMe.\n\nRegional overload triggers priority load shedding—preserving frontier models for paid interactive streams while degrading batch/free traffic to distilled pools or spilling cross-region via weighted Geo-DNS."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "prerequisites": [
+    {
+      "title": "Conversational AI Serving & SSE Streaming",
+      "summary": "Conversational AI serving combines stateful multi-turn context hydration, continuous GPU batching, KV-cache prefix reuse, and backpressure-aware Server-Sent Events (SSE) to deliver sub-300ms Time-to-First-Token (TTFT) at 100M+ DAU."
+    }
+  ],
+  "simulation": {
+    "title": "Design a Conversational AI Serving Platform (ChatGPT Scale) — Interactive Execution Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Workload & Budget"
+      },
+      {
+        "id": "router",
+        "label": "Gateway / Router",
+        "role": "Admission & Dispatch"
+      },
+      {
+        "id": "engine",
+        "label": "Core Engine",
+        "role": "Primary Execution"
+      },
+      {
+        "id": "replica",
+        "label": "Replica / Fallback",
+        "role": "Durability & Recovery"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "router",
+        "label": "request"
+      },
+      {
+        "from": "router",
+        "to": "engine",
+        "label": "route"
+      },
+      {
+        "from": "engine",
+        "to": "replica",
+        "label": "sync / fallback"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Capacity Estimation & SLO Targets",
+        "actionLabel": "Dispatch nominal request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "router"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "Ingress",
+          "p99_ms": 8,
+          "error_rate": "0.0%"
+        },
+        "explanation": "Caller sends work into the gateway with explicit timeout and concurrency bounds (Capacity Estimation & SLO Targets)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Edge Ingress, Anycast POPs & SSE Connection Management",
+        "actionLabel": "Execute core invariant",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "Core Path",
+          "p99_ms": 18,
+          "in_flight": 124
+        },
+        "explanation": "The core engine processes the hot path while keeping state transitions deterministic (Edge Ingress, Anycast POPs & SSE Connection Management)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Branching Conversation Store & Async Context Hydration",
+        "actionLabel": "Detect skew or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Degraded",
+          "p99_ms": 64,
+          "retries_capped": "true"
+        },
+        "explanation": "Under load or replica lag, bounded backoff and isolation prevent cascading saturation (Branching Conversation Store & Async Context Hydration)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Async Telemetry, Token Billing & Moderation Audit Pipeline",
+        "actionLabel": "Converge & restore SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 11,
+          "drift": 0
+        },
+        "explanation": "State converges cleanly and telemetry confirms the system returned within its SLO envelope (Async Telemetry, Token Billing & Moderation Audit Pipeline)."
+      }
+    ]
+  }
+}

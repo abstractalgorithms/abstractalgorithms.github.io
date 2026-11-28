@@ -1,0 +1,661 @@
+{
+  "id": "design-high-performance-code-editor-buffer",
+  "slug": "design-high-performance-code-editor-buffer",
+  "title": "Design a 100MB-File Code Editor Text Buffer with O(log N) Edits, Undo & Line Index",
+  "domain": "Software Architecture",
+  "tagline": "Architect a 60fps 100 MB code editor buffer using a 64 KB-chunked Red-Black Piece Tree, descending multi-cursor edits, and incremental Tree-sitter deltas.",
+  "purpose": "Design a high-performance text buffer that supports <0.1 ms edits, O(log P) line lookups, O(1) Undo, and crash-safe saves on 100 MB+ files.",
+  "spark": {
+    "summary": "A 64 KB-chunked Red-Black Piece Tree with augmented (left_len, left_lf) counts delivers <0.1 ms edits, O(log P) line slicing, 64B Undo deltas, and lock-free worker snapshots.",
+    "keyTakeaway": "Chunk 100 MB mmap files into 64 KB immutable pieces, apply multi-cursor edits in descending offset order, and save via .tmp + fsync + atomic rename.",
+    "byteSummary": "Modern code editors (VS Code, Zed, Neovim) must open 100 MB+ minified bundles or log files in <100 ms, sustain 1,000-cursor edits inside a 16 ms (60fps) frame budget, serve `O(log P)` line/column lookups for virtualized viewport rendering, and run background Tree-sitter parsing and LSP diagnostics without blocking the UI thread.\n\nThe architecture centers on a **64 KB-Chunked Red-Black Piece Tree**: the 100 MB file is memory-mapped or lazily paged in 64 KB chunks as an immutable Original Buffer, while keystrokes append to an Add Buffer. Each tree node caches `(left_len, left_lf)` for `O(log P)` offset and line-number navigation. A persistent **Command Undo/Redo Stack** stores ~64-byte inverse piece deltas, while path-copied immutable tree snapshots feed background Tree-sitter incremental reparsing (`<3 ms`) and LSP workers lock-free.\n\nTo stay resilient in production, the buffer guards UTF-16 surrogate and CRLF boundaries, compacts fragmented trees past 50,000 pieces on idle frames, logs unsaved deltas every 2s to a crash-recovery WAL, and saves via `.tmp` streaming + `fsync()` + atomic `rename()`."
+  },
+  "learningJourney": [
+    {
+      "id": "01-p-budget",
+      "eyebrow": "STAGE 01 · FRAME & MEMORY BUDGET",
+      "title": "Sizing 100 MB Files, 16 ms 60fps Frames & 1,000-Cursor Edits",
+      "level": "foundation",
+      "purpose": "Establish <100 ms file-open, <1 ms multi-cursor edit, and <50 MB overhead budgets for 100 MB files.",
+      "explanation": {
+        "foundation": "Target: open a 100 MB file (~2M lines) in `<100 ms`, execute 1,000 simultaneous cursor edits in `<2 ms`, and render 60fps (`<16 ms/frame`).",
+        "core": "Splitting the 100 MB Original Buffer into ~1,600 x 64 KB chunks keeps initial Piece Tree build under 30 ms and avoids allocating 2,000,000 per-line string objects (~320 MB heap bloat).",
+        "deepDive": "Virtualizing the viewport renders only the ~60 visible lines via `O(log P)` `get_line_content(row)` calls—never materializing the whole file."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 01 · FRAME & MEMORY BUDGET",
+        "title": "Sizing 100 MB Files, 16 ms 60fps Frames & 1,000-Cursor Edits",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "100 MB File / 2M Lines",
+            "sub": "1,600 x 64 KB Chunks",
+            "role": "Lazy Mmap Load"
+          },
+          {
+            "id": "n2",
+            "label": "<2 ms 1K-Cursor Edit",
+            "sub": "Piece Tree Mutation",
+            "role": "Frame Budget"
+          },
+          {
+            "id": "n3",
+            "label": "60-Line Viewport",
+            "sub": "O(log P) Line Fetch",
+            "role": "Virtual Render"
+          },
+          {
+            "id": "n4",
+            "label": "<16 ms 60fps Frame",
+            "sub": "Zero GC Pause Stalls",
+            "role": "UX SLA"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "indexes"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "queries"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "renders"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Heap Savings",
+            "detail": "Avoiding 2M per-line string objects saves >300 MB RAM and eliminates multi-second V8/JVM GC pauses."
+          },
+          {
+            "label": "64 KB Chunk Size",
+            "detail": "64 KB chunks fit L2 CPU cache cleanly during line-feed scanning."
+          },
+          {
+            "label": "Viewport Virtualization",
+            "detail": "Scrolling to line 1,800,000 touches only 15 tree nodes and 60 lines."
+          }
+        ],
+        "summary": "64 KB chunked buffers, O(log P) line lookups, and 60-line virtual rendering hit 60fps on 100 MB files.",
+        "caption": "64 KB chunked buffers, O(log P) line lookups, and 60-line virtual rendering hit 60fps on 100 MB files."
+      }
+    },
+    {
+      "id": "02-p-arch",
+      "eyebrow": "STAGE 02 · BUFFER & WORKER ARCHITECTURE",
+      "title": "Piece Tree + Incremental Tree-sitter + Background LSP Snapshots",
+      "level": "foundation",
+      "purpose": "Coordinate UI-thread Piece Tree edits with lock-free immutable snapshots for Tree-sitter and LSP workers.",
+      "explanation": {
+        "foundation": "Every keystroke mutates the Red-Black Piece Tree on the UI thread in `<100 us` and pushes a ~64B inverse command onto the Undo stack.",
+        "core": "The buffer emits an exact `(start_byte, old_end_byte, new_end_byte)` edit delta to **Tree-sitter** so syntax highlighting reparses only the modified AST subtree in `<3 ms`.",
+        "deepDive": "Background LSP and search threads read an immutable path-copied tree root snapshot—never blocking UI typing."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 02 · BUFFER & WORKER ARCHITECTURE",
+        "title": "Piece Tree + Incremental Tree-sitter + Background LSP Snapshots",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "Keystroke (<100 us)",
+            "sub": "Mutate Piece Tree",
+            "role": "UI Thread"
+          },
+          {
+            "id": "n2",
+            "label": "64B Undo Command",
+            "sub": "Push Undo/Redo Stack",
+            "role": "O(1) History"
+          },
+          {
+            "id": "n3",
+            "label": "Edit Byte Delta",
+            "sub": "Tree-sitter Incremental",
+            "role": "<3 ms Syntax AST"
+          },
+          {
+            "id": "n4",
+            "label": "Immutable Root Snap",
+            "sub": "LSP / Search Worker",
+            "role": "Lock-Free Read"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "records"
+          },
+          {
+            "from": "n1",
+            "to": "n3",
+            "label": "emits delta"
+          },
+          {
+            "from": "n1",
+            "to": "n4",
+            "label": "shares root"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Exact Byte Deltas",
+            "detail": "Tree-sitter needs exact byte offsets and (row, col) points—both served in O(log P) by the Piece Tree."
+          },
+          {
+            "label": "Lock-Free Background Search",
+            "detail": "Regex Find-in-File scans an immutable snapshot across worker threads without locking the editor."
+          },
+          {
+            "label": "Zero String Concat",
+            "detail": "Tokens and viewport lines read directly from buffer slices."
+          }
+        ],
+        "summary": "The Piece Tree drives <100 us UI edits, 64B undo entries, <3 ms Tree-sitter deltas, and lock-free worker snapshots.",
+        "caption": "The Piece Tree drives <100 us UI edits, 64B undo entries, <3 ms Tree-sitter deltas, and lock-free worker snapshots."
+      }
+    },
+    {
+      "id": "03-p-impl",
+      "eyebrow": "STAGE 03 · SAFE IMPLEMENTATION",
+      "title": "Reverse-Sorted Multi-Cursor Edits & O(log P) Line-Offset Lookup",
+      "level": "intermediate",
+      "purpose": "Apply multi-cursor edits in descending offset order so earlier offsets stay valid without shifting.",
+      "explanation": {
+        "foundation": "If 1,000 cursors edit in ascending offset order, edit #1 shifts the byte offsets of edits #2..#1,000!",
+        "core": "```python\ndef apply_multi_cursor_edits(piece_tree, edits: list[tuple[int, int, str]]) -> None:\n    \"\"\"edits = [(offset, delete_len, insert_text), ...]\"\"\"\n    # Sort descending by offset so higher offsets mutate before lower ones\n    sorted_edits = sorted(edits, key=lambda e: e[0], reverse=True)\n    for i in range(len(sorted_edits) - 1):\n        off_hi, _, _ = sorted_edits[i]\n        off_lo, del_lo, _ = sorted_edits[i + 1]\n        if off_lo + del_lo > off_hi:\n            raise ValueError('Overlapping cursor edits must be merged first')\n    for offset, delete_len, text in sorted_edits:\n        if delete_len > 0:\n            piece_tree.delete(offset, delete_len)\n        if text:\n            piece_tree.insert(offset, text)\n```",
+        "deepDive": "Checking `off_lo + del_lo > off_hi` prevents corrupt overlapping deletions when two cursors converge on the same word."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 03 · SAFE IMPLEMENTATION",
+        "title": "Reverse-Sorted Multi-Cursor Edits & O(log P) Line-Offset Lookup",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "1,000 Cursor Edits",
+            "sub": "Sort Descending Offset",
+            "role": "Order Prep"
+          },
+          {
+            "id": "n2",
+            "label": "Overlap Guard",
+            "sub": "off_lo + del_lo <= off_hi",
+            "role": "Merge Check"
+          },
+          {
+            "id": "n3",
+            "label": "Apply High -> Low",
+            "sub": "Delete + Insert Piece",
+            "role": "Zero Offset Shift"
+          },
+          {
+            "id": "n4",
+            "label": "Single Undo Batch",
+            "sub": "Group 1K Deltas as 1",
+            "role": "Atomic Undo"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "validates"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "applies"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "commits as"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Descending Order Invariant",
+            "detail": "Mutating from bottom-of-file upward means lower offsets remain 100% valid without recalculation."
+          },
+          {
+            "label": "Atomic Multi-Cursor Undo",
+            "detail": "Wrap all 1,000 cursor deltas in one composite Undo group so Ctrl+Z reverts all cursors together."
+          },
+          {
+            "label": "Overlap Merge",
+            "detail": "Merge adjacent/overlapping selections before applying edits."
+          }
+        ],
+        "summary": "Descending-offset sorting, overlap checks, and composite Undo grouping execute 1,000-cursor edits cleanly.",
+        "caption": "Descending-offset sorting, overlap checks, and composite Undo grouping execute 1,000-cursor edits cleanly."
+      }
+    },
+    {
+      "id": "04-p-scaling",
+      "eyebrow": "STAGE 04 · SCALING & LONG LINES",
+      "title": "Handling 10 MB Single-Line Minified JS Without Freezing Tokenizers",
+      "level": "intermediate",
+      "purpose": "Bound viewport horizontal slicing and tokenizer line caps when a single line spans millions of characters.",
+      "explanation": {
+        "foundation": "A minified `.min.js` file has 1 line that is 10,000,000 characters long—rendering or regex-tokenizing the whole line freezes the UI!",
+        "core": "Cap `get_line_slice(line, col_start, col_end)` to the visible horizontal viewport (`~300 chars`) using `O(log P)` offset slicing, and disable expensive regex syntax highlighting on lines `> 20,000 chars`.",
+        "deepDive": "Because Piece Tree nodes track `left_len`, slicing columns `[500_000 .. 500_300]` on a 10M-char single line still runs in `O(log P)`."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 04 · SCALING & LONG LINES",
+        "title": "Handling 10 MB Single-Line Minified JS Without Freezing Tokenizers",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "10M-Char Single Line",
+            "sub": "Minified Bundle Hazard",
+            "role": "Pathological Input"
+          },
+          {
+            "id": "n2",
+            "label": "Viewport Slice Guard",
+            "sub": "Fetch Only [col..col+300]",
+            "role": "O(log P) Window"
+          },
+          {
+            "id": "n3",
+            "label": "Tokenizer Line Cap",
+            "sub": "Skip Regex > 20K Chars",
+            "role": "CPU Protection"
+          },
+          {
+            "id": "n4",
+            "label": "Instant Scroll & Edit",
+            "sub": "60fps Maintained",
+            "role": "Resilient UX"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "sliced by"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "paired with"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "achieves"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Horizontal Virtualization",
+            "detail": "Never materialize a 10M-char line string just to draw 200 visible columns."
+          },
+          {
+            "label": "Syntax Guardrail",
+            "detail": "Falling back to plain monochrome text on >20K-char lines prevents catastrophic regex backtracking."
+          },
+          {
+            "label": "64 KB Chunk Limit",
+            "detail": "Even on a 1-line 100 MB file, 64 KB chunking keeps individual piece operations tiny."
+          }
+        ],
+        "summary": "Horizontal O(log P) viewport slicing and 20K-char tokenizer caps keep 10 MB minified single-line files responsive.",
+        "caption": "Horizontal O(log P) viewport slicing and 20K-char tokenizer caps keep 10 MB minified single-line files responsive."
+      }
+    },
+    {
+      "id": "05-p-isolation",
+      "eyebrow": "STAGE 05 · FAULT ISOLATION & ENCODING",
+      "title": "CRLF Split Guards, UTF-16 Surrogate Safety & Idle Piece Compaction",
+      "level": "advanced",
+      "purpose": "Protect line-feed invariants across piece boundaries and compact >50K-piece trees without frame drops.",
+      "explanation": {
+        "foundation": "Cross-piece `\\r` + `\\n` boundaries and fragmented trees from 100K Find-and-Replace edits can skew line numbers or bloat depth.",
+        "core": "Enforce CRLF-atomic split points (never split between `\\r` and `\\n`), validate UTF-16 surrogate boundaries, and compact contiguous Add-Buffer pieces in 2 ms time-sliced idle chunks when `P > 50,000`.",
+        "deepDive": "Time-slicing compaction inside `requestIdleCallback` ensures defragmentation never causes a visible typing stutter."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 05 · FAULT ISOLATION & ENCODING",
+        "title": "CRLF Split Guards, UTF-16 Surrogate Safety & Idle Piece Compaction",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "Split Boundary Guard",
+            "sub": "Snap Off \\r|\\n & Pairs",
+            "role": "Encoding Safety"
+          },
+          {
+            "id": "n2",
+            "label": "P > 50K Fragmented",
+            "sub": "Find-Replace Churn",
+            "role": "Tree Bloat"
+          },
+          {
+            "id": "n3",
+            "label": "2 ms Idle Compaction",
+            "sub": "Time-Sliced Defrag",
+            "role": "Zero Frame Drop"
+          },
+          {
+            "id": "n4",
+            "label": "Exact Line / Col Index",
+            "sub": "Zero Off-By-One Bugs",
+            "role": "Invariant Kept"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "paired with"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "triggers"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "preserves"
+          }
+        ],
+        "cards": [
+          {
+            "label": "CRLF Boundary Rule",
+            "detail": "Checking adjacent piece ends handles mixed LF/CRLF files without corrupting line numbers."
+          },
+          {
+            "label": "Budgeted Compaction",
+            "detail": "Spending at most 2 ms per idle frame keeps typing latency untouched."
+          },
+          {
+            "label": "Bounded Add Buffer",
+            "detail": "Compaction also discards dead deleted slices during full file saves."
+          }
+        ],
+        "summary": "Encoding-safe split guards and 2 ms idle-time compaction protect line accuracy and prevent tree bloat.",
+        "caption": "Encoding-safe split guards and 2 ms idle-time compaction protect line accuracy and prevent tree bloat."
+      }
+    },
+    {
+      "id": "06-p-recovery",
+      "eyebrow": "STAGE 06 · CRASH RECOVERY & ATOMIC SAVE",
+      "title": "2-Second Edit WAL Recovery & Safe Atomic Mmap Re-Binding",
+      "level": "advanced",
+      "purpose": "Recover unsaved edits after power loss and save 100 MB files without corrupting active mmap buffers.",
+      "explanation": {
+        "foundation": "Power loss or OOM kills between saves must not lose hours of unsaved edits.",
+        "core": "Flush edit deltas every 2 seconds to a local recovery WAL keyed by `(file_path, base_sha256)`. On save, stream pieces to `.tmp`, `fsync()`, `rename()`, and swap the Original Buffer cleanly.",
+        "deepDive": "If the file changed externally on disk while unsaved WAL deltas exist, surface a 3-way diff instead of blindly overwriting."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 06 · CRASH RECOVERY & ATOMIC SAVE",
+        "title": "2-Second Edit WAL Recovery & Safe Atomic Mmap Re-Binding",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "2s Delta WAL Flush",
+            "sub": "(base_sha256, edits)",
+            "role": "Crash Journal"
+          },
+          {
+            "id": "n2",
+            "label": "Ctrl+S -> Stream .tmp",
+            "sub": "fsync + Atomic Rename",
+            "role": "Safe Disk Save"
+          },
+          {
+            "id": "n3",
+            "label": "Re-Bind Fresh mmap",
+            "sub": "Reset to 1 Root Piece",
+            "role": "Clean Tree"
+          },
+          {
+            "id": "n4",
+            "label": "Crash Startup Check",
+            "sub": "Replay WAL or 3-Way",
+            "role": "Zero Lost Work"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n4",
+            "label": "replays on boot"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "swaps"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "protected by"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Base Hash Verification",
+            "detail": "Checking base_sha256 before replaying WAL deltas prevents applying edits onto an externally modified file."
+          },
+          {
+            "label": "Atomic Mmap Swap",
+            "detail": "Unmap the old Original Buffer only after .tmp rename succeeds and the new Piece Tree root is bound."
+          },
+          {
+            "label": "Truncate WAL on Save",
+            "detail": "Clear the recovery journal immediately after atomic rename completes."
+          }
+        ],
+        "summary": "Hash-verified 2s WAL journals and atomic .tmp-to-mmap swaps guarantee crash recovery and safe 100 MB saves.",
+        "caption": "Hash-verified 2s WAL journals and atomic .tmp-to-mmap swaps guarantee crash recovery and safe 100 MB saves."
+      }
+    },
+    {
+      "id": "07-p-observability",
+      "eyebrow": "STAGE 07 · OBSERVABILITY & TELEMETRY",
+      "title": "Monitoring Keystroke Frame Drops, Piece Depth & Memory Footprint",
+      "level": "advanced",
+      "purpose": "Track p99 keystroke-to-paint latency, piece count, and Tree-sitter parse budgets in production.",
+      "explanation": {
+        "foundation": "IDE sluggishness often hides in a single slow extension or pathological regex on large files.",
+        "core": "Record `editor_frame_time_p99_ms` (target `< 16 ms`), `piece_tree_nodes`, `add_buffer_bytes`, and `treesitter_reparse_p95_ms`.",
+        "deepDive": "Automatically shed non-essential LSP inlays or regex decorators if frame time exceeds 16 ms for 5 consecutive frames."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 07 · OBSERVABILITY & TELEMETRY",
+        "title": "Monitoring Keystroke Frame Drops, Piece Depth & Memory Footprint",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "frame_time_p99 <16ms",
+            "sub": "Keystroke -> Paint",
+            "role": "UX SLO"
+          },
+          {
+            "id": "n2",
+            "label": "piece_tree_nodes",
+            "sub": "Trigger >50K Compact",
+            "role": "Structure KPI"
+          },
+          {
+            "id": "n3",
+            "label": "treesitter_p95 <3ms",
+            "sub": "Incremental AST Cost",
+            "role": "Syntax KPI"
+          },
+          {
+            "id": "n4",
+            "label": "Auto-Shed Decorators",
+            "sub": "Disable Heavy Regex",
+            "role": "60fps Guardrail"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "correlates"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "pairs with"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "trips"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Graceful Large-File Mode",
+            "detail": "Automatically disable expensive regex/inlay decorators above 50 MB while keeping Piece Tree edits fast."
+          },
+          {
+            "label": "Compaction Telemetry",
+            "detail": "Track piece count before/after idle compaction to tune chunk thresholds."
+          },
+          {
+            "label": "Zero-Content Logging",
+            "detail": "Never log user source code—emit only timings, byte sizes, and piece counts."
+          }
+        ],
+        "summary": "Tracking 16 ms frame budgets, piece counts, and incremental AST times keeps large-file editing smooth.",
+        "caption": "Tracking 16 ms frame budgets, piece counts, and incremental AST times keeps large-file editing smooth."
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-edb-1",
+        "question": "When applying 1,000 simultaneous multi-cursor edits to a Piece Tree, why should they be sorted in **descending** offset order?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Mutating higher byte offsets first leaves all lower byte offsets unchanged, avoiding O(C^2) offset recalculations.",
+            "correct": true,
+            "feedback": "Correct! Applying edits from bottom-of-file upward keeps every earlier cursor offset valid."
+          },
+          {
+            "id": "b",
+            "text": "Because Red-Black trees can only delete nodes from the right leaf.",
+            "correct": false,
+            "feedback": "Red-Black trees support deletions anywhere; descending order preserves cursor offsets."
+          },
+          {
+            "id": "c",
+            "text": "Because Tree-sitter requires edits in reverse chronological order.",
+            "correct": false,
+            "feedback": "Tree-sitter accepts sequential edit deltas; descending order is for multi-cursor offset stability."
+          },
+          {
+            "id": "d",
+            "text": "To force the Add Buffer to grow backward.",
+            "correct": false,
+            "feedback": "The Add Buffer is always append-only."
+          }
+        ],
+        "explanation": "Applying non-overlapping edits from highest offset to lowest keeps all preceding cursor offsets intact."
+      },
+      {
+        "id": "kc-edb-2",
+        "question": "A user opens a 10 MB minified JavaScript file consisting of a **single line**. How does the buffer avoid freezing the UI thread during scrolling?",
+        "options": [
+          {
+            "id": "a",
+            "text": "It uses O(log P) offset slicing to fetch only the ~300 visible horizontal columns and disables regex tokenizers on lines >20K chars.",
+            "correct": true,
+            "feedback": "Correct! Horizontal viewport slicing + tokenizer line caps prevent O(N) string allocation and regex backtracking."
+          },
+          {
+            "id": "b",
+            "text": "It inserts artificial newlines every 80 characters into the Original Buffer.",
+            "correct": false,
+            "feedback": "Mutating the user's file content silently would corrupt their source code."
+          },
+          {
+            "id": "c",
+            "text": "It refuses to open any file smaller than 100 lines.",
+            "correct": false,
+            "feedback": "Minified files must still open and scroll smoothly."
+          },
+          {
+            "id": "d",
+            "text": "It loads the file into a flat array instead of a Piece Tree.",
+            "correct": false,
+            "feedback": "A flat array still suffers O(N) shifts on edits."
+          }
+        ],
+        "explanation": "O(log P) horizontal column slicing and tokenizer length caps keep single-line 10 MB files at 60fps."
+      },
+      {
+        "id": "kc-edb-3",
+        "question": "Why does background LSP/syntax indexing remain lock-free while the user types rapidly in the UI?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Immutable Original/Add buffers plus O(log P) path-copied tree roots give background workers a frozen snapshot with zero 100 MB copies.",
+            "correct": true,
+            "feedback": "Correct! Structural sharing lets workers read a consistent snapshot while UI edits advance a new root."
+          },
+          {
+            "id": "b",
+            "text": "LSP workers read directly from the user's keyboard driver.",
+            "correct": false,
+            "feedback": "Workers read document text snapshots from the buffer."
+          },
+          {
+            "id": "c",
+            "text": "The editor pauses all typing for 500 ms after every keystroke.",
+            "correct": false,
+            "feedback": "Pausing typing would destroy 60fps responsiveness."
+          },
+          {
+            "id": "d",
+            "text": "Undo stacks automatically broadcast diffs over WebSockets.",
+            "correct": false,
+            "feedback": "Local worker snapshots use in-memory tree structural sharing."
+          }
+        ],
+        "explanation": "Structural sharing over immutable buffers provides O(log P) read snapshots without locking the UI thread."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "A fast code editor buffer keeps 100 MB files untouched in chunks, appends keystrokes to a scratchpad, and renders only the visible 60 lines.",
+      "keyTakeaway": "Use a Piece Tree, apply multi-cursor edits bottom-up, and save via a temporary file so you never corrupt the open file.",
+      "byteSummary": "To edit a 100 MB file at 60 frames per second, an editor never copies the whole file. It slices only the visible lines on screen, applies multi-cursor edits from bottom to top, and writes saves to a temporary file first."
+    },
+    "intermediate": {
+      "summary": "Combine a 64 KB-chunked Red-Black Piece Tree, descending multi-cursor application, 64B Undo deltas, and horizontal viewport slicing.",
+      "keyTakeaway": "Pair O(log P) line/offset lookups with exact Tree-sitter byte deltas and atomic .tmp + fsync saves.",
+      "byteSummary": "Modern code editors (VS Code, Zed, Neovim) must open 100 MB+ minified bundles or log files in <100 ms, sustain 1,000-cursor edits inside a 16 ms (60fps) frame budget, serve `O(log P)` line/column lookups for virtualized viewport rendering, and run background Tree-sitter parsing and LSP diagnostics without blocking the UI thread.\n\nThe architecture centers on a **64 KB-Chunked Red-Black Piece Tree**: the 100 MB file is memory-mapped or lazily paged in 64 KB chunks as an immutable Original Buffer, while keystrokes append to an Add Buffer. Each tree node caches `(left_len, left_lf)` for `O(log P)` offset and line-number navigation. A persistent **Command Undo/Redo Stack** stores ~64-byte inverse piece deltas, while path-copied immutable tree snapshots feed background Tree-sitter incremental reparsing (`<3 ms`) and LSP workers lock-free.\n\nTo stay resilient in production, the buffer guards UTF-16 surrogate and CRLF boundaries, compacts fragmented trees past 50,000 pieces on idle frames, logs unsaved deltas every 2s to a crash-recovery WAL, and saves via `.tmp` streaming + `fsync()` + atomic `rename()`."
+    },
+    "advanced": {
+      "summary": "Harden 100 MB IDE buffers with >20K-char tokenizer caps, CRLF/UTF-16 split guards, 2 ms idle compaction, 2s hash-verified WAL recovery, and 16 ms frame telemetry.",
+      "keyTakeaway": "Shed heavy regex/inlay decorators automatically if frame time exceeds 16 ms and compact trees past 50K pieces during idle frames.",
+      "byteSummary": "Modern code editors (VS Code, Zed, Neovim) must open 100 MB+ minified bundles or log files in <100 ms, sustain 1,000-cursor edits inside a 16 ms (60fps) frame budget, serve `O(log P)` line/column lookups for virtualized viewport rendering, and run background Tree-sitter parsing and LSP diagnostics without blocking the UI thread.\n\nThe architecture centers on a **64 KB-Chunked Red-Black Piece Tree**: the 100 MB file is memory-mapped or lazily paged in 64 KB chunks as an immutable Original Buffer, while keystrokes append to an Add Buffer. Each tree node caches `(left_len, left_lf)` for `O(log P)` offset and line-number navigation. A persistent **Command Undo/Redo Stack** stores ~64-byte inverse piece deltas, while path-copied immutable tree snapshots feed background Tree-sitter incremental reparsing (`<3 ms`) and LSP workers lock-free.\n\nTo stay resilient in production, the buffer guards UTF-16 surrogate and CRLF boundaries, compacts fragmented trees past 50,000 pieces on idle frames, logs unsaved deltas every 2s to a crash-recovery WAL, and saves via `.tmp` streaming + `fsync()` + atomic `rename()`."
+    }
+  }
+}

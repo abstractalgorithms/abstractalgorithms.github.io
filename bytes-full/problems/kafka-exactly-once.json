@@ -1,0 +1,841 @@
+{
+  "id": "kafka-exactly-once",
+  "slug": "kafka-exactly-once",
+  "title": "Kafka Exactly-Once Processing & Zombie Fencing",
+  "problemType": "system-design",
+  "difficulty": "hard",
+  "prompt": "A real-time fraud-scoring pipeline reads from Kafka `payments.raw`, scores events, and atomically writes results to `payments.scored` while committing consumer offsets using Kafka Transactions (`EOS`). During a Kubernetes pod eviction and rebalance, a stalled pod hangs in a 25-second JVM GC pause and wakes up while its replacement pod is already processing the same partition. Operators observe both `ProducerFencedException` crashes and duplicate records appearing in a downstream microservice. Design a deterministic `transactional.id` mapping, zombie-fencing lifecycle, and consumer isolation configuration that guarantees zero duplicates across rebalances and GC pauses.",
+  "spark": {
+    "summary": "In Kafka `consume-transform-produce` EOS pipelines, a stalled producer waking from a GC pause becomes a 'zombie' that can commit duplicate outputs unless fenced by a deterministic `transactional.id` and monotonically increasing `producer_epoch`.",
+    "keyTakeaway": "When a single bottleneck threatens end-to-end availability, assign a deterministic, partition-bound `transactional.id`, call `initTransactions()` to bump `producer_epoch` and fence zombies, commit consumer offsets via `sendOffsetsToTransaction()`, and configure downstream consumers with `isolation.level=read_committed`.",
+    "byteSummary": "**Core Mechanics:** A Kafka 3.6 fraud-scoring pipeline (`acks=all`, `enable.idempotence=true`, 32 partitions, **15,000 events/sec**) reads `payments.raw`, scores events, and writes `payments.scored` atomically.\n\n**Visual & Structural Flow:** Depicts Producer Epoch Bump Fences Stalled GC Pod (Zombie Pod (e=1) -> Tx Coordinator -> New Pod (e=2) -> Downstream); Two-Phase Commit Across Topic & __consumer_offsets (payments.raw -> Tx Coordinator -> payments.scored -> __consumer_offsets).\n\n**Trade-Offs & Production:** Generating a random UUID for `transactional.id` on every pod startup breaks fencing completely: the replacement pod gets a *new* `transactional.id` instead of bumping the. Guarantee end-to-end EOS across rebalances and 20–30s GC pauses: **Deterministic `transactional.id` + Static Membership (EOS v2)**: Bind `transactional.id` and `group.instance.id`.\n\n**Failure Modes & Application:** Fenced transactional streaming is critical whenever duplicate events cause financial or state corruption: **Real-Time Fraud & Risk Scoring**: Ensures every payment is scored and alerted once across pod evictions."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why Kafka Exactly-Once & Zombie Fencing Matter",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "Think of **Why Kafka Exactly-Once & Zombie Fencing Matter** as the intuition layer for Kafka Exactly-Once Processing & Zombie Fencing: The mechanism: understand how Why Kafka Exactly-Once & Zombie Fencing Matter works from first principles.",
+        "core": "A Kafka 3.6 fraud-scoring pipeline (`acks=all`, `enable.idempotence=true`, 32 partitions, **15,000 events/sec**) reads `payments.raw`, scores events, and writes `payments.scored` atomically. When a pod hits a **25-second JVM GC pause**, Kafka rebalances its partition to a replacement pod—then the stalled 'zombie' pod wakes up and commits duplicate outputs.",
+        "deepDive": "Under heavy load or partial failure, why kafka exactly-once & zombie fencing matter becomes a critical lever for predictable latency and correctness. In Kafka `consume-transform-produce` EOS pipelines, a stalled producer waking from a GC pause becomes a 'zombie' that can commit duplicate outputs unless fenced by a deterministic `transactional.id` and monotonically increasing `producer_epoch`."
+      },
+      "purpose": "The mechanism: understand how Why Kafka Exactly-Once & Zombie Fencing Matter works from first principles."
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "Real-World Impact of Unfenced Zombie Producers",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Without deterministic zombie fencing and `read_committed` isolation:",
+        "core": "1. **Duplicate Downstream Actions**: Both the waking zombie and the new owner write scored fraud events for the same input offset.\n2. **Dirty Reads**: Downstream consumers using default `read_uncommitted` process messages from aborted transactions.\n3. **Split Offset Commits**: Committing consumer offsets separately from `producer.send()` creates a crash window between output write and offset commit.",
+        "deepDive": "In production deployments of Kafka Exactly-Once Processing & Zombie Fencing, watch how real-world impact of unfenced zombie producers interacts with tail latency, retry amplification, and partial failures. In Kafka `consume-transform-produce` EOS pipelines, a stalled producer waking from a GC pause becomes a 'zombie' that can commit duplicate outputs unless fenced by a deterministic `transactional.id` and monotonically increasing `producer_epoch`."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Kafka EOS Zombie Fencing",
+        "title": "Producer Epoch Bump Fences Stalled GC Pod",
+        "actors": [
+          {
+            "id": "zomb",
+            "label": "Zombie Pod (e=1)"
+          },
+          {
+            "id": "tc",
+            "label": "Tx Coordinator"
+          },
+          {
+            "id": "newp",
+            "label": "New Pod (e=2)"
+          },
+          {
+            "id": "cons",
+            "label": "Downstream"
+          }
+        ],
+        "events": [
+          {
+            "from": "zomb",
+            "to": "tc",
+            "label": "25s GC pause -> Rebalance triggered",
+            "status": "warn"
+          },
+          {
+            "from": "newp",
+            "to": "tc",
+            "label": "initTransactions(txId) -> epoch=2",
+            "status": "ok"
+          },
+          {
+            "from": "zomb",
+            "to": "tc",
+            "label": "Wakes up, sends batch with epoch=1",
+            "status": "fail"
+          },
+          {
+            "from": "tc",
+            "to": "zomb",
+            "label": "ProducerFencedException (rejected!)",
+            "status": "ok"
+          },
+          {
+            "from": "newp",
+            "to": "cons",
+            "label": "Commit Tx + offsets (read_committed)",
+            "status": "ok"
+          }
+        ],
+        "summary": "Deterministic transactional.id bumps producer_epoch on takeover, fencing any stalled zombie with ProducerFencedException."
+      },
+      "purpose": "The problem: see what breaks without Real-World Impact of Unfenced Zombie Producers under real concurrency or scale.",
+      "decisionFramework": {
+        "problem": "How to implement Kafka Exactly-Once Processing & Zombie Fencing without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "When a single bottleneck threatens end-to-end availability, assign a deterministic, partition-bound `transactional.id`, call `initTransactions()` to bump `producer_epoch` and fence zombies, commit consumer offsets via `sendOffsetsToTransaction()`, and configure downstream consumers with `isolation.level=read_committed`.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Kafka Exactly-Once Processing & Zombie Fencing experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Naive Solution (and Why It Breaks)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Think of **Naive Solution (and Why It Breaks)** as the intuition layer for Kafka Exactly-Once Processing & Zombie Fencing: The problem: see what breaks without Naive Solution under real concurrency or scale.",
+        "core": "Generating a random UUID for `transactional.id` on every pod startup breaks fencing completely: the replacement pod gets a *new* `transactional.id` instead of bumping the `producer_epoch` of the stalled pod, so the zombie's old epoch remains valid! Likewise, leaving downstream consumers on `read_uncommitted` exposes uncommitted/aborted records.",
+        "deepDive": "Under heavy load or partial failure, naive solution (and why it breaks) becomes a critical lever for predictable latency and correctness. In Kafka `consume-transform-produce` EOS pipelines, a stalled producer waking from a GC pause becomes a 'zombie' that can commit duplicate outputs unless fenced by a deterministic `transactional.id` and monotonically increasing `producer_epoch`."
+      },
+      "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Request & State Flow",
+        "title": "Naive Solution (and Why It Breaks)",
+        "actors": [
+          {
+            "id": "prod",
+            "label": "Producer / TX"
+          },
+          {
+            "id": "broker",
+            "label": "Broker Partition"
+          },
+          {
+            "id": "cons",
+            "label": "Consumer Group"
+          },
+          {
+            "id": "dlq",
+            "label": "DLQ / Retry"
+          }
+        ],
+        "events": [
+          {
+            "from": "prod",
+            "to": "broker",
+            "label": "Append event with idempotency key"
+          },
+          {
+            "from": "broker",
+            "to": "cons",
+            "label": "Deliver batch in partition order"
+          },
+          {
+            "from": "cons",
+            "to": "dlq",
+            "label": "Route poison pill after max retries"
+          },
+          {
+            "from": "cons",
+            "to": "broker",
+            "label": "Commit offset after durable sink"
+          }
+        ]
+      }
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise Solution: Deterministic `transactional.id` + `sendOffsetsToTransaction()`",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": {
+        "foundation": "Guarantee end-to-end EOS across rebalances and 20–30s GC pauses:",
+        "core": "- **Deterministic `transactional.id` + Static Membership (EOS v2)**: Bind `transactional.id` and `group.instance.id` to the pod's stable identity (e.g., StatefulSet ordinal `fraud-scorer-0`). Calling `initTransactions()` bumps `producer_epoch` and aborts any open zombie transaction.\n- **Atomic Output + Offset Commit**: Call `producer.sendOffsetsToTransaction(offsets, consumer.groupMetadata())` before `commitTransaction()` so `__consumer_offsets` and `payments.scored` commit atomically.\n- **Timeout Alignment & Downstream Isolation**: Set `transaction.timeout.ms=15000`, `delivery.timeout.ms=12000`, `max.poll.interval.ms=30000`, and configure downstream consumers with `isolation.level=read_committed` + idempotent DB `ON CONFLICT DO NOTHING`.",
+        "deepDive": "In production deployments of Kafka Exactly-Once Processing & Zombie Fencing, watch how enterprise solution: deterministic `transactional.id` + `sendoffsetstotransaction()` interacts with tail latency, retry amplification, and partial failures. In Kafka `consume-transform-produce` EOS pipelines, a stalled producer waking from a GC pause becomes a 'zombie' that can commit duplicate outputs unless fenced by a deterministic `transactional.id` and monotonically increasing `producer_epoch`."
+      },
+      "sectionDiagram": {
+        "kind": "wal-mvcc",
+        "eyebrow": "Atomic Consume-Transform-Produce",
+        "title": "Two-Phase Commit Across Topic & __consumer_offsets",
+        "nodes": [
+          {
+            "label": "payments.raw",
+            "role": "Poll + score batch"
+          },
+          {
+            "label": "Tx Coordinator",
+            "role": "epoch fencing + 2PC"
+          },
+          {
+            "label": "payments.scored",
+            "role": "read_committed view"
+          },
+          {
+            "label": "__consumer_offsets",
+            "role": "Atomic offset commit"
+          }
+        ],
+        "edges": [
+          {
+            "label": "beginTransaction()"
+          },
+          {
+            "label": "sendOffsetsToTransaction()"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Epoch Fencing",
+            "detail": "Coordinator rejects any write with epoch < current producer_epoch."
+          },
+          {
+            "label": "EOS v2 Static ID",
+            "detail": "One deterministic transactional.id per static consumer instance."
+          },
+          {
+            "label": "read_committed",
+            "detail": "Downstream consumers buffer until LSO (Last Stable Offset) advances."
+          },
+          {
+            "label": "Sink Idempotency",
+            "detail": "External DB sinks still use ON CONFLICT DO NOTHING for true E2E EOS."
+          }
+        ],
+        "summary": "Kafka's Transaction Coordinator atomically commits output messages and input offsets while fencing stale epochs."
+      },
+      "markdownContent": "```java\n// EOS v2: one deterministic transactional.id per static consumer instance\nprops.put(ProducerConfig.TRANSACTIONAL_ID_CONFIG, \"fraud-scorer-\" + staticInstanceId);\nprops.put(ConsumerConfig.GROUP_INSTANCE_ID_CONFIG, staticInstanceId);\n\nproducer.initTransactions();\nwhile (running) {\n    ConsumerRecords<String, byte[]> records = consumer.poll(Duration.ofMillis(200));\n    if (records.isEmpty()) continue;\n    try {\n        producer.beginTransaction();\n        Map<TopicPartition, OffsetAndMetadata> offsets = new HashMap<>();\n        for (ConsumerRecord<String, byte[]> rec : records) {\n            byte[] scored = scoreFraud(rec.value());\n            producer.send(new ProducerRecord<>(\"payments.scored\", rec.key(), scored));\n            offsets.put(new TopicPartition(rec.topic(), rec.partition()), new OffsetAndMetadata(rec.offset() + 1));\n        }\n        producer.sendOffsetsToTransaction(offsets, consumer.groupMetadata());\n        producer.commitTransaction();\n    } catch (ProducerFencedException | OutOfOrderSequenceException | AuthorizationException fatal) {\n        producer.close(Duration.ZERO);\n        consumer.close();\n        throw fatal;\n    } catch (KafkaException transientEx) {\n        producer.abortTransaction();\n        resetToCommittedOffsets(consumer);\n    }\n}\n\n// Mandatory downstream consumer config for EOS\nProperties props = new Properties();\nprops.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, \"kafka:9092\");\nprops.put(ConsumerConfig.GROUP_ID_CONFIG, \"fraud-alert-service\");\nprops.put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, \"read_committed\");\nprops.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, \"false\");\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where Kafka EOS & Fencing Apply in System Design",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Fenced transactional streaming is critical whenever duplicate events cause financial or state corruption:",
+        "core": "- **Real-Time Fraud & Risk Scoring**: Ensures every payment is scored and alerted once across pod evictions.\n- **Stream Aggregations (Kafka Streams / Flink)**: Ties RocksDB changelog updates to input offsets.\n- **Multi-Stage Financial Pipelines**: Combines Kafka EOS with Postgres `ON CONFLICT` for true end-to-end exactly-once.",
+        "deepDive": "In production deployments of Kafka Exactly-Once Processing & Zombie Fencing, watch how where kafka eos & fencing apply in system design interacts with tail latency, retry amplification, and partial failures. In Kafka `consume-transform-produce` EOS pipelines, a stalled producer waking from a GC pause becomes a 'zombie' that can commit duplicate outputs unless fenced by a deterministic `transactional.id` and monotonically increasing `producer_epoch`."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "replicated-logs-sequencing",
+          "title": "Concept: Replicated Logs & Sequencing",
+          "kind": "concept"
+        },
+        {
+          "slug": "two-phase-commit",
+          "title": "Concept: Two-Phase Commit",
+          "kind": "concept"
+        },
+        {
+          "slug": "idempotency-deduplication",
+          "title": "Concept: Idempotency & Deduplication",
+          "kind": "concept"
+        },
+        {
+          "slug": "design-lock-fencing-tokens",
+          "title": "System Design: Distributed Lock Fencing Tokens",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "What happens if you use a random UUID for `transactional.id` on every Kafka consumer pod restart?",
+      "options": [
+        {
+          "id": "a",
+          "text": "The replacement pod cannot fence a stalled zombie pod because `producer_epoch` is only bumped for the exact same `transactional.id`",
+          "correct": true,
+          "feedback": "Correct: deterministic, stable `transactional.id` mapping is required for zombie fencing."
+        },
+        {
+          "id": "b",
+          "text": "Kafka brokers reject any `transactional.id` containing hyphens",
+          "correct": false,
+          "feedback": "Hyphens are valid; the issue is losing epoch continuity across restarts."
+        },
+        {
+          "id": "c",
+          "text": "Downstream `read_committed` consumers automatically deduplicate messages across different `transactional.id`s",
+          "correct": false,
+          "feedback": "`read_committed` only filters aborted transactions; it does not deduplicate separate producers."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "What happens if you use a random UUID for `transactional.id` on every Kafka consumer pod restart?",
+        "options": [
+          {
+            "id": "a",
+            "text": "The replacement pod cannot fence a stalled zombie pod because `producer_epoch` is only bumped for the exact same `transactional.id`",
+            "correct": true,
+            "feedback": "Correct: deterministic, stable `transactional.id` mapping is required for zombie fencing."
+          },
+          {
+            "id": "b",
+            "text": "Kafka brokers reject any `transactional.id` containing hyphens",
+            "correct": false,
+            "feedback": "Hyphens are valid; the issue is losing epoch continuity across restarts."
+          },
+          {
+            "id": "c",
+            "text": "Downstream `read_committed` consumers automatically deduplicate messages across different `transactional.id`s",
+            "correct": false,
+            "feedback": "`read_committed` only filters aborted transactions; it does not deduplicate separate producers."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why Kafka Exactly-Once & Zombie Fencing Matter', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "A Kafka 3.6 fraud-scoring pipeline (acks=all, enable.idempotence=true, 32 partitions, **15,000 events/sec**) reads payments.raw, scores events, and writes payments.scored…",
+            "correct": true,
+            "feedback": "Correct: A Kafka 3.6 fraud-scoring pipeline (acks=all, enable.idempotence=true, 32 partitions, **15,000 events/sec**) reads payments.raw, scores events, and writes payments.scored…"
+          },
+          {
+            "id": "b",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "c",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Real-World Impact of Unfenced Zombie Producers', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "b",
+            "text": "Without deterministic zombie fencing and read_committed isolation: 1.",
+            "correct": true,
+            "feedback": "Correct: Without deterministic zombie fencing and read_committed isolation: 1."
+          },
+          {
+            "id": "c",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** A Kafka 3.6 fraud-scoring pipeline (`acks=all`, `enable.idempotence=true`, 32 partitions, **15,000 events/sec**) reads `payments.raw`, scores events, and writes `payments.scored` atomically.\n\n**How It Flows:** Think of Kafka Exactly-Once Processing & Zombie Fencing as a clear step-by-step chain: Zombie Pod (e=1) -> Tx Coordinator -> New Pod (e=2) -> Downstream -> payments.raw.\n\n**Why Beginners Should Care:** Assign a deterministic, partition-bound `transactional.id`, call `initTransactions()` to bump `producer_epoch` and fence zombies, commit consumer offsets via.",
+      "spark": {
+        "summary": "A Kafka 3.6 fraud-scoring pipeline (`acks=all`, `enable.idempotence=true`, 32 partitions, **15,000 events/sec**) reads `payments.raw`, scores events, and writes `payments.scored` atomically.",
+        "keyTakeaway": "Assign a deterministic, partition-bound `transactional.id`, call `initTransactions()` to bump `producer_epoch` and fence zombies, commit consumer offsets via."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why Kafka Exactly-Once & Zombie Fencing Matter",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why Kafka Exactly-Once & Zombie Fencing Matter works from first principles.",
+          "explanation": "A Kafka 3.6 fraud-scoring pipeline (`acks=all`, `enable.idempotence=true`, 32 partitions, **15,000 events/sec**) reads `payments.raw`, scores events, and writes `payments.scored` atomically. When a pod hits a **25-second JVM GC pause**, Kafka rebalances its partition to a replacement pod—then the stalled 'zombie' pod wakes up and commits duplicate outputs.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Real-World Impact of Unfenced Zombie Producers",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without Real-World Impact of Unfenced Zombie Producers under real concurrency or scale.",
+          "explanation": "Without deterministic zombie fencing and `read_committed` isolation: 1. **Duplicate Downstream Actions**: Both the waking zombie and the new owner write scored fraud events for the same input offset. 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Kafka EOS Zombie Fencing",
+            "title": "Producer Epoch Bump Fences Stalled GC Pod",
+            "actors": [
+              {
+                "id": "zomb",
+                "label": "Zombie Pod (e=1)"
+              },
+              {
+                "id": "tc",
+                "label": "Tx Coordinator"
+              },
+              {
+                "id": "newp",
+                "label": "New Pod (e=2)"
+              },
+              {
+                "id": "cons",
+                "label": "Downstream"
+              }
+            ],
+            "events": [
+              {
+                "from": "zomb",
+                "to": "tc",
+                "label": "25s GC pause -> Rebalance triggered",
+                "status": "warn"
+              },
+              {
+                "from": "newp",
+                "to": "tc",
+                "label": "initTransactions(txId) -> epoch=2",
+                "status": "ok"
+              },
+              {
+                "from": "zomb",
+                "to": "tc",
+                "label": "Wakes up, sends batch with epoch=1",
+                "status": "fail"
+              },
+              {
+                "from": "tc",
+                "to": "zomb",
+                "label": "ProducerFencedException (rejected!)",
+                "status": "ok"
+              },
+              {
+                "from": "newp",
+                "to": "cons",
+                "label": "Commit Tx + offsets (read_committed)",
+                "status": "ok"
+              }
+            ],
+            "summary": "Deterministic transactional.id bumps producer_epoch on takeover, fencing any stalled zombie with ProducerFencedException."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive Solution (and Why It Breaks)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+          "explanation": "Generating a random UUID for `transactional.id` on every pod startup breaks fencing completely: the replacement pod gets a *new* `transactional.id` instead of bumping the `producer_epoch` of the stalled pod, so the zombie's old epoch remains valid! Likewise, leaving downstream consumers on `read_uncommitted` exposes uncommitted/aborted records.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise Solution: Deterministic `transactional.id` + `sendOffsetsToTransaction()`",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Guarantee end-to-end EOS across rebalances and 20–30s GC pauses: **Deterministic `transactional.id` + Static Membership (EOS v2)**: Bind `transactional.id` and `group.instance.id` to the pod's stable identity (e.g., StatefulSet ordinal `fraud-scorer-0`). Calling `initTransactions()` bumps `producer_epoch` and aborts any open zombie transaction.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "wal-mvcc",
+            "eyebrow": "Atomic Consume-Transform-Produce",
+            "title": "Two-Phase Commit Across Topic & __consumer_offsets",
+            "nodes": [
+              {
+                "label": "payments.raw",
+                "role": "Poll + score batch"
+              },
+              {
+                "label": "Tx Coordinator",
+                "role": "epoch fencing + 2PC"
+              },
+              {
+                "label": "payments.scored",
+                "role": "read_committed view"
+              },
+              {
+                "label": "__consumer_offsets",
+                "role": "Atomic offset commit"
+              }
+            ],
+            "edges": [
+              {
+                "label": "beginTransaction()"
+              },
+              {
+                "label": "sendOffsetsToTransaction()"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Epoch Fencing",
+                "detail": "Coordinator rejects any write with epoch < current producer_epoch."
+              },
+              {
+                "label": "EOS v2 Static ID",
+                "detail": "One deterministic transactional.id per static consumer instance."
+              },
+              {
+                "label": "read_committed",
+                "detail": "Downstream consumers buffer until LSO (Last Stable Offset) advances."
+              },
+              {
+                "label": "Sink Idempotency",
+                "detail": "External DB sinks still use ON CONFLICT DO NOTHING for true E2E EOS."
+              }
+            ],
+            "summary": "Kafka's Transaction Coordinator atomically commits output messages and input offsets while fencing stale epochs."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Assign a deterministic, partition-bound `transactional.id`, call `initTransactions()` to bump `producer_epoch` and fence zombies, commit consumer offsets via.",
+      "summary": "In Kafka `consume-transform-produce` EOS pipelines, a stalled producer waking from a GC pause becomes a 'zombie' that can commit duplicate outputs unless fenced by a deterministic `transactional.id` and monotonically increasing `producer_epoch`.",
+      "keyTakeaway": "When a single bottleneck threatens end-to-end availability, assign a deterministic, partition-bound `transactional.id`, call `initTransactions()` to bump `producer_epoch` and fence zombies, commit consumer offsets via `sendOffsetsToTransaction()`, and configure downstream consumers with `isolation.level=read_committed`."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** A Kafka 3.6 fraud-scoring pipeline (`acks=all`, `enable.idempotence=true`, 32 partitions, **15,000 events/sec**) reads `payments.raw`, scores events, and writes `payments.scored` atomically.\n\n**Visual & Structural Flow:** Depicts Producer Epoch Bump Fences Stalled GC Pod (Zombie Pod (e=1) -> Tx Coordinator -> New Pod (e=2) -> Downstream); Two-Phase Commit Across Topic & __consumer_offsets (payments.raw -> Tx Coordinator -> payments.scored -> __consumer_offsets).\n\n**Trade-Offs & Production:** Generating a random UUID for `transactional.id` on every pod startup breaks fencing completely: the replacement pod gets a *new* `transactional.id` instead of bumping the. Guarantee end-to-end EOS across rebalances and 20–30s GC pauses: **Deterministic `transactional.id` + Static Membership (EOS v2)**: Bind `transactional.id` and `group.instance.id`.\n\n**Failure Modes & Application:** Fenced transactional streaming is critical whenever duplicate events cause financial or state corruption: **Real-Time Fraud & Risk Scoring**: Ensures every payment is scored and alerted once across pod evictions.",
+      "spark": {
+        "summary": "In Kafka `consume-transform-produce` EOS pipelines, a stalled producer waking from a GC pause becomes a 'zombie' that can commit duplicate outputs unless fenced by a deterministic `transactional.id` and monotonically increasing `producer_epoch`.",
+        "keyTakeaway": "Assign a deterministic, partition-bound `transactional.id`, call `initTransactions()` to bump `producer_epoch` and fence zombies, commit consumer offsets via `sendOffsetsToTransaction()`, and configure downstream consumers with `isolation.level=read_committed`."
+      },
+      "summary": "In Kafka `consume-transform-produce` EOS pipelines, a stalled producer waking from a GC pause becomes a 'zombie' that can commit duplicate outputs unless fenced by a deterministic `transactional.id` and monotonically increasing `producer_epoch`.",
+      "keyTakeaway": "When a single bottleneck threatens end-to-end availability, assign a deterministic, partition-bound `transactional.id`, call `initTransactions()` to bump `producer_epoch` and fence zombies, commit consumer offsets via `sendOffsetsToTransaction()`, and configure downstream consumers with `isolation.level=read_committed`."
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** In Kafka `consume-transform-produce` EOS pipelines, a stalled producer waking from a GC pause becomes a 'zombie' that can commit duplicate outputs unless fenced by a deterministic `transactional.id` and monotonically increasing `producer_epoch`.\n\n**Production Trade-Offs:** Generating a random UUID for `transactional.id` on every pod startup breaks fencing completely: the replacement pod gets a *new* `transactional.id` instead of bumping the `producer_epoch` of the stalled pod, so the zombie's old epoch remains valid!\n\n**Failure Modes & Edge Cases:** Fenced transactional streaming is critical whenever duplicate events cause financial or state corruption: **Real-Time Fraud & Risk Scoring**: Ensures every payment is scored and alerted once across pod evictions.\n\n**Principal Takeaway:** Assign a deterministic, partition-bound `transactional.id`, call `initTransactions()` to bump `producer_epoch` and fence zombies, commit consumer offsets via `sendOffsetsToTransaction()`, and configure downstream.",
+      "spark": {
+        "summary": "In Kafka `consume-transform-produce` EOS pipelines, a stalled producer waking from a GC pause becomes a 'zombie' that can commit duplicate outputs unless fenced by a deterministic `transactional.id` and monotonically increasing `producer_epoch`.",
+        "keyTakeaway": "Assign a deterministic, partition-bound `transactional.id`, call `initTransactions()` to bump `producer_epoch` and fence zombies, commit consumer offsets via `sendOffsetsToTransaction()`, and configure downstream."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why Kafka Exactly-Once & Zombie Fencing Matter",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why Kafka Exactly-Once & Zombie Fencing Matter works from first principles.",
+          "explanation": "A Kafka 3.6 fraud-scoring pipeline (`acks=all`, `enable.idempotence=true`, 32 partitions, **15,000 events/sec**) reads `payments.raw`, scores events, and writes `payments.scored` atomically. When a pod hits a **25-second JVM GC pause**, Kafka rebalances its partition to a replacement pod—then the stalled 'zombie' pod wakes up and commits duplicate outputs.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Real-World Impact of Unfenced Zombie Producers",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without Real-World Impact of Unfenced Zombie Producers under real concurrency or scale.",
+          "explanation": "Without deterministic zombie fencing and `read_committed` isolation:\n\n1. **Duplicate Downstream Actions**: Both the waking zombie and the new owner write scored fraud events for the same input offset.\n2. **Dirty Reads**: Downstream consumers using default `read_uncommitted` process messages from aborted transactions.\n3. **Split Offset Commits**: Committing consumer offsets separately from `producer.send()` creates a crash window between output write and offset commit.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Kafka EOS Zombie Fencing",
+            "title": "Producer Epoch Bump Fences Stalled GC Pod",
+            "actors": [
+              {
+                "id": "zomb",
+                "label": "Zombie Pod (e=1)"
+              },
+              {
+                "id": "tc",
+                "label": "Tx Coordinator"
+              },
+              {
+                "id": "newp",
+                "label": "New Pod (e=2)"
+              },
+              {
+                "id": "cons",
+                "label": "Downstream"
+              }
+            ],
+            "events": [
+              {
+                "from": "zomb",
+                "to": "tc",
+                "label": "25s GC pause -> Rebalance triggered",
+                "status": "warn"
+              },
+              {
+                "from": "newp",
+                "to": "tc",
+                "label": "initTransactions(txId) -> epoch=2",
+                "status": "ok"
+              },
+              {
+                "from": "zomb",
+                "to": "tc",
+                "label": "Wakes up, sends batch with epoch=1",
+                "status": "fail"
+              },
+              {
+                "from": "tc",
+                "to": "zomb",
+                "label": "ProducerFencedException (rejected!)",
+                "status": "ok"
+              },
+              {
+                "from": "newp",
+                "to": "cons",
+                "label": "Commit Tx + offsets (read_committed)",
+                "status": "ok"
+              }
+            ],
+            "summary": "Deterministic transactional.id bumps producer_epoch on takeover, fencing any stalled zombie with ProducerFencedException."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive Solution (and Why It Breaks)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+          "explanation": "Generating a random UUID for `transactional.id` on every pod startup breaks fencing completely: the replacement pod gets a *new* `transactional.id` instead of bumping the `producer_epoch` of the stalled pod, so the zombie's old epoch remains valid! Likewise, leaving downstream consumers on `read_uncommitted` exposes uncommitted/aborted records.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise Solution: Deterministic `transactional.id` + `sendOffsetsToTransaction()`",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Guarantee end-to-end EOS across rebalances and 20–30s GC pauses:\n\n- **Deterministic `transactional.id` + Static Membership (EOS v2)**: Bind `transactional.id` and `group.instance.id` to the pod's stable identity (e.g., StatefulSet ordinal `fraud-scorer-0`). Calling `initTransactions()` bumps `producer_epoch` and aborts any open zombie transaction.\n- **Atomic Output + Offset Commit**: Call `producer.sendOffsetsToTransaction(offsets, consumer.groupMetadata())` before `commitTransaction()` so `__consumer_offsets` and `payments.scored` commit atomically.\n- **Timeout Alignment & Downstream Isolation**: Set `transaction.timeout.ms=15000`, `delivery.timeout.ms=12000`, `max.poll.interval.ms=30000`, and configure downstream consumers with `isolation.level=read_committed` + idempotent DB `ON CONFLICT DO NOTHING`.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "wal-mvcc",
+            "eyebrow": "Atomic Consume-Transform-Produce",
+            "title": "Two-Phase Commit Across Topic & __consumer_offsets",
+            "nodes": [
+              {
+                "label": "payments.raw",
+                "role": "Poll + score batch"
+              },
+              {
+                "label": "Tx Coordinator",
+                "role": "epoch fencing + 2PC"
+              },
+              {
+                "label": "payments.scored",
+                "role": "read_committed view"
+              },
+              {
+                "label": "__consumer_offsets",
+                "role": "Atomic offset commit"
+              }
+            ],
+            "edges": [
+              {
+                "label": "beginTransaction()"
+              },
+              {
+                "label": "sendOffsetsToTransaction()"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Epoch Fencing",
+                "detail": "Coordinator rejects any write with epoch < current producer_epoch."
+              },
+              {
+                "label": "EOS v2 Static ID",
+                "detail": "One deterministic transactional.id per static consumer instance."
+              },
+              {
+                "label": "read_committed",
+                "detail": "Downstream consumers buffer until LSO (Last Stable Offset) advances."
+              },
+              {
+                "label": "Sink Idempotency",
+                "detail": "External DB sinks still use ON CONFLICT DO NOTHING for true E2E EOS."
+              }
+            ],
+            "summary": "Kafka's Transaction Coordinator atomically commits output messages and input offsets while fencing stale epochs."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where Kafka EOS & Fencing Apply in System Design",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Fenced transactional streaming is critical whenever duplicate events cause financial or state corruption:\n\n- **Real-Time Fraud & Risk Scoring**: Ensures every payment is scored and alerted once across pod evictions.\n- **Stream Aggregations (Kafka Streams / Flink)**: Ties RocksDB changelog updates to input offsets.\n- **Multi-Stage Financial Pipelines**: Combines Kafka EOS with Postgres `ON CONFLICT` for true end-to-end exactly-once.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Assign a deterministic, partition-bound `transactional.id`, call `initTransactions()` to bump `producer_epoch` and fence zombies, commit consumer offsets via `sendOffsetsToTransaction()`, and configure downstream.",
+      "summary": "In Kafka `consume-transform-produce` EOS pipelines, a stalled producer waking from a GC pause becomes a 'zombie' that can commit duplicate outputs unless fenced by a deterministic `transactional.id` and monotonically increasing `producer_epoch`.",
+      "keyTakeaway": "When a single bottleneck threatens end-to-end availability, assign a deterministic, partition-bound `transactional.id`, call `initTransactions()` to bump `producer_epoch` and fence zombies, commit consumer offsets via `sendOffsetsToTransaction()`, and configure downstream consumers with `isolation.level=read_committed`."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "simulation": {
+    "title": "Kafka Exactly-Once Processing & Zombie Fencing — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "prod",
+        "label": "Producer",
+        "role": "Idempotent Publish"
+      },
+      {
+        "id": "broker",
+        "label": "Partition Log",
+        "role": "Ordered Append"
+      },
+      {
+        "id": "cons",
+        "label": "Consumer",
+        "role": "Deduplicated Sink"
+      },
+      {
+        "id": "dlq",
+        "label": "Dead-Letter Queue",
+        "role": "Poison Isolation"
+      }
+    ],
+    "edges": [
+      {
+        "from": "prod",
+        "to": "broker",
+        "label": "append(key)"
+      },
+      {
+        "from": "broker",
+        "to": "cons",
+        "label": "poll(offset)"
+      },
+      {
+        "from": "cons",
+        "to": "dlq",
+        "label": "dead-letter"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why Kafka Exactly-Once & Zombie Fencing Matter",
+        "actionLabel": "append(key)",
+        "status": "healthy",
+        "activeNodeIds": [
+          "prod",
+          "broker"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "append(key)",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Producer sends work to Partition Log (Why Kafka Exactly-Once & Zombie Fencing Matter)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Real-World Impact of Unfenced Zombie Producers",
+        "actionLabel": "poll(offset)",
+        "status": "healthy",
+        "activeNodeIds": [
+          "broker",
+          "cons"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "poll(offset)",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Partition Log coordinates with Consumer while preserving the core invariant (Real-World Impact of Unfenced Zombie Producers)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Naive Solution (and Why It Breaks)",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "cons",
+          "dlq"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, Dead-Letter Queue absorbs pressure without cascading (Naive Solution (and Why It Breaks))."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Where Kafka EOS & Fencing Apply in System Design",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "prod",
+          "broker",
+          "cons",
+          "dlq"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Where Kafka EOS & Fencing Apply in System Design)."
+      }
+    ]
+  }
+}

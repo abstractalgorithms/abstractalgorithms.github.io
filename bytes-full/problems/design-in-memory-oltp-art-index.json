@@ -1,0 +1,537 @@
+{
+  "id": "design-in-memory-oltp-art-index",
+  "slug": "design-in-memory-oltp-art-index",
+  "title": "Design an In-Memory Multi-Core OLTP Index Engine with Adaptive Radix Trees & Epoch Reclamation",
+  "problemType": "architecture",
+  "difficulty": "hard",
+  "domain": "Algorithms & Data Structures",
+  "tagline": "Sustaining 20M+ concurrent reads and writes/sec on 64 cores with OLC, EBR, and zero reader cache-line bouncing.",
+  "purpose": "Design a thread-safe, memory-bounded ordered index engine for an in-memory OLTP database that supports point lookups, range scans, and concurrent node resizing without use-after-free bugs.",
+  "prompt": "Design an in-memory ordered index engine for a 64-core OLTP database holding 500M keys (mixed 64-bit IDs and variable-length composite keys) with 90% point/range reads and 10% inserts/deletes, targeting <500 ns p99 lookup latency and zero use-after-free crashes during node grow/shrink.",
+  "pedagogicalFramework": "RESHADED",
+  "prerequisites": [
+    {
+      "title": "Adaptive Radix Trees (ART)",
+      "summary": "Know Node4/16/48/256 layouts, path compression, and why OLC uses version counters instead of reader locks."
+    },
+    {
+      "title": "Memory Reclamation (EBR / Hazard Pointers)",
+      "summary": "Understand why lock-free/optimistic readers cannot allow writers to `free()` a replaced node immediately."
+    }
+  ],
+  "spark": {
+    "summary": "Pair ART (Node4/16/48/256) with Optimistic Lock Coupling (OLC) for zero-write read paths and Epoch-Based Reclamation (EBR) with bounded limbo-list reclamation.",
+    "keyTakeaway": "When building a multi-core in-memory OLTP index, combine Adaptive Radix Trees with Optimistic Lock Coupling for lock-free reads and Epoch-Based Reclamation so node grow/shrink never triggers use-after-free crashes.",
+    "byteSummary": "An in-memory OLTP engine serving 500M keys across 64 cores will collapse if readers acquire shared mutexes or RW-locks—every atomic lock increment bounces the cache line across all 64 cores. Yet simply removing locks causes readers to crash with use-after-free segfaults whenever a writer grows a Node4 into a Node16 and frees the old Node4.\n\nThe architecture pairs an Adaptive Radix Tree (ART) with Optimistic Lock Coupling (OLC) and Epoch-Based Reclamation (EBR). Readers enter a thread-local epoch guard (`epoch_enter()`), traverse nodes by validating monotonic 64-bit version counters before and after reading child pointers, and restart if a writer bumped a node's version or set its obsolete bit.\n\nWriters acquire per-node exclusive write locks in top-down coupling order, allocate the new Node16/48/256, atomically swap the parent's child pointer, mark the old node obsolete, and push it onto a thread-local EBR limbo list. A background or amortized reclamation sweep frees retired nodes only after all active worker threads have exited older epochs—while a quiescent watchdog ensures stalled threads cannot pin memory indefinitely."
+  },
+  "learningJourney": [
+    {
+      "id": "stage-1-requirements-estimations",
+      "stageNumber": 1,
+      "title": "R & E · Requirements, Memory Budget & Latency Math",
+      "whyThisMatters": "Establishes exact DRAM bounds for 500M keys and why cache misses dominate the 500 ns budget.",
+      "explanation": {
+        "foundation": "With 500M keys and a 500 ns p99 lookup budget, you can afford at most 4–5 DRAM cache misses (~70–90 ns each) per lookup—leaving zero room for lock contention.",
+        "core": "Illustrative Memory Sizing: At ~48–60 bytes per key including inner nodes + 8-byte leaf pointers, 500M keys occupy ~24–30 GB of DRAM for inner structure plus leaf payloads—easily fitting inside a single 256 GB–512 GB dual-socket server, compared to ~100+ GB for a naive 256-way trie.",
+        "deepDive": "If a reader acquires a standard `std::shared_mutex` on the root node, 64 cores contending on that single cache line serialize throughput below 2M ops/sec. Write-free OLC version reads eliminate all inter-core invalidations on the read path, scaling linearly past 20M+ ops/sec."
+      },
+      "sectionDiagram": {
+        "kind": "behavior-transition",
+        "eyebrow": "Multi-Core Scaling",
+        "title": "Shared RWLock Contention vs. Optimistic Lock Coupling (OLC)",
+        "before": {
+          "label": "Per-Node RWLock",
+          "metrics": [
+            "Readers dirty shared cache line",
+            "64 cores serialize at root",
+            "<2M ops/sec ceiling"
+          ]
+        },
+        "after": {
+          "label": "ART + OLC + EBR",
+          "metrics": [
+            "Zero memory writes on reads",
+            "Linear scaling across 64 cores",
+            "<500 ns p99 lookup"
+          ]
+        }
+      }
+    },
+    {
+      "id": "stage-2-storage-schema-node-layout",
+      "stageNumber": 2,
+      "title": "S · Storage & Cache-Aligned Node Headers",
+      "whyThisMatters": "Embeds the OLC version word, obsolete bit, and compressed prefix into a single cache line.",
+      "explanation": {
+        "foundation": "Every ART inner node starts with a compact 16-byte header so the CPU fetches the version word, node type, and compressed prefix in the exact same 64-byte cache line.",
+        "core": "Header layout: `uint64_t version_lock_obsolete` (8B: bit 0 = lock, bit 1 = obsolete, bits 2..63 = monotonic version), `uint8_t type` (Node4/16/48/256), `uint8_t count`, `uint16_t prefix_len`, and `uint8_t prefix[8]` (8B inline compressed prefix). Total header = 20 bytes.",
+        "deepDive": "For Node4 (20B header + 4B keys + 32B pointers = 56 bytes), the entire node fits inside a single 64-byte CPU cache line! A reader loads the header and all 4 children in one memory fetch."
+      },
+      "sectionDiagram": {
+        "kind": "tree-index",
+        "eyebrow": "64-Byte Cache-Line Header",
+        "title": "20B OLC Header + Adaptive Child Payload",
+        "levels": [
+          {
+            "label": "Bits 0..63: Version + Lock + Obsolete",
+            "detail": "8-byte atomic word"
+          },
+          {
+            "label": "Type + Count + PrefixLen + Prefix[8]",
+            "detail": "12-byte metadata & path compression"
+          },
+          {
+            "label": "Adaptive Payload (Node4/16/48/256)",
+            "detail": "36B to 2,048B child pointers"
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-3-high-level-architecture",
+      "stageNumber": 3,
+      "title": "H & A · High-Level Engine & OLC Traversal Contract",
+      "whyThisMatters": "Defines the exact read/validate/restart contract and range-scan cursor semantics.",
+      "explanation": {
+        "foundation": "Every lookup or range scan begins by registering the worker thread's current epoch (`EbrGuard`) and reading the root node's version.",
+        "core": "During traversal, before dereferencing `child = parent.find_child(byte)`, the reader checks `parent.read_unlock_or_restart(v_parent)`. Only after confirming `parent` was untouched does it load `v_child` and descend—this is 'lock coupling' without holding any read locks!",
+        "deepDive": "For range scans (`scan(low, high)`), OLC validates each node along the DFS stack; if any node version changes mid-scan, the iterator restarts from the last validated key (`last_key`) rather than from `low`, guaranteeing forward progress even under concurrent writes."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "OLC Read Coupling",
+        "title": "Epoch-Guarded Optimistic Descent & Version Validation",
+        "actors": [
+          {
+            "id": "w",
+            "label": "Worker Thread"
+          },
+          {
+            "id": "ebr",
+            "label": "EBR Epoch"
+          },
+          {
+            "id": "par",
+            "label": "Parent Node"
+          },
+          {
+            "id": "ch",
+            "label": "Child Node"
+          }
+        ],
+        "events": [
+          {
+            "from": "w",
+            "to": "ebr",
+            "label": "Enter active epoch e"
+          },
+          {
+            "from": "w",
+            "to": "par",
+            "label": "Load v_p, find child ptr"
+          },
+          {
+            "from": "w",
+            "to": "par",
+            "label": "Validate v_p unchanged"
+          },
+          {
+            "from": "w",
+            "to": "ch",
+            "label": "Load v_c & descend"
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-4-detailed-design-ebr",
+      "stageNumber": 4,
+      "title": "D · Detailed Design: Node Grow/Shrink & Epoch Reclamation",
+      "whyThisMatters": "Prevents use-after-free crashes when writers replace Node4->Node16 under concurrent readers.",
+      "explanation": {
+        "foundation": "A writer cannot call `delete old_node` immediately after swapping a Node4 for a Node16, because an optimistic reader might still be inspecting `old_node` before its validation check.",
+        "core": "With 3-epoch EBR (`e`, `e-1`, `e-2`), each worker keeps a local limbo list of retired nodes tagged with the epoch `e` when they were retired. Periodically, a thread scans all active threads' announced epochs; once `min_active_epoch >= e + 2`, every node retired in epoch `e` is guaranteed unreachable by any reader and is freed in batch.",
+        "deepDive": "If a Node48 shrinks below 13 children (hysteresis threshold < 16 to avoid thrashing!), the writer allocates a Node16, swaps the parent pointer, marks the Node48 obsolete (`version |= OBSOLETE_BIT`), and retires it to EBR. Hysteresis (grow at 16, shrink at 12) prevents repeated alloc/free ping-pong on oscillating workloads."
+      },
+      "codeExample": {
+        "language": "cpp",
+        "title": "Optimistic Read Validation & Node Grow with EBR Retire (C++ Conceptual)",
+        "code": "bool read_unlock_or_restart(const ArtNode* n, uint64_t start_v) {\n    std::atomic_thread_fence(std::memory_order_acquire);\n    uint64_t cur = n->version_lock_obsolete.load(std::memory_order_relaxed);\n    return (cur == start_v); // false if locked, bumped, or obsolete\n}\n\nvoid retire_old_node(ArtNode* old_node, EbrThreadState& ebr) {\n    old_node->version_lock_obsolete.fetch_or(OBSOLETE_BIT, std::memory_order_release);\n    ebr.limbo[ebr.current_epoch % 3].push_back(old_node);\n    ebr.try_reclaim_oldest_epoch();\n}\n"
+      },
+      "decisionFramework": {
+        "problem": "How to safely reclaim retired ART nodes without slowing down optimistic readers.",
+        "naiveSolution": "Immediately `free()` replaced nodes or use per-pointer Hazard Pointers on every hop.",
+        "whyItFails": "Immediate `free()` causes segfaults on concurrent OLC readers; Hazard Pointers require an expensive atomic store + memory fence (`MFENCE`) at every single tree level.",
+        "alternatives": "Reference counting vs. Hazard Pointers vs. 3-Epoch Based Reclamation (EBR).",
+        "decision": "Use 3-Epoch Based Reclamation (EBR) with hysteresis on node shrink and a bounded-epoch stall check.",
+        "tradeOffs": "Amortizes reclamation overhead to once per operation batch (zero fences inside tree traversal), assuming workers do not block inside an epoch guard."
+      },
+      "decisionExercise": {
+        "prompt": "During a bulk delete workload, a worker thread enters an EBR epoch guard, then makes a slow synchronous HTTP call to an external service before exiting the guard. What happens to the 64-core OLTP index?",
+        "options": [
+          {
+            "id": "a",
+            "label": "The stalled thread pins the minimum active epoch, preventing all 64 cores from freeing retired nodes in EBR limbo lists and causing unbounded memory growth.",
+            "isCorrect": true,
+            "explanation": "Correct! EBR can only free nodes older than the earliest active reader epoch. Never perform blocking I/O inside an EBR guard; keep guards strictly scoped to in-memory index operations."
+          },
+          {
+            "id": "b",
+            "label": "Other threads automatically switch from ART to a B+Tree.",
+            "isCorrect": false,
+            "explanation": "Threads continue using ART; only memory reclamation stalls."
+          },
+          {
+            "id": "c",
+            "label": "EBR immediately frees the nodes anyway after 10 ms.",
+            "isCorrect": false,
+            "explanation": "Freeing while a thread holds an old epoch would violate memory safety and risk use-after-free."
+          }
+        ]
+      },
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "EBR Limbo Lifecycle",
+        "title": "Active -> Obsolete + Retired -> Epoch Advance -> Safe Free",
+        "states": [
+          {
+            "id": "live",
+            "label": "Live Node",
+            "tone": "good"
+          },
+          {
+            "id": "obs",
+            "label": "Obsolete (Swapped)",
+            "tone": "warn"
+          },
+          {
+            "id": "limbo",
+            "label": "EBR Limbo (Epoch e)",
+            "tone": "info"
+          },
+          {
+            "id": "freed",
+            "label": "Freed (min_e >= e+2)",
+            "tone": "good"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "live",
+            "to": "obs",
+            "label": "grow / shrink"
+          },
+          {
+            "from": "obs",
+            "to": "limbo",
+            "label": "push to limbo[e]"
+          },
+          {
+            "from": "limbo",
+            "to": "freed",
+            "label": "all readers > e+1"
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-5-evaluation-assumptions-glossary",
+      "stageNumber": 5,
+      "title": "E & D · Evaluation, Assumptions, Limitations & Glossary",
+      "whyThisMatters": "Documents hardware assumptions, stalled-epoch risks, and core concurrency terms.",
+      "explanation": {
+        "foundation": "This design assumes all index data fits in DRAM on a cache-coherent NUMA server and that threads exit EBR guards within microseconds.",
+        "core": "Assumptions & Limitations: Memory estimates (~24–30 GB for 500M keys) assume moderate key prefix sharing and exclude WAL/MVCC tuple payloads. Under extreme skew where 64 writers continuously resize the exact same Node4/Node16, OLC read restarts can spike; falling back to a brief shared read lock after K=8 restarts guarantees bounded tail latency.",
+        "deepDive": "Glossary: OLC (Optimistic Lock Coupling — version-validated lock-free reads + exclusive write locks); EBR (Epoch-Based Reclamation — deferred batch freeing across 3 global epochs); Limbo List (Per-thread queue of retired pointers awaiting epoch advancement); Hysteresis (Gap between grow and shrink thresholds to prevent node thrashing)."
+      },
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "End-to-End OLTP Index",
+        "title": "OLC Workers -> ART Adaptive Nodes -> EBR Limbo -> Slab Allocator",
+        "graphNodes": [
+          {
+            "id": "workers",
+            "label": "64 Core Workers",
+            "role": "ingress",
+            "col": 0,
+            "row": 0,
+            "tone": "primary"
+          },
+          {
+            "id": "olc",
+            "label": "OLC Version Engine",
+            "role": "compute",
+            "col": 1,
+            "row": 0,
+            "tone": "tint"
+          },
+          {
+            "id": "art",
+            "label": "ART (4/16/48/256)",
+            "role": "storage",
+            "col": 2,
+            "row": 0,
+            "tone": "tint"
+          },
+          {
+            "id": "ebr",
+            "label": "3-Epoch EBR + Slab",
+            "role": "control",
+            "col": 0,
+            "row": 1,
+            "tone": "tint"
+          }
+        ],
+        "graphEdges": [
+          {
+            "from": "workers",
+            "to": "olc",
+            "label": "epoch guard + read",
+            "style": "solid",
+            "tone": "green"
+          },
+          {
+            "from": "olc",
+            "to": "art",
+            "label": "SIMD / lock couple",
+            "style": "solid",
+            "tone": "green"
+          },
+          {
+            "from": "art",
+            "to": "ebr",
+            "label": "retire & batch free",
+            "style": "solid",
+            "tone": "green"
+          }
+        ]
+      }
+    }
+  ],
+  "simulation": {
+    "title": "In-Memory OLTP ART Engine — Concurrent Read, Grow & EBR",
+    "nodes": [
+      {
+        "id": "readers",
+        "label": "64 Reader Cores",
+        "role": "OLC Lock-Free Reads"
+      },
+      {
+        "id": "art",
+        "label": "ART Index",
+        "role": "Node4/16/48/256"
+      },
+      {
+        "id": "writer",
+        "label": "Writer Core",
+        "role": "Lock Couple & Grow"
+      },
+      {
+        "id": "ebr",
+        "label": "EBR Reclaimer",
+        "role": "3-Epoch Limbo Free"
+      }
+    ],
+    "edges": [
+      {
+        "from": "readers",
+        "to": "art",
+        "label": "version-checked read"
+      },
+      {
+        "from": "writer",
+        "to": "art",
+        "label": "exclusive node lock"
+      },
+      {
+        "from": "art",
+        "to": "ebr",
+        "label": "retire obsolete node"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Write-Free OLC Point & Range Reads",
+        "actionLabel": "Validate version counters",
+        "status": "healthy",
+        "activeNodeIds": [
+          "readers",
+          "art"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "ops_sec": "22M",
+          "p99_ns": 340,
+          "cache_bounces": 0
+        },
+        "explanation": "64 cores traverse Node4/16/48/256 in parallel without writing any lock words, sustaining 22M ops/sec."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Writer Promotes Node16 -> Node48",
+        "actionLabel": "Lock couple & swap pointer",
+        "status": "healthy",
+        "activeNodeIds": [
+          "writer",
+          "art"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "node_promoted": "Node16->Node48",
+          "old_node": "OBSOLETE",
+          "epoch": 42
+        },
+        "explanation": "Writer locks parent and child, allocates Node48, swaps the pointer, and marks the old Node16 obsolete."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Optimistic Reader Restarts Safely",
+        "actionLabel": "Restart on obsolete bit",
+        "status": "warning",
+        "activeNodeIds": [
+          "readers",
+          "art"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "restarts": 1,
+          "uaf_crashes": 0,
+          "limbo_pending": 1
+        },
+        "explanation": "An in-flight reader sees OBSOLETE_BIT set during validation and cleanly restarts; old Node16 stays valid in EBR limbo."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Epoch 44 Advances & Reclaims Memory",
+        "actionLabel": "Batch free epoch 42 limbo",
+        "status": "healthy",
+        "activeNodeIds": [
+          "art",
+          "ebr"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "active_epoch": 44,
+          "freed_epoch_42": 1,
+          "dram_leaked": 0
+        },
+        "explanation": "Once all readers pass epoch 43, EBR batch-frees all retired nodes from epoch 42."
+      }
+    ]
+  },
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-1",
+        "question": "Why does an OLC-based ART engine use a shrink hysteresis threshold (e.g., grow Node16->48 at 17 keys, shrink Node48->16 at 12 keys)?",
+        "options": [
+          {
+            "id": "a",
+            "text": "To prevent repeated node allocations and EBR retirements when inserts/deletes oscillate right around 16 keys.",
+            "correct": true,
+            "feedback": "Correct! Without hysteresis, alternating insert/delete at the boundary thrashes allocators and floods EBR limbo lists."
+          },
+          {
+            "id": "b",
+            "text": "Because Node48 cannot hold fewer than 12 pointers in C++.",
+            "correct": false,
+            "feedback": "Node48 can physically hold any count <= 48; hysteresis is purely for stability."
+          },
+          {
+            "id": "c",
+            "text": "To keep the OLC version counter even.",
+            "correct": false,
+            "feedback": "Version parity only tracks whether a write lock is currently held."
+          },
+          {
+            "id": "d",
+            "text": "Because SIMD instructions only work on multiples of 12.",
+            "correct": false,
+            "feedback": "SSE2 compares 16 bytes at once."
+          }
+        ],
+        "explanation": "Hysteresis avoids pathological allocation/reclamation thrashing at node size boundaries."
+      },
+      {
+        "id": "kc-2",
+        "question": "Why is Epoch-Based Reclamation (EBR) preferred over Hazard Pointers on every ART node traversal?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Hazard Pointers require an expensive atomic store + memory barrier on every node hop, whereas EBR only updates an epoch once per operation.",
+            "correct": true,
+            "feedback": "Correct! Per-hop fences would destroy ART's <500 ns read latency budget."
+          },
+          {
+            "id": "b",
+            "text": "Hazard Pointers cannot protect Node256.",
+            "correct": false,
+            "feedback": "Hazard Pointers work on any pointer size, just with higher per-hop overhead."
+          },
+          {
+            "id": "c",
+            "text": "EBR works even if a reader thread hangs indefinitely inside an epoch.",
+            "correct": false,
+            "feedback": "That is actually Hazard Pointers' advantage—EBR requires threads to exit guards promptly."
+          },
+          {
+            "id": "d",
+            "text": "EBR eliminates the need for OLC version validation.",
+            "correct": false,
+            "feedback": "EBR protects memory lifetime; OLC protects logical read consistency."
+          }
+        ],
+        "explanation": "Amortizing memory safety to one epoch entry/exit per query preserves ART's cache-line efficiency."
+      },
+      {
+        "id": "kc-3",
+        "question": "What happens if an OLC reader experiences repeated restarts (e.g., >8 retries) on a heavily contended node?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Fallback to acquiring a brief shared/exclusive lock or bounded backoff so tail latency stays bounded without starvation.",
+            "correct": true,
+            "feedback": "Correct! Bounded optimistic retries + lock fallback prevents livelock under extreme write hotspots."
+          },
+          {
+            "id": "b",
+            "text": "Return stale data without validating the version.",
+            "correct": false,
+            "feedback": "Returning unvalidated data can read torn pointers or corrupted keys."
+          },
+          {
+            "id": "c",
+            "text": "Force an immediate EBR global reclamation.",
+            "correct": false,
+            "feedback": "EBR reclamation does not resolve write contention on a live node."
+          },
+          {
+            "id": "d",
+            "text": "Delete the contended node.",
+            "correct": false,
+            "feedback": "Deleting live index nodes would cause data loss."
+          }
+        ],
+        "explanation": "Hybrid optimistic-then-pessimistic fallback guarantees forward progress under extreme hotspot writes."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Build a fast multi-core in-memory index by letting readers check node versions without locks and freeing replaced nodes safely via epochs.",
+      "keyTakeaway": "When 64 CPU cores read an in-memory index at once, avoid reader locks by checking node version numbers and delaying node deletion until active readers finish.",
+      "byteSummary": "Instead of slowing down 64 cores with reader locks, readers check a node's version number before and after reading. When a writer resizes a node, Epoch-Based Reclamation waits until all active readers move on before freeing the old memory."
+    },
+    "intermediate": {
+      "summary": "Combine ART (Node4/16/48/256) with OLC version validation and 3-epoch EBR limbo lists to achieve <500 ns p99 lookups across 64 cores.",
+      "keyTakeaway": "When designing a multi-core OLTP index, pair ART + OLC with 3-epoch EBR and shrink hysteresis to prevent cache-line bouncing and allocator thrashing.",
+      "byteSummary": "Embedding a 64-bit OLC version word in ART's 20-byte header keeps reads write-free, while 3-epoch EBR safely frees obsolete nodes after grow/shrink without per-hop memory fences."
+    },
+    "advanced": {
+      "summary": "Cache-line-aligned ART headers with OLC, 3-epoch EBR with shrink hysteresis, and retry-bounded pessimistic fallback for hotspot keys.",
+      "keyTakeaway": "When targeting 20M+ ops/sec on 64 cores with <500 ns p99, keep EBR guards strictly scoped off I/O and add bounded-retry fallback for hotspot nodes.",
+      "byteSummary": "Packing OLC version/lock/obsolete bits + 8B inline prefix into one 64B cache line, pairing 3-epoch EBR with grow/shrink hysteresis, and capping OLC restarts with lock fallback delivers predictable <500 ns p99 under skew."
+    }
+  }
+}

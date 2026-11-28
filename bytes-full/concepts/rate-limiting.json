@@ -1,0 +1,961 @@
+{
+  "id": "concept-rate-limiting",
+  "slug": "rate-limiting",
+  "name": "Rate Limiting Algorithms, Token Buckets & Redis Lua",
+  "domain": "Security & Identity",
+  "tagline": "Enforcing per-caller and per-tenant request budgets at the edge using Token Buckets, Sliding Window Counters, and atomic Redis Lua scripts.",
+  "purpose": "Build a progressive mental model of rate limiting—from Token vs. Leaky Buckets and 2x fixed-window boundary spikes to atomic Redis Lua execution and hot-key token batching.",
+  "spark": {
+    "summary": "Rate limiting enforces caps on request or resource consumption per caller, tenant, or endpoint over time to protect downstream capacity, ensure fair multi-tenant sharing, and blunt abuse.",
+    "keyTakeaway": "If credentials or tokens are verified at the edge, token Buckets & Redis Lua, pair an in-memory local limiter (token bucket) for sub-millisecond burst protection with a Redis Lua sliding-window or token-bucket store for global tenant quotas, and always return HTTP 429 with `Retry-After`.",
+    "byteSummary": "**Core Mechanics:** Rate limiting decouples **incoming demand** from **system capacity** by enforcing an admission budget keyed by `tenant_id`, `api_key`, or `ip:route` before expensive auth or database work runs.\n\n**Visual & Structural Flow:** Depicts Two-Tier Local Token Bucket + Redis Lua Global Rate Limiter (API Client -> Gateway L1 Bucket -> Redis Lua (L2) -> Origin Service); Local Token-Lease Batching + Async Redis Sync (Client (500k RPS) -> Edge Gateway -> Regional Redis).\n\n**Trade-Offs & Production:** Choose the algorithm based on memory per key, burst tolerance, and exactness. To eliminate cross-region RTT and Redis hot-key contention at 500,000 RPS, regional Envoy gateways enforce local in-memory Token Buckets and asynchronously batch-sync quota leases.\n\n**Failure Modes & Application:** Explore distributed rate limiter architectures, token bucket designs, and retry-storm prevention."
+  },
+  "learningJourney": [
+    {
+      "id": "01-what-it-is",
+      "eyebrow": "STAGE 01 · WHAT IT IS",
+      "title": "What is Rate Limiting",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "Rate limiting decouples **incoming demand** from **system capacity** by enforcing an admission budget keyed by `tenant_id`, `api_key`, or `ip:route` before expensive auth or database work runs.",
+        "core": "**Token Bucket** allows controlled bursts up to capacity $B$ while capping sustained rate at $R$ tokens/sec in $O(1)$ memory. **Leaky Bucket** smooths bursts into a constant egress rate. **Sliding Window Counter** eliminates the 2x boundary-burst spike of Fixed Windows in $O(1)$ space.",
+        "deepDive": "In production deployments of Rate Limiting Algorithms, Token Buckets & Redis Lua, watch how what is rate limiting interacts with tail latency, retry amplification, and partial failures. Rate limiting enforces caps on request or resource consumption per caller, tenant, or endpoint over time to protect downstream capacity, ensure fair multi-tenant sharing, and blunt abuse."
+      },
+      "sectionDiagram": {
+        "kind": "cache-tier",
+        "eyebrow": "Hybrid Edge + Global Quota",
+        "title": "Two-Tier Local Token Bucket + Redis Lua Global Rate Limiter",
+        "nodes": [
+          {
+            "id": "cli",
+            "label": "API Client",
+            "role": "429 + Retry-After"
+          },
+          {
+            "id": "gw",
+            "label": "Gateway L1 Bucket",
+            "role": "Sub-ms burst shield"
+          },
+          {
+            "id": "rad",
+            "label": "Redis Lua (L2)",
+            "role": "Atomic TIME + PEXPIRE"
+          },
+          {
+            "id": "api",
+            "label": "Origin Service",
+            "role": "Protected capacity"
+          }
+        ],
+        "edges": [
+          {
+            "label": "EVALSHA atomic check"
+          },
+          {
+            "label": "Allowed -> forward"
+          }
+        ],
+        "cards": [
+          {
+            "label": "1. Edge Rejection",
+            "detail": "Reject 429s at the outermost L7 proxy before JWT verification or DB queries."
+          },
+          {
+            "label": "2. Atomic Lua",
+            "detail": "Single Redis EVALSHA script reads/refills/decrements tokens and sets PEXPIRE TTL atomically."
+          },
+          {
+            "label": "3. Fail-Open Fallback",
+            "detail": "If Redis is unreachable, fall back to the gateway's local in-memory Token Bucket."
+          }
+        ],
+        "summary": "Hybrid local + Redis Lua rate limiting protects origin pools in <1 ms without a single point of failure."
+      },
+      "purpose": "The mechanism: understand how Rate Limiting works from first principles."
+    },
+    {
+      "id": "02-why-we-need-it",
+      "eyebrow": "STAGE 02 · WHY WE NEED IT",
+      "title": "Why we need Rate Limiting (Race Conditions & Boundary Stampedes)",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "Think of **Why we need Rate Limiting (Race Conditions & Boundary Stampedes)** as the intuition layer for Rate Limiting Algorithms, Token Buckets & Redis Lua: The problem: see what breaks without Rate Limiting under real concurrency or scale.",
+        "core": "Without rate limiting, a single buggy retry loop or scraper saturates DB pools and causes 503 outages for all tenants. Implementing it naively introduces two classic bugs: (1) separate Redis `GET` then `INCR` commands create **read-modify-write race conditions** that over-admit concurrent bursts; (2) **Fixed Window Counters** allow 2x quota (1,000 req at `12:00:59` + 1,000 req at `12:01:01`).",
+        "deepDive": "Under heavy load or partial failure, why we need rate limiting (race conditions & boundary stampedes) becomes a critical lever for predictable latency and correctness. Rate limiting enforces caps on request or resource consumption per caller, tenant, or endpoint over time to protect downstream capacity, ensure fair multi-tenant sharing, and blunt abuse."
+      },
+      "ideas": [
+        {
+          "title": "Weighted Cost Budgets",
+          "description": "Charge `cost = 1` for `GET /items/{id}` and `cost = 25` for `POST /search/export` against the same tenant bucket so heavy routes cannot starve cheap ones."
+        },
+        {
+          "title": "IETF RateLimit Headers + `429`",
+          "description": "Always return `429 Too Many Requests` (never `500`/`503`) with `Retry-After`, `RateLimit-Limit`, `RateLimit-Remaining`, and `RateLimit-Reset`."
+        }
+      ],
+      "purpose": "The problem: see what breaks without Rate Limiting under real concurrency or scale.",
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Request & State Flow",
+        "title": "Why we need Rate Limiting (Race Conditions & Boundary Stampedes)",
+        "actors": [
+          {
+            "id": "client",
+            "label": "API Caller"
+          },
+          {
+            "id": "gw",
+            "label": "API Gateway"
+          },
+          {
+            "id": "redis",
+            "label": "Redis Lua Counter"
+          },
+          {
+            "id": "svc",
+            "label": "Upstream Service"
+          }
+        ],
+        "events": [
+          {
+            "from": "client",
+            "to": "gw",
+            "label": "Send API request + tenant key"
+          },
+          {
+            "from": "gw",
+            "to": "redis",
+            "label": "EVALSHA atomic token decrement"
+          },
+          {
+            "from": "redis",
+            "to": "gw",
+            "label": "Allow (tokens > 0) or 429"
+          },
+          {
+            "from": "gw",
+            "to": "svc",
+            "label": "Forward admitted request"
+          }
+        ]
+      },
+      "decisionFramework": {
+        "problem": "How to implement Rate Limiting Algorithms, Token Buckets & Redis Lua without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "If credentials or tokens are verified at the edge, token Buckets & Redis Lua, pair an in-memory local limiter (token bucket) for sub-millisecond burst protection with a Redis Lua sliding-window or token-bucket store for global tenant quotas, and always return HTTP 429 with `Retry-After`.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Rate Limiting Algorithms, Token Buckets & Redis Lua experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-where-it-is-used",
+      "eyebrow": "STAGE 03 · WHERE IT IS USED",
+      "title": "Where Rate Limiting applies (and where Healthchecks Must Bypass)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Think of **Where Rate Limiting applies (and where Healthchecks Must Bypass)** as the intuition layer for Rate Limiting Algorithms, Token Buckets & Redis Lua: Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+        "core": "Apply rate limits to public APIs, login/OTP endpoints, and expensive LLM/export routes; exempt internal healthchecks and metrics scrapes.",
+        "deepDive": "Under heavy load or partial failure, where rate limiting applies (and where healthchecks must bypass) becomes a critical lever for predictable latency and correctness. Rate limiting enforces caps on request or resource consumption per caller, tenant, or endpoint over time to protect downstream capacity, ensure fair multi-tenant sharing, and blunt abuse."
+      },
+      "comparison": [
+        {
+          "choice": "Good Candidate: Public APIs, Login/OTP & Multi-Tenant Quotas",
+          "benefits": [
+            "Prevents brute-force attacks, scraping, and noisy-neighbor DB pool exhaustion."
+          ],
+          "costs": [
+            "Requires keying authenticated routes on `tenant_id`/`api_key_hash` rather than shared carrier NAT IPs."
+          ]
+        },
+        {
+          "choice": "Avoid: `/healthz`, Readiness & Prometheus Scrape Paths",
+          "benefits": [
+            "Keep probe endpoints unthrottled so Kubernetes never triggers false-positive pod restarts under load."
+          ],
+          "costs": [
+            "Throttling `/healthz` turns a traffic spike into a cascading pod-eviction outage."
+          ]
+        },
+        {
+          "choice": "Avoid: Pure Downstream Slowness Bottlenecks",
+          "benefits": [
+            "Use adaptive concurrency limits (Vegas/Gradient2) or backpressure when downstream latency degrades regardless of RPS."
+          ],
+          "costs": [
+            "Static RPS limits cannot adapt when DB queries slow from 5 ms to 500 ms."
+          ]
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    },
+    {
+      "id": "04-how-it-is-managed",
+      "eyebrow": "STAGE 04 · HOW IT IS MANAGED",
+      "title": "How Atomic Token Buckets & Redis Lua are implemented",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Think of **How Atomic Token Buckets & Redis Lua are implemented** as the intuition layer for Rate Limiting Algorithms, Token Buckets & Redis Lua: Operational control: configure bounds, failure handling, and safe production defaults.",
+        "core": "Use Redis `TIME` inside Lua scripts (avoiding gateway wall-clock skew), attach `PEXPIRE` TTLs to every key so one-off IPs never leak RAM, and deploy new limits in shadow/dry-run mode (`enforce: false`) before blocking traffic.",
+        "deepDive": "Under heavy load or partial failure, how atomic token buckets & redis lua are implemented becomes a critical lever for predictable latency and correctness. Rate limiting enforces caps on request or resource consumption per caller, tenant, or endpoint over time to protect downstream capacity, ensure fair multi-tenant sharing, and blunt abuse."
+      },
+      "markdownContent": "```lua\n-- Atomic Redis Token Bucket (KEYS[1]=key, ARGV[1]=cap, ARGV[2]=rate_per_sec, ARGV[3]=cost)\nlocal t = redis.call('TIME')\nlocal now = tonumber(t[1]) + tonumber(t[2]) / 1000000\nlocal data = redis.call('HMGET', KEYS[1], 'tokens', 'ts')\nlocal tokens = tonumber(data[1]) or tonumber(ARGV[1])\nlocal last = tonumber(data[2]) or now\n\ntokens = math.min(tonumber(ARGV[1]), tokens + math.max(0, now - last) * tonumber(ARGV[2]))\nlocal allowed = 0\nif tokens >= tonumber(ARGV[3]) then\n  tokens = tokens - tonumber(ARGV[3])\n  allowed = 1\nend\nredis.call('HMSET', KEYS[1], 'tokens', tokens, 'ts', now)\nredis.call('PEXPIRE', KEYS[1], math.ceil((tonumber(ARGV[1]) / tonumber(ARGV[2])) * 1000) + 1000)\nreturn {allowed, math.floor(tokens)}\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-alternatives",
+      "eyebrow": "STAGE 05 · ALTERNATIVES",
+      "title": "Alternatives: Token Bucket vs. Sliding Window Log vs. Sliding Window Counter",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": {
+        "foundation": "Think of **Alternatives: Token Bucket vs. Sliding Window Log vs. Sliding Window Counter** as the intuition layer for Rate Limiting Algorithms, Token Buckets & Redis Lua: The trade-off: compare competing approaches across latency, consistency, and operational cost.",
+        "core": "Choose the algorithm based on memory per key, burst tolerance, and exactness.",
+        "deepDive": "Under heavy load or partial failure, alternatives: token bucket vs. sliding window log vs. sliding window counter becomes a critical lever for predictable latency and correctness. Rate limiting enforces caps on request or resource consumption per caller, tenant, or endpoint over time to protect downstream capacity, ensure fair multi-tenant sharing, and blunt abuse."
+      },
+      "comparison": [
+        {
+          "choice": "Token Bucket (Redis Hash / Local)",
+          "benefits": [
+            "$O(1)$ memory (2 numbers), allows controlled bursts up to $B$, zero boundary spikes."
+          ],
+          "costs": [
+            "Requires atomic Lua script for distributed accuracy."
+          ]
+        },
+        {
+          "choice": "Sliding Window Counter",
+          "benefits": [
+            "$O(1)$ memory and smooths 2x fixed-window boundary spikes via weighted overlap."
+          ],
+          "costs": [
+            "Approximate interpolation across the previous window."
+          ]
+        },
+        {
+          "choice": "Sliding Window Log (Redis `ZSET`)",
+          "benefits": [
+            "100% exact to the millisecond with zero boundary approximation."
+          ],
+          "costs": [
+            "Stores $O(N)$ timestamps per key—explodes RAM for high-rate tenants."
+          ]
+        }
+      ],
+      "purpose": "The trade-off: compare competing approaches across latency, consistency, and operational cost.",
+      "sectionDiagram": {
+        "kind": "behavior-transition",
+        "eyebrow": "Design Trade-Off",
+        "title": "Alternatives: Token Bucket vs. Sliding Window Log vs. Sliding Window Counter",
+        "before": {
+          "label": "Naive Get-Then-Set",
+          "metrics": [
+            "Race condition drops limits",
+            "Redis round-trip per check",
+            "Thundering retry storm"
+          ]
+        },
+        "after": {
+          "label": "Atomic Lua + Local Burst",
+          "metrics": [
+            "Single-RTT atomic Lua script",
+            "Retry-After jittered backoff",
+            "Per-tenant quota isolation"
+          ]
+        }
+      }
+    },
+    {
+      "id": "06-production-architecture",
+      "eyebrow": "STAGE 06 · PRODUCTION ARCHITECTURE",
+      "title": "Production example: Multi-Region Gateway with Token-Lease Batching",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Think of **Production example: Multi-Region Gateway with Token-Lease Batching** as the intuition layer for Rate Limiting Algorithms, Token Buckets & Redis Lua: Production architecture: see how the components compose end to end under real load.",
+        "core": "To eliminate cross-region RTT and Redis hot-key contention at 500,000 RPS, regional Envoy gateways enforce local in-memory Token Buckets and asynchronously batch-sync quota leases (`INCRBY 50`) with a regional Redis/Valkey shard every 50–100 ms.",
+        "deepDive": "Under heavy load or partial failure, production example: multi-region gateway with token-lease batching becomes a critical lever for predictable latency and correctness. Rate limiting enforces caps on request or resource consumption per caller, tenant, or endpoint over time to protect downstream capacity, ensure fair multi-tenant sharing, and blunt abuse."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Hot-Key Mitigation",
+        "title": "Local Token-Lease Batching + Async Redis Sync",
+        "actors": [
+          {
+            "id": "cli",
+            "label": "Client (500k RPS)"
+          },
+          {
+            "id": "gw",
+            "label": "Edge Gateway"
+          },
+          {
+            "id": "red",
+            "label": "Regional Redis"
+          }
+        ],
+        "events": [
+          {
+            "from": "cli",
+            "to": "gw",
+            "label": "Burst requests (sub-ms local check)",
+            "status": "ok"
+          },
+          {
+            "from": "gw",
+            "to": "red",
+            "label": "Batch lease 50 tokens via EVALSHA",
+            "status": "ok"
+          },
+          {
+            "from": "gw",
+            "to": "cli",
+            "label": "Bucket empty -> 429 + Retry-After",
+            "status": "fail"
+          }
+        ],
+        "summary": "Batching 50-token leases cuts Redis QPS by 50x and keeps normal API checks at sub-millisecond local latency."
+      },
+      "purpose": "Production architecture: see how the components compose end to end under real load."
+    },
+    {
+      "id": "07-problems-and-further-reading",
+      "eyebrow": "STAGE 07 · PROBLEMS SOLVED & FURTHER DEEP DIVE",
+      "title": "Problems solved by Rate Limiting & System Design Deep Dives",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Think of **Problems solved by Rate Limiting & System Design Deep Dives** as the intuition layer for Rate Limiting Algorithms, Token Buckets & Redis Lua: Applied problems: connect these internals to concrete system design and debugging scenarios.",
+        "core": "Explore distributed rate limiter architectures, token bucket designs, and retry-storm prevention.",
+        "deepDive": "Under heavy load or partial failure, problems solved by rate limiting & system design deep dives becomes a critical lever for predictable latency and correctness. Rate limiting enforces caps on request or resource consumption per caller, tenant, or endpoint over time to protect downstream capacity, ensure fair multi-tenant sharing, and blunt abuse."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "design-rate-limiter",
+          "title": "System Design: Distributed Rate Limiter",
+          "kind": "problem"
+        },
+        {
+          "slug": "design-token-bucket",
+          "title": "Problem: Token Bucket Rate Limiter",
+          "kind": "problem"
+        },
+        {
+          "slug": "retry-storms-jitter",
+          "title": "Problem: Preventing Retry Storms with Jitter & Budgets",
+          "kind": "problem"
+        },
+        {
+          "slug": "api-gateway",
+          "title": "Concept: API Gateway",
+          "kind": "concept"
+        },
+        {
+          "slug": "reverse-proxy-patterns",
+          "title": "Concept: Reverse Proxy Patterns",
+          "kind": "concept"
+        }
+      ],
+      "purpose": "Applied problems: connect these internals to concrete system design and debugging scenarios."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why are separate Redis `GET` and `SET`/`INCR` commands unsafe for enforcing API rate limits across concurrent gateway pods?",
+      "options": [
+        {
+          "id": "a",
+          "text": "Concurrent pods read the same counter value before incrementing, creating a race condition that over-admits bursts",
+          "correct": true,
+          "feedback": "Correct: use an atomic Redis Lua script (`EVALSHA`) so read, refill, check, and decrement execute as one indivisible step."
+        },
+        {
+          "id": "b",
+          "text": "Because Redis `GET` flushes to disk synchronously on every read",
+          "correct": false,
+          "feedback": "Redis reads from memory; the bug is the non-atomic read-modify-write race."
+        },
+        {
+          "id": "c",
+          "text": "Because `INCR` cannot store integer values",
+          "correct": false,
+          "feedback": "`INCR` is atomic for simple counters, but token buckets and TTL initialization require Lua atomicity."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why are separate Redis `GET` and `SET`/`INCR` commands unsafe for enforcing API rate limits across concurrent gateway pods?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Concurrent pods read the same counter value before incrementing, creating a race condition that over-admits bursts",
+            "correct": true,
+            "feedback": "Correct: use an atomic Redis Lua script (`EVALSHA`) so read, refill, check, and decrement execute as one indivisible step."
+          },
+          {
+            "id": "b",
+            "text": "Because Redis `GET` flushes to disk synchronously on every read",
+            "correct": false,
+            "feedback": "Redis reads from memory; the bug is the non-atomic read-modify-write race."
+          },
+          {
+            "id": "c",
+            "text": "Because `INCR` cannot store integer values",
+            "correct": false,
+            "feedback": "`INCR` is atomic for simple counters, but token buckets and TTL initialization require Lua atomicity."
+          }
+        ]
+      },
+      {
+        "question": "What is the main benefit—and corresponding operational trade-off—of using Good Candidate: Public APIs, Login/OTP & Multi-Tenant Quotas in Rate Limiting Algorithms, Token Buckets & Redis Lua?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Advantage: Keep probe endpoints unthrottled so Kubernetes never triggers false-positive pod restarts under load. It has zero operational or latency overhead compared to Avoid: /healthz, Readiness & Prometheus Scrape Paths.",
+            "correct": false,
+            "feedback": "Not quite: that describes Avoid: /healthz, Readiness & Prometheus Scrape Paths, whereas Good Candidate: Public APIs, Login/OTP & Multi-Tenant Quotas specifically trades off: Requires keying authenticated routes on tenant_id/api_key_hash rather than shared carrier NAT IPs."
+          },
+          {
+            "id": "b",
+            "text": "Relying solely on Pure Downstream Slowness Bottlenecks avoids all operational and latency trade-offs",
+            "correct": false,
+            "feedback": "Incorrect: every production option in Rate Limiting Algorithms, Token Buckets & Redis Lua carries concrete latency, consistency, or operational costs."
+          },
+          {
+            "id": "c",
+            "text": "Advantage: Prevents brute-force attacks, scraping, and noisy-neighbor DB pool exhaustion. Cost: Requires keying authenticated routes on tenant_id/api_key_hash rather than shared carrier NAT IPs.",
+            "correct": true,
+            "feedback": "Correct: Good Candidate: Public APIs, Login/OTP & Multi-Tenant Quotas delivers prevents brute-force attacks, scraping, and noisy-neighbor DB pool exhaustion. while requiring you to manage requires keying authenticated routes on tenant_id/api_key_hash rather than shared carrier NAT IPs."
+          }
+        ]
+      },
+      {
+        "question": "Why is IETF RateLimit Headers + 429 critical when operating Rate Limiting Algorithms, Token Buckets & Redis Lua in production?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Always return 429 Too Many Requests (never 500/503) with Retry-After, RateLimit-Limit, RateLimit-Remaining, and RateLimit-Reset.",
+            "correct": true,
+            "feedback": "Correct: Always return 429 Too Many Requests (never 500/503) with Retry-After, RateLimit-Limit, RateLimit-Remaining, and RateLimit-Reset."
+          },
+          {
+            "id": "b",
+            "text": "It only applies during local unit testing and can be disabled in production to save memory.",
+            "correct": false,
+            "feedback": "Incorrect: 'IETF RateLimit Headers + 429' directly governs production reliability and correctness under real traffic."
+          },
+          {
+            "id": "c",
+            "text": "It replaces the need for observability, timeouts, or capacity planning across Rate Limiting Algorithms, Token Buckets & Redis Lua.",
+            "correct": false,
+            "feedback": "Incorrect: 'IETF RateLimit Headers + 429' works alongside proper bounds, monitoring, and failure isolation."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** Rate limiting decouples **incoming demand** from **system capacity** by enforcing an admission budget keyed by `tenant_id`, `api_key`, or `ip:route` before expensive auth or database work runs.\n\n**How It Flows:** Think of Rate Limiting Algorithms, Token Buckets & Redis Lua as a clear step-by-step chain: API Client -> Gateway L1 Bucket -> Redis Lua (L2) -> Origin Service -> Client (500k RPS).\n\n**Why Beginners Should Care:** Pair an in-memory local limiter (token bucket) for sub-millisecond burst protection with a Redis Lua sliding-window or token-bucket store for global tenant quotas, and always return HTTP 429 with `Retry-After`.",
+      "spark": {
+        "summary": "Rate limiting decouples **incoming demand** from **system capacity** by enforcing an admission budget keyed by `tenant_id`, `api_key`, or `ip:route` before expensive auth or database work runs.",
+        "keyTakeaway": "Pair an in-memory local limiter (token bucket) for sub-millisecond burst protection with a Redis Lua sliding-window or token-bucket store for global tenant quotas, and always return HTTP 429 with `Retry-After`."
+      },
+      "learningJourney": [
+        {
+          "id": "01-what-it-is",
+          "title": "What is Rate Limiting",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Rate Limiting works from first principles.",
+          "explanation": "Rate limiting decouples **incoming demand** from **system capacity** by enforcing an admission budget keyed by `tenant_id`, `api_key`, or `ip:route` before expensive auth or database work runs. **Token Bucket** allows controlled bursts up to capacity $B$ while capping sustained rate at $R$ tokens/sec in $O(1)$ memory. **Leaky Bucket** smooths bursts into a constant egress rate.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Hybrid Edge + Global Quota",
+            "title": "Two-Tier Local Token Bucket + Redis Lua Global Rate Limiter",
+            "nodes": [
+              {
+                "id": "cli",
+                "label": "API Client",
+                "role": "429 + Retry-After"
+              },
+              {
+                "id": "gw",
+                "label": "Gateway L1 Bucket",
+                "role": "Sub-ms burst shield"
+              },
+              {
+                "id": "rad",
+                "label": "Redis Lua (L2)",
+                "role": "Atomic TIME + PEXPIRE"
+              },
+              {
+                "id": "api",
+                "label": "Origin Service",
+                "role": "Protected capacity"
+              }
+            ],
+            "edges": [
+              {
+                "label": "EVALSHA atomic check"
+              },
+              {
+                "label": "Allowed -> forward"
+              }
+            ],
+            "cards": [
+              {
+                "label": "1. Edge Rejection",
+                "detail": "Reject 429s at the outermost L7 proxy before JWT verification or DB queries."
+              },
+              {
+                "label": "2. Atomic Lua",
+                "detail": "Single Redis EVALSHA script reads/refills/decrements tokens and sets PEXPIRE TTL atomically."
+              },
+              {
+                "label": "3. Fail-Open Fallback",
+                "detail": "If Redis is unreachable, fall back to the gateway's local in-memory Token Bucket."
+              }
+            ],
+            "summary": "Hybrid local + Redis Lua rate limiting protects origin pools in <1 ms without a single point of failure."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-why-we-need-it",
+          "title": "Why we need Rate Limiting (Race Conditions & Boundary Stampedes)",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without Rate Limiting under real concurrency or scale.",
+          "explanation": "Without rate limiting, a single buggy retry loop or scraper saturates DB pools and causes 503 outages for all tenants. Implementing it naively introduces two classic bugs: (1) separate Redis `GET` then `INCR` commands create **read-modify-write race conditions** that over-admit concurrent bursts; (2) **Fixed Window Counters** allow 2x quota (1,000 req at `12:00:59` + 1,000 req at `12:01:01`).",
+          "ideas": [
+            {
+              "title": "Weighted Cost Budgets",
+              "description": "Charge `cost = 1` for `GET /items/{id}` and `cost = 25` for `POST /search/export` against the same tenant bucket so heavy routes cannot starve cheap ones."
+            },
+            {
+              "title": "IETF RateLimit Headers + `429`",
+              "description": "Always return `429 Too Many Requests` (never `500`/`503`) with `Retry-After`, `RateLimit-Limit`, `RateLimit-Remaining`, and `RateLimit-Reset`."
+            }
+          ],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-where-it-is-used",
+          "title": "Where Rate Limiting applies (and where Healthchecks Must Bypass)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Apply rate limits to public APIs, login/OTP endpoints, and expensive LLM/export routes; exempt internal healthchecks and metrics scrapes.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "06-production-architecture",
+          "title": "Production example: Multi-Region Gateway with Token-Lease Batching",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Production architecture: see how the components compose end to end under real load.",
+          "explanation": "To eliminate cross-region RTT and Redis hot-key contention at 500,000 RPS, regional Envoy gateways enforce local in-memory Token Buckets and asynchronously batch-sync quota leases (`INCRBY 50`) with a regional Redis/Valkey shard every 50–100 ms.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Hot-Key Mitigation",
+            "title": "Local Token-Lease Batching + Async Redis Sync",
+            "actors": [
+              {
+                "id": "cli",
+                "label": "Client (500k RPS)"
+              },
+              {
+                "id": "gw",
+                "label": "Edge Gateway"
+              },
+              {
+                "id": "red",
+                "label": "Regional Redis"
+              }
+            ],
+            "events": [
+              {
+                "from": "cli",
+                "to": "gw",
+                "label": "Burst requests (sub-ms local check)",
+                "status": "ok"
+              },
+              {
+                "from": "gw",
+                "to": "red",
+                "label": "Batch lease 50 tokens via EVALSHA",
+                "status": "ok"
+              },
+              {
+                "from": "gw",
+                "to": "cli",
+                "label": "Bucket empty -> 429 + Retry-After",
+                "status": "fail"
+              }
+            ],
+            "summary": "Batching 50-token leases cuts Redis QPS by 50x and keeps normal API checks at sub-millisecond local latency."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Pair an in-memory local limiter (token bucket) for sub-millisecond burst protection with a Redis Lua sliding-window or token-bucket store for global tenant quotas, and always return HTTP 429 with `Retry-After`.",
+      "summary": "Rate limiting enforces caps on request or resource consumption per caller, tenant, or endpoint over time to protect downstream capacity, ensure fair multi-tenant sharing, and blunt abuse.",
+      "keyTakeaway": "If credentials or tokens are verified at the edge, Token Buckets & Redis Lua, pair an in-memory local limiter (token bucket) for sub-millisecond burst protection with a Redis Lua sliding-window or token-bucket store for global tenant quotas, and always return HTTP 429 with `Retry-After`."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** Rate limiting decouples **incoming demand** from **system capacity** by enforcing an admission budget keyed by `tenant_id`, `api_key`, or `ip:route` before expensive auth or database work runs.\n\n**Visual & Structural Flow:** Depicts Two-Tier Local Token Bucket + Redis Lua Global Rate Limiter (API Client -> Gateway L1 Bucket -> Redis Lua (L2) -> Origin Service); Local Token-Lease Batching + Async Redis Sync (Client (500k RPS) -> Edge Gateway -> Regional Redis).\n\n**Trade-Offs & Production:** Choose the algorithm based on memory per key, burst tolerance, and exactness. To eliminate cross-region RTT and Redis hot-key contention at 500,000 RPS, regional Envoy gateways enforce local in-memory Token Buckets and asynchronously batch-sync quota leases.\n\n**Failure Modes & Application:** Explore distributed rate limiter architectures, token bucket designs, and retry-storm prevention.",
+      "spark": {
+        "summary": "Rate limiting enforces caps on request or resource consumption per caller, tenant, or endpoint over time to protect downstream capacity, ensure fair multi-tenant sharing, and blunt abuse.",
+        "keyTakeaway": "Pair an in-memory local limiter (token bucket) for sub-millisecond burst protection with a Redis Lua sliding-window or token-bucket store for global tenant quotas, and always return HTTP 429 with `Retry-After`."
+      },
+      "summary": "Rate limiting enforces caps on request or resource consumption per caller, tenant, or endpoint over time to protect downstream capacity, ensure fair multi-tenant sharing, and blunt abuse.",
+      "keyTakeaway": "If credentials or tokens are verified at the edge, Token Buckets & Redis Lua, pair an in-memory local limiter (token bucket) for sub-millisecond burst protection with a Redis Lua sliding-window or token-bucket store for global tenant quotas, and always return HTTP 429 with `Retry-After`."
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** Rate limiting enforces caps on request or resource consumption per caller, tenant, or endpoint over time to protect downstream capacity, ensure fair multi-tenant sharing, and blunt abuse.\n\n**Production Trade-Offs:** Use Redis `TIME` inside Lua scripts (avoiding gateway wall-clock skew), attach `PEXPIRE` TTLs to every key so one-off IPs never leak RAM, and deploy new limits in shadow/dry-run mode (`enforce: false`) before blocking traffic.\n\n**Failure Modes & Edge Cases:** Explore distributed rate limiter architectures, token bucket designs, and retry-storm prevention.\n\n**Principal Takeaway:** Pair an in-memory local limiter (token bucket) for sub-millisecond burst protection with a Redis Lua sliding-window or token-bucket store for global tenant quotas, and always return HTTP 429 with `Retry-After`.",
+      "spark": {
+        "summary": "Rate limiting enforces caps on request or resource consumption per caller, tenant, or endpoint over time to protect downstream capacity, ensure fair multi-tenant sharing, and blunt abuse.",
+        "keyTakeaway": "Pair an in-memory local limiter (token bucket) for sub-millisecond burst protection with a Redis Lua sliding-window or token-bucket store for global tenant quotas, and always return HTTP 429 with `Retry-After`."
+      },
+      "learningJourney": [
+        {
+          "id": "01-what-it-is",
+          "title": "What is Rate Limiting",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Rate Limiting works from first principles.",
+          "explanation": "Rate limiting decouples **incoming demand** from **system capacity** by enforcing an admission budget keyed by `tenant_id`, `api_key`, or `ip:route` before expensive auth or database work runs.\n\n**Token Bucket** allows controlled bursts up to capacity $B$ while capping sustained rate at $R$ tokens/sec in $O(1)$ memory. **Leaky Bucket** smooths bursts into a constant egress rate. **Sliding Window Counter** eliminates the 2x boundary-burst spike of Fixed Windows in $O(1)$ space.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Hybrid Edge + Global Quota",
+            "title": "Two-Tier Local Token Bucket + Redis Lua Global Rate Limiter",
+            "nodes": [
+              {
+                "id": "cli",
+                "label": "API Client",
+                "role": "429 + Retry-After"
+              },
+              {
+                "id": "gw",
+                "label": "Gateway L1 Bucket",
+                "role": "Sub-ms burst shield"
+              },
+              {
+                "id": "rad",
+                "label": "Redis Lua (L2)",
+                "role": "Atomic TIME + PEXPIRE"
+              },
+              {
+                "id": "api",
+                "label": "Origin Service",
+                "role": "Protected capacity"
+              }
+            ],
+            "edges": [
+              {
+                "label": "EVALSHA atomic check"
+              },
+              {
+                "label": "Allowed -> forward"
+              }
+            ],
+            "cards": [
+              {
+                "label": "1. Edge Rejection",
+                "detail": "Reject 429s at the outermost L7 proxy before JWT verification or DB queries."
+              },
+              {
+                "label": "2. Atomic Lua",
+                "detail": "Single Redis EVALSHA script reads/refills/decrements tokens and sets PEXPIRE TTL atomically."
+              },
+              {
+                "label": "3. Fail-Open Fallback",
+                "detail": "If Redis is unreachable, fall back to the gateway's local in-memory Token Bucket."
+              }
+            ],
+            "summary": "Hybrid local + Redis Lua rate limiting protects origin pools in <1 ms without a single point of failure."
+          },
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-why-we-need-it",
+          "title": "Why we need Rate Limiting (Race Conditions & Boundary Stampedes)",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without Rate Limiting under real concurrency or scale.",
+          "explanation": "Without rate limiting, a single buggy retry loop or scraper saturates DB pools and causes 503 outages for all tenants. Implementing it naively introduces two classic bugs: (1) separate Redis `GET` then `INCR` commands create **read-modify-write race conditions** that over-admit concurrent bursts; (2) **Fixed Window Counters** allow 2x quota (1,000 req at `12:00:59` + 1,000 req at `12:01:01`).",
+          "caveats": null,
+          "ideas": [
+            {
+              "title": "Weighted Cost Budgets",
+              "description": "Charge `cost = 1` for `GET /items/{id}` and `cost = 25` for `POST /search/export` against the same tenant bucket so heavy routes cannot starve cheap ones."
+            },
+            {
+              "title": "IETF RateLimit Headers + `429`",
+              "description": "Always return `429 Too Many Requests` (never `500`/`503`) with `Retry-After`, `RateLimit-Limit`, `RateLimit-Remaining`, and `RateLimit-Reset`."
+            }
+          ],
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "03-where-it-is-used",
+          "title": "Where Rate Limiting applies (and where Healthchecks Must Bypass)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Apply rate limits to public APIs, login/OTP endpoints, and expensive LLM/export routes; exempt internal healthchecks and metrics scrapes.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-how-it-is-managed",
+          "title": "How Atomic Token Buckets & Redis Lua are implemented",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Use Redis `TIME` inside Lua scripts (avoiding gateway wall-clock skew), attach `PEXPIRE` TTLs to every key so one-off IPs never leak RAM, and deploy new limits in shadow/dry-run mode (`enforce: false`) before blocking traffic.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "05-alternatives",
+          "title": "Alternatives: Token Bucket vs. Sliding Window Log vs. Sliding Window Counter",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "The trade-off: compare competing approaches across latency, consistency, and operational cost.",
+          "explanation": "Choose the algorithm based on memory per key, burst tolerance, and exactness.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "06-production-architecture",
+          "title": "Production example: Multi-Region Gateway with Token-Lease Batching",
+          "eyebrow": "Advanced Path · Stage 06",
+          "purpose": "Production architecture: see how the components compose end to end under real load.",
+          "explanation": "To eliminate cross-region RTT and Redis hot-key contention at 500,000 RPS, regional Envoy gateways enforce local in-memory Token Buckets and asynchronously batch-sync quota leases (`INCRBY 50`) with a regional Redis/Valkey shard every 50–100 ms.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Hot-Key Mitigation",
+            "title": "Local Token-Lease Batching + Async Redis Sync",
+            "actors": [
+              {
+                "id": "cli",
+                "label": "Client (500k RPS)"
+              },
+              {
+                "id": "gw",
+                "label": "Edge Gateway"
+              },
+              {
+                "id": "red",
+                "label": "Regional Redis"
+              }
+            ],
+            "events": [
+              {
+                "from": "cli",
+                "to": "gw",
+                "label": "Burst requests (sub-ms local check)",
+                "status": "ok"
+              },
+              {
+                "from": "gw",
+                "to": "red",
+                "label": "Batch lease 50 tokens via EVALSHA",
+                "status": "ok"
+              },
+              {
+                "from": "gw",
+                "to": "cli",
+                "label": "Bucket empty -> 429 + Retry-After",
+                "status": "fail"
+              }
+            ],
+            "summary": "Batching 50-token leases cuts Redis QPS by 50x and keeps normal API checks at sub-millisecond local latency."
+          },
+          "level": "L7 · STAFF / PRINCIPAL"
+        },
+        {
+          "id": "07-problems-and-further-reading",
+          "title": "Problems solved by Rate Limiting & System Design Deep Dives",
+          "eyebrow": "Advanced Path · Stage 07",
+          "purpose": "Applied problems: connect these internals to concrete system design and debugging scenarios.",
+          "explanation": "Explore distributed rate limiter architectures, token bucket designs, and retry-storm prevention.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Pair an in-memory local limiter (token bucket) for sub-millisecond burst protection with a Redis Lua sliding-window or token-bucket store for global tenant quotas, and always return HTTP 429 with `Retry-After`.",
+      "summary": "Rate limiting enforces caps on request or resource consumption per caller, tenant, or endpoint over time to protect downstream capacity, ensure fair multi-tenant sharing, and blunt abuse.",
+      "keyTakeaway": "If credentials or tokens are verified at the edge, Token Buckets & Redis Lua, pair an in-memory local limiter (token bucket) for sub-millisecond burst protection with a Redis Lua sliding-window or token-bucket store for global tenant quotas, and always return HTTP 429 with `Retry-After`."
+    }
+  },
+  "pedagogicalFramework": "PRIME",
+  "prerequisites": [
+    {
+      "title": "Distributed & Application Caching",
+      "summary": "Caching keeps a reusable copy of data so an application can avoid repeating a database query, calculation, or network call. It can make responses faster and reduce database load. The trade-off: the copy may be out of date."
+    }
+  ],
+  "simulation": {
+    "title": "Rate Limiting Algorithms, Token Buckets & Redis Lua — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "API Client",
+        "role": "Burst Traffic"
+      },
+      {
+        "id": "gw",
+        "label": "Edge Gateway",
+        "role": "Quota Enforcer"
+      },
+      {
+        "id": "redis",
+        "label": "Redis Lua",
+        "role": "Atomic Bucket State"
+      },
+      {
+        "id": "svc",
+        "label": "Backend Pool",
+        "role": "Protected Capacity"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "gw",
+        "label": "HTTP Request"
+      },
+      {
+        "from": "gw",
+        "to": "redis",
+        "label": "EVALSHA check"
+      },
+      {
+        "from": "gw",
+        "to": "svc",
+        "label": "Admitted Traffic"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "What is Rate Limiting",
+        "actionLabel": "HTTP Request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "gw"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "HTTP Request",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "API Client sends work to Edge Gateway (What is Rate Limiting)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Why we need Rate Limiting (Race Conditions & Boundary Stampedes)",
+        "actionLabel": "EVALSHA check",
+        "status": "healthy",
+        "activeNodeIds": [
+          "gw",
+          "redis"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "EVALSHA check",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Edge Gateway coordinates with Redis Lua while preserving the core invariant (Why we need Rate Limiting (Race Conditions & Boundary Stampedes))."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Where Rate Limiting applies (and where Healthchecks Must Bypass)",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "redis",
+          "svc"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, Backend Pool absorbs pressure without cascading (Where Rate Limiting applies (and where Healthchecks Must Bypass))."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Problems solved by Rate Limiting & System Design Deep Dives",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "gw",
+          "redis",
+          "svc"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Problems solved by Rate Limiting & System Design Deep Dives)."
+      }
+    ]
+  }
+}

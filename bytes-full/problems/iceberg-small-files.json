@@ -1,0 +1,845 @@
+{
+  "id": "iceberg-small-files",
+  "slug": "iceberg-small-files",
+  "title": "Apache Iceberg Small-Files & Manifest Bloat Remediation",
+  "problemType": "architecture",
+  "difficulty": "hard",
+  "prompt": "Your Kafka-to-Iceberg streaming pipeline commits micro-batches every 30 seconds across 40 partitions on Amazon S3. After 3 weeks, the table holds 200,000 tiny (~200 KB) Parquet files and 50,000 uncompacted manifest files across 60,000 snapshots. Trino and Spark query planning now stalls for 45 seconds before reading a single byte, S3 throws intermittent `503 Slow Down` errors, and coordinator memory spikes dangerously. Design a zero-downtime remediation and ongoing write/maintenance architecture.",
+  "spark": {
+    "summary": "Stop small-file creation at the source via 5-minute write buffering and hash-repartitioning, then clear the 200K-file backlog with batched rewrite_data_files, rewrite_manifests, and expire_snapshots.",
+    "keyTakeaway": "When traffic spikes expose hidden coupling, fix both write-side micro-batch cadence (30s -> 5m) and read-side maintenance (data files + manifests + snapshot expiry) with bounded concurrency.",
+    "byteSummary": "Committing a streaming Iceberg sink every 30 seconds across 40 partitions generates `40 * 120 = 4,800` new Parquet files and 120 snapshots *every hour*. Within three weeks, the Iceberg metadata tree balloons to 50,000 manifest files and 60,000 snapshots, forcing Trino/Spark coordinators to spend 45 seconds downloading and merging manifest lists from S3—triggering `503 Slow Down` throttling.\n\nRemediation requires two coordinated phases. First, **stop the bleeding on the write path**: increase the Kafka sink trigger interval from `30s` to `5m` (or use Spark/Flink pre-write hash/range repartitioning + `write.target-file-size-bytes = 536870912`), cutting new file creation by 10x–40x immediately.\n\nSecond, **drain the 200K-file backlog safely**: run `rewrite_data_files` partition-by-partition in bounded batches (so you don't OOM Spark executors or trigger OCC conflicts), then run `rewrite_manifests` to collapse 50,000 manifests into ~10–20 clean manifests, and finally run `expire_snapshots` (keeping 3–7 days for Time Travel) to reclaim S3 space and shrink `metadata.json`.\n\nThe core trade-off is ingestion freshness versus metadata health: shifting from 30s to 5m micro-batches adds 4.5 minutes of analytical latency, which is easily offset for most BI/ML workloads by 100x faster query planning (45s -> 400ms)—or bridged with a hot-tier speed layer for sub-minute dashboards."
+  },
+  "learningJourney": [
+    {
+      "id": "stage-1-math-of-bloat",
+      "eyebrow": "Stage 1 • Triage",
+      "title": "The Math Behind 200K Files and 50K Manifests in 3 Weeks",
+      "level": "foundation",
+      "purpose": "Quantify how 30-second multi-partition commits explode both data files and Iceberg metadata.",
+      "explanation": {
+        "foundation": "At 1 commit every 30 seconds (`2,880 commits/day`) across 40 partitions:",
+        "core": "- **Data File Explosion**: Even 1 file per partition per commit = `115,200` tiny 200 KB files/day.\n- **Manifest Explosion**: Every commit writes a new manifest file + manifest list + `metadata.json`. At 60,000 snapshots, query planners spend 45s just fetching metadata JSON/Avro files from S3.",
+        "deepDive": "In production deployments of Apache Iceberg Small-Files & Manifest Bloat Remediation, watch how the math behind 200k files and 50k manifests in 3 weeks interacts with tail latency, retry amplification, and partial failures. Stop small-file creation at the source via 5-minute write buffering and hash-repartitioning, then clear the 200K-file backlog with batched rewrite_data_files, rewrite_manifests, and expire_snapshots."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Bloat Cascade",
+        "title": "30s Commits x 40 Partitions -> 45s Planning Stall",
+        "nodes": [
+          {
+            "id": "kfk",
+            "label": "30s Kafka Commits",
+            "sublabel": "40 partitions/batch"
+          },
+          {
+            "id": "man",
+            "label": "50K Manifests",
+            "sublabel": "60K snapshots on S3"
+          },
+          {
+            "id": "pln",
+            "label": "45s Query Planning",
+            "sublabel": "S3 503 + Coordinator OOM"
+          }
+        ],
+        "edges": [
+          {
+            "from": "kfk",
+            "to": "man",
+            "label": "2,880 snapshots/day"
+          },
+          {
+            "from": "man",
+            "to": "pln",
+            "label": "Metadata storm"
+          }
+        ],
+        "cards": [
+          {
+            "title": "Metadata > Data",
+            "body": "Query latency is dominated by reading 50,000 Avro manifest files, not Parquet data."
+          },
+          {
+            "title": "S3 Prefix Throttling",
+            "body": "Thousands of concurrent metadata GETs hit S3 prefix rate limits."
+          }
+        ],
+        "summary": "Caption: 30-second commits across 40 partitions generate thousands of daily snapshots and manifests, causing 45-second query planning stalls and S3 503 throttling."
+      }
+    },
+    {
+      "id": "stage-2-write-side-fix",
+      "eyebrow": "Stage 2 • Write-Path Fix",
+      "title": "Stopping New Small Files: Buffering & Pre-Write Distribution",
+      "level": "foundation",
+      "purpose": "Reduce incoming file creation by 10x–40x before running backlog compaction.",
+      "explanation": {
+        "foundation": "Compacting the backlog fails if the streaming job keeps creating 4,800 tiny files every hour:",
+        "core": "- **Increase Micro-Batch Interval**: Move trigger from `30s` to `5m` (10x fewer commits/snapshots).\n- **Iceberg Fanout / Hash Distribution**: Set `write.distribution-mode = hash` on the partition key so each partition is written by 1–2 tasks rather than all 40 executors writing 40 tiny files per partition.",
+        "deepDive": "In production deployments of Apache Iceberg Small-Files & Manifest Bloat Remediation, watch how stopping new small files: buffering & pre-write distribution interacts with tail latency, retry amplification, and partial failures. Stop small-file creation at the source via 5-minute write buffering and hash-repartitioning, then clear the 200K-file backlog with batched rewrite_data_files, rewrite_manifests, and expire_snapshots."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Write-Side Fix",
+        "title": "30s Fanout Writes vs 5m Hash-Distributed Writes",
+        "nodes": [
+          {
+            "id": "bad",
+            "label": "30s + No Shuffle",
+            "sublabel": "4,800 files/hr"
+          },
+          {
+            "id": "good",
+            "label": "5m + Hash Distribution",
+            "sublabel": "~120 larger files/hr"
+          }
+        ],
+        "edges": [
+          {
+            "from": "bad",
+            "to": "good",
+            "label": "40x fewer files & snapshots"
+          }
+        ],
+        "cards": [
+          {
+            "title": "Distribution Mode",
+            "body": "write.distribution-mode=hash prevents every Spark/Flink task from opening a file in every partition."
+          },
+          {
+            "title": "Zstd Compression",
+            "body": "Set write.parquet.compression-codec=zstd for 25% smaller files at low CPU."
+          }
+        ],
+        "summary": "Caption: Extending micro-batches to 5 minutes and enabling hash write distribution cuts incoming Parquet file and snapshot creation by up to 40x."
+      },
+      "decisionFramework": {
+        "problem": "How to implement Apache Iceberg Small-Files & Manifest Bloat Remediation without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "When traffic spikes expose hidden coupling, fix both write-side micro-batch cadence (30s -> 5m) and read-side maintenance (data files + manifests + snapshot expiry) with bounded concurrency.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Apache Iceberg Small-Files & Manifest Bloat Remediation experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-3-backlog-compaction-order",
+      "eyebrow": "Stage 3 • Backlog Drain",
+      "title": "Safe 3-Step Backlog Drain: Data -> Manifests -> Snapshots",
+      "level": "intermediate",
+      "purpose": "Execute backlog cleanup in bounded partition batches without OOMing Spark or Trino.",
+      "explanation": {
+        "foundation": "Rewriting 200,000 files in a single Spark job can OOM the driver. Drain the backlog in **three ordered steps**:",
+        "core": "1. **`rewrite_data_files` (Partition-Scoped)**: Filter `WHERE event_date = '...'` day-by-day with `partial-progress.enabled = true` so partial progress commits safely even if a job restarts.\n2. **`rewrite_manifests`**: Collapses 50,000 small manifest files into ~15–20 ~8 MB manifests.\n3. **`expire_snapshots`**: Drops snapshots older than 7 days (`retain_last => 10`), shrinking `metadata.json` and deleting old 200 KB files from S3.",
+        "deepDive": "In production deployments of Apache Iceberg Small-Files & Manifest Bloat Remediation, watch how safe 3-step backlog drain: data -> manifests -> snapshots interacts with tail latency, retry amplification, and partial failures. Stop small-file creation at the source via 5-minute write buffering and hash-repartitioning, then clear the 200K-file backlog with batched rewrite_data_files, rewrite_manifests, and expire_snapshots."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Ordered Cleanup",
+        "title": "Partial-Progress Data -> Manifests -> Snapshot Expiry",
+        "nodes": [
+          {
+            "id": "d1",
+            "label": "1. rewrite_data_files",
+            "sublabel": "partial-progress=true"
+          },
+          {
+            "id": "d2",
+            "label": "2. rewrite_manifests",
+            "sublabel": "50K -> 20 manifests"
+          },
+          {
+            "id": "d3",
+            "label": "3. expire_snapshots",
+            "sublabel": "60K -> ~2K snapshots"
+          }
+        ],
+        "edges": [
+          {
+            "from": "d1",
+            "to": "d2",
+            "label": "Merge 200 KB -> 512 MB"
+          },
+          {
+            "from": "d2",
+            "to": "d3",
+            "label": "Prune metadata & S3"
+          }
+        ],
+        "cards": [
+          {
+            "title": "Partial Progress",
+            "body": "Commits completed file groups every N tasks so a 2-hour job never loses work."
+          },
+          {
+            "title": "Immediate Win",
+            "body": "Even before data compaction finishes, rewrite_manifests + expire_snapshots slashes planning time."
+          }
+        ],
+        "summary": "Caption: Running partial-progress data compaction per partition, followed by rewrite_manifests and expire_snapshots, safely clears the 200K-file backlog."
+      }
+    },
+    {
+      "id": "stage-4-s3-throttling-guardrails",
+      "eyebrow": "Stage 4 • S3 Resilience",
+      "title": "Preventing S3 `503 Slow Down` During Heavy Compaction",
+      "level": "intermediate",
+      "purpose": "Throttle compaction concurrency and tune Hadoop/AWS S3A retries so backlog cleanup doesn't DoS live queries.",
+      "explanation": {
+        "foundation": "Reading 200,000 small files in parallel from one S3 bucket prefix can trigger `503 Slow Down` for *live* Trino/Spark queries:",
+        "core": "- **Cap Concurrent Groups**: Set `max-concurrent-file-group-rewrites = 4` and `max-file-group-size-bytes = 10737418240` (10 GB).\n- **Adaptive S3 Retry**: Configure `fs.s3a.retry.limit = 10` and `fs.s3a.connection.maximum = 200` with exponential backoff.\n- **Iceberg Object-Store Layout (`write.object-storage.enabled = true`)**: Prepends a deterministic hash prefix to Parquet paths so S3 distributes IOPS across thousands of virtual shards.",
+        "deepDive": "In production deployments of Apache Iceberg Small-Files & Manifest Bloat Remediation, watch how preventing s3 `503 slow down` during heavy compaction interacts with tail latency, retry amplification, and partial failures. Stop small-file creation at the source via 5-minute write buffering and hash-repartitioning, then clear the 200K-file backlog with batched rewrite_data_files, rewrite_manifests, and expire_snapshots."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "S3 IOPS Protection",
+        "title": "Unbounded Parallelism vs Throttled Hash-Prefixed S3",
+        "nodes": [
+          {
+            "id": "unb",
+            "label": "Unbounded Compaction",
+            "sublabel": "S3 503 Slow Down on live queries"
+          },
+          {
+            "id": "thr",
+            "label": "4x Concurrency + Hash Prefix",
+            "sublabel": "0 S3 503s, smooth IOPS"
+          }
+        ],
+        "edges": [
+          {
+            "from": "unb",
+            "to": "thr",
+            "label": "write.object-storage.enabled=true"
+          }
+        ],
+        "cards": [
+          {
+            "title": "Hash Prefixing",
+            "body": "Spreads S3 keys across partitions so no single prefix hits 5,500 GET/s."
+          },
+          {
+            "title": "Bounded File Groups",
+            "body": "10 GB group cap keeps executor memory predictable."
+          }
+        ],
+        "summary": "Caption: Bounding concurrent file-group rewrites and enabling Iceberg object-storage hash prefixes eliminates S3 503 throttling during backlog compaction."
+      }
+    },
+    {
+      "id": "stage-5-implementation",
+      "eyebrow": "Stage 5 • Implementation",
+      "title": "Safe Partition-by-Partition Backlog Drainer (Python / PySpark)",
+      "level": "intermediate",
+      "purpose": "Implement a resumable partition drainer with bounded retry, partial-progress commits, and rollback.",
+      "explanation": {
+        "foundation": "Below is a resumable Python driver that drains partitions incrementally with `partial-progress.enabled = true` and bounded exponential backoff:",
+        "core": "```python\nimport random, time\n\ndef drain_iceberg_backlog(spark, table: str, partition_dates: list[str], max_retries: int = 3) -> None:\n    for dt in partition_dates:\n        sql = f'''\n            CALL iceberg.system.rewrite_data_files(\n                table => '{table}',\n                where => \"event_date = DATE '{dt}'\",\n                options => map(\n                    'target-file-size-bytes', '536870912',\n                    'min-input-files', '5',\n                    'partial-progress.enabled', 'true',\n                    'partial-progress.max-commits', '10',\n                    'max-concurrent-file-group-rewrites', '4'\n                )\n            )\n        '''\n        for attempt in range(max_retries):\n            try:\n                spark.sql(sql)\n                break\n            except Exception as exc:\n                if attempt == max_retries - 1:\n                    raise RuntimeError(f'Backlog drain stalled on {dt}: {exc}') from exc\n                time.sleep((5.0 * (2 ** attempt)) + random.uniform(0, 2.0))",
+        "deepDive": "spark.sql(f\"CALL iceberg.system.rewrite_manifests('{table}')\")\n    spark.sql(f\"CALL iceberg.system.expire_snapshots(table => '{table}', retain_last => 10)\")\n```"
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Resumable Drainer",
+        "title": "Partition Loop -> Partial Progress -> Manifest & Expiry",
+        "nodes": [
+          {
+            "id": "lp",
+            "label": "Date Partition Loop",
+            "sublabel": "Bounded blast radius"
+          },
+          {
+            "id": "pp",
+            "label": "partial-progress=true",
+            "sublabel": "Up to 10 commits/day"
+          },
+          {
+            "id": "cl",
+            "label": "Manifests + Expiry",
+            "sublabel": "Shrinks metadata.json"
+          }
+        ],
+        "edges": [
+          {
+            "from": "lp",
+            "to": "pp",
+            "label": "Bounded retry + jitter"
+          },
+          {
+            "from": "pp",
+            "to": "cl",
+            "label": "Finalize table health"
+          }
+        ],
+        "cards": [
+          {
+            "title": "Zero Lost Progress",
+            "body": "partial-progress commits finished groups even if a spot executor is preempted."
+          },
+          {
+            "title": "512 MB Target",
+            "body": "Larger 512 MB files minimize manifest count for cold historical partitions."
+          }
+        ],
+        "summary": "Caption: Iterating date partitions with partial-progress commits and bounded retry drains massive small-file backlogs without OOMing coordinators."
+      }
+    },
+    {
+      "id": "stage-6-metadata-tuning",
+      "eyebrow": "Stage 6 • Metadata Properties",
+      "title": "Tuning Iceberg Table Properties for Long-Term Stability",
+      "level": "advanced",
+      "purpose": "Configure automatic metadata cleanup properties directly on the Iceberg table.",
+      "explanation": {
+        "foundation": "Prevent metadata bloat from ever returning by setting table-level governance properties:",
+        "core": "- **`write.metadata.delete-after-commit.enabled = true`** and **`write.metadata.previous-versions-max = 20`**: Automatically deletes old `metadata.json` files after commits.\n- **`history.expire.max-snapshot-age-ms = 604800000`** (7 days): Bounds snapshot history.\n- **`commit.manifest.min-count-to-merge = 20`**: Auto-merges small manifests during regular commits.",
+        "deepDive": "In production deployments of Apache Iceberg Small-Files & Manifest Bloat Remediation, watch how tuning iceberg table properties for long-term stability interacts with tail latency, retry amplification, and partial failures. Stop small-file creation at the source via 5-minute write buffering and hash-repartitioning, then clear the 200K-file backlog with batched rewrite_data_files, rewrite_manifests, and expire_snapshots."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Table Governance",
+        "title": "Default Unbounded Metadata vs Self-Cleaning Table Props",
+        "nodes": [
+          {
+            "id": "def",
+            "label": "Default Iceberg",
+            "sublabel": "Keeps all metadata.json forever"
+          },
+          {
+            "id": "gov",
+            "label": "Auto-Pruned Props",
+            "sublabel": "Max 20 metadata, 7d snapshots"
+          }
+        ],
+        "edges": [
+          {
+            "from": "def",
+            "to": "gov",
+            "label": "Prevent future planning stalls"
+          }
+        ],
+        "cards": [
+          {
+            "title": "Manifest Auto-Merge",
+            "body": "commit.manifest.min-count-to-merge keeps manifest count flat automatically."
+          },
+          {
+            "title": "Metadata GC",
+            "body": "delete-after-commit prevents S3 from accumulating 60,000 metadata JSONs."
+          }
+        ],
+        "summary": "Caption: Configuring Iceberg metadata auto-deletion and manifest merge thresholds keeps snapshot and manifest counts bounded indefinitely."
+      }
+    },
+    {
+      "id": "stage-7-slos-observability",
+      "eyebrow": "Stage 7 • Verification",
+      "title": "Monitoring File Size Distributions & Planning Latency SLOs",
+      "level": "advanced",
+      "purpose": "Query Iceberg system tables (`$files`, `$manifests`, `$snapshots`) to verify table health.",
+      "explanation": {
+        "foundation": "Add automated Iceberg metadata health checks to your observability dashboard:",
+        "core": "- **`SELECT count(*), avg(file_size_in_bytes)/1e6 FROM table.files`**: Alert if average file size drops below `64 MB` or total file count exceeds `10,000`.\n- **`SELECT count(*) FROM table.manifests`**: Keep under `50` manifests.\n- **Trino/Spark Planning Latency**: Track `query_planning_ms` p99 (target `< 500 ms` vs `45,000 ms` prior).",
+        "deepDive": "In production deployments of Apache Iceberg Small-Files & Manifest Bloat Remediation, watch how monitoring file size distributions & planning latency slos interacts with tail latency, retry amplification, and partial failures. Stop small-file creation at the source via 5-minute write buffering and hash-repartitioning, then clear the 200K-file backlog with batched rewrite_data_files, rewrite_manifests, and expire_snapshots."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Post-Fix Telemetry",
+        "title": "45s Planning + S3 503s vs 400ms Healthy Steady State",
+        "nodes": [
+          {
+            "id": "bad",
+            "label": "Before",
+            "sublabel": "200K files • 45s planning • 503s"
+          },
+          {
+            "id": "good",
+            "label": "After",
+            "sublabel": "~1.2K 512MB files • 400ms planning"
+          }
+        ],
+        "edges": [
+          {
+            "from": "bad",
+            "to": "good",
+            "label": "100x faster planning, 0 S3 503s"
+          }
+        ],
+        "cards": [
+          {
+            "title": "System Table Probes",
+            "body": "Query $files and $manifests hourly with zero S3 data scans."
+          },
+          {
+            "title": "Early Alerting",
+            "body": "Alert if manifest count > 100 or avg file size < 64 MB."
+          }
+        ],
+        "summary": "Caption: Tracking Iceberg $files and $manifests system tables verifies that average file sizes stay >64 MB and query planning remains under 500 ms."
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why did Trino and Spark stall for 45 seconds BEFORE reading any data rows, even though total table size wasn't extreme?",
+      "options": [
+        "Inspecting 50,000 manifest files and 200,000 file-level column stats over S3 saturated coordinator planning and triggered S3 503 throttling",
+        "Parquet files cannot be read by Trino without converting them to CSV first",
+        "Kafka consumers lock Iceberg tables during every 30-second commit",
+        "S3 deletes files larger than 200 KB after 24 hours"
+      ],
+      "correctIndex": 0,
+      "explanation": "Iceberg query planning downloads manifest lists and manifest Avro files from S3 to prune files; 50,000 uncompacted manifests create massive metadata I/O."
+    },
+    "knowledgeChecks": [
+      {
+        "id": "kc-iceberg-write-mode",
+        "question": "What does setting `write.distribution-mode = hash` on the Iceberg table accomplish for the streaming sink?",
+        "options": [
+          {
+            "id": "a",
+            "text": "It shuffles records by partition key before writing so 1–2 tasks write each partition instead of all 40 executors creating 40 tiny files per partition",
+            "correct": true,
+            "feedback": "Correct! Without hash distribution, every parallel writer task writes a separate file for every partition it sees in a micro-batch, multiplying small files by task count."
+          },
+          {
+            "id": "b",
+            "text": "It encrypts all Parquet columns with SHA-256",
+            "correct": false,
+            "feedback": "Without hash distribution, every parallel writer task writes a separate file for every partition it sees in a micro-batch, multiplying small files by task count."
+          },
+          {
+            "id": "c",
+            "text": "It disables Iceberg snapshots completely",
+            "correct": false,
+            "feedback": "Without hash distribution, every parallel writer task writes a separate file for every partition it sees in a micro-batch, multiplying small files by task count."
+          },
+          {
+            "id": "d",
+            "text": "It forces Kafka to commit every 1 second",
+            "correct": false,
+            "feedback": "Without hash distribution, every parallel writer task writes a separate file for every partition it sees in a micro-batch, multiplying small files by task count."
+          }
+        ],
+        "correctIndex": 0,
+        "explanation": "Without hash distribution, every parallel writer task writes a separate file for every partition it sees in a micro-batch, multiplying small files by task count."
+      },
+      {
+        "id": "kc-iceberg-partial",
+        "question": "Why should you enable `partial-progress.enabled = true` when draining a 200,000-file Iceberg backlog?",
+        "options": [
+          {
+            "id": "a",
+            "text": "It commits compacted file groups incrementally so spot/preemptible failures or OCC retries don't discard hours of completed work",
+            "correct": true,
+            "feedback": "Correct! Partial progress breaks a huge rewrite into smaller commits so completed groups are immediately durable and visible to readers."
+          },
+          {
+            "id": "b",
+            "text": "It skips rewriting Parquet files and only deletes manifests",
+            "correct": false,
+            "feedback": "Partial progress breaks a huge rewrite into smaller commits so completed groups are immediately durable and visible to readers."
+          },
+          {
+            "id": "c",
+            "text": "It disables S3 authentication",
+            "correct": false,
+            "feedback": "Partial progress breaks a huge rewrite into smaller commits so completed groups are immediately durable and visible to readers."
+          },
+          {
+            "id": "d",
+            "text": "It allows two jobs to overwrite the same file without snapshots",
+            "correct": false,
+            "feedback": "Partial progress breaks a huge rewrite into smaller commits so completed groups are immediately durable and visible to readers."
+          }
+        ],
+        "correctIndex": 0,
+        "explanation": "Partial progress breaks a huge rewrite into smaller commits so completed groups are immediately durable and visible to readers."
+      },
+      {
+        "id": "kc-iceberg-objstore",
+        "question": "How does `write.object-storage.enabled = true` help mitigate S3 `503 Slow Down` errors?",
+        "options": [
+          {
+            "id": "a",
+            "text": "It prepends a deterministic hash prefix to Parquet object paths so S3 distributes requests across multiple storage shards instead of one hot partition prefix",
+            "correct": true,
+            "feedback": "Correct! S3 enforces 5,500 GETs/sec per prefix; hash-prefixing distributes files across many prefixes to avoid single-prefix throttling."
+          },
+          {
+            "id": "b",
+            "text": "It moves Parquet files from S3 into local `/tmp`",
+            "correct": false,
+            "feedback": "S3 enforces 5,500 GETs/sec per prefix; hash-prefixing distributes files across many prefixes to avoid single-prefix throttling."
+          },
+          {
+            "id": "c",
+            "text": "It disables Parquet compression",
+            "correct": false,
+            "feedback": "S3 enforces 5,500 GETs/sec per prefix; hash-prefixing distributes files across many prefixes to avoid single-prefix throttling."
+          },
+          {
+            "id": "d",
+            "text": "It reduces file size to 10 KB",
+            "correct": false,
+            "feedback": "S3 enforces 5,500 GETs/sec per prefix; hash-prefixing distributes files across many prefixes to avoid single-prefix throttling."
+          }
+        ],
+        "correctIndex": 0,
+        "explanation": "S3 enforces 5,500 GETs/sec per prefix; hash-prefixing distributes files across many prefixes to avoid single-prefix throttling."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "Committing a Kafka stream every 30 seconds across 40 partitions created 200,000 tiny files and 50,000 manifests, stalling queries for 45 seconds. Fix it by buffering writes to 5-minute batches, compacting files into 512 MB chunks, merging manifests, and expiring old snapshots.",
+      "spark": {
+        "summary": "Batch streaming writes to 5-minute intervals and run Iceberg data, manifest, and snapshot maintenance to fix 45-second query stalls.",
+        "keyTakeaway": "Slow down tiny commits on the write side, then compact data files, manifests, and snapshots in order."
+      },
+      "learningJourney": [
+        {
+          "stageId": "stage-1-math-of-bloat",
+          "summary": "30-second commits create 115K+ tiny files every day.",
+          "id": "stage-1-math-of-bloat",
+          "title": "The Math Behind 200K Files and 50K Manifests in 3 Weeks",
+          "eyebrow": "Stage 1 • Triage",
+          "explanation": "30-second commits create 115K+ tiny files every day."
+        },
+        {
+          "stageId": "stage-2-write-side-fix",
+          "summary": "Switch to 5-minute micro-batches and hash-distribute writes.",
+          "id": "stage-2-write-side-fix",
+          "title": "Stopping New Small Files: Buffering & Pre-Write Distribution",
+          "eyebrow": "Stage 2 • Write-Path Fix",
+          "explanation": "Switch to 5-minute micro-batches and hash-distribute writes."
+        },
+        {
+          "stageId": "stage-3-backlog-compaction-order",
+          "summary": "Compact data files, then manifests, then expire old snapshots.",
+          "id": "stage-3-backlog-compaction-order",
+          "title": "Safe 3-Step Backlog Drain: Data -> Manifests -> Snapshots",
+          "eyebrow": "Stage 3 • Backlog Drain",
+          "explanation": "Compact data files, then manifests, then expire old snapshots."
+        },
+        {
+          "stageId": "stage-4-s3-throttling-guardrails",
+          "summary": "Limit concurrent compaction tasks so S3 doesn't throttle live queries.",
+          "id": "stage-4-s3-throttling-guardrails",
+          "title": "Preventing S3 `503 Slow Down` During Heavy Compaction",
+          "eyebrow": "Stage 4 • S3 Resilience",
+          "explanation": "Limit concurrent compaction tasks so S3 doesn't throttle live queries."
+        },
+        {
+          "stageId": "stage-5-implementation",
+          "summary": "Compact one date partition at a time with partial-progress enabled.",
+          "id": "stage-5-implementation",
+          "title": "Safe Partition-by-Partition Backlog Drainer (Python / PySpark)",
+          "eyebrow": "Stage 5 • Implementation",
+          "explanation": "Compact one date partition at a time with partial-progress enabled."
+        },
+        {
+          "stageId": "stage-6-metadata-tuning",
+          "summary": "Turn on automatic metadata cleanup on the Iceberg table.",
+          "id": "stage-6-metadata-tuning",
+          "title": "Tuning Iceberg Table Properties for Long-Term Stability",
+          "eyebrow": "Stage 6 • Metadata Properties",
+          "explanation": "Turn on automatic metadata cleanup on the Iceberg table."
+        },
+        {
+          "stageId": "stage-7-slos-observability",
+          "summary": "Monitor average file size and manifest count using system tables.",
+          "id": "stage-7-slos-observability",
+          "title": "Monitoring File Size Distributions & Planning Latency SLOs",
+          "eyebrow": "Stage 7 • Verification",
+          "explanation": "Monitor average file size and manifest count using system tables."
+        }
+      ],
+      "finalSummary": "Fixing write-side batching and running ordered Iceberg maintenance turns 45-second stalls into 400 ms planning.",
+      "summary": "Stop small-file creation at the source via 5-minute write buffering and hash-repartitioning, then clear the 200K-file backlog with batched rewrite_data_files, rewrite_manifests, and expire_snapshots.",
+      "keyTakeaway": "When traffic spikes expose hidden coupling, fix both write-side micro-batch cadence (30s -> 5m) and read-side maintenance (data files + manifests + snapshot expiry) with bounded concurrency."
+    },
+    "intermediate": {
+      "byteSummary": "30-second commits across 40 partitions generated 200K small files and 50K manifests, causing 45s planning stalls and S3 503s. Remediate by shifting to 5-minute hash-distributed writes, draining the backlog partition-by-partition with partial-progress=true, running rewrite_manifests + expire_snapshots, and enabling object-storage hash prefixes.",
+      "spark": {
+        "summary": "Eliminate Iceberg small-file and manifest bloat via 5m hash-distributed writes, throttled partial-progress compaction, manifest rewrites, and snapshot expiry.",
+        "keyTakeaway": "Always pair backlog compaction with write-side batching and S3 concurrency caps to avoid recurring bloat and 503 throttling."
+      },
+      "learningJourney": [
+        {
+          "stageId": "stage-1-math-of-bloat",
+          "summary": "2,880 daily commits explode data files, manifests, and snapshots.",
+          "id": "stage-1-math-of-bloat",
+          "title": "The Math Behind 200K Files and 50K Manifests in 3 Weeks",
+          "eyebrow": "Stage 1 • Triage",
+          "explanation": "2,880 daily commits explode data files, manifests, and snapshots."
+        },
+        {
+          "stageId": "stage-2-write-side-fix",
+          "summary": "5-minute triggers + write.distribution-mode=hash cut files 40x.",
+          "id": "stage-2-write-side-fix",
+          "title": "Stopping New Small Files: Buffering & Pre-Write Distribution",
+          "eyebrow": "Stage 2 • Write-Path Fix",
+          "explanation": "5-minute triggers + write.distribution-mode=hash cut files 40x."
+        },
+        {
+          "stageId": "stage-3-backlog-compaction-order",
+          "summary": "Ordered partial-progress data -> manifests -> snapshot expiry.",
+          "id": "stage-3-backlog-compaction-order",
+          "title": "Safe 3-Step Backlog Drain: Data -> Manifests -> Snapshots",
+          "eyebrow": "Stage 3 • Backlog Drain",
+          "explanation": "Ordered partial-progress data -> manifests -> snapshot expiry."
+        },
+        {
+          "stageId": "stage-4-s3-throttling-guardrails",
+          "summary": "4x group cap and write.object-storage.enabled=true stop S3 503s.",
+          "id": "stage-4-s3-throttling-guardrails",
+          "title": "Preventing S3 `503 Slow Down` During Heavy Compaction",
+          "eyebrow": "Stage 4 • S3 Resilience",
+          "explanation": "4x group cap and write.object-storage.enabled=true stop S3 503s."
+        },
+        {
+          "stageId": "stage-5-implementation",
+          "summary": "Resumable PySpark partition drainer with bounded backoff.",
+          "id": "stage-5-implementation",
+          "title": "Safe Partition-by-Partition Backlog Drainer (Python / PySpark)",
+          "eyebrow": "Stage 5 • Implementation",
+          "explanation": "Resumable PySpark partition drainer with bounded backoff."
+        },
+        {
+          "stageId": "stage-6-metadata-tuning",
+          "summary": "Auto-prune metadata.json and auto-merge manifests.",
+          "id": "stage-6-metadata-tuning",
+          "title": "Tuning Iceberg Table Properties for Long-Term Stability",
+          "eyebrow": "Stage 6 • Metadata Properties",
+          "explanation": "Auto-prune metadata.json and auto-merge manifests."
+        },
+        {
+          "stageId": "stage-7-slos-observability",
+          "summary": "Alert on $files avg size < 64 MB and $manifests > 100.",
+          "id": "stage-7-slos-observability",
+          "title": "Monitoring File Size Distributions & Planning Latency SLOs",
+          "eyebrow": "Stage 7 • Verification",
+          "explanation": "Alert on $files avg size < 64 MB and $manifests > 100."
+        }
+      ],
+      "finalSummary": "Coordinated write buffering, throttled partial-progress compaction, and metadata auto-pruning restore 400 ms query planning.",
+      "summary": "Stop small-file creation at the source via 5-minute write buffering and hash-repartitioning, then clear the 200K-file backlog with batched rewrite_data_files, rewrite_manifests, and expire_snapshots.",
+      "keyTakeaway": "When traffic spikes expose hidden coupling, fix both write-side micro-batch cadence (30s -> 5m) and read-side maintenance (data files + manifests + snapshot expiry) with bounded concurrency."
+    },
+    "advanced": {
+      "byteSummary": "Unchecked 30s multi-partition Iceberg commits exhaust S3 prefix limits and coordinator memory via 50K uncompacted manifests and 60K snapshots. Production remediation pairs 5m hash-distributed ingestion with object-storage hash prefixes, throttled partial-progress partition draining, manifest merging, snapshot expiry, and $files/$manifests SLO probes.",
+      "spark": {
+        "summary": "End-to-end Iceberg recovery: 5m hash-distributed writes, S3 hash-prefixed throttled compaction, manifest merging, and metadata governance.",
+        "keyTakeaway": "Bound concurrent file-group rewrites to protect live S3 IOPS, commit with partial-progress, and enforce metadata auto-pruning."
+      },
+      "learningJourney": [
+        {
+          "stageId": "stage-1-math-of-bloat",
+          "summary": "Metadata-bound planning latency and S3 prefix rate exhaustion.",
+          "id": "stage-1-math-of-bloat",
+          "title": "The Math Behind 200K Files and 50K Manifests in 3 Weeks",
+          "eyebrow": "Stage 1 • Triage",
+          "explanation": "Metadata-bound planning latency and S3 prefix rate exhaustion."
+        },
+        {
+          "stageId": "stage-2-write-side-fix",
+          "summary": "5m triggers, hash distribution, and Zstd Parquet tuning.",
+          "id": "stage-2-write-side-fix",
+          "title": "Stopping New Small Files: Buffering & Pre-Write Distribution",
+          "eyebrow": "Stage 2 • Write-Path Fix",
+          "explanation": "5m triggers, hash distribution, and Zstd Parquet tuning."
+        },
+        {
+          "stageId": "stage-3-backlog-compaction-order",
+          "summary": "Partition-scoped partial-progress rewrite -> manifest -> expiry.",
+          "id": "stage-3-backlog-compaction-order",
+          "title": "Safe 3-Step Backlog Drain: Data -> Manifests -> Snapshots",
+          "eyebrow": "Stage 3 • Backlog Drain",
+          "explanation": "Partition-scoped partial-progress rewrite -> manifest -> expiry."
+        },
+        {
+          "stageId": "stage-4-s3-throttling-guardrails",
+          "summary": "4x group throttling, S3A retries, and object-storage hash prefixes.",
+          "id": "stage-4-s3-throttling-guardrails",
+          "title": "Preventing S3 `503 Slow Down` During Heavy Compaction",
+          "eyebrow": "Stage 4 • S3 Resilience",
+          "explanation": "4x group throttling, S3A retries, and object-storage hash prefixes."
+        },
+        {
+          "stageId": "stage-5-implementation",
+          "summary": "Resumable PySpark drainer with bounded exponential backoff.",
+          "id": "stage-5-implementation",
+          "title": "Safe Partition-by-Partition Backlog Drainer (Python / PySpark)",
+          "eyebrow": "Stage 5 • Implementation",
+          "explanation": "Resumable PySpark drainer with bounded exponential backoff."
+        },
+        {
+          "stageId": "stage-6-metadata-tuning",
+          "summary": "delete-after-commit, max-snapshot-age-ms, and manifest merge.",
+          "id": "stage-6-metadata-tuning",
+          "title": "Tuning Iceberg Table Properties for Long-Term Stability",
+          "eyebrow": "Stage 6 • Metadata Properties",
+          "explanation": "delete-after-commit, max-snapshot-age-ms, and manifest merge."
+        },
+        {
+          "stageId": "stage-7-slos-observability",
+          "summary": "Zero-scan $files/$manifests alerts and <500ms planning SLOs.",
+          "id": "stage-7-slos-observability",
+          "title": "Monitoring File Size Distributions & Planning Latency SLOs",
+          "eyebrow": "Stage 7 • Verification",
+          "explanation": "Zero-scan $files/$manifests alerts and <500ms planning SLOs."
+        }
+      ],
+      "finalSummary": "Aligning write distribution, S3-safe throttled compaction, and table-level metadata GC sustains 400 ms planning at scale.",
+      "summary": "Stop small-file creation at the source via 5-minute write buffering and hash-repartitioning, then clear the 200K-file backlog with batched rewrite_data_files, rewrite_manifests, and expire_snapshots.",
+      "keyTakeaway": "When traffic spikes expose hidden coupling, fix both write-side micro-batch cadence (30s -> 5m) and read-side maintenance (data files + manifests + snapshot expiry) with bounded concurrency."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "prerequisites": [
+    {
+      "title": "Lakehouse File Compaction, Z-Ordering & Data Skipping",
+      "summary": "Lakehouse engines achieve warehouse-grade scan speeds on S3/GCS by compacting tiny streaming files into 256–512 MB Parquet files and co-locating multi-column query predicates via Z-ordering so min/max stats prune irrelevant files."
+    },
+    {
+      "title": "Lakehouse Table Formats (Iceberg, Delta, Hudi)",
+      "summary": "Open table formats (Delta Lake, Apache Iceberg, Apache Hudi) add an ACID transaction log and metadata layer on top of cloud object storage (S3/GCS/ADLS) and Parquet files, enabling time travel, schema evolution, concurrent writes, and Medallion (Bronze/Silver/..."
+    },
+    {
+      "title": "Spark Shuffle, Partitioning & AQE",
+      "summary": "Spark shuffles redistribute records across executors over the network whenever wide transformations (join, groupBy, repartition) cross partition boundaries. Mastering partitioning, Broadcast Hash Joins, executor memory sizing, and Adaptive Query Execution (AQE..."
+    }
+  ],
+  "simulation": {
+    "title": "Apache Iceberg Small-Files & Manifest Bloat Remediation — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Input Workload"
+      },
+      {
+        "id": "entry",
+        "label": "Router / API",
+        "role": "Admission Control"
+      },
+      {
+        "id": "worker",
+        "label": "Processor",
+        "role": "Domain Logic"
+      },
+      {
+        "id": "store",
+        "label": "State Layer",
+        "role": "Durable Store"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "entry",
+        "label": "request"
+      },
+      {
+        "from": "entry",
+        "to": "worker",
+        "label": "dispatch"
+      },
+      {
+        "from": "worker",
+        "to": "store",
+        "label": "read/write"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "The Math Behind 200K Files and 50K Manifests in 3 Weeks",
+        "actionLabel": "request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "entry"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "request",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Caller sends work to Router / API (The Math Behind 200K Files and 50K Manifests in 3 Weeks)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Stopping New Small Files: Buffering & Pre-Write Distribution",
+        "actionLabel": "dispatch",
+        "status": "healthy",
+        "activeNodeIds": [
+          "entry",
+          "worker"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "dispatch",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Router / API coordinates with Processor while preserving the core invariant (Stopping New Small Files: Buffering & Pre-Write Distribution)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Safe 3-Step Backlog Drain: Data -> Manifests -> Snapshots",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "worker",
+          "store"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, State Layer absorbs pressure without cascading (Safe 3-Step Backlog Drain: Data -> Manifests -> Snapshots)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Monitoring File Size Distributions & Planning Latency SLOs",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "entry",
+          "worker",
+          "store"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Monitoring File Size Distributions & Planning Latency SLOs)."
+      }
+    ]
+  }
+}

@@ -1,0 +1,819 @@
+{
+  "id": "blue-green-database",
+  "slug": "blue-green-database",
+  "title": "Zero-Downtime Blue-Green Database Deployments",
+  "problemType": "engineering",
+  "difficulty": "hard",
+  "prompt": "A 2,000 RPS payments service shares one PostgreSQL 15 database across Blue (v41) and Green (v42) behind an AWS ALB (60 s drain). Green's Flyway migration renamed `billing_zip` to `postal_code` and added `tax_jurisdiction NOT NULL` without a default, breaking Blue rollback with 100% HTTP 500s. Design an instant-rollback (< 30 s) Blue-Green schema pipeline.",
+  "spark": {
+    "summary": "Running a destructive `RENAME COLUMN` or bare `NOT NULL` migration during a Green deploy breaks Blue (N-1) instantly on a shared database, destroying rollback safety.",
+    "keyTakeaway": "If latency budgets leave no room for synchronous retries, enforce 4-phase Expand-and-Contract schema evolution with dual-writes (`BEFORE` trigger or app), `COALESCE` reads, and CI SQL linting (Squawk) so N and N-1 always coexist.",
+    "byteSummary": "**Core Mechanics:** Stateless Blue and Green application fleets can be swapped in seconds behind an AWS ALB, but they almost always share a single primary PostgreSQL database (`2,000 RPS`).\n\n**Visual & Structural Flow:** Depicts Shared-DB Schema Breakage During 60s ALB Drain (AWS ALB (60s drain) -> Blue v41 (N-1) -> Green v42 (N) -> Shared PostgreSQL 15); N and N-1 Coexistence Across 4 Migration Phases (1. EXPAND -> 2. DUAL-COMPAT -> 3. CONTRACT).\n\n**Trade-Offs & Production:** Putting down-migrations in Flyway (`U42__undo.sql`) fails in production because rolling back a `DROP` loses data written by Green during canarying, and re-adding `billing_zip` under `ACCESS EXCLUSIVE` stalls `2,000 RPS`. Every zero-downtime deployment pipeline with shared state relies on backward-compatible migrations: **GitOps & Progressive Delivery**: ArgoCD/Spinnaker Blue-Green and Canary.\n\n**Failure Modes & Application:** Every zero-downtime deployment pipeline with shared state relies on backward-compatible migrations: **GitOps & Progressive Delivery**: ArgoCD/Spinnaker Blue-Green and Canary rollouts require `N` and `N-1` schema compatibility during traffic shifting."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why Blue-Green apps still share one database",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "Think of **Why Blue-Green apps still share one database** as the intuition layer for Zero-Downtime Blue-Green Database Deployments: The mechanism: understand how Why Blue-Green apps still share one database works from first principles.",
+        "core": "Stateless Blue and Green application fleets can be swapped in seconds behind an AWS ALB, but they almost always share a single primary PostgreSQL database (`2,000 RPS`). Because ALB connection draining takes up to `60 seconds`, Blue (`v41`) and Green (`v42`) execute reads and writes concurrently—meaning any schema change that breaks `N-1` turns a routine rollback into a 100% outage.",
+        "deepDive": "Under heavy load or partial failure, why blue-green apps still share one database becomes a critical lever for predictable latency and correctness. Running a destructive `RENAME COLUMN` or bare `NOT NULL` migration during a Green deploy breaks Blue (N-1) instantly on a shared database, destroying rollback safety."
+      },
+      "purpose": "The mechanism: understand how Why Blue-Green apps still share one database works from first principles."
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "Why destructive DDL traps both Blue and Green",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "When Green (`v42`) ran `RENAME COLUMN billing_zip TO postal_code` and `ADD COLUMN tax_jurisdiction NOT NULL`:",
+        "core": "1. **Rollback Broken**: Flipping the ALB back to Blue (`v41`) caused 100% HTTP 500s (`column billing_zip does not exist`, `23502 not_null_violation`).\n2. **Table-Lock Risk**: Adding `NOT NULL` without a default or running `SET NOT NULL` without `NOT VALID` scans 50M rows under `ACCESS EXCLUSIVE`.\n3. **ORM `SELECT *` Crashes**: Strict mappers fail if unexpected columns appear.",
+        "deepDive": "In production deployments of Zero-Downtime Blue-Green Database Deployments, watch how why destructive ddl traps both blue and green interacts with tail latency, retry amplification, and partial failures. Running a destructive `RENAME COLUMN` or bare `NOT NULL` migration during a Green deploy breaks Blue (N-1) instantly on a shared database, destroying rollback safety."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Broken Rollback vs. N/N-1 Overlap",
+        "title": "Shared-DB Schema Breakage During 60s ALB Drain",
+        "actors": [
+          {
+            "id": "alb",
+            "label": "AWS ALB (60s drain)"
+          },
+          {
+            "id": "blue",
+            "label": "Blue v41 (N-1)"
+          },
+          {
+            "id": "green",
+            "label": "Green v42 (N)"
+          },
+          {
+            "id": "pg",
+            "label": "Shared PostgreSQL 15"
+          }
+        ],
+        "events": [
+          {
+            "from": "green",
+            "to": "pg",
+            "label": "RENAME billing_zip + ADD NOT NULL",
+            "status": "fail"
+          },
+          {
+            "from": "alb",
+            "to": "blue",
+            "label": "Rollback to v41 (12% Green bug)",
+            "status": "warn"
+          },
+          {
+            "from": "blue",
+            "to": "pg",
+            "label": "INSERT/SELECT billing_zip -> 500!",
+            "status": "fail"
+          },
+          {
+            "from": "pg",
+            "to": "blue",
+            "label": "Expand-Contract keeps both valid",
+            "status": "ok"
+          }
+        ],
+        "summary": "Blue and Green overlap on one database during drains and rollbacks, requiring strict N/N-1 backward compatibility."
+      },
+      "purpose": "The problem: see what breaks without Why destructive DDL traps both Blue and Green under real concurrency or scale.",
+      "decisionFramework": {
+        "problem": "How to implement Zero-Downtime Blue-Green Database Deployments without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "If latency budgets leave no room for synchronous retries, enforce 4-phase Expand-and-Contract schema evolution with dual-writes (`BEFORE` trigger or app), `COALESCE` reads, and CI SQL linting (Squawk) so N and N-1 always coexist.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Zero-Downtime Blue-Green Database Deployments experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Naive workarounds (and why they fail at 2,000 RPS)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Think of **Naive workarounds (and why they fail at 2,000 RPS)** as the intuition layer for Zero-Downtime Blue-Green Database Deployments: The problem: see what breaks without Naive workarounds under real concurrency or scale.",
+        "core": "Putting down-migrations in Flyway (`U42__undo.sql`) fails in production because rolling back a `DROP` loses data written by Green during canarying, and re-adding `billing_zip` under `ACCESS EXCLUSIVE` stalls `2,000 RPS`. Similarly, cloning a separate Green database introduces async replication lag and split-brain payment writes.",
+        "deepDive": "Under heavy load or partial failure, naive workarounds (and why they fail at 2,000 rps) becomes a critical lever for predictable latency and correctness. Running a destructive `RENAME COLUMN` or bare `NOT NULL` migration during a Green deploy breaks Blue (N-1) instantly on a shared database, destroying rollback safety."
+      },
+      "purpose": "The problem: see what breaks without Naive workarounds under real concurrency or scale.",
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "Component Topology",
+        "title": "Naive workarounds (and why they fail at 2,000 RPS)",
+        "graphNodes": [
+          {
+            "id": "ingress",
+            "label": "Ingress / LB",
+            "role": "ingress",
+            "col": 0,
+            "row": 0,
+            "tone": "primary"
+          },
+          {
+            "id": "ctrl",
+            "label": "K8s Control",
+            "role": "compute",
+            "col": 1,
+            "row": 0,
+            "tone": "tint"
+          },
+          {
+            "id": "node",
+            "label": "Worker Node",
+            "role": "storage",
+            "col": 2,
+            "row": 0,
+            "tone": "tint"
+          },
+          {
+            "id": "pod",
+            "label": "App Pods",
+            "role": "control",
+            "col": 0,
+            "row": 1,
+            "tone": "tint"
+          }
+        ],
+        "graphEdges": [
+          {
+            "from": "ingress",
+            "to": "pod",
+            "label": "active traffic",
+            "style": "solid",
+            "tone": "green"
+          },
+          {
+            "from": "ctrl",
+            "to": "node",
+            "label": "reconcile",
+            "style": "solid",
+            "tone": "green"
+          },
+          {
+            "from": "node",
+            "to": "pod",
+            "label": "probe / SIGTERM",
+            "style": "solid",
+            "tone": "green"
+          }
+        ]
+      }
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise solution: 4-Phase Expand-and-Contract + CI Squawk Gate",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": {
+        "foundation": "Decouple schema changes from code cutovers across four safe phases:",
+        "core": "1. **Expand**: Add nullable `postal_code` and `tax_jurisdiction` (`< 5 ms` metadata lock in PG 15) plus a lightweight `BEFORE INSERT OR UPDATE` sync trigger (`< 0.2 ms` overhead).\n2. **Migrate / Dual-Read**: Backfill historical rows in small `5,000`-row batches; Green reads `COALESCE(postal_code, billing_zip)` and writes both.\n3. **Verify & Cutover**: Blue (`v41`) and Green (`v42`) are both 100% compatible, allowing `< 30 s` ALB rollback anytime.\n4. **Contract (7+ days later)**: Only after `pg_stat_statements` confirms `0` queries touch `billing_zip`, add `CHECK (tax_jurisdiction IS NOT NULL) NOT VALID` -> `VALIDATE CONSTRAINT` (non-blocking) and drop `billing_zip`.\n- **CI Gate**: Block `DROP`, `RENAME`, and bare `NOT NULL` in PRs with **Squawk**.",
+        "deepDive": "In production deployments of Zero-Downtime Blue-Green Database Deployments, watch how enterprise solution: 4-phase expand-and-contract + ci squawk gate interacts with tail latency, retry amplification, and partial failures. Running a destructive `RENAME COLUMN` or bare `NOT NULL` migration during a Green deploy breaks Blue (N-1) instantly on a shared database, destroying rollback safety."
+      },
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "Expand-and-Contract Lifecycle",
+        "title": "N and N-1 Coexistence Across 4 Migration Phases",
+        "states": [
+          {
+            "id": "expand",
+            "label": "1. EXPAND",
+            "sublabel": "Nullable cols + sync trigger (<5ms)",
+            "tone": "green"
+          },
+          {
+            "id": "dual",
+            "label": "2. DUAL-COMPAT",
+            "sublabel": "Blue v41 & Green v42 both safe",
+            "tone": "blue"
+          },
+          {
+            "id": "contract",
+            "label": "3. CONTRACT",
+            "sublabel": "VALIDATE + drop after 7d zero-read",
+            "tone": "amber"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "expand",
+            "to": "dual",
+            "label": "Batch backfill 5k rows"
+          },
+          {
+            "from": "dual",
+            "to": "dual",
+            "label": "<30s ALB rollback anytime"
+          },
+          {
+            "from": "dual",
+            "to": "contract",
+            "label": "7d zero refs in pg_stat_statements"
+          }
+        ],
+        "summary": "Blue and Green overlap safely in Phase 2 until 7 days of zero legacy-column reads authorize Phase 3 contraction."
+      },
+      "markdownContent": "```sql\n-- Phase 1 (Expand): < 5ms metadata lock, 100% Blue v41 compatible\nALTER TABLE invoices ADD COLUMN postal_code VARCHAR(20);\nALTER TABLE invoices ADD COLUMN tax_jurisdiction VARCHAR(16);\n\nCREATE OR REPLACE FUNCTION sync_invoice_zip() RETURNS trigger AS $$\nBEGIN\n  IF NEW.postal_code IS NULL THEN NEW.postal_code := NEW.billing_zip; END IF;\n  IF NEW.billing_zip IS NULL THEN NEW.billing_zip := NEW.postal_code; END IF;\n  RETURN NEW;\nEND; $$ LANGUAGE plpgsql;\n\nCREATE TRIGGER trg_sync_invoice_zip\n  BEFORE INSERT OR UPDATE ON invoices\n  FOR EACH ROW EXECUTE FUNCTION sync_invoice_zip();\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where Expand-and-Contract is used in production",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Every zero-downtime deployment pipeline with shared state relies on backward-compatible migrations:",
+        "core": "- **GitOps & Progressive Delivery**: ArgoCD/Spinnaker Blue-Green and Canary rollouts require `N` and `N-1` schema compatibility during traffic shifting.\n- **High-Volume OLTP Migrations**: Tools like `gh-ost`, `pt-online-schema-change`, and PostgreSQL `NOT VALID` constraints avoid table locks on multi-terabyte tables.",
+        "deepDive": "In production deployments of Zero-Downtime Blue-Green Database Deployments, watch how where expand-and-contract is used in production interacts with tail latency, retry amplification, and partial failures. Running a destructive `RENAME COLUMN` or bare `NOT NULL` migration during a Green deploy breaks Blue (N-1) instantly on a shared database, destroying rollback safety."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "blue-green-deployment",
+          "title": "Concept: Blue-Green Deployment",
+          "kind": "concept"
+        },
+        {
+          "slug": "online-schema-migrations",
+          "title": "Concept: Online Schema Migrations",
+          "kind": "concept"
+        },
+        {
+          "slug": "blue-green-and-canary",
+          "title": "Concept: Progressive Delivery",
+          "kind": "concept"
+        },
+        {
+          "slug": "expand-contract-column",
+          "title": "System Design: Expand-and-Contract Column Renames",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "In PostgreSQL 15, how should you enforce `NOT NULL` on a 50M-row table during the Contract phase without blocking 2,000 RPS writes?",
+      "options": [
+        {
+          "id": "a",
+          "text": "Add `CHECK (col IS NOT NULL) NOT VALID`, then run `ALTER TABLE ... VALIDATE CONSTRAINT` under a non-blocking `SHARE UPDATE EXCLUSIVE` lock",
+          "correct": true,
+          "feedback": "Correct: `NOT VALID` + `VALIDATE CONSTRAINT` avoids holding `ACCESS EXCLUSIVE` across the 50M-row scan."
+        },
+        {
+          "id": "b",
+          "text": "Run `ALTER TABLE invoices ALTER COLUMN tax_jurisdiction SET NOT NULL` directly inside Green's Flyway script",
+          "correct": false,
+          "feedback": "Without an already-validated NOT NULL CHECK constraint, `SET NOT NULL` scans the entire table under `ACCESS EXCLUSIVE`, blocking all reads and writes."
+        },
+        {
+          "id": "c",
+          "text": "Use `SELECT *` in both Blue and Green so PostgreSQL skips constraint validation",
+          "correct": false,
+          "feedback": "`SELECT *` actually breaks strict ORM mappers when columns change and does not affect DDL locking."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "In PostgreSQL 15, how should you enforce `NOT NULL` on a 50M-row table during the Contract phase without blocking 2,000 RPS writes?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Add `CHECK (col IS NOT NULL) NOT VALID`, then run `ALTER TABLE ... VALIDATE CONSTRAINT` under a non-blocking `SHARE UPDATE EXCLUSIVE` lock",
+            "correct": true,
+            "feedback": "Correct: `NOT VALID` + `VALIDATE CONSTRAINT` avoids holding `ACCESS EXCLUSIVE` across the 50M-row scan."
+          },
+          {
+            "id": "b",
+            "text": "Run `ALTER TABLE invoices ALTER COLUMN tax_jurisdiction SET NOT NULL` directly inside Green's Flyway script",
+            "correct": false,
+            "feedback": "Without an already-validated NOT NULL CHECK constraint, `SET NOT NULL` scans the entire table under `ACCESS EXCLUSIVE`, blocking all reads and writes."
+          },
+          {
+            "id": "c",
+            "text": "Use `SELECT *` in both Blue and Green so PostgreSQL skips constraint validation",
+            "correct": false,
+            "feedback": "`SELECT *` actually breaks strict ORM mappers when columns change and does not affect DDL locking."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why Blue-Green apps still share one database', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "b",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "c",
+            "text": "Stateless Blue and Green application fleets can be swapped in seconds behind an AWS ALB, but they almost always share a single primary PostgreSQL database (2,000 RPS).",
+            "correct": true,
+            "feedback": "Correct: Stateless Blue and Green application fleets can be swapped in seconds behind an AWS ALB, but they almost always share a single primary PostgreSQL database (2,000 RPS)."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why destructive DDL traps both Blue and Green', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "When Green (v42) ran RENAME COLUMN billing_zip TO postal_code and ADD COLUMN tax_jurisdiction NOT NULL: 1.",
+            "correct": true,
+            "feedback": "Correct: When Green (v42) ran RENAME COLUMN billing_zip TO postal_code and ADD COLUMN tax_jurisdiction NOT NULL: 1."
+          },
+          {
+            "id": "b",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "c",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** Stateless Blue and Green application fleets can be swapped in seconds behind an AWS ALB, but they almost always share a single primary PostgreSQL database (`2,000 RPS`).\n\n**How It Flows:** Think of Zero-Downtime Blue-Green Database Deployments as a clear step-by-step chain: AWS ALB (60s drain) -> Blue v41 (N-1) -> Green v42 (N) -> Shared PostgreSQL 15 -> 1. EXPAND.\n\n**Why Beginners Should Care:** Enforce 4-phase Expand-and-Contract schema evolution with dual-writes (`BEFORE` trigger or app), `COALESCE` reads, and CI SQL linting (Squawk) so N and N-1 always coexist.",
+      "spark": {
+        "summary": "Stateless Blue and Green application fleets can be swapped in seconds behind an AWS ALB, but they almost always share a single primary PostgreSQL database (`2,000 RPS`).",
+        "keyTakeaway": "Enforce 4-phase Expand-and-Contract schema evolution with dual-writes (`BEFORE` trigger or app), `COALESCE` reads, and CI SQL linting (Squawk) so N and N-1 always coexist."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why Blue-Green apps still share one database",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why Blue-Green apps still share one database works from first principles.",
+          "explanation": "Stateless Blue and Green application fleets can be swapped in seconds behind an AWS ALB, but they almost always share a single primary PostgreSQL database (`2,000 RPS`). Because ALB connection draining takes up to `60 seconds`, Blue (`v41`) and Green (`v42`) execute reads and writes concurrently—meaning any schema change that breaks `N-1` turns a routine rollback into a 100% outage.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Why destructive DDL traps both Blue and Green",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without Why destructive DDL traps both Blue and Green under real concurrency or scale.",
+          "explanation": "When Green (`v42`) ran `RENAME COLUMN billing_zip TO postal_code` and `ADD COLUMN tax_jurisdiction NOT NULL`: 1. **Rollback Broken**: Flipping the ALB back to Blue (`v41`) caused 100% HTTP 500s (`column billing_zip does not exist`, `23502 not_null_violation`). 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Broken Rollback vs. N/N-1 Overlap",
+            "title": "Shared-DB Schema Breakage During 60s ALB Drain",
+            "actors": [
+              {
+                "id": "alb",
+                "label": "AWS ALB (60s drain)"
+              },
+              {
+                "id": "blue",
+                "label": "Blue v41 (N-1)"
+              },
+              {
+                "id": "green",
+                "label": "Green v42 (N)"
+              },
+              {
+                "id": "pg",
+                "label": "Shared PostgreSQL 15"
+              }
+            ],
+            "events": [
+              {
+                "from": "green",
+                "to": "pg",
+                "label": "RENAME billing_zip + ADD NOT NULL",
+                "status": "fail"
+              },
+              {
+                "from": "alb",
+                "to": "blue",
+                "label": "Rollback to v41 (12% Green bug)",
+                "status": "warn"
+              },
+              {
+                "from": "blue",
+                "to": "pg",
+                "label": "INSERT/SELECT billing_zip -> 500!",
+                "status": "fail"
+              },
+              {
+                "from": "pg",
+                "to": "blue",
+                "label": "Expand-Contract keeps both valid",
+                "status": "ok"
+              }
+            ],
+            "summary": "Blue and Green overlap on one database during drains and rollbacks, requiring strict N/N-1 backward compatibility."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive workarounds (and why they fail at 2,000 RPS)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "The problem: see what breaks without Naive workarounds under real concurrency or scale.",
+          "explanation": "Putting down-migrations in Flyway (`U42__undo.sql`) fails in production because rolling back a `DROP` loses data written by Green during canarying, and re-adding `billing_zip` under `ACCESS EXCLUSIVE` stalls `2,000 RPS`. Similarly, cloning a separate Green database introduces async replication lag and split-brain payment writes.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: 4-Phase Expand-and-Contract + CI Squawk Gate",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Decouple schema changes from code cutovers across four safe phases: 1. **Expand**: Add nullable `postal_code` and `tax_jurisdiction` (`< 5 ms` metadata lock in PG 15) plus a lightweight `BEFORE INSERT OR UPDATE` sync trigger (`< 0.2 ms` overhead). 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "state-machine",
+            "eyebrow": "Expand-and-Contract Lifecycle",
+            "title": "N and N-1 Coexistence Across 4 Migration Phases",
+            "states": [
+              {
+                "id": "expand",
+                "label": "1. EXPAND",
+                "sublabel": "Nullable cols + sync trigger (<5ms)",
+                "tone": "green"
+              },
+              {
+                "id": "dual",
+                "label": "2. DUAL-COMPAT",
+                "sublabel": "Blue v41 & Green v42 both safe",
+                "tone": "blue"
+              },
+              {
+                "id": "contract",
+                "label": "3. CONTRACT",
+                "sublabel": "VALIDATE + drop after 7d zero-read",
+                "tone": "amber"
+              }
+            ],
+            "transitions": [
+              {
+                "from": "expand",
+                "to": "dual",
+                "label": "Batch backfill 5k rows"
+              },
+              {
+                "from": "dual",
+                "to": "dual",
+                "label": "<30s ALB rollback anytime"
+              },
+              {
+                "from": "dual",
+                "to": "contract",
+                "label": "7d zero refs in pg_stat_statements"
+              }
+            ],
+            "summary": "Blue and Green overlap safely in Phase 2 until 7 days of zero legacy-column reads authorize Phase 3 contraction."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Enforce 4-phase Expand-and-Contract schema evolution with dual-writes (`BEFORE` trigger or app), `COALESCE` reads, and CI SQL linting (Squawk) so N and N-1 always coexist.",
+      "summary": "Running a destructive `RENAME COLUMN` or bare `NOT NULL` migration during a Green deploy breaks Blue (N-1) instantly on a shared database, destroying rollback safety.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, enforce 4-phase Expand-and-Contract schema evolution with dual-writes (`BEFORE` trigger or app), `COALESCE` reads, and CI SQL linting (Squawk) so N and N-1 always coexist."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** Stateless Blue and Green application fleets can be swapped in seconds behind an AWS ALB, but they almost always share a single primary PostgreSQL database (`2,000 RPS`).\n\n**Visual & Structural Flow:** Depicts Shared-DB Schema Breakage During 60s ALB Drain (AWS ALB (60s drain) -> Blue v41 (N-1) -> Green v42 (N) -> Shared PostgreSQL 15); N and N-1 Coexistence Across 4 Migration Phases (1. EXPAND -> 2. DUAL-COMPAT -> 3. CONTRACT).\n\n**Trade-Offs & Production:** Putting down-migrations in Flyway (`U42__undo.sql`) fails in production because rolling back a `DROP` loses data written by Green during canarying, and re-adding `billing_zip` under `ACCESS EXCLUSIVE` stalls `2,000 RPS`. Every zero-downtime deployment pipeline with shared state relies on backward-compatible migrations: **GitOps & Progressive Delivery**: ArgoCD/Spinnaker Blue-Green and Canary.\n\n**Failure Modes & Application:** Every zero-downtime deployment pipeline with shared state relies on backward-compatible migrations: **GitOps & Progressive Delivery**: ArgoCD/Spinnaker Blue-Green and Canary rollouts require `N` and `N-1` schema compatibility during traffic shifting.",
+      "spark": {
+        "summary": "Running a destructive `RENAME COLUMN` or bare `NOT NULL` migration during a Green deploy breaks Blue (N-1) instantly on a shared database, destroying rollback safety.",
+        "keyTakeaway": "Enforce 4-phase Expand-and-Contract schema evolution with dual-writes (`BEFORE` trigger or app), `COALESCE` reads, and CI SQL linting (Squawk) so N and N-1 always coexist."
+      },
+      "summary": "Running a destructive `RENAME COLUMN` or bare `NOT NULL` migration during a Green deploy breaks Blue (N-1) instantly on a shared database, destroying rollback safety.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, enforce 4-phase Expand-and-Contract schema evolution with dual-writes (`BEFORE` trigger or app), `COALESCE` reads, and CI SQL linting (Squawk) so N and N-1 always coexist."
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** Running a destructive `RENAME COLUMN` or bare `NOT NULL` migration during a Green deploy breaks Blue (N-1) instantly on a shared database, destroying rollback safety.\n\n**Production Trade-Offs:** Putting down-migrations in Flyway (`U42__undo.sql`) fails in production because rolling back a `DROP` loses data written by Green during canarying, and re-adding `billing_zip` under `ACCESS EXCLUSIVE` stalls `2,000 RPS`.\n\n**Failure Modes & Edge Cases:** Every zero-downtime deployment pipeline with shared state relies on backward-compatible migrations: **GitOps & Progressive Delivery**: ArgoCD/Spinnaker Blue-Green and Canary rollouts require `N` and `N-1` schema compatibility during traffic shifting.\n\n**Principal Takeaway:** Enforce 4-phase Expand-and-Contract schema evolution with dual-writes (`BEFORE` trigger or app), `COALESCE` reads, and CI SQL linting (Squawk) so N and N-1 always coexist.",
+      "spark": {
+        "summary": "Running a destructive `RENAME COLUMN` or bare `NOT NULL` migration during a Green deploy breaks Blue (N-1) instantly on a shared database, destroying rollback safety.",
+        "keyTakeaway": "Enforce 4-phase Expand-and-Contract schema evolution with dual-writes (`BEFORE` trigger or app), `COALESCE` reads, and CI SQL linting (Squawk) so N and N-1 always coexist."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why Blue-Green apps still share one database",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why Blue-Green apps still share one database works from first principles.",
+          "explanation": "Stateless Blue and Green application fleets can be swapped in seconds behind an AWS ALB, but they almost always share a single primary PostgreSQL database (`2,000 RPS`). Because ALB connection draining takes up to `60 seconds`, Blue (`v41`) and Green (`v42`) execute reads and writes concurrently—meaning any schema change that breaks `N-1` turns a routine rollback into a 100% outage.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Why destructive DDL traps both Blue and Green",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without Why destructive DDL traps both Blue and Green under real concurrency or scale.",
+          "explanation": "When Green (`v42`) ran `RENAME COLUMN billing_zip TO postal_code` and `ADD COLUMN tax_jurisdiction NOT NULL`:\n\n1. **Rollback Broken**: Flipping the ALB back to Blue (`v41`) caused 100% HTTP 500s (`column billing_zip does not exist`, `23502 not_null_violation`).\n2. **Table-Lock Risk**: Adding `NOT NULL` without a default or running `SET NOT NULL` without `NOT VALID` scans 50M rows under `ACCESS EXCLUSIVE`.\n3. **ORM `SELECT *` Crashes**: Strict mappers fail if unexpected columns appear.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Broken Rollback vs. N/N-1 Overlap",
+            "title": "Shared-DB Schema Breakage During 60s ALB Drain",
+            "actors": [
+              {
+                "id": "alb",
+                "label": "AWS ALB (60s drain)"
+              },
+              {
+                "id": "blue",
+                "label": "Blue v41 (N-1)"
+              },
+              {
+                "id": "green",
+                "label": "Green v42 (N)"
+              },
+              {
+                "id": "pg",
+                "label": "Shared PostgreSQL 15"
+              }
+            ],
+            "events": [
+              {
+                "from": "green",
+                "to": "pg",
+                "label": "RENAME billing_zip + ADD NOT NULL",
+                "status": "fail"
+              },
+              {
+                "from": "alb",
+                "to": "blue",
+                "label": "Rollback to v41 (12% Green bug)",
+                "status": "warn"
+              },
+              {
+                "from": "blue",
+                "to": "pg",
+                "label": "INSERT/SELECT billing_zip -> 500!",
+                "status": "fail"
+              },
+              {
+                "from": "pg",
+                "to": "blue",
+                "label": "Expand-Contract keeps both valid",
+                "status": "ok"
+              }
+            ],
+            "summary": "Blue and Green overlap on one database during drains and rollbacks, requiring strict N/N-1 backward compatibility."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive workarounds (and why they fail at 2,000 RPS)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "The problem: see what breaks without Naive workarounds under real concurrency or scale.",
+          "explanation": "Putting down-migrations in Flyway (`U42__undo.sql`) fails in production because rolling back a `DROP` loses data written by Green during canarying, and re-adding `billing_zip` under `ACCESS EXCLUSIVE` stalls `2,000 RPS`. Similarly, cloning a separate Green database introduces async replication lag and split-brain payment writes.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: 4-Phase Expand-and-Contract + CI Squawk Gate",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Decouple schema changes from code cutovers across four safe phases:\n\n1. **Expand**: Add nullable `postal_code` and `tax_jurisdiction` (`< 5 ms` metadata lock in PG 15) plus a lightweight `BEFORE INSERT OR UPDATE` sync trigger (`< 0.2 ms` overhead).\n2. **Migrate / Dual-Read**: Backfill historical rows in small `5,000`-row batches; Green reads `COALESCE(postal_code, billing_zip)` and writes both.\n3. **Verify & Cutover**: Blue (`v41`) and Green (`v42`) are both 100% compatible, allowing `< 30 s` ALB rollback anytime.\n4. **Contract (7+ days later)**: Only after `pg_stat_statements` confirms `0` queries touch `billing_zip`, add `CHECK (tax_jurisdiction IS NOT NULL) NOT VALID` -> `VALIDATE CONSTRAINT` (non-blocking) and drop `billing_zip`.\n- **CI Gate**: Block `DROP`, `RENAME`, and bare `NOT NULL` in PRs with **Squawk**.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "state-machine",
+            "eyebrow": "Expand-and-Contract Lifecycle",
+            "title": "N and N-1 Coexistence Across 4 Migration Phases",
+            "states": [
+              {
+                "id": "expand",
+                "label": "1. EXPAND",
+                "sublabel": "Nullable cols + sync trigger (<5ms)",
+                "tone": "green"
+              },
+              {
+                "id": "dual",
+                "label": "2. DUAL-COMPAT",
+                "sublabel": "Blue v41 & Green v42 both safe",
+                "tone": "blue"
+              },
+              {
+                "id": "contract",
+                "label": "3. CONTRACT",
+                "sublabel": "VALIDATE + drop after 7d zero-read",
+                "tone": "amber"
+              }
+            ],
+            "transitions": [
+              {
+                "from": "expand",
+                "to": "dual",
+                "label": "Batch backfill 5k rows"
+              },
+              {
+                "from": "dual",
+                "to": "dual",
+                "label": "<30s ALB rollback anytime"
+              },
+              {
+                "from": "dual",
+                "to": "contract",
+                "label": "7d zero refs in pg_stat_statements"
+              }
+            ],
+            "summary": "Blue and Green overlap safely in Phase 2 until 7 days of zero legacy-column reads authorize Phase 3 contraction."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where Expand-and-Contract is used in production",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Every zero-downtime deployment pipeline with shared state relies on backward-compatible migrations:\n\n- **GitOps & Progressive Delivery**: ArgoCD/Spinnaker Blue-Green and Canary rollouts require `N` and `N-1` schema compatibility during traffic shifting.\n- **High-Volume OLTP Migrations**: Tools like `gh-ost`, `pt-online-schema-change`, and PostgreSQL `NOT VALID` constraints avoid table locks on multi-terabyte tables.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Enforce 4-phase Expand-and-Contract schema evolution with dual-writes (`BEFORE` trigger or app), `COALESCE` reads, and CI SQL linting (Squawk) so N and N-1 always coexist.",
+      "summary": "Running a destructive `RENAME COLUMN` or bare `NOT NULL` migration during a Green deploy breaks Blue (N-1) instantly on a shared database, destroying rollback safety.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, enforce 4-phase Expand-and-Contract schema evolution with dual-writes (`BEFORE` trigger or app), `COALESCE` reads, and CI SQL linting (Squawk) so N and N-1 always coexist."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "simulation": {
+    "title": "Zero-Downtime Blue-Green Database Deployments — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "ingress",
+        "label": "Ingress / LB",
+        "role": "Traffic Shift"
+      },
+      {
+        "id": "ctrl",
+        "label": "K8s Control",
+        "role": "PDB & HPA"
+      },
+      {
+        "id": "node",
+        "label": "Worker Node",
+        "role": "Cgroups & Conntrack"
+      },
+      {
+        "id": "pod",
+        "label": "App Pods",
+        "role": "Readiness & Drain"
+      }
+    ],
+    "edges": [
+      {
+        "from": "ingress",
+        "to": "pod",
+        "label": "active traffic"
+      },
+      {
+        "from": "ctrl",
+        "to": "node",
+        "label": "reconcile"
+      },
+      {
+        "from": "node",
+        "to": "pod",
+        "label": "probe / SIGTERM"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why Blue-Green apps still share one database",
+        "actionLabel": "active traffic",
+        "status": "healthy",
+        "activeNodeIds": [
+          "ingress",
+          "ctrl"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "active traffic",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Ingress / LB sends work to K8s Control (Why Blue-Green apps still share one database)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Why destructive DDL traps both Blue and Green",
+        "actionLabel": "reconcile",
+        "status": "healthy",
+        "activeNodeIds": [
+          "ctrl",
+          "node"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "reconcile",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "K8s Control coordinates with Worker Node while preserving the core invariant (Why destructive DDL traps both Blue and Green)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Naive workarounds (and why they fail at 2,000 RPS)",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "node",
+          "pod"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, App Pods absorbs pressure without cascading (Naive workarounds (and why they fail at 2,000 RPS))."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Where Expand-and-Contract is used in production",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "ingress",
+          "ctrl",
+          "node",
+          "pod"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Where Expand-and-Contract is used in production)."
+      }
+    ]
+  }
+}

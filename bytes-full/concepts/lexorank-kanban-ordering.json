@@ -1,0 +1,714 @@
+{
+  "slug": "lexorank-kanban-ordering",
+  "title": "Lexorank & Distributed Kanban Board Ordering",
+  "domain": "system-design",
+  "diagram": "diagram.png",
+  "spark": {
+    "summary": "Lexorank encodes list positions as variable-length base-36 strings prefixed by a rebalancing bucket, enabling O(1) drag-and-drop card reordering without rewriting sibling rows.",
+    "keyTakeaway": "If latency budgets leave no room for synchronous retries, by computing the lexicographical midpoint between two adjacent rank strings (e.g., '0|i00007:' and '0|i0000f:' -> '0|i0000b:'), Kanban boards avoid O(N) integer re-indexing while using 3-bucket rotation to bound string length.",
+    "byteSummary": "Naive Kanban implementations store an integer position column (1, 2, 3...) for each issue on a board. Moving card #500 to position #1 forces an O(N) UPDATE across 499 rows inside a serializable transaction, causing severe lock contention and deadlocks when multiple team members triage a backlog simultaneously.\n\nLexorank solves this with lexicographical fractional indexing. Every card receives a rank string formatted as '<bucket>|<base36-value>:' (such as '0|i00007:'). When a card is dropped between two neighbors, the service computes the exact lexicographical midpoint string in O(1) time and updates only that single row.\n\nBecause repeated insertions into the same gap eventually lengthen the rank string, Lexorank introduces three rotating buckets (0, 1, 2). A background rebalancing worker asynchronously redistributes compressed ranks into the next bucket (0 -> 1 -> 2 -> 0) without blocking live drag-and-drop writes."
+  },
+  "learningJourney": [
+    {
+      "id": "stage-1-integer-bottleneck",
+      "title": "Why Integer Positions Fail at Scale",
+      "level": "foundation",
+      "purpose": "Diagnose the O(N) write amplification and row-lock deadlocks caused by sequential integer rank columns.",
+      "explanation": {
+        "foundation": "Think of **Why Integer Positions Fail at Scale** as the intuition layer for Lexorank & Distributed Kanban Board Ordering: Diagnose the O(N) write amplification and row-lock deadlocks caused by sequential integer rank columns.",
+        "core": "In a PostgreSQL-backed Kanban board with 10,000 issues, storing an integer `position` forces every drag-and-drop reorder from index 9,000 to index 5 to execute `UPDATE issues SET position = position + 1 WHERE position BETWEEN 5 AND 8999`. Under concurrent backlog grooming, two transactions acquiring row locks in opposite directions immediately trigger deadlocks.",
+        "deepDive": "Under heavy load or partial failure, why integer positions fail at scale becomes a critical lever for predictable latency and correctness. Production Lexorank requires `C` collation, sentinel bounds, unique-index CAS retries, and non-blocking modulo-3 bucket rotation."
+      },
+      "codeExample": "def move_integer_naive(conn, board_id, issue_id, old_pos, new_pos):\n    try:\n        with conn.transaction():\n            if new_pos < old_pos:\n                conn.execute('UPDATE issues SET pos = pos + 1 WHERE board_id=%s AND pos>=%s AND pos<%s', (board_id, new_pos, old_pos))\n            conn.execute('UPDATE issues SET pos = %s WHERE id=%s', (new_pos, issue_id))\n    except Exception as exc:\n        conn.rollback()\n        raise RuntimeError(f'Lock contention or deadlock during reorder: {exc}')",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "FOUNDATION",
+        "title": "O(N) Row-Lock Amplification",
+        "nodes": [
+          {
+            "id": "drag",
+            "label": "Drag Event",
+            "sub": "Card #9000 -> #5",
+            "role": "client"
+          },
+          {
+            "id": "tx",
+            "label": "SQL Range UPDATE",
+            "sub": "Locks 8,995 rows",
+            "role": "compute"
+          },
+          {
+            "id": "deadlock",
+            "label": "Lock Contention",
+            "sub": "Concurrent triage stalls",
+            "role": "risk"
+          }
+        ],
+        "edges": [
+          {
+            "from": "drag",
+            "to": "tx",
+            "label": "acquires range locks"
+          },
+          {
+            "from": "tx",
+            "to": "deadlock",
+            "label": "blocks concurrent writes"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Write Amplification",
+            "detail": "1 UI move = up to N-1 DB row mutations."
+          },
+          {
+            "label": "Deadlock Vector",
+            "detail": "Opposing range updates collide on B-tree index pages."
+          }
+        ],
+        "summary": "Sequential integer positions couple a single UI move to O(N) database row locks.",
+        "caption": "Integer position columns trigger O(N) range locks and deadlocks under concurrent board edits."
+      }
+    },
+    {
+      "id": "stage-2-fractional-floats",
+      "title": "Floating-Point Midpoints & Precision Collapse",
+      "level": "foundation",
+      "purpose": "Understand why IEEE-754 floats initially solve O(1) writes but collapse after ~52 bisections.",
+      "explanation": {
+        "foundation": "Replacing integers with 64-bit floats (`pos = (prev + next) / 2.0`) reduces reordering to a single-row UPDATE.",
+        "core": "However, IEEE-754 double precision only provides 53 bits of significand.",
+        "deepDive": "Repeatedly dropping cards at the top of a column halves the gap until `prev + (next - prev) / 2.0 == prev`, producing duplicate ranks and non-deterministic sort order."
+      },
+      "codeExample": "def float_midpoint(prev_pos: float, next_pos: float) -> float:\n    mid = (prev_pos + next_pos) / 2.0\n    if mid == prev_pos or mid == next_pos:\n        raise ValueError('IEEE-754 precision exhausted; re-indexing required')\n    return mid",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "FOUNDATION",
+        "title": "IEEE-754 Precision Exhaustion",
+        "nodes": [
+          {
+            "id": "gap1",
+            "label": "Initial Gap",
+            "sub": "1.0 to 2.0",
+            "role": "state"
+          },
+          {
+            "id": "bisect",
+            "label": "53 Bisections",
+            "sub": "Gap < 2^-53",
+            "role": "compute"
+          },
+          {
+            "id": "collapse",
+            "label": "Precision Collapse",
+            "sub": "mid == prev_pos",
+            "role": "risk"
+          }
+        ],
+        "edges": [
+          {
+            "from": "gap1",
+            "to": "bisect",
+            "label": "repeated top-of-column drops"
+          },
+          {
+            "from": "bisect",
+            "to": "collapse",
+            "label": "produces duplicate rank keys"
+          }
+        ],
+        "cards": [
+          {
+            "label": "53-Bit Ceiling",
+            "detail": "IEEE-754 doubles fail after ~52 consecutive insertions in one gap."
+          },
+          {
+            "label": "Silent Tie",
+            "detail": "Duplicate float keys break deterministic ORDER BY queries."
+          }
+        ],
+        "summary": "64-bit floats defer re-indexing but still hit a hard 53-bit precision wall.",
+        "caption": "Repeatedly halving a floating-point interval exhausts IEEE-754 mantissa bits after 52 insertions."
+      },
+      "decisionFramework": {
+        "problem": "How to implement Lexorank & Distributed Kanban Board Ordering without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "If latency budgets leave no room for synchronous retries, by computing the lexicographical midpoint between two adjacent rank strings (e.g., '0|i00007:' and '0|i0000f:' -> '0|i0000b:'), Kanban boards avoid O(N) integer re-indexing while using 3-bucket rotation to bound string length.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Lexorank & Distributed Kanban Board Ordering experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-3-lexorank-format",
+      "title": "Lexorank String Anatomy & Base-36 Encoding",
+      "level": "intermediate",
+      "purpose": "Construct the `<bucket>|<rank>:` string format using fixed-width base-36 digits for arbitrary-precision ordering.",
+      "explanation": {
+        "foundation": "Lexorank represents positions as ASCII strings sorted by standard `C` / `POSIX` byte collation, e.g., `0|hzzzzz:`.",
+        "core": "The leading `0|` is the active rebalancing bucket (0, 1, or 2), followed by a 6-character base-36 value (`0-9`, `a-z`) and a trailing `:` marker.",
+        "deepDive": "Because strings can grow arbitrarily in length when a gap narrows, precision never collapses."
+      },
+      "codeExample": "ALPHABET = '0123456789abcdefghijklmnopqrstuvwxyz'\n\ndef format_lexorank(bucket: int, value: str) -> str:\n    if bucket not in (0, 1, 2):\n        raise ValueError('Bucket must be 0, 1, or 2')\n    return f'{bucket}|{value}:'",
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "INTERMEDIATE",
+        "title": "Lexorank String Structure",
+        "cards": [
+          {
+            "label": "Collation Rule",
+            "detail": "Database column MUST use C/binary collation, not locale-aware UTF-8."
+          },
+          {
+            "label": "36^6 Space",
+            "detail": "6 base-36 chars yield 2.17 billion initial slots before extending."
+          }
+        ],
+        "summary": "A 3-part string format (`bucket|base36:`) gives arbitrary precision with native B-tree sorting.",
+        "caption": "Lexorank combines a bucket prefix, base-36 payload, and colon sentinel for binary B-tree sorting.",
+        "graphNodes": [
+          {
+            "id": "bkt",
+            "label": "Bucket Prefix",
+            "role": "prefix",
+            "col": 0,
+            "row": 0,
+            "tone": "primary"
+          },
+          {
+            "id": "val",
+            "label": "Base-36 Payload",
+            "role": "key",
+            "col": 1,
+            "row": 0,
+            "tone": "tint"
+          },
+          {
+            "id": "term",
+            "label": "Colon Sentinel",
+            "role": "suffix",
+            "col": 2,
+            "row": 0,
+            "tone": "tint"
+          }
+        ],
+        "graphEdges": [
+          {
+            "from": "bkt",
+            "to": "val",
+            "label": "groups generation epoch",
+            "style": "solid",
+            "tone": "green"
+          },
+          {
+            "from": "val",
+            "to": "term",
+            "label": "prevents prefix ambiguity",
+            "style": "solid",
+            "tone": "green"
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-4-midpoint-algorithm",
+      "title": "Arbitrary-Precision Lexicographical Midpoint",
+      "level": "intermediate",
+      "purpose": "Compute the exact midpoint between two unequal-length base-36 strings in O(L) time.",
+      "explanation": {
+        "foundation": "Think of **Arbitrary-Precision Lexicographical Midpoint** as the intuition layer for Lexorank & Distributed Kanban Board Ordering: Compute the exact midpoint between two unequal-length base-36 strings in O(L) time.",
+        "core": "To insert between `prev` and `next`, pad the shorter string on the right with `0` (and treat `next` as having a trailing virtual character if needed), then compute `(val(prev) + val(next)) // 2` in base-36. If `prev` and `next` differ by 1 at the last digit (e.g., `i00007` and `i00008`), append midpoint digit `i` (`18` in base-36) to `prev`, yielding `i00007i`.",
+        "deepDive": "Under heavy load or partial failure, arbitrary-precision lexicographical midpoint becomes a critical lever for predictable latency and correctness. Production Lexorank requires `C` collation, sentinel bounds, unique-index CAS retries, and non-blocking modulo-3 bucket rotation."
+      },
+      "codeExample": "ALPHABET = '0123456789abcdefghijklmnopqrstuvwxyz'\nIDX = {c: i for i, c in enumerate(ALPHABET)}\n\ndef lexo_midpoint(a: str, b: str) -> str:\n    if a >= b:\n        raise ValueError('Left rank must be strictly less than right rank')\n    max_len = max(len(a), len(b))\n    a_pad = a.ljust(max_len, '0')\n    b_pad = b.ljust(max_len, '0')\n    num_a = sum(IDX[c] * (36 ** (max_len - 1 - i)) for i, c in enumerate(a_pad))\n    num_b = sum(IDX[c] * (36 ** (max_len - 1 - i)) for i, c in enumerate(b_pad))\n    if num_b - num_a <= 1:\n        return a + 'i'\n    mid = (num_a + num_b) // 2\n    chars = []\n    for _ in range(max_len):\n        chars.append(ALPHABET[mid % 36])\n        mid //= 36\n    return ''.join(reversed(chars)).rstrip('0') or '0'",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "INTERMEDIATE",
+        "title": "Base-36 Midpoint Calculation",
+        "nodes": [
+          {
+            "id": "pad",
+            "label": "Right-Pad to MaxLen",
+            "sub": "i00007 -> i000070",
+            "role": "compute"
+          },
+          {
+            "id": "avg",
+            "label": "Integer Midpoint",
+            "sub": "(A + B) // 2 in base-36",
+            "role": "compute"
+          },
+          {
+            "id": "ext",
+            "label": "Adjacent Fallback",
+            "sub": "Append 'i' when diff <= 1",
+            "role": "fallback"
+          }
+        ],
+        "edges": [
+          {
+            "from": "pad",
+            "to": "avg",
+            "label": "aligns positional weights"
+          },
+          {
+            "from": "avg",
+            "to": "ext",
+            "label": "triggers when gap == 1"
+          }
+        ],
+        "cards": [
+          {
+            "label": "O(1) DB Write",
+            "detail": "Only the moved issue row is updated in PostgreSQL."
+          },
+          {
+            "label": "Adjacent Extension",
+            "detail": "Appending 'i' splits a unit gap cleanly without touching neighbors."
+          }
+        ],
+        "summary": "Base-36 midpoint arithmetic guarantees a strictly ordered key between any two ranks.",
+        "caption": "When two adjacent strings differ by 1, appending base-36 'i' creates a valid midpoint."
+      }
+    },
+    {
+      "id": "stage-5-concurrent-collisions",
+      "title": "Optimistic Locking & Concurrent Rank Collisions",
+      "level": "intermediate",
+      "purpose": "Prevent duplicate ranks when two users simultaneously drop different cards into the exact same gap.",
+      "explanation": {
+        "foundation": "If Alice and Bob both drag cards between `0|i00007:` and `0|i0000f:` at the same millisecond, both compute `0|i0000b:`.",
+        "core": "Without concurrency control, both cards receive identical ranks.",
+        "deepDive": "Enforcing a `UNIQUE (board_id, rank)` constraint plus optimistic version checking with jittered retry ensures the second writer re-reads the updated neighbor (`0|i0000b:`) and computes `0|i0000d:`."
+      },
+      "codeExample": "import random, time\n\ndef assign_rank_with_retry(repo, board_id, issue_id, left_id, right_id, max_retries=4):\n    for attempt in range(max_retries):\n        left_rank, right_rank = repo.fetch_neighbor_ranks(board_id, left_id, right_id)\n        candidate = lexo_midpoint(left_rank, right_rank)\n        try:\n            repo.update_rank_cas(board_id, issue_id, candidate)\n            return candidate\n        except UniqueRankViolation:\n            time.sleep(0.01 * (2 ** attempt) + random.uniform(0, 0.005))\n    raise RuntimeError('Exceeded max retries on concurrent rank assignment')",
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "INTERMEDIATE",
+        "title": "CAS Retry on Rank Collision",
+        "cards": [
+          {
+            "label": "Unique Index",
+            "detail": "UNIQUE(board_id, rank) acts as the linearizability guard."
+          },
+          {
+            "label": "Bounded Backoff",
+            "detail": "Exponential backoff + jitter prevents thundering-herd retries."
+          }
+        ],
+        "summary": "A unique index on `(board_id, rank)` turns silent rank collisions into safe retries.",
+        "caption": "Optimistic retry with unique constraint enforcement resolves concurrent midpoint collisions.",
+        "states": [
+          {
+            "id": "read",
+            "label": "Read Neighbors",
+            "sublabel": "0|i00007: & 0|i0000f:",
+            "tone": "blue"
+          },
+          {
+            "id": "cas",
+            "label": "UNIQUE (board_id, rank)",
+            "sublabel": "Detects concurrent 0|i0000b:",
+            "tone": "amber"
+          },
+          {
+            "id": "retry",
+            "label": "Jittered Recompute",
+            "sublabel": "Computes 0|i0000d:",
+            "tone": "blue"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "read",
+            "to": "cas",
+            "label": "submits candidate rank"
+          },
+          {
+            "from": "cas",
+            "to": "retry",
+            "label": "re-fetches updated neighbor on conflict"
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-6-bucket-rebalancing",
+      "title": "3-Bucket Rotation & Zero-Downtime Rebalancing",
+      "level": "advanced",
+      "purpose": "Prevent unbounded rank string growth using asynchronous 3-bucket rotation (0 -> 1 -> 2 -> 0).",
+      "explanation": {
+        "foundation": "Once any rank string on a board exceeds a length threshold (e.g., 128 characters), a background rebalancer triggers.",
+        "core": "Moving from bucket `0` to `1`, it walks issues in current `ORDER BY rank ASC` order and assigns evenly spaced 6-char keys in bucket `1` (`1|00000g:`, `1|00000w:`, ...).",
+        "deepDive": "Because `'0|...' < '1|...' < '2|...'`, live writes continue uninterrupted while the bucket flips."
+      },
+      "codeExample": "def rebalance_step(repo, board_id, current_bucket, batch_size=200):\n    next_bucket = (current_bucket + 1) % 3\n    issues = repo.fetch_bucket_ordered(board_id, current_bucket, limit=batch_size)\n    if not issues:\n        return False\n    step = 36 ** 4\n    for idx, issue in enumerate(issues):\n        new_rank = format_lexorank(next_bucket, encode_base36((idx + 1) * step, width=6))\n        repo.compare_and_swap_rank(issue.id, expected=issue.rank, new_rank=new_rank)\n    return True",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "ADVANCED",
+        "title": "Asynchronous 3-Bucket Rotation",
+        "nodes": [
+          {
+            "id": "trigger",
+            "label": "Length > 128 Chars",
+            "sub": "Enqueues board rebalance",
+            "role": "trigger"
+          },
+          {
+            "id": "worker",
+            "label": "Rebalance Worker",
+            "sub": "Rewrites Bucket 0 -> Bucket 1",
+            "role": "compute"
+          },
+          {
+            "id": "wrap",
+            "label": "Modulo-3 Wrap",
+            "sub": "Bucket 2 -> Bucket 0",
+            "role": "state"
+          }
+        ],
+        "edges": [
+          {
+            "from": "trigger",
+            "to": "worker",
+            "label": "starts background migration"
+          },
+          {
+            "from": "worker",
+            "to": "wrap",
+            "label": "cycles cleanly after drain"
+          }
+        ],
+        "cards": [
+          {
+            "label": "3-Bucket Invariant",
+            "detail": "Never reuse a bucket until 100% of rows have drained out of it."
+          },
+          {
+            "label": "Zero Lockout",
+            "detail": "Live drag-and-drop writes keep working during background rebalancing."
+          }
+        ],
+        "summary": "Three rotating buckets let a background worker compact rank strings without locking the board.",
+        "caption": "Background rebalancing migrates rows across buckets 0, 1, and 2 while live writes continue."
+      }
+    },
+    {
+      "id": "stage-7-marker-rows",
+      "title": "Sentinel Boundary Rows & Multi-Column Moves",
+      "level": "advanced",
+      "purpose": "Handle empty columns, top/bottom insertions, and cross-column status transitions cleanly.",
+      "explanation": {
+        "foundation": "Dropping a card at the top or bottom of a column requires a neighbor rank on both sides.",
+        "core": "Storing hidden `MIN_RANK` (`0|000000:`) and `MAX_RANK` (`0|zzzzzz:`) sentinel markers per board guarantees every insertion has a valid `(left, right)` pair.",
+        "deepDive": "Moving a card between Kanban columns updates `status` and `rank` atomically in one transaction."
+      },
+      "codeExample": "def move_card_across_columns(conn, board_id, issue_id, target_status, left_rank, right_rank, expected_ver):\n    new_rank = lexo_midpoint(left_rank, right_rank)\n    with conn.transaction():\n        updated = conn.execute(\n            'UPDATE issues SET status=%s, rank=%s, version=version+1 WHERE id=%s AND board_id=%s AND version=%s',\n            (target_status, new_rank, issue_id, board_id, expected_ver)\n        )\n        if updated.rowcount == 0:\n            raise ConcurrentModificationError('Issue modified by another user')\n    return new_rank",
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "ADVANCED",
+        "title": "Atomic Status + Rank Transition",
+        "cards": [
+          {
+            "label": "Boundary Safety",
+            "detail": "Sentinel ranks eliminate special-case null checks on empty columns."
+          },
+          {
+            "label": "Version CAS",
+            "detail": "Optimistic version check prevents stale drag-and-drop overwrites."
+          }
+        ],
+        "summary": "Sentinel bounds and single-row CAS transactions keep cross-column Kanban moves atomic.",
+        "caption": "Combining MIN/MAX sentinels with optimistic version CAS makes cross-column moves atomic.",
+        "graphNodes": [
+          {
+            "id": "sentinels",
+            "label": "MIN / MAX Sentinels",
+            "role": "boundary",
+            "col": 0,
+            "row": 0,
+            "tone": "primary"
+          },
+          {
+            "id": "tx",
+            "label": "Single-Row CAS",
+            "role": "compute",
+            "col": 1,
+            "row": 0,
+            "tone": "tint"
+          },
+          {
+            "id": "pub",
+            "label": "Redis Pub/Sub",
+            "role": "output",
+            "col": 2,
+            "row": 0,
+            "tone": "tint"
+          }
+        ],
+        "graphEdges": [
+          {
+            "from": "sentinels",
+            "to": "tx",
+            "label": "provides bounded midpoint",
+            "style": "solid",
+            "tone": "green"
+          },
+          {
+            "from": "tx",
+            "to": "pub",
+            "label": "emits committed state",
+            "style": "solid",
+            "tone": "green"
+          }
+        ]
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-1",
+        "question": "Why does Lexorank use three buckets (0, 1, 2) instead of two buckets (0, 1) for background rebalancing?",
+        "options": [
+          {
+            "id": "a",
+            "text": "To allow three separate users to drag cards simultaneously without locks.",
+            "correct": false,
+            "feedback": "Concurrency is handled by unique constraints and CAS retries, not bucket count."
+          },
+          {
+            "id": "b",
+            "text": "Because '0|' < '2|' would invert sort order during wrap-around if a second rebalance starts before the old bucket drains.",
+            "correct": true,
+            "feedback": "Correct! During 2 -> 0 wrap-around, 3 buckets ensure a clear gap so stale rows in an old bucket never interleave with newly compacted rows."
+          },
+          {
+            "id": "c",
+            "text": "Base-36 encoding requires a modulo-3 prefix to remain valid ASCII.",
+            "correct": false,
+            "feedback": "Base-36 encoding is independent of the bucket prefix."
+          },
+          {
+            "id": "d",
+            "text": "PostgreSQL B-tree indexes only support 3-way partitioning.",
+            "correct": false,
+            "feedback": "PostgreSQL B-trees have no 3-way partitioning constraint."
+          }
+        ],
+        "explanation": "Three buckets ensure that when rebalancing wraps from bucket 2 back to bucket 0, bucket 1 acts as a buffer so old and new generations never collide."
+      },
+      {
+        "id": "kc-2",
+        "question": "Which database column collation is mandatory for a Lexorank `rank` column in PostgreSQL?",
+        "options": [
+          {
+            "id": "a",
+            "text": "en_US.UTF-8",
+            "correct": false,
+            "feedback": "Locale-aware collations ignore punctuation like '|' and ':' or sort case-insensitively, breaking Lexorank order."
+          },
+          {
+            "id": "b",
+            "text": "C / POSIX (binary byte order)",
+            "correct": true,
+            "feedback": "Correct! Lexorank relies on strict ASCII byte ordering ('0'..'9' < 'a'..'z' < '|')."
+          },
+          {
+            "id": "c",
+            "text": "UTF8_UNICODE_CI",
+            "correct": false,
+            "feedback": "Case-insensitive collations corrupt base-36 ordering."
+          },
+          {
+            "id": "d",
+            "text": "NUMERIC(36, 6)",
+            "correct": false,
+            "feedback": "Lexorank values are strings containing '|' and ':', not numeric types."
+          }
+        ],
+        "explanation": "Locale collations reorder punctuation and letters non-lexicographically; `COLLATE \"C\"` guarantees exact ASCII byte order."
+      },
+      {
+        "id": "kc-3",
+        "question": "Two engineers drop different issues into the exact same gap at the same time and both compute `0|i0000b:`. What prevents silent ordering corruption?",
+        "options": [
+          {
+            "id": "a",
+            "text": "PostgreSQL automatically averages the two strings.",
+            "correct": false,
+            "feedback": "Databases do not average string values on conflict."
+          },
+          {
+            "id": "b",
+            "text": "The background rebalancer immediately pauses all board writes.",
+            "correct": false,
+            "feedback": "Rebalancing is asynchronous and does not block live writes."
+          },
+          {
+            "id": "c",
+            "text": "A UNIQUE (board_id, rank) constraint rejects the second write, triggering a jittered retry against the updated neighbor.",
+            "correct": true,
+            "feedback": "Correct! The second transaction catches the unique violation, re-reads the new neighbor rank, and computes a fresh midpoint."
+          },
+          {
+            "id": "d",
+            "text": "The client generates a random UUID suffix on every rank.",
+            "correct": false,
+            "feedback": "Random suffixes would break deterministic midpoint ordering."
+          }
+        ],
+        "explanation": "Enforcing `UNIQUE (board_id, rank)` ensures the second writer fails fast and retries with the newly committed neighbor."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Lexorank uses alphabetical strings instead of numbers to order Kanban cards so moving one card only updates one row.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, by computing the lexicographical midpoint between two adjacent rank strings (e.g., '0|i00007:' and '0|i0000f:' -> '0|i0000b:'), Kanban boards avoid O(N) integer re-indexing while using 3-bucket rotation to bound string length.",
+      "byteSummary": "Numbering cards 1, 2, 3 forces you to renumber hundreds of cards whenever you drag one to the top. Lexorank gives each card a text label like '0|i00007:'. To place a card between two others, you just pick a text label alphabetically in the middle, updating only a single database row."
+    },
+    "intermediate": {
+      "summary": "Lexorank encodes issue positions as `<bucket>|<base36>:` strings with `COLLATE \"C\"` and a 3-bucket background rebalancer.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, by computing the lexicographical midpoint between two adjacent rank strings (e.g., '0|i00007:' and '0|i0000f:' -> '0|i0000b:'), Kanban boards avoid O(N) integer re-indexing while using 3-bucket rotation to bound string length.",
+      "byteSummary": "By combining base-36 midpoint calculation with a `UNIQUE (board_id, rank)` constraint and jittered CAS retries, Lexorank handles concurrent backlog grooming without range-lock deadlocks. When rank strings grow past 128 characters, a background worker compacts them into the next modulo-3 bucket."
+    },
+    "advanced": {
+      "summary": "Production Lexorank requires `C` collation, sentinel bounds, unique-index CAS retries, and non-blocking modulo-3 bucket rotation.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, by computing the lexicographical midpoint between two adjacent rank strings (e.g., '0|i00007:' and '0|i0000f:' -> '0|i0000b:'), Kanban boards avoid O(N) integer re-indexing while using 3-bucket rotation to bound string length.",
+      "byteSummary": "At Jira scale, Lexorank pairs single-row optimistic updates (`WHERE version = expected`) with a `UNIQUE (board_id, rank)` constraint to linearize concurrent moves. Rebalancing workers drain bucket `b` to `(b+1)%3` in bounded batches, guaranteeing `b` is empty before wrap-around."
+    }
+  },
+  "pedagogicalFramework": "PRIME",
+  "simulation": {
+    "title": "Lexorank & Distributed Kanban Board Ordering — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Input Workload"
+      },
+      {
+        "id": "entry",
+        "label": "Router / API",
+        "role": "Admission Control"
+      },
+      {
+        "id": "worker",
+        "label": "Processor",
+        "role": "Domain Logic"
+      },
+      {
+        "id": "store",
+        "label": "State Layer",
+        "role": "Durable Store"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "entry",
+        "label": "request"
+      },
+      {
+        "from": "entry",
+        "to": "worker",
+        "label": "dispatch"
+      },
+      {
+        "from": "worker",
+        "to": "store",
+        "label": "read/write"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why Integer Positions Fail at Scale",
+        "actionLabel": "request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "entry"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "request",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Caller sends work to Router / API (Why Integer Positions Fail at Scale)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Floating-Point Midpoints & Precision Collapse",
+        "actionLabel": "dispatch",
+        "status": "healthy",
+        "activeNodeIds": [
+          "entry",
+          "worker"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "dispatch",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Router / API coordinates with Processor while preserving the core invariant (Floating-Point Midpoints & Precision Collapse)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Lexorank String Anatomy & Base-36 Encoding",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "worker",
+          "store"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, State Layer absorbs pressure without cascading (Lexorank String Anatomy & Base-36 Encoding)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Sentinel Boundary Rows & Multi-Column Moves",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "entry",
+          "worker",
+          "store"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Sentinel Boundary Rows & Multi-Column Moves)."
+      }
+    ]
+  }
+}

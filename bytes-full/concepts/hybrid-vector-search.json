@@ -1,0 +1,980 @@
+{
+  "id": "concept-hybrid-vector-search",
+  "slug": "hybrid-vector-search",
+  "name": "Hybrid Vector Search (BM25 + HNSW + RRF)",
+  "domain": "ML Systems & Search",
+  "tagline": "Combining sparse lexical scoring (BM25) with dense semantic embeddings (HNSW) via Reciprocal Rank Fusion (RRF) and cross-encoder reranking.",
+  "purpose": "Build a progressive mental model of hybrid search—from why dense vectors miss exact SKUs and error codes to RRF (k=60), single-stage filtered HNSW, and int8 scalar quantization.",
+  "spark": {
+    "summary": "Hybrid vector search combines sparse lexical scoring (BM25) with dense semantic embeddings (HNSW/IVF) via Reciprocal Rank Fusion (RRF) and optional cross-encoder reranking to achieve high recall on both exact identifiers and conceptual queries.",
+    "keyTakeaway": "When batching and tail latency compete for accelerator cycles, dense vectors alone miss exact SKUs, error codes, and proper nouns, while BM25 misses synonyms; run both in parallel, fuse with RRF (k=60), and cross-encoder rerank only the top 20–50 candidates.",
+    "byteSummary": "**Core Mechanics:** Pure dense vector search embeds queries into 768–1536D vectors (indexed in **HNSW** graphs for `~10 ms` ANN lookup) and excels at paraphrases—but routinely misses exact tokens like `ERR_CONNECTION_RESET` or `SKU-4920B`.\n\n**Visual & Structural Flow:** Depicts Parallel BM25 + HNSW -> RRF Fusion (k=60) -> Cross-Encoder Top-50 (User Query -> BM25 + HNSW Parallel -> RRF Fusion (k=60) -> Cross-Encoder Rerank); Hybrid Search Execution with Oversampling & Reranking (Search API -> BM25 + int8 HNSW -> RRF + Rescore -> GPU Cross-Encoder).\n\n**Trade-Offs & Production:** Compare fusion strategies and sparse-dense architectures. To keep 1536-dim HNSW indexes affordable in RAM, production clusters (Qdrant, OpenSearch, pgvector) apply **int8 scalar quantization** (4x RAM reduction) and oversample top-100.\n\n**Failure Modes & Application:** Explore the inverted-index foundations behind BM25 and production search pagination."
+  },
+  "learningJourney": [
+    {
+      "id": "01-what-it-is",
+      "eyebrow": "STAGE 01 · WHAT IT IS",
+      "title": "What is Hybrid Vector Search",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "Pure dense vector search embeds queries into 768–1536D vectors (indexed in **HNSW** graphs for `~10 ms` ANN lookup) and excels at paraphrases—but routinely misses exact tokens like `ERR_CONNECTION_RESET` or `SKU-4920B`. Conversely, **BM25** nails exact rare tokens via inverted indexes but misses synonyms.",
+        "core": "**Hybrid search** runs both retrievers in parallel and merges their ranked lists using **Reciprocal Rank Fusion (RRF)**: `RRF(d) = sum(1 / (k + rank_i(d)))` (typically `k = 60`), requiring zero brittle score normalization between unbounded BM25 scores and `[0, 1]` cosine similarities.",
+        "deepDive": "In production deployments of Hybrid Vector Search (BM25 + HNSW + RRF), watch how what is hybrid vector search interacts with tail latency, retry amplification, and partial failures. Hybrid vector search combines sparse lexical scoring (BM25) with dense semantic embeddings (HNSW/IVF) via Reciprocal Rank Fusion (RRF) and optional cross-encoder reranking to achieve high recall on both exact identifiers and conceptual queries."
+      },
+      "sectionDiagram": {
+        "kind": "cache-tier",
+        "eyebrow": "Two-Stage Retrieval",
+        "title": "Parallel BM25 + HNSW -> RRF Fusion (k=60) -> Cross-Encoder Top-50",
+        "nodes": [
+          {
+            "id": "q",
+            "label": "User Query",
+            "role": "Intent + Exact Tokens"
+          },
+          {
+            "id": "ret",
+            "label": "BM25 + HNSW Parallel",
+            "role": "Top-100 Each + Bitset"
+          },
+          {
+            "id": "rrf",
+            "label": "RRF Fusion (k=60)",
+            "role": "Scale-Free Rank Merge"
+          },
+          {
+            "id": "ce",
+            "label": "Cross-Encoder Rerank",
+            "role": "Top-50 -> Final Top-10"
+          }
+        ],
+        "edges": [
+          {
+            "label": "Single-stage filter"
+          },
+          {
+            "label": "40–150ms GPU rerank"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Scale-Free RRF",
+            "detail": "Fuses ranks rather than raw scores, avoiding arbitrary BM25 vs. cosine scaling."
+          },
+          {
+            "label": "Single-Stage Filtering",
+            "detail": "Evaluates tenant/stock bitsets *inside* HNSW traversal so selective filters never return 0 results."
+          },
+          {
+            "label": "Scalar Quantization",
+            "detail": "int8 quantization cuts HNSW RAM by 4x with minimal recall loss when oversampling top-K."
+          }
+        ],
+        "summary": "Parallel lexical + dense retrieval fused with RRF captures both exact identifiers and semantic intent."
+      },
+      "purpose": "The mechanism: understand how Hybrid Vector Search works from first principles."
+    },
+    {
+      "id": "02-why-we-need-it",
+      "eyebrow": "STAGE 02 · WHY WE NEED IT",
+      "title": "Why Post-Filtering & Naive Score Addition Fail",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "Think of **Why Post-Filtering & Naive Score Addition Fail** as the intuition layer for Hybrid Vector Search (BM25 + HNSW + RRF): The problem: see what breaks without Why Post-Filtering & Naive Score Addition Fail under real concurrency or scale.",
+        "core": "Two classic traps ruin hybrid search: (1) **Post-filtering** runs HNSW top-20 first and then applies `WHERE in_stock = true`—returning 0 results if the top-20 were out of stock; and (2) **Naive score addition** (`bm25 + cosine`) lets unbounded BM25 scores (`0..40+`) drown out cosine (`0..1`).",
+        "deepDive": "Under heavy load or partial failure, why post-filtering & naive score addition fail becomes a critical lever for predictable latency and correctness. Hybrid vector search combines sparse lexical scoring (BM25) with dense semantic embeddings (HNSW/IVF) via Reciprocal Rank Fusion (RRF) and optional cross-encoder reranking to achieve high recall on both exact identifiers and conceptual queries."
+      },
+      "ideas": [
+        {
+          "title": "Structure-Aware Chunking",
+          "description": "Split docs on Markdown/HTML headings with 10–15% overlap and prepend the document title/breadcrumb to each chunk so embeddings never lose context."
+        },
+        {
+          "title": "Cross-Encoder Precision",
+          "description": "Bi-encoders encode query and doc separately; a cross-encoder runs full attention over `(query, doc)` pairs on just the top 20–50 RRF candidates to resolve negation and subtle nuance."
+        }
+      ],
+      "purpose": "The problem: see what breaks without Why Post-Filtering & Naive Score Addition Fail under real concurrency or scale.",
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "Lifecycle & Failure Recovery",
+        "title": "Why Post-Filtering & Naive Score Addition Fail",
+        "states": [
+          {
+            "id": "prefill",
+            "label": "Prefill (Compute-Bound)",
+            "tone": "info"
+          },
+          {
+            "id": "decode",
+            "label": "Decode (Memory-BW)",
+            "tone": "info"
+          },
+          {
+            "id": "stream",
+            "label": "SSE Streaming",
+            "tone": "good"
+          },
+          {
+            "id": "evict",
+            "label": "KV Cache Pressure",
+            "tone": "warn"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "prefill",
+            "to": "decode",
+            "label": "KV blocks allocated"
+          },
+          {
+            "from": "decode",
+            "to": "stream",
+            "label": "token sampled"
+          },
+          {
+            "from": "decode",
+            "to": "evict",
+            "label": "VRAM > 90%"
+          }
+        ]
+      },
+      "decisionFramework": {
+        "problem": "How to implement Hybrid Vector Search (BM25 + HNSW + RRF) without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "When batching and tail latency compete for accelerator cycles, dense vectors alone miss exact SKUs, error codes, and proper nouns, while BM25 misses synonyms; run both in parallel, fuse with RRF (k=60), and cross-encoder rerank only the top 20–50 candidates.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Hybrid Vector Search (BM25 + HNSW + RRF) experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-where-it-is-used",
+      "eyebrow": "STAGE 03 · WHERE IT IS USED",
+      "title": "Where Hybrid Search Pays Off (and Where Simpler Indexes Win)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Think of **Where Hybrid Search Pays Off (and Where Simpler Indexes Win)** as the intuition layer for Hybrid Vector Search (BM25 + HNSW + RRF): Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+        "core": "Use hybrid search when queries mix natural language with exact codes/names; skip vector HNSW for exact IDs or tiny corpora.",
+        "deepDive": "Under heavy load or partial failure, where hybrid search pays off (and where simpler indexes win) becomes a critical lever for predictable latency and correctness. Hybrid vector search combines sparse lexical scoring (BM25) with dense semantic embeddings (HNSW/IVF) via Reciprocal Rank Fusion (RRF) and optional cross-encoder reranking to achieve high recall on both exact identifiers and conceptual queries."
+      },
+      "comparison": [
+        {
+          "choice": "Good Candidate: Enterprise RAG & Developer Docs",
+          "benefits": [
+            "Retrieves both conceptual guides and exact error codes (`HMAC_SHA256_MISMATCH`) reliably."
+          ],
+          "costs": [
+            "Maintains both an inverted index and an HNSW vector graph (higher RAM footprint)."
+          ]
+        },
+        {
+          "choice": "Good Candidate: E-Commerce Catalog Search",
+          "benefits": [
+            "Matches `'warm waterproof winter jacket'` with exact brand/SKU/size pre-filters."
+          ],
+          "costs": [
+            "Requires single-stage filtered HNSW so tight price/stock filters don't collapse recall."
+          ]
+        },
+        {
+          "choice": "Avoid: Exact Primary-Key / UUID Lookups or <5k Rows",
+          "benefits": [
+            "B-trees, inverted indexes, or brute-force cosine / SQLite FTS5 are 10x cheaper and deterministic."
+          ],
+          "costs": [
+            "HNSW graph maintenance is unnecessary overhead for <5,000 short records."
+          ]
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    },
+    {
+      "id": "04-how-it-is-managed",
+      "eyebrow": "STAGE 04 · HOW IT IS MANAGED",
+      "title": "Reciprocal Rank Fusion (RRF) & Single-Stage Filtered Retrieval",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Think of **Reciprocal Rank Fusion (RRF) & Single-Stage Filtered Retrieval** as the intuition layer for Hybrid Vector Search (BM25 + HNSW + RRF): Operational control: configure bounds, failure handling, and safe production defaults.",
+        "core": "Implement RRF with `k = 60` so documents appearing near the top of *both* BM25 and HNSW lists receive a strong boost without tuning per-corpus alpha weights.",
+        "deepDive": "Under heavy load or partial failure, reciprocal rank fusion (rrf) & single-stage filtered retrieval becomes a critical lever for predictable latency and correctness. Hybrid vector search combines sparse lexical scoring (BM25) with dense semantic embeddings (HNSW/IVF) via Reciprocal Rank Fusion (RRF) and optional cross-encoder reranking to achieve high recall on both exact identifiers and conceptual queries."
+      },
+      "markdownContent": "```python\nfrom collections import defaultdict\n\ndef reciprocal_rank_fusion(\n    bm25_ids: list[str],\n    vector_ids: list[str],\n    k: int = 60,\n    top_n: int = 20,\n) -> list[tuple[str, float]]:\n    scores: dict[str, float] = defaultdict(float)\n    for rank, doc_id in enumerate(bm25_ids, start=1):\n        scores[doc_id] += 1.0 / (k + rank)\n    for rank, doc_id in enumerate(vector_ids, start=1):\n        scores[doc_id] += 1.0 / (k + rank)\n    return sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_n]\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-alternatives",
+      "eyebrow": "STAGE 05 · ALTERNATIVES",
+      "title": "Alternatives: RRF vs. Linear Alpha Fusion vs. Learned Sparse (SPLADE)",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": {
+        "foundation": "Think of **Alternatives: RRF vs. Linear Alpha Fusion vs. Learned Sparse (SPLADE)** as the intuition layer for Hybrid Vector Search (BM25 + HNSW + RRF): The trade-off: compare competing approaches across latency, consistency, and operational cost.",
+        "core": "Compare fusion strategies and sparse-dense architectures.",
+        "deepDive": "Under heavy load or partial failure, alternatives: rrf vs. linear alpha fusion vs. learned sparse (splade) becomes a critical lever for predictable latency and correctness. Hybrid vector search combines sparse lexical scoring (BM25) with dense semantic embeddings (HNSW/IVF) via Reciprocal Rank Fusion (RRF) and optional cross-encoder reranking to achieve high recall on both exact identifiers and conceptual queries."
+      },
+      "comparison": [
+        {
+          "choice": "Reciprocal Rank Fusion (`k = 60`)",
+          "benefits": [
+            "Zero score calibration needed; resilient to BM25's unbounded `[0, inf)` range."
+          ],
+          "costs": [
+            "Discards score magnitude gaps (a `0.99` exact hit vs. a `0.51` weak hit look identical at rank 1)."
+          ]
+        },
+        {
+          "choice": "Normalized Linear Fusion (`alpha * dense + (1-alpha) * sparse`)",
+          "benefits": [
+            "Preserves score confidence gaps when scores are min-max or z-score normalized per query."
+          ],
+          "costs": [
+            "Requires domain-specific tuning of `alpha` and breaks if score distributions shift."
+          ]
+        },
+        {
+          "choice": "Cross-Encoder Reranking (Stage 2)",
+          "benefits": [
+            "Highest precision on top-50 candidates via full query-document token attention."
+          ],
+          "costs": [
+            "Adds 40–150 ms GPU latency (200+ ms CPU); unsuitable for sub-20 ms autocomplete."
+          ]
+        }
+      ],
+      "purpose": "The trade-off: compare competing approaches across latency, consistency, and operational cost.",
+      "sectionDiagram": {
+        "kind": "behavior-transition",
+        "eyebrow": "Design Trade-Off",
+        "title": "Alternatives: RRF vs. Linear Alpha Fusion vs. Learned Sparse (SPLADE)",
+        "before": {
+          "label": "Static Batch + Raw Prompt",
+          "metrics": [
+            "Head-of-line blocking on long prompts",
+            "O(N^2) KV fragmentation",
+            "Unfiltered RAG leaks ACLs"
+          ]
+        },
+        "after": {
+          "label": "PagedAttention + Guardrails",
+          "metrics": [
+            "Zero-waste paged KV blocks",
+            "Pre-retrieval ACL & RRF rerank",
+            "Continuous batching boosts tok/s"
+          ]
+        }
+      }
+    },
+    {
+      "id": "06-production-architecture",
+      "eyebrow": "STAGE 06 · PRODUCTION ARCHITECTURE",
+      "title": "Production Search: Filtered HNSW + int8 Quantization + Reranker",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Think of **Production Search: Filtered HNSW + int8 Quantization + Reranker** as the intuition layer for Hybrid Vector Search (BM25 + HNSW + RRF): Production architecture: see how the components compose end to end under real load.",
+        "core": "To keep 1536-dim HNSW indexes affordable in RAM, production clusters (Qdrant, OpenSearch, pgvector) apply **int8 scalar quantization** (4x RAM reduction) and oversample top-100 candidates before rescoring with full float32 vectors or a cross-encoder.",
+        "deepDive": "Under heavy load or partial failure, production search: filtered hnsw + int8 quantization + reranker becomes a critical lever for predictable latency and correctness. Hybrid vector search combines sparse lexical scoring (BM25) with dense semantic embeddings (HNSW/IVF) via Reciprocal Rank Fusion (RRF) and optional cross-encoder reranking to achieve high recall on both exact identifiers and conceptual queries."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Latency & Recall Budget",
+        "title": "Hybrid Search Execution with Oversampling & Reranking",
+        "actors": [
+          {
+            "id": "api",
+            "label": "Search API"
+          },
+          {
+            "id": "idx",
+            "label": "BM25 + int8 HNSW"
+          },
+          {
+            "id": "rrf",
+            "label": "RRF + Rescore"
+          },
+          {
+            "id": "ce",
+            "label": "GPU Cross-Encoder"
+          }
+        ],
+        "events": [
+          {
+            "from": "api",
+            "label": "Embed query + tokenize (8ms)",
+            "to": "idx",
+            "status": "ok"
+          },
+          {
+            "from": "idx",
+            "label": "Filtered top-100 each (12ms)",
+            "to": "rrf",
+            "status": "ok"
+          },
+          {
+            "from": "rrf",
+            "label": "RRF(k=60) -> top-30 candidates",
+            "to": "ce",
+            "status": "ok"
+          },
+          {
+            "from": "ce",
+            "label": "Reranked top-10 (55ms)",
+            "to": "api",
+            "status": "ok"
+          }
+        ],
+        "summary": "Bounding cross-encoder reranking to the top 20–50 RRF candidates keeps total RAG retrieval under ~80 ms."
+      },
+      "purpose": "Production architecture: see how the components compose end to end under real load."
+    },
+    {
+      "id": "07-problems-and-further-reading",
+      "eyebrow": "STAGE 07 · PROBLEMS SOLVED & FURTHER DEEP DIVE",
+      "title": "Inverted Indexes, Pagination & Retrieval Systems",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Think of **Inverted Indexes, Pagination & Retrieval Systems** as the intuition layer for Hybrid Vector Search (BM25 + HNSW + RRF): Applied problems: connect these internals to concrete system design and debugging scenarios.",
+        "core": "Explore the inverted-index foundations behind BM25 and production search pagination.",
+        "deepDive": "Under heavy load or partial failure, inverted indexes, pagination & retrieval systems becomes a critical lever for predictable latency and correctness. Hybrid vector search combines sparse lexical scoring (BM25) with dense semantic embeddings (HNSW/IVF) via Reciprocal Rank Fusion (RRF) and optional cross-encoder reranking to achieve high recall on both exact identifiers and conceptual queries."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "elasticsearch-search-after",
+          "title": "Problem: Elasticsearch search_after vs. Deep Pagination",
+          "kind": "problem"
+        },
+        {
+          "slug": "dual-write-sync-drift",
+          "title": "Problem: Eliminating Dual-Write DB/Search Drift",
+          "kind": "problem"
+        },
+        {
+          "slug": "full-text-inverted",
+          "title": "Concept: Full-Text Inverted Indexes",
+          "kind": "concept"
+        }
+      ],
+      "purpose": "Applied problems: connect these internals to concrete system design and debugging scenarios."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why does Reciprocal Rank Fusion (`1 / (k + rank)`) outperform naively adding raw BM25 and cosine similarity scores?",
+      "options": [
+        {
+          "id": "a",
+          "text": "Because BM25 scores are unbounded (`[0, inf)`) while cosine similarity is bounded (`[-1, 1]`), so rank-based RRF fuses them without brittle score normalization",
+          "correct": true,
+          "feedback": "Correct: RRF uses rank positions (`k=60`), preventing unbounded BM25 scores from drowning out vector similarity."
+        },
+        {
+          "id": "b",
+          "text": "Because RRF runs the cross-encoder inside HNSW",
+          "correct": false,
+          "feedback": "RRF is a lightweight rank-merging formula; cross-encoder reranking is a separate second stage."
+        },
+        {
+          "id": "c",
+          "text": "Because RRF eliminates the need for an inverted index",
+          "correct": false,
+          "feedback": "RRF still consumes ranked lists from both BM25 and vector retrieval."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why does Reciprocal Rank Fusion (`1 / (k + rank)`) outperform naively adding raw BM25 and cosine similarity scores?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Because BM25 scores are unbounded (`[0, inf)`) while cosine similarity is bounded (`[-1, 1]`), so rank-based RRF fuses them without brittle score normalization",
+            "correct": true,
+            "feedback": "Correct: RRF uses rank positions (`k=60`), preventing unbounded BM25 scores from drowning out vector similarity."
+          },
+          {
+            "id": "b",
+            "text": "Because RRF runs the cross-encoder inside HNSW",
+            "correct": false,
+            "feedback": "RRF is a lightweight rank-merging formula; cross-encoder reranking is a separate second stage."
+          },
+          {
+            "id": "c",
+            "text": "Because RRF eliminates the need for an inverted index",
+            "correct": false,
+            "feedback": "RRF still consumes ranked lists from both BM25 and vector retrieval."
+          }
+        ]
+      },
+      {
+        "question": "What is the main benefit—and corresponding operational trade-off—of using Good Candidate: Enterprise RAG & Developer Docs in Hybrid Vector Search (BM25 + HNSW + RRF)?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Advantage: Retrieves both conceptual guides and exact error codes (HMAC_SHA256_MISMATCH) reliably. Cost: Maintains both an inverted index and an HNSW vector graph (higher RAM footprint).",
+            "correct": true,
+            "feedback": "Correct: Good Candidate: Enterprise RAG & Developer Docs delivers retrieves both conceptual guides and exact error codes (HMAC_SHA256_MISMATCH) reliably. while requiring you to manage maintains both an inverted index and an HNSW vector graph (higher RAM footprint)."
+          },
+          {
+            "id": "b",
+            "text": "Advantage: Matches 'warm waterproof winter jacket' with exact brand/SKU/size pre-filters. It has zero operational or latency overhead compared to Good Candidate: E-Commerce Catalog Search.",
+            "correct": false,
+            "feedback": "Not quite: that describes Good Candidate: E-Commerce Catalog Search, whereas Good Candidate: Enterprise RAG & Developer Docs specifically trades off: Maintains both an inverted index and an HNSW vector graph (higher RAM footprint)."
+          },
+          {
+            "id": "c",
+            "text": "Relying solely on Exact Primary-Key / UUID Lookups or <5k Rows avoids all operational and latency trade-offs",
+            "correct": false,
+            "feedback": "Incorrect: every production option in Hybrid Vector Search (BM25 + HNSW + RRF) carries concrete latency, consistency, or operational costs."
+          }
+        ]
+      },
+      {
+        "question": "Why is Cross-Encoder Precision critical when operating Hybrid Vector Search (BM25 + HNSW + RRF) in production?",
+        "options": [
+          {
+            "id": "a",
+            "text": "It only applies during local unit testing and can be disabled in production to save memory.",
+            "correct": false,
+            "feedback": "Incorrect: 'Cross-Encoder Precision' directly governs production reliability and correctness under real traffic."
+          },
+          {
+            "id": "b",
+            "text": "It replaces the need for observability, timeouts, or capacity planning across Hybrid Vector Search (BM25 + HNSW + RRF).",
+            "correct": false,
+            "feedback": "Incorrect: 'Cross-Encoder Precision' works alongside proper bounds, monitoring, and failure isolation."
+          },
+          {
+            "id": "c",
+            "text": "Bi-encoders encode query and doc separately; a cross-encoder runs full attention over (query, doc) pairs on just the top 20–50 RRF candidates to resolve negation and subtle…",
+            "correct": true,
+            "feedback": "Correct: Bi-encoders encode query and doc separately; a cross-encoder runs full attention over (query, doc) pairs on just the top 20–50 RRF candidates to resolve negation and subtle…"
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** Pure dense vector search embeds queries into 768–1536D vectors (indexed in **HNSW** graphs for `~10 ms` ANN lookup) and excels at paraphrases—but routinely misses exact tokens like `ERR_CONNECTION_RESET` or `SKU-4920B`.\n\n**How It Flows:** Think of Hybrid Vector Search (BM25 + HNSW + RRF) as a clear step-by-step chain: User Query -> BM25 + HNSW Parallel -> RRF Fusion (k=60) -> Cross-Encoder Rerank -> Search API.\n\n**Why Beginners Should Care:** Dense vectors alone miss exact SKUs, error codes, and proper nouns, while BM25 misses synonyms; run both in parallel, fuse with RRF (k=60), and cross-encoder rerank only the top 20–50 candidates.",
+      "spark": {
+        "summary": "Pure dense vector search embeds queries into 768–1536D vectors (indexed in **HNSW** graphs for `~10 ms` ANN lookup) and excels at paraphrases—but routinely misses exact tokens like `ERR_CONNECTION_RESET` or `SKU-4920B`.",
+        "keyTakeaway": "Dense vectors alone miss exact SKUs, error codes, and proper nouns, while BM25 misses synonyms; run both in parallel, fuse with RRF (k=60), and cross-encoder rerank only the top 20–50 candidates."
+      },
+      "learningJourney": [
+        {
+          "id": "01-what-it-is",
+          "title": "What is Hybrid Vector Search",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Hybrid Vector Search works from first principles.",
+          "explanation": "Pure dense vector search embeds queries into 768–1536D vectors (indexed in **HNSW** graphs for `~10 ms` ANN lookup) and excels at paraphrases—but routinely misses exact tokens like `ERR_CONNECTION_RESET` or `SKU-4920B`. Conversely, **BM25** nails exact rare tokens via inverted indexes but misses synonyms.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Two-Stage Retrieval",
+            "title": "Parallel BM25 + HNSW -> RRF Fusion (k=60) -> Cross-Encoder Top-50",
+            "nodes": [
+              {
+                "id": "q",
+                "label": "User Query",
+                "role": "Intent + Exact Tokens"
+              },
+              {
+                "id": "ret",
+                "label": "BM25 + HNSW Parallel",
+                "role": "Top-100 Each + Bitset"
+              },
+              {
+                "id": "rrf",
+                "label": "RRF Fusion (k=60)",
+                "role": "Scale-Free Rank Merge"
+              },
+              {
+                "id": "ce",
+                "label": "Cross-Encoder Rerank",
+                "role": "Top-50 -> Final Top-10"
+              }
+            ],
+            "edges": [
+              {
+                "label": "Single-stage filter"
+              },
+              {
+                "label": "40–150ms GPU rerank"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Scale-Free RRF",
+                "detail": "Fuses ranks rather than raw scores, avoiding arbitrary BM25 vs. cosine scaling."
+              },
+              {
+                "label": "Single-Stage Filtering",
+                "detail": "Evaluates tenant/stock bitsets *inside* HNSW traversal so selective filters never return 0 results."
+              },
+              {
+                "label": "Scalar Quantization",
+                "detail": "int8 quantization cuts HNSW RAM by 4x with minimal recall loss when oversampling top-K."
+              }
+            ],
+            "summary": "Parallel lexical + dense retrieval fused with RRF captures both exact identifiers and semantic intent."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-why-we-need-it",
+          "title": "Why Post-Filtering & Naive Score Addition Fail",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without Why Post-Filtering & Naive Score Addition Fail under real concurrency or scale.",
+          "explanation": "Two classic traps ruin hybrid search: (1) **Post-filtering** runs HNSW top-20 first and then applies `WHERE in_stock = true`—returning 0 results if the top-20 were out of stock; and (2) **Naive score addition** (`bm25 + cosine`) lets unbounded BM25 scores (`0..40+`) drown out cosine (`0..1`).",
+          "ideas": [
+            {
+              "title": "Structure-Aware Chunking",
+              "description": "Split docs on Markdown/HTML headings with 10–15% overlap and prepend the document title/breadcrumb to each chunk so embeddings never lose context."
+            },
+            {
+              "title": "Cross-Encoder Precision",
+              "description": "Bi-encoders encode query and doc separately; a cross-encoder runs full attention over `(query, doc)` pairs on just the top 20–50 RRF candidates to resolve negation and subtle nuance."
+            }
+          ],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-where-it-is-used",
+          "title": "Where Hybrid Search Pays Off (and Where Simpler Indexes Win)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Use hybrid search when queries mix natural language with exact codes/names; skip vector HNSW for exact IDs or tiny corpora.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "06-production-architecture",
+          "title": "Production Search: Filtered HNSW + int8 Quantization + Reranker",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Production architecture: see how the components compose end to end under real load.",
+          "explanation": "To keep 1536-dim HNSW indexes affordable in RAM, production clusters (Qdrant, OpenSearch, pgvector) apply **int8 scalar quantization** (4x RAM reduction) and oversample top-100 candidates before rescoring with full float32 vectors or a cross-encoder.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Latency & Recall Budget",
+            "title": "Hybrid Search Execution with Oversampling & Reranking",
+            "actors": [
+              {
+                "id": "api",
+                "label": "Search API"
+              },
+              {
+                "id": "idx",
+                "label": "BM25 + int8 HNSW"
+              },
+              {
+                "id": "rrf",
+                "label": "RRF + Rescore"
+              },
+              {
+                "id": "ce",
+                "label": "GPU Cross-Encoder"
+              }
+            ],
+            "events": [
+              {
+                "from": "api",
+                "label": "Embed query + tokenize (8ms)",
+                "to": "idx",
+                "status": "ok"
+              },
+              {
+                "from": "idx",
+                "label": "Filtered top-100 each (12ms)",
+                "to": "rrf",
+                "status": "ok"
+              },
+              {
+                "from": "rrf",
+                "label": "RRF(k=60) -> top-30 candidates",
+                "to": "ce",
+                "status": "ok"
+              },
+              {
+                "from": "ce",
+                "label": "Reranked top-10 (55ms)",
+                "to": "api",
+                "status": "ok"
+              }
+            ],
+            "summary": "Bounding cross-encoder reranking to the top 20–50 RRF candidates keeps total RAG retrieval under ~80 ms."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Dense vectors alone miss exact SKUs, error codes, and proper nouns, while BM25 misses synonyms; run both in parallel, fuse with RRF (k=60), and cross-encoder rerank only the top 20–50 candidates.",
+      "summary": "Hybrid vector search combines sparse lexical scoring (BM25) with dense semantic embeddings (HNSW/IVF) via Reciprocal Rank Fusion (RRF) and optional cross-encoder reranking to achieve high recall on both exact identifiers and conceptual queries.",
+      "keyTakeaway": "When batching and tail latency compete for accelerator cycles, dense vectors alone miss exact SKUs, error codes, and proper nouns, while BM25 misses synonyms; run both in parallel, fuse with RRF (k=60), and cross-encoder rerank only the top 20–50 candidates."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** Pure dense vector search embeds queries into 768–1536D vectors (indexed in **HNSW** graphs for `~10 ms` ANN lookup) and excels at paraphrases—but routinely misses exact tokens like `ERR_CONNECTION_RESET` or `SKU-4920B`.\n\n**Visual & Structural Flow:** Depicts Parallel BM25 + HNSW -> RRF Fusion (k=60) -> Cross-Encoder Top-50 (User Query -> BM25 + HNSW Parallel -> RRF Fusion (k=60) -> Cross-Encoder Rerank); Hybrid Search Execution with Oversampling & Reranking (Search API -> BM25 + int8 HNSW -> RRF + Rescore -> GPU Cross-Encoder).\n\n**Trade-Offs & Production:** Compare fusion strategies and sparse-dense architectures. To keep 1536-dim HNSW indexes affordable in RAM, production clusters (Qdrant, OpenSearch, pgvector) apply **int8 scalar quantization** (4x RAM reduction) and oversample top-100.\n\n**Failure Modes & Application:** Explore the inverted-index foundations behind BM25 and production search pagination.",
+      "spark": {
+        "summary": "Hybrid vector search combines sparse lexical scoring (BM25) with dense semantic embeddings (HNSW/IVF) via Reciprocal Rank Fusion (RRF) and optional cross-encoder reranking to achieve high recall on both exact identifiers and conceptual queries.",
+        "keyTakeaway": "Dense vectors alone miss exact SKUs, error codes, and proper nouns, while BM25 misses synonyms; run both in parallel, fuse with RRF (k=60), and cross-encoder rerank only the top 20–50 candidates."
+      },
+      "summary": "Hybrid vector search combines sparse lexical scoring (BM25) with dense semantic embeddings (HNSW/IVF) via Reciprocal Rank Fusion (RRF) and optional cross-encoder reranking to achieve high recall on both exact identifiers and conceptual queries.",
+      "keyTakeaway": "When batching and tail latency compete for accelerator cycles, dense vectors alone miss exact SKUs, error codes, and proper nouns, while BM25 misses synonyms; run both in parallel, fuse with RRF (k=60), and cross-encoder rerank only the top 20–50 candidates."
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** Hybrid vector search combines sparse lexical scoring (BM25) with dense semantic embeddings (HNSW/IVF) via Reciprocal Rank Fusion (RRF) and optional cross-encoder reranking to achieve high recall on both exact identifiers and conceptual queries.\n\n**Production Trade-Offs:** Implement RRF with `k = 60` so documents appearing near the top of *both* BM25 and HNSW lists receive a strong boost without tuning per-corpus alpha weights.\n\n**Failure Modes & Edge Cases:** Explore the inverted-index foundations behind BM25 and production search pagination.\n\n**Principal Takeaway:** Dense vectors alone miss exact SKUs, error codes, and proper nouns, while BM25 misses synonyms; run both in parallel, fuse with RRF (k=60), and cross-encoder rerank only the top 20–50 candidates.",
+      "spark": {
+        "summary": "Hybrid vector search combines sparse lexical scoring (BM25) with dense semantic embeddings (HNSW/IVF) via Reciprocal Rank Fusion (RRF) and optional cross-encoder reranking to achieve high recall on both exact identifiers and conceptual queries.",
+        "keyTakeaway": "Dense vectors alone miss exact SKUs, error codes, and proper nouns, while BM25 misses synonyms; run both in parallel, fuse with RRF (k=60), and cross-encoder rerank only the top 20–50 candidates."
+      },
+      "learningJourney": [
+        {
+          "id": "01-what-it-is",
+          "title": "What is Hybrid Vector Search",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Hybrid Vector Search works from first principles.",
+          "explanation": "Pure dense vector search embeds queries into 768–1536D vectors (indexed in **HNSW** graphs for `~10 ms` ANN lookup) and excels at paraphrases—but routinely misses exact tokens like `ERR_CONNECTION_RESET` or `SKU-4920B`. Conversely, **BM25** nails exact rare tokens via inverted indexes but misses synonyms.\n\n**Hybrid search** runs both retrievers in parallel and merges their ranked lists using **Reciprocal Rank Fusion (RRF)**: `RRF(d) = sum(1 / (k + rank_i(d)))` (typically `k = 60`), requiring zero brittle score normalization between unbounded BM25 scores and `[0, 1]` cosine similarities.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Two-Stage Retrieval",
+            "title": "Parallel BM25 + HNSW -> RRF Fusion (k=60) -> Cross-Encoder Top-50",
+            "nodes": [
+              {
+                "id": "q",
+                "label": "User Query",
+                "role": "Intent + Exact Tokens"
+              },
+              {
+                "id": "ret",
+                "label": "BM25 + HNSW Parallel",
+                "role": "Top-100 Each + Bitset"
+              },
+              {
+                "id": "rrf",
+                "label": "RRF Fusion (k=60)",
+                "role": "Scale-Free Rank Merge"
+              },
+              {
+                "id": "ce",
+                "label": "Cross-Encoder Rerank",
+                "role": "Top-50 -> Final Top-10"
+              }
+            ],
+            "edges": [
+              {
+                "label": "Single-stage filter"
+              },
+              {
+                "label": "40–150ms GPU rerank"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Scale-Free RRF",
+                "detail": "Fuses ranks rather than raw scores, avoiding arbitrary BM25 vs. cosine scaling."
+              },
+              {
+                "label": "Single-Stage Filtering",
+                "detail": "Evaluates tenant/stock bitsets *inside* HNSW traversal so selective filters never return 0 results."
+              },
+              {
+                "label": "Scalar Quantization",
+                "detail": "int8 quantization cuts HNSW RAM by 4x with minimal recall loss when oversampling top-K."
+              }
+            ],
+            "summary": "Parallel lexical + dense retrieval fused with RRF captures both exact identifiers and semantic intent."
+          },
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-why-we-need-it",
+          "title": "Why Post-Filtering & Naive Score Addition Fail",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without Why Post-Filtering & Naive Score Addition Fail under real concurrency or scale.",
+          "explanation": "Two classic traps ruin hybrid search: (1) **Post-filtering** runs HNSW top-20 first and then applies `WHERE in_stock = true`—returning 0 results if the top-20 were out of stock; and (2) **Naive score addition** (`bm25 + cosine`) lets unbounded BM25 scores (`0..40+`) drown out cosine (`0..1`).",
+          "caveats": null,
+          "ideas": [
+            {
+              "title": "Structure-Aware Chunking",
+              "description": "Split docs on Markdown/HTML headings with 10–15% overlap and prepend the document title/breadcrumb to each chunk so embeddings never lose context."
+            },
+            {
+              "title": "Cross-Encoder Precision",
+              "description": "Bi-encoders encode query and doc separately; a cross-encoder runs full attention over `(query, doc)` pairs on just the top 20–50 RRF candidates to resolve negation and subtle nuance."
+            }
+          ],
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "03-where-it-is-used",
+          "title": "Where Hybrid Search Pays Off (and Where Simpler Indexes Win)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Use hybrid search when queries mix natural language with exact codes/names; skip vector HNSW for exact IDs or tiny corpora.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-how-it-is-managed",
+          "title": "Reciprocal Rank Fusion (RRF) & Single-Stage Filtered Retrieval",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Implement RRF with `k = 60` so documents appearing near the top of *both* BM25 and HNSW lists receive a strong boost without tuning per-corpus alpha weights.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "05-alternatives",
+          "title": "Alternatives: RRF vs. Linear Alpha Fusion vs. Learned Sparse (SPLADE)",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "The trade-off: compare competing approaches across latency, consistency, and operational cost.",
+          "explanation": "Compare fusion strategies and sparse-dense architectures.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "06-production-architecture",
+          "title": "Production Search: Filtered HNSW + int8 Quantization + Reranker",
+          "eyebrow": "Advanced Path · Stage 06",
+          "purpose": "Production architecture: see how the components compose end to end under real load.",
+          "explanation": "To keep 1536-dim HNSW indexes affordable in RAM, production clusters (Qdrant, OpenSearch, pgvector) apply **int8 scalar quantization** (4x RAM reduction) and oversample top-100 candidates before rescoring with full float32 vectors or a cross-encoder.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Latency & Recall Budget",
+            "title": "Hybrid Search Execution with Oversampling & Reranking",
+            "actors": [
+              {
+                "id": "api",
+                "label": "Search API"
+              },
+              {
+                "id": "idx",
+                "label": "BM25 + int8 HNSW"
+              },
+              {
+                "id": "rrf",
+                "label": "RRF + Rescore"
+              },
+              {
+                "id": "ce",
+                "label": "GPU Cross-Encoder"
+              }
+            ],
+            "events": [
+              {
+                "from": "api",
+                "label": "Embed query + tokenize (8ms)",
+                "to": "idx",
+                "status": "ok"
+              },
+              {
+                "from": "idx",
+                "label": "Filtered top-100 each (12ms)",
+                "to": "rrf",
+                "status": "ok"
+              },
+              {
+                "from": "rrf",
+                "label": "RRF(k=60) -> top-30 candidates",
+                "to": "ce",
+                "status": "ok"
+              },
+              {
+                "from": "ce",
+                "label": "Reranked top-10 (55ms)",
+                "to": "api",
+                "status": "ok"
+              }
+            ],
+            "summary": "Bounding cross-encoder reranking to the top 20–50 RRF candidates keeps total RAG retrieval under ~80 ms."
+          },
+          "level": "L7 · STAFF / PRINCIPAL"
+        },
+        {
+          "id": "07-problems-and-further-reading",
+          "title": "Inverted Indexes, Pagination & Retrieval Systems",
+          "eyebrow": "Advanced Path · Stage 07",
+          "purpose": "Applied problems: connect these internals to concrete system design and debugging scenarios.",
+          "explanation": "Explore the inverted-index foundations behind BM25 and production search pagination.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Dense vectors alone miss exact SKUs, error codes, and proper nouns, while BM25 misses synonyms; run both in parallel, fuse with RRF (k=60), and cross-encoder rerank only the top 20–50 candidates.",
+      "summary": "Hybrid vector search combines sparse lexical scoring (BM25) with dense semantic embeddings (HNSW/IVF) via Reciprocal Rank Fusion (RRF) and optional cross-encoder reranking to achieve high recall on both exact identifiers and conceptual queries.",
+      "keyTakeaway": "When batching and tail latency compete for accelerator cycles, dense vectors alone miss exact SKUs, error codes, and proper nouns, while BM25 misses synonyms; run both in parallel, fuse with RRF (k=60), and cross-encoder rerank only the top 20–50 candidates."
+    }
+  },
+  "pedagogicalFramework": "PRIME",
+  "prerequisites": [
+    {
+      "title": "Prompt Engineering, LLM Reasoning & Thinking Models",
+      "summary": "Systematic design of system instructions, context layout, delimiters, and constrained output schemas to make LLM behavior reliable, cache-friendly, and production-grade."
+    }
+  ],
+  "simulation": {
+    "title": "Hybrid Vector Search (BM25 + HNSW + RRF) — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "user",
+        "label": "Caller / Agent",
+        "role": "Prompt & Tool Loop"
+      },
+      {
+        "id": "gw",
+        "label": "LLM Gateway",
+        "role": "Routing & Guardrails"
+      },
+      {
+        "id": "ret",
+        "label": "Radix / Vector",
+        "role": "Prefix & RAG Lookup"
+      },
+      {
+        "id": "gpu",
+        "label": "GPU Pool",
+        "role": "Paged KV & Decode"
+      }
+    ],
+    "edges": [
+      {
+        "from": "user",
+        "to": "gw",
+        "label": "prompt"
+      },
+      {
+        "from": "gw",
+        "to": "ret",
+        "label": "prefix / RAG"
+      },
+      {
+        "from": "ret",
+        "to": "gpu",
+        "label": "batched decode"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "What is Hybrid Vector Search",
+        "actionLabel": "prompt",
+        "status": "healthy",
+        "activeNodeIds": [
+          "user",
+          "gw"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "prompt",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Caller / Agent sends work to LLM Gateway (What is Hybrid Vector Search)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Why Post-Filtering & Naive Score Addition Fail",
+        "actionLabel": "prefix / RAG",
+        "status": "healthy",
+        "activeNodeIds": [
+          "gw",
+          "ret"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "prefix / RAG",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "LLM Gateway coordinates with Radix / Vector while preserving the core invariant (Why Post-Filtering & Naive Score Addition Fail)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Where Hybrid Search Pays Off (and Where Simpler Indexes Win)",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "ret",
+          "gpu"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, GPU Pool absorbs pressure without cascading (Where Hybrid Search Pays Off (and Where Simpler Indexes Win))."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Inverted Indexes, Pagination & Retrieval Systems",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "user",
+          "gw",
+          "ret",
+          "gpu"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Inverted Indexes, Pagination & Retrieval Systems)."
+      }
+    ]
+  }
+}

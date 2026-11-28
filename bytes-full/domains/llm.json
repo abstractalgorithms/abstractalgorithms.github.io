@@ -1,0 +1,645 @@
+{
+  "id": "llm",
+  "slug": "llm",
+  "title": "Large Language Models (LLM) Systems & Inference",
+  "pedagogicalFramework": "SCOPE",
+  "spark": {
+    "summary": "Serving Large Language Models in production fails when treated like stateless CPU microservices: autoregressive decoding is strictly GPU HBM memory-bandwidth bound, unpaged KV caches waste 60\u201380% of VRAM via fragmentation, and static request batching stalls fast users behind 2,000-token generations. Engineering high-throughput LLM gateways requires separating compute-bound Prefill from memory-bound Decode, paging KV-cache blocks (PagedAttention), caching shared system prefixes via radix trees, and enforcing deterministic schema + prompt-injection guardrails.",
+    "keyTakeaway": "When architecting production LLM inference systems, separate compute-bound prefill from HBM-bandwidth-bound decode with continuous iteration-level batching and paged KV-cache blocks so GPU utilization scales without blowing Time-To-First-Token (TTFT) or tail inter-token latency.",
+    "byteSummary": "LLM inference splits into two radically different hardware regimes: **Prefill** processes all input prompt tokens in parallel (compute-bound on Tensor Cores, governing Time-To-First-Token / TTFT), while **Decode** generates one output token at a time sequentially (HBM memory-bandwidth bound, governing Time-Per-Output-Token / TPOT).\n\nBecause every decoding step must read the entire Key-Value (KV) cache from GPU HBM, VRAM capacity and memory bandwidth\u2014not FLOPs\u2014cap concurrent batch size. PagedAttention eliminates contiguous KV-cache fragmentation by mapping non-contiguous 16-token blocks via page tables, while RadixAttention / Prefix Caching reuses precomputed system prompts across requests.\n\nAt the application edge, production LLM systems enforce constrained JSON decoding (FSM token masking), semantic + exact prefix caching, and egress PII/citation verification."
+  },
+  "domain": {
+    "purpose": "Architect, optimize, and govern production LLM inference engines, KV-cache memory budgets, prefix caching, speculative decoding, and safety guardrails.",
+    "audience": [
+      "AI Infrastructure Engineers",
+      "Backend & Platform Architects",
+      "Staff/Principal Engineers"
+    ]
+  },
+  "prerequisites": [
+    {
+      "title": "Prefill (Compute-Bound) vs. Decode (HBM Memory-Bandwidth Bound)",
+      "summary": "Prefill saturates GPU matrix units across all prompt tokens simultaneously; Decode streams all model weights and KV-cache tensors from HBM for every single generated token."
+    },
+    {
+      "title": "KV-Cache Memory Footprint Math",
+      "summary": "Per-token KV cache size = 2 * layers * kv_heads * head_dim * bytes_per_element; long 32K-token contexts consume gigabytes of VRAM per active sequence."
+    }
+  ],
+  "learningJourney": [
+    {
+      "id": "01-prefill-decode-and-kv-physics",
+      "eyebrow": "STAGE 01 \u00b7 SHIFT IN MINDSET & GPU HARDWARE PHYSICS",
+      "title": "Prefill vs. Decode, Arithmetic Intensity & KV-Cache VRAM Math",
+      "level": "foundation",
+      "purpose": "Calculate exact GPU HBM memory and bandwidth limits for autoregressive Transformer inference.",
+      "explanation": {
+        "foundation": "During **Prefill** of a 4,000-token prompt, the GPU multiplies `[4000, d_model]` matrices in parallel\u2014achieving high arithmetic intensity (FLOPs per byte read from HBM). During **Decode**, batch size $B = 1$ multiplies `[1, d_model]` vectors: the GPU reads all model weights (e.g., 140 GB for a 70B FP16 model) from HBM just to produce *one* token.",
+        "core": "On an NVIDIA H100 (3.35 TB/s HBM3 bandwidth), reading 140 GB of weights takes $140 / 3350 \\approx 42\\text{ ms}$ minimum per token\u2014leaving Tensor Cores 95% idle unless you batch $B = 64\\text{\u2013}128$ sequences together.\n\n**KV-Cache Sizing Formula**: For a Llama-style 70B model (80 layers, 8 GQA KV heads, 128 head_dim, FP16 = 2 bytes):\n$$\\text{KV per token} = 2 \\times 80 \\times 8 \\times 128 \\times 2\\text{ B} = 327,680\\text{ B} \\approx 320\\text{ KB/token}$$\nA single 32,768-token session consumes **$10.5\\text{ GB}$ of VRAM** just for its KV cache.",
+        "deepDive": "**Disaggregated Prefill / Decode**: Long 16K-token prefills mixed into a decode batch cause 400 ms inter-token stalls for every concurrent user. High-scale serving engines (vLLM, TensorRT-LLM, DistServe) run dedicated Prefill GPUs and transfer KV-cache blocks over NVLink/RDMA to Decode GPUs so TPOT stays flat under 25 ms. [INSERT YOUR BENCHMARK / PROD NOTE]"
+      },
+      "sectionDiagram": {
+        "kind": "behavior-transition",
+        "eyebrow": "STATIC BATCHING VS. CONTINUOUS PAGING",
+        "title": "Eliminating VRAM Fragmentation & Tail Decode Stalls",
+        "before": {
+          "label": "Static Batching + Contiguous KV Allocation",
+          "metrics": [
+            "60-80% VRAM wasted on max_len",
+            "Fast requests wait for longest output",
+            "OOM at small concurrency"
+          ],
+          "steps": [
+            "Pre-allocate contiguous 32K KV buffer per request",
+            "Pad batch until longest sequence hits EOS",
+            "GPU sits idle while short sequences wait"
+          ]
+        },
+        "after": {
+          "label": "PagedAttention + Iteration-Level Batching",
+          "metrics": [
+            "<4% KV memory waste",
+            "Dynamic join/exit every token step",
+            "3x-4x higher throughput"
+          ],
+          "steps": [
+            "Allocate 16-token KV blocks on demand via page table",
+            "Evict finished sequence on exact EOS step",
+            "Admit waiting prefill immediately on next iteration"
+          ]
+        }
+      }
+    },
+    {
+      "id": "02-paged-attention-and-prefix-caching",
+      "eyebrow": "STAGE 02 \u00b7 CORE PRIMITIVES & MEMORY MANAGEMENT",
+      "title": "PagedAttention Block Tables & Radix-Tree Prefix Caching",
+      "level": "core",
+      "purpose": "Share immutable system-prompt KV blocks across requests via copy-on-write radix trees.",
+      "explanation": {
+        "foundation": "Inspired by OS virtual memory paging, **PagedAttention** splits each sequence's KV cache into fixed-size blocks (e.g., 16 tokens per block) mapped through a block table\u2014eliminating external fragmentation and internal over-reservation.",
+        "core": "In agentic and RAG workloads, 85% of prompt tokens are identical across requests (system instructions, JSON tool schemas, few-shot examples). **RadixAttention (Prefix Caching)** hashes token block prefixes into a radix tree in GPU HBM: when a new request shares a 3,000-token system prompt, it links directly to existing read-only KV blocks with reference counting\u2014cutting **TTFT by 5x\u201310x** and saving prefill FLOPs.",
+        "deepDive": "**KV-Cache Offloading Hierarchy**: Warm KV blocks evicted from GPU HBM spill asynchronously to host CPU DRAM over PCIe Gen5 and local NVMe, restoring multi-turn chat sessions without recomputing attention."
+      },
+      "sectionDiagram": {
+        "kind": "cache-tier",
+        "eyebrow": "MULTI-TIER KV & PREFIX CACHE",
+        "title": "Sharing System-Prompt KV Blocks Across Concurrent Sessions",
+        "nodes": [
+          {
+            "id": "req",
+            "label": "Incoming Prompt (3K Sys + 200 User)",
+            "detail": "Hashes 16-token prefix blocks"
+          },
+          {
+            "id": "hbm",
+            "label": "GPU HBM Radix KV Cache",
+            "detail": "Zero-compute hit on 3K system prefix (<5 ms)"
+          },
+          {
+            "id": "dram",
+            "label": "Host CPU DRAM KV Tier",
+            "detail": "Warm multi-turn session spillover"
+          }
+        ],
+        "cards": [
+          {
+            "title": "Copy-on-Write Sharing",
+            "body": "100 concurrent agents share one copy of tool schemas in GPU VRAM."
+          },
+          {
+            "title": "Sub-50 ms TTFT",
+            "body": "Only the 200 new user tokens run through prefill matrix multiplication."
+          }
+        ],
+        "summary": "Block-level prefix caching eliminates redundant prefill compute across shared system prompts and multi-turn conversations."
+      }
+    },
+    {
+      "id": "03-speculative-decoding-and-quantization",
+      "eyebrow": "STAGE 03 \u00b7 LATENCY ACCELERATION & QUANTIZATION",
+      "title": "FP8/INT4 Weight Quantization & Speculative Decoding",
+      "level": "core",
+      "purpose": "Break the single-request HBM bandwidth wall using low-bit weights and draft-verify token speculation.",
+      "explanation": {
+        "foundation": "Because Decode is memory-bandwidth bound, shrinking model weights from 16-bit (`FP16`) to 8-bit (`FP8` on H100) or 4-bit (`AWQ`/`GPTQ` `INT4`) halves or quarters HBM bytes transferred per token\u2014nearly doubling single-stream token generation speed.",
+        "core": "**Speculative Decoding (EAGLE / Medusa / Draft Model)**: A tiny draft model (or multi-head MTP predictor) guesses the next $\\gamma = 5$ tokens autoregressively in ~4 ms, and the target 70B model verifies all 5 tokens in **one parallel forward pass** (identical arithmetic cost to 1 decode step). Using lossless rejection sampling, the output distribution is **mathematically identical** to greedy/nucleus sampling from the 70B model alone, yielding **2.0x\u20132.8x faster TPOT**.",
+        "deepDive": "**Quantization Calibration Warning**: Never quantize sensitive outlier activation channels blindly; activation-aware weight quantization (AWQ) or FP8 per-channel scaling preserves coding and math reasoning accuracy within < 0.5% of FP16."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "LOSSLESS SPECULATIVE DECODING",
+        "title": "Drafting 5 Candidate Tokens & Verifying in One Target Forward Pass",
+        "actors": [
+          "Draft / MTP Head",
+          "Target 70B Model",
+          "Rejection Sampler"
+        ],
+        "events": [
+          {
+            "from": "Draft / MTP Head",
+            "to": "Target 70B Model",
+            "label": "1. Propose 5 tokens [t1, t2, t3, t4, t5] in 4 ms"
+          },
+          {
+            "from": "Target 70B Model",
+            "to": "Rejection Sampler",
+            "label": "2. Score all 5 positions in 1 parallel pass (42 ms)"
+          },
+          {
+            "from": "Rejection Sampler",
+            "to": "Draft / MTP Head",
+            "label": "3. Accept 4 matching tokens + sample 5th -> 4x throughput"
+          }
+        ],
+        "summary": "Parallel verification turns memory-bound sequential steps into compute-efficient batch verification without changing output quality."
+      }
+    },
+    {
+      "id": "04-structured-outputs-and-python-budgeter",
+      "eyebrow": "STAGE 04 \u00b7 DETERMINISTIC GUARDRAILS & KV-CACHE SIZER",
+      "title": "Constrained FSM JSON Decoding & KV-Cache Capacity Calculator in Python",
+      "level": "core",
+      "purpose": "Guarantee 100% schema-valid JSON outputs and prevent GPU VRAM OOM via exact KV-cache admission control.",
+      "explanation": {
+        "foundation": "Prompting an LLM with *'Please output valid JSON'* still fails 2\u20135% of the time on escaped quotes or trailing commas. **Constrained Decoding** compiles a JSON Schema / Regex into a Finite State Machine (FSM) and masks out invalid vocabulary logits (`-inf`) before softmax at every token step\u2014guaranteeing 100% syntactic schema compliance.",
+        "core": "```python\nfrom dataclasses import dataclass\n\n@dataclass(frozen=True)\nclass KvCacheBudget:\n    bytes_per_token: int\n    max_concurrent_sequences: int\n    total_kv_gb: float\n\ndef calculate_kv_cache_capacity(\n    total_gpu_vram_gb: float,\n    model_weights_gb: float,\n    num_layers: int,\n    num_kv_heads: int,\n    head_dim: int,\n    kv_bytes_per_elem: int = 2,  # 2 for FP16/BF16, 1 for FP8\n    avg_seq_len_tokens: int = 8192,\n    vram_utilization_cap: float = 0.90,\n) -> KvCacheBudget:\n    usable_vram_bytes = int(total_gpu_vram_gb * vram_utilization_cap * (1024**3))\n    weights_bytes = int(model_weights_gb * (1024**3))\n    available_kv_bytes = usable_vram_bytes - weights_bytes\n    if available_kv_bytes <= 0:\n        raise ValueError(\"Model weights exceed usable GPU VRAM budget\")\n\n    bytes_per_token = 2 * num_layers * num_kv_heads * head_dim * kv_bytes_per_elem\n    bytes_per_seq = bytes_per_token * avg_seq_len_tokens\n    max_seqs = available_kv_bytes // bytes_per_seq\n\n    return KvCacheBudget(\n        bytes_per_token=bytes_per_token,\n        max_concurrent_sequences=max_seqs,\n        total_kv_gb=round(available_kv_bytes / (1024**3), 2),\n    )\n```",
+        "deepDive": "Notice how `kv_bytes_per_elem = 1` (**FP8 KV-cache quantization**) doubles `max_concurrent_sequences` immediately on Hopper/Ada GPUs with negligible perplexity impact."
+      },
+      "decisionFramework": {
+        "problem": "How to keep interactive chat Time-Per-Output-Token (TPOT) under 30 ms while serving mixed 500-token and 16,000-token requests.",
+        "naiveSolution": "Mix long 16K-token prefills into the same GPU batch loop as active decode requests with no chunking.",
+        "whyItFails": "A single 16K prefill monopolizes the GPU for 300\u2013500 ms, freezing token streaming for every active user on that GPU.",
+        "alternatives": "Compare unchunked mixed batching, Chunked Prefill (512-token slices), and Disaggregated Prefill/Decode pools.",
+        "decision": "Enable Chunked Prefill (slicing long prompts into 512-token chunks piggybacked onto decode steps) on single-node deployments, and separate Prefill vs. Decode GPU pools at multi-node scale.",
+        "tradeOffs": "Caps decode jitter under 30 ms TPOT in exchange for slightly higher scheduler complexity or KV transfer bandwidth."
+      },
+      "decisionExercise": {
+        "prompt": "Your 70B FP16 inference cluster runs on 8x H100 (80 GB) GPUs. Users report that streaming responses smoothly emit tokens at 25 ms/token, then abruptly freeze for 600 ms whenever another user submits a 24,000-token document summary. What architectural fix eliminates the 600 ms freeze?",
+        "options": [
+          {
+            "id": "chunked-or-disagg-prefill",
+            "label": "Enable Chunked Prefill (splitting 24K prompts into 512-token slices) or route long prefills to dedicated Prefill GPUs disaggregated from Decode GPUs.",
+            "isCorrect": true,
+            "explanation": "Correct: preventing huge prefills from monopolizing a single forward pass eliminates head-of-line decode stalls."
+          },
+          {
+            "id": "increase-temperature",
+            "label": "Increase sampling temperature from 0.2 to 1.0 so tokens generate faster.",
+            "isCorrect": false,
+            "explanation": "Sampling temperature changes token probability sharpness, not GPU matrix-multiplication compute time."
+          },
+          {
+            "id": "disable-paged-attention",
+            "label": "Disable PagedAttention and pre-allocate 32K contiguous buffers per request.",
+            "isCorrect": false,
+            "explanation": "Pre-allocating contiguous buffers wastes VRAM and reduces batch concurrency without stopping long prefill stalls."
+          }
+        ]
+      },
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "DISAGGREGATED LLM SERVING",
+        "title": "Separating Compute-Bound Prefill GPUs From Bandwidth-Bound Decode GPUs",
+        "graphNodes": [
+          {
+            "id": "gw",
+            "label": "LLM Router (Prefix-Cache Aware)"
+          },
+          {
+            "id": "pf",
+            "label": "Prefill GPU Pool (Compute Optimized)"
+          },
+          {
+            "id": "kv",
+            "label": "RDMA / NVLink KV Transfer"
+          },
+          {
+            "id": "dc",
+            "label": "Decode GPU Pool (Continuous Batching)"
+          }
+        ],
+        "graphEdges": [
+          {
+            "from": "gw",
+            "to": "pf",
+            "label": "1. Compute prompt KV blocks"
+          },
+          {
+            "from": "pf",
+            "to": "kv",
+            "label": "2. Stream paged KV blocks"
+          },
+          {
+            "from": "kv",
+            "to": "dc",
+            "label": "3. Admit to decode batch"
+          },
+          {
+            "from": "dc",
+            "to": "gw",
+            "label": "4. Stream SSE tokens (<25 ms TPOT)"
+          }
+        ]
+      }
+    },
+    {
+      "id": "05-guardrails-evals-and-when-not-to-use",
+      "eyebrow": "STAGE 05 \u00b7 SAFETY, HALLUCINATION DEFENSE & MODEL ROUTING",
+      "title": "Prompt-Injection Sandboxing, Cascaded Model Routing & When Not to Use an LLM",
+      "level": "deepDive",
+      "purpose": "Defend production LLM endpoints against injection/exfiltration and avoid paying GPU costs for deterministic tasks.",
+      "explanation": {
+        "foundation": "**Defense-in-Depth Guardrails**:\n1. **Input Shield**: Fast lightweight classifier + heuristic scanner blocking jailbreaks and PII leaks.\n2. **Data-Plane Isolation**: Wrap retrieved RAG/tool outputs in escaped XML tags (`<untrusted_context>`) with explicit system instructions.\n3. **Output Verifier**: Constrained JSON schema decoding + regex/PII egress filter + deterministic citation verification.",
+        "core": "**Multi-Model Cascaded Routing**: Do not send classification, entity extraction, or simple FAQ queries to a 70B/405B frontier model. Route 70% of structured/simple traffic to a fine-tuned 8B model (10x cheaper, 4x faster) and escalate only multi-step reasoning or low-confidence responses to the flagship model.\n\n**When NOT to Use an LLM**: Never use a generative LLM for deterministic arithmetic, exact SQL aggregations, regex validation, or low-latency (< 5 ms) hot-path routing\u2014deterministic code and classical ML classifiers are 1,000x faster, cheaper, and 100% reproducible.",
+        "deepDive": "**Assumptions & Glossary**: **TTFT**: Time-To-First-Token (prefill latency). **TPOT**: Time-Per-Output-Token (decode inter-token latency). **GQA**: Grouped-Query Attention (shares KV heads across multiple query heads to shrink KV cache size by 4x\u20138x). **PagedAttention**: Virtual-memory-style block paging for GPU KV caches."
+      },
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "REQUEST ADMISSION & KV PREEMPTION",
+        "title": "Handling GPU VRAM Watermarks Under Burst Concurrency",
+        "states": [
+          {
+            "id": "prefill",
+            "label": "PREFILL_COMPUTE"
+          },
+          {
+            "id": "decode",
+            "label": "DECODE_BATCH_ACTIVE"
+          },
+          {
+            "id": "swapped",
+            "label": "KV_SWAPPED_TO_CPU_RAM"
+          },
+          {
+            "id": "done",
+            "label": "EOS_BLOCKS_FREED"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "prefill",
+            "to": "decode",
+            "label": "Initial KV blocks allocated"
+          },
+          {
+            "from": "decode",
+            "to": "swapped",
+            "label": "VRAM > 95% -> preempt lowest-priority seq"
+          },
+          {
+            "from": "swapped",
+            "to": "decode",
+            "label": "VRAM frees -> reload KV blocks"
+          },
+          {
+            "from": "decode",
+            "to": "done",
+            "label": "EOS reached -> release KV blocks"
+          }
+        ]
+      }
+    }
+  ],
+  "endToEndExample": {
+    "title": "Enterprise Multi-Model LLM Inference Gateway (600 Req/Sec)",
+    "scenario": "An enterprise assistant serves 600 requests/sec across code review, document Q&A, and JSON tool calling with < 250 ms TTFT, < 25 ms TPOT, 100% schema-valid JSON outputs, and zero cross-tenant KV cache leaks.",
+    "architecture": "Prefix-aware consistent-hash routing directs requests to vLLM/TensorRT-LLM workers running FP8 weights + FP8 KV caches with PagedAttention, Chunked Prefill (512 tokens), EAGLE speculative decoding, and FSM-constrained JSON decoding."
+  },
+  "decisionFramework": [
+    {
+      "question": "Why is LLM autoregressive decoding bound by GPU HBM memory bandwidth rather than Tensor Core FLOPs?",
+      "reason": "At small batch sizes, generating 1 token reads tens of gigabytes of model weights and KV caches from HBM for just a few matrix-vector operations."
+    },
+    {
+      "question": "How do you eliminate long-prompt prefill spikes from stalling concurrent streaming users?",
+      "reason": "Use Chunked Prefill (512-token slices) or Disaggregated Prefill/Decode GPU pools."
+    }
+  ],
+  "simulation": {
+    "title": "PagedAttention & Prefix-Cache Hit Simulator",
+    "nodes": [
+      {
+        "id": "gw",
+        "label": "Prefix-Aware Router",
+        "role": "Hashes System Prompt"
+      },
+      {
+        "id": "kv",
+        "label": "GPU HBM Radix Cache",
+        "role": "Shared 3K System Blocks"
+      },
+      {
+        "id": "eng",
+        "label": "Continuous Batch Engine",
+        "role": "Chunked Prefill + Decode"
+      }
+    ],
+    "edges": [
+      {
+        "from": "gw",
+        "to": "kv",
+        "label": "Lookup 3K-token prefix"
+      },
+      {
+        "from": "kv",
+        "to": "eng",
+        "label": "Reuse KV blocks -> prefill 150 tokens only"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Radix Prefix Cache Hit",
+        "actionLabel": "Reuse 3,000 system prompt KV blocks (0 prefill FLOPs)",
+        "status": "healthy",
+        "activeNodeIds": [
+          "gw",
+          "kv"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "prefix_hit_tokens": 3000,
+          "ttft_ms": 38,
+          "vram_saved_mb": 960
+        },
+        "explanation": "Prefix cache reuses existing read-only KV blocks, dropping TTFT from 310 ms to 38 ms."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Continuous Iteration Batching",
+        "actionLabel": "Step 48 active sequences at 21 ms TPOT",
+        "status": "healthy",
+        "activeNodeIds": [
+          "kv",
+          "eng"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "active_seqs": 48,
+          "tpot_ms": 21,
+          "kv_fragmentation_pct": 2.4
+        },
+        "explanation": "Paged 16-token blocks keep VRAM utilization above 92% with smooth token streaming."
+      }
+    ]
+  },
+  "practice": {
+    "knowledgeCheck": {
+      "id": "kc-llm-1",
+      "question": "Why is autoregressive LLM token generation (Decode) primarily bound by GPU HBM memory bandwidth rather than compute FLOPs at small batch sizes?",
+      "options": [
+        {
+          "id": "a",
+          "text": "Because GPUs disable Tensor Cores during text generation.",
+          "correct": false,
+          "feedback": "Tensor Cores are active, but matrix-vector multiplication has very low arithmetic intensity (FLOPs per byte loaded)."
+        },
+        {
+          "id": "b",
+          "text": "Every single output token requires streaming the entire model weights and KV cache from HBM memory to compute just one token position.",
+          "correct": true,
+          "feedback": "Correct: reading 140 GB of weights at 3.35 TB/s takes ~42 ms regardless of compute speed until batch size grows large enough to amortize weight reads."
+        },
+        {
+          "id": "c",
+          "text": "Because tokenizers run on slow magnetic hard drives.",
+          "correct": false,
+          "feedback": "Tokenization takes microseconds on CPU."
+        },
+        {
+          "id": "d",
+          "text": "Because softmax cannot execute in parallel across attention heads.",
+          "correct": false,
+          "feedback": "Attention heads execute in parallel; HBM bandwidth is the physical bottleneck."
+        }
+      ],
+      "explanation": "Understanding HBM bandwidth limits explains why continuous batching, quantization, and speculative decoding speed up decode."
+    },
+    "knowledgeChecks": [
+      {
+        "id": "kc-llm-1",
+        "question": "Why is autoregressive LLM token generation (Decode) primarily bound by GPU HBM memory bandwidth rather than compute FLOPs at small batch sizes?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Because GPUs disable Tensor Cores during text generation.",
+            "correct": false,
+            "feedback": "Tensor Cores are active, but matrix-vector multiplication has very low arithmetic intensity (FLOPs per byte loaded)."
+          },
+          {
+            "id": "b",
+            "text": "Every single output token requires streaming the entire model weights and KV cache from HBM memory to compute just one token position.",
+            "correct": true,
+            "feedback": "Correct: reading 140 GB of weights at 3.35 TB/s takes ~42 ms regardless of compute speed until batch size grows large enough to amortize weight reads."
+          },
+          {
+            "id": "c",
+            "text": "Because tokenizers run on slow magnetic hard drives.",
+            "correct": false,
+            "feedback": "Tokenization takes microseconds on CPU."
+          },
+          {
+            "id": "d",
+            "text": "Because softmax cannot execute in parallel across attention heads.",
+            "correct": false,
+            "feedback": "Attention heads execute in parallel; HBM bandwidth is the physical bottleneck."
+          }
+        ],
+        "explanation": "Understanding HBM bandwidth limits explains why continuous batching, quantization, and speculative decoding speed up decode."
+      },
+      {
+        "id": "kc-llm-2",
+        "question": "How does PagedAttention solve GPU VRAM exhaustion during high-concurrency LLM serving?",
+        "options": [
+          {
+            "id": "a",
+            "text": "It compresses model weights to 1-bit integers.",
+            "correct": false,
+            "feedback": "PagedAttention is a KV-cache virtual memory allocator, not a weight quantization method."
+          },
+          {
+            "id": "b",
+            "text": "It partitions each sequence's KV cache into non-contiguous fixed-size token blocks managed via a page table, eliminating contiguous pre-allocation fragmentation and enabling prefix block sharing.",
+            "correct": true,
+            "feedback": "Correct: paging cuts KV memory waste from ~70% down to <4% and allows copy-on-write sharing of system prompts."
+          },
+          {
+            "id": "c",
+            "text": "It deletes the KV cache after every 10 generated tokens.",
+            "correct": false,
+            "feedback": "Deleting KV blocks forces expensive O(N^2) recomputation."
+          },
+          {
+            "id": "d",
+            "text": "It moves all matrix multiplications onto the host CPU.",
+            "correct": false,
+            "feedback": "All attention math stays on the GPU."
+          }
+        ],
+        "explanation": "PagedAttention eliminates internal and external KV-cache fragmentation in GPU HBM."
+      },
+      {
+        "id": "kc-llm-3",
+        "question": "How does Speculative Decoding accelerate LLM inference without degrading output quality?",
+        "options": [
+          {
+            "id": "a",
+            "text": "It skips attention layers on every second token.",
+            "correct": false,
+            "feedback": "Skipping layers alters the output distribution."
+          },
+          {
+            "id": "b",
+            "text": "A fast draft model proposes K candidate tokens, and the large target model verifies all K tokens in one parallel forward pass using lossless rejection sampling.",
+            "correct": true,
+            "feedback": "Correct: parallel verification costs roughly one target forward pass while accepting multiple tokens per step with mathematically identical distribution."
+          },
+          {
+            "id": "c",
+            "text": "It caches user answers in localStorage.",
+            "correct": false,
+            "feedback": "Speculative decoding accelerates token generation on novel prompts."
+          },
+          {
+            "id": "d",
+            "text": "It reduces context length to 128 tokens.",
+            "correct": false,
+            "feedback": "Speculative decoding works across full context windows."
+          }
+        ],
+        "explanation": "Speculative decoding trades spare Tensor Core compute during memory-bound decode for 2x\u20132.8x faster token throughput."
+      },
+      {
+        "id": "kc-llm-4",
+        "question": "How does Constrained Decoding guarantee 100% schema-valid JSON output from an LLM?",
+        "options": [
+          {
+            "id": "a",
+            "text": "By retrying failed API calls 10 times until valid JSON appears.",
+            "correct": false,
+            "feedback": "Retries add latency and cost without guaranteeing validity."
+          },
+          {
+            "id": "b",
+            "text": "By compiling the JSON Schema into a Finite State Machine (FSM) and masking invalid vocabulary token logits to `-inf` before sampling at each step.",
+            "correct": true,
+            "feedback": "Correct: FSM logit masking makes it mathematically impossible for the model to emit syntax-violating tokens."
+          },
+          {
+            "id": "c",
+            "text": "By fine-tuning the model on JSON files for 1 epoch.",
+            "correct": false,
+            "feedback": "Fine-tuning improves formatting rates but cannot guarantee 100% structural validity."
+          },
+          {
+            "id": "d",
+            "text": "By stripping all curly braces from the prompt.",
+            "correct": false,
+            "feedback": "JSON requires valid structural braces and quotes."
+          }
+        ],
+        "explanation": "FSM-guided logit masking guarantees structural schema compliance on the very first generation pass."
+      }
+    ]
+  },
+  "relatedConcepts": [
+    {
+      "slug": "prefill-decode-split",
+      "title": "Prefill vs. Decode Split & Chunked Prefill"
+    },
+    {
+      "slug": "radix-prefix-caching",
+      "title": "Radix-Tree KV Prefix Caching"
+    },
+    {
+      "slug": "quantization-llm-inference",
+      "title": "Quantization & Speculative Decoding in LLM Inference"
+    }
+  ],
+  "courseCurriculum": [
+    {
+      "moduleNumber": 1,
+      "id": "01-prefill-decode-and-kv-physics",
+      "title": "Prefill vs. Decode & KV-Cache VRAM Physics",
+      "description": "Arithmetic intensity, HBM bandwidth ceilings, and per-token KV sizing.",
+      "conceptSlugs": [
+        "prefill-decode-split"
+      ]
+    },
+    {
+      "moduleNumber": 2,
+      "id": "02-paged-attention-and-prefix-caching",
+      "title": "PagedAttention & Radix Prefix Caching",
+      "description": "Virtual-memory KV block paging and copy-on-write system prompt sharing.",
+      "conceptSlugs": [
+        "radix-prefix-caching"
+      ]
+    },
+    {
+      "moduleNumber": 3,
+      "id": "03-speculative-decoding-and-quantization",
+      "title": "Quantization & Lossless Speculative Decoding",
+      "description": "FP8/AWQ weight compression and parallel draft-verify token acceleration.",
+      "conceptSlugs": [
+        "quantization-llm-inference"
+      ]
+    },
+    {
+      "moduleNumber": 4,
+      "id": "04-structured-outputs-and-python-budgeter",
+      "title": "FSM Constrained Decoding & KV Admission Control",
+      "description": "100% valid JSON generation and exact VRAM capacity sizing.",
+      "conceptSlugs": [
+        "model-serving-batching"
+      ]
+    },
+    {
+      "moduleNumber": 5,
+      "id": "05-guardrails-evals-and-when-not-to-use",
+      "title": "Prompt Guardrails, Cascaded Routing & Boundaries",
+      "description": "Indirect injection defense, 8B->70B cascades, and non-LLM boundaries.",
+      "conceptSlugs": [
+        "prompt-injection-defense",
+        "multi-model-llm-routing"
+      ]
+    }
+  ],
+  "appliedCaseStudies": [
+    {
+      "source": "problem",
+      "slug": "design-rag-gateway",
+      "title": "Multi-Tenant Enterprise RAG Gateway With ACL Enforcement",
+      "summary": "Integrating pre-filtered hybrid search, XML prompt sandboxing, and deterministic citation verification."
+    },
+    {
+      "source": "problem",
+      "slug": "design-foundation-model-semantic-caching-tier",
+      "title": "Foundation Model Semantic & Prefix Caching Tier",
+      "summary": "Cutting LLM inference latency and GPU cost via two-tier exact prefix and vector semantic caches."
+    }
+  ],
+  "tipsAndTricks": [
+    "Size GPU VRAM around peak KV-cache concurrency (`2 * layers * kv_heads * head_dim * bytes`) before choosing model quantization.",
+    "Enable Chunked Prefill (`512` tokens) so long document summaries never freeze streaming tokens for concurrent users.",
+    "Route prefix-heavy agent traffic using consistent hashing on the first 256 prompt tokens to maximize GPU HBM Radix KV cache hits."
+  ],
+  "finalSummary": "Production LLM engineering treats inference as a memory-bandwidth-bound distributed systems problem: page KV-cache blocks to eliminate fragmentation, share system prefixes via radix trees, isolate long prefills from decode loops, and enforce FSM structured outputs and XML data sandboxing.",
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Large Language Models generate text one token at a time, storing conversation memory in a GPU 'KV cache'. Production LLM servers batch multiple users together and reuse shared system-prompt memory so responses stream fast without running out of GPU RAM.",
+      "keyTakeaway": "When deploying LLMs for real users, reuse cached system prompts and batch incoming requests dynamically so GPUs stay busy and responses stream smoothly.",
+      "byteSummary": "Running an LLM for one user at a time leaves expensive GPUs waiting on memory transfers. Modern inference engines pack many users into continuous batches and share cached system instructions across requests, cutting response times and GPU bills."
+    },
+    "intermediate": {
+      "summary": "Optimize LLM serving across Prefill (compute-bound TTFT) and Decode (HBM bandwidth-bound TPOT) using PagedAttention block tables, RadixAttention prefix caching, Chunked Prefill, FP8 quantization, and FSM-constrained JSON decoding.",
+      "keyTakeaway": "When architecting production LLM inference systems, separate compute-bound prefill from HBM-bandwidth-bound decode with continuous iteration-level batching and paged KV-cache blocks so GPU utilization scales without blowing Time-To-First-Token (TTFT) or tail inter-token latency.",
+      "byteSummary": "Contiguous KV-cache allocation wastes up to 70% of GPU HBM, while unchunked long prompts stall active token streams. PagedAttention + Chunked Prefill + prefix caching unlock high concurrency at sub-25 ms inter-token latency."
+    },
+    "advanced": {
+      "summary": "Disaggregate Prefill and Decode across NVLink/RDMA pools, deploy FP8 KV-cache quantization + EAGLE/MTP lossless speculative decoding, and route requests with prefix-aware consistent hashing plus multi-tier HBM->DRAM KV offloading.",
+      "keyTakeaway": "When scaling multi-hundred-RPS LLM clusters, disaggregate Prefill and Decode GPU pools, pair FP8 KV quantization with lossless speculative decoding, and route by prompt-prefix hashes to maximize HBM radix cache hit rates.",
+      "byteSummary": "At high scale, mixing 16K-token prefills with tight-TPOT decode loops creates unavoidable interference. Disaggregated Prefill/Decode clusters paired with speculative decoding and multi-tier KV offloading maximize goodput per GPU dollar."
+    }
+  }
+}

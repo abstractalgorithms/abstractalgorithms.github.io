@@ -1,0 +1,783 @@
+{
+  "version": 3,
+  "slug": "design-realtime-road-congestion-analytics",
+  "title": "Design a Real-Time Geospatial Road Congestion Analytics System (1M Pings/sec)",
+  "domain": "system-design",
+  "spark": {
+    "summary": "Design a Real-Time Geospatial Road Congestion Analytics platform ingesting 1M GPS pings/sec from connected vehicles and mobile apps to power live traffic heatmaps and <10ms dynamic ETA routing.",
+    "keyTakeaway": "If 10M active vehicles each send 1 ping every 10s, raw ingress is 1M pings/sec, batch GPS pings at the mobile SDK, ingest via gRPC into Kafka, run stateful Flink HMM map-matching + 60s tumbling windows, and serve Redis H3 tiles alongside ClickHouse spatial analytics.",
+    "byteSummary": "Ingesting 1,000,000 GPS pings per second globally requires careful edge batching, spatial sharding, and dual-speed serving.\n\nConnected vehicles and mobile SDKs buffer 5–10 pings and flush compressed Protobuf batches over gRPC Ingest into Kafka. Apache Flink performs Viterbi HMM map-matching and 60-second tumbling-window harmonic speed aggregation.\n\nLive segment speeds and H3 tile summaries write to Redis Geo/H3 Tile Cache (<5ms reads) for Live Traffic Heatmaps and Dynamic ETA Routing APIs, while full trajectories stream into ClickHouse for historical spatial analytics."
+  },
+  "learningJourney": [
+    {
+      "id": "stage-1",
+      "stageNumber": 1,
+      "level": "foundation",
+      "title": "1M GPS Pings/sec Scale & Edge Batching",
+      "purpose": "Quantify bandwidth, RPC rates, and mobile battery/network savings.",
+      "explanation": {
+        "foundation": "If 10M active vehicles each send 1 ping every 10s, raw ingress is 1M pings/sec.",
+        "core": "Sending 1M individual HTTP requests/sec wastes TLS/header overhead.",
+        "deepDive": "Mobile SDKs batch 5 pings (50s window) into a 120-byte Protobuf payload, cutting gRPC QPS from 1M to 200K QPS (~24 MB/s)."
+      },
+      "codeExample": "def compute_ingested_qps(pings_per_sec=1_000_000, pings_per_batch=5, bytes_per_batch=120):\n    rpc_qps = pings_per_sec // pings_per_batch\n    mb_per_sec = (rpc_qps * bytes_per_batch) / (1024 * 1024)\n    return {'grpc_qps': rpc_qps, 'bandwidth_mb_s': round(mb_per_sec, 2)}",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Ingress Sizing",
+        "title": "SDK 5-Ping Batching: 1M Pings/s -> 200K gRPC QPS",
+        "nodes": [
+          {
+            "id": "veh",
+            "label": "10M Active Vehicles",
+            "sub": "1 ping / 10s each",
+            "role": "Telemetry source"
+          },
+          {
+            "id": "sdk",
+            "label": "Mobile/Car SDK Batcher",
+            "sub": "5-ping Protobuf (120B)",
+            "role": "5x RPC reduction"
+          },
+          {
+            "id": "grp",
+            "label": "gRPC Ingest Tier",
+            "sub": "200K QPS, 24 MB/s",
+            "role": "Stateless gateway"
+          },
+          {
+            "id": "kfk",
+            "label": "Kafka Telemetry Bus",
+            "sub": "Partitioned by vehicle_id",
+            "role": "Durable buffer"
+          }
+        ],
+        "edges": [
+          {
+            "from": "veh",
+            "to": "sdk",
+            "label": "Buffers 5 pings"
+          },
+          {
+            "from": "sdk",
+            "to": "grp",
+            "label": "Streams Protobuf"
+          },
+          {
+            "from": "grp",
+            "to": "kfk",
+            "label": "Publishes batches"
+          }
+        ],
+        "cards": [
+          {
+            "label": "5x Lower RPCs",
+            "detail": "Batching 5 pings per gRPC frame slashes mobile battery drain and server TLS overhead."
+          },
+          {
+            "label": "Pre-Sorted Trajectory",
+            "detail": "A 5-ping batch arrives together, giving Flink's HMM instant multi-point context."
+          }
+        ],
+        "summary": "Client-side 5-ping Protobuf batching cuts ingress QPS by 5x while giving HMM instant trajectory context.",
+        "caption": "Compressing batches at the edge keeps global ingress under 25 MB/s."
+      }
+    },
+    {
+      "id": "stage-2",
+      "stageNumber": 2,
+      "level": "foundation",
+      "title": "Dual-Sink Serving & Spatial Analytics Topology",
+      "purpose": "Serve live heatmaps and ETA APIs from Redis while archiving trajectories in ClickHouse.",
+      "explanation": {
+        "foundation": "Think of **Dual-Sink Serving & Spatial Analytics Topology** as the intuition layer for Design a Real-Time Geospatial Road Congestion Analytics System (1M Pings/sec): Serve live heatmaps and ETA APIs from Redis while archiving trajectories in ClickHouse.",
+        "core": "Flink outputs 60-second aggregated segment speeds to two sinks: Redis H3 Tile Cache (for sub-5ms traffic tile rendering and CCH ETA graph updates) and ClickHouse Spatial Analytics (storing raw/snapped trajectories for urban planning and ST-GNN training).",
+        "deepDive": "Under heavy load or partial failure, dual-sink serving & spatial analytics topology becomes a critical lever for predictable latency and correctness. Production traffic analytics blueprint with 15-min ephemeral session IDs, 200m endpoint privacy stripping, and 2-minute Z-score incident detection."
+      },
+      "codeExample": "def emit_segment_speed(segment_id, h3_res6, speed_kmh, sample_cnt):\n    if sample_cnt >= 3:\n        redis_pipe.hset(f'h3:tile:{h3_res6}', segment_id, f'{speed_kmh}:{int(time.time())}')\n    clickhouse_batch.append((segment_id, h3_res6, speed_kmh, sample_cnt))",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "System Blueprint",
+        "title": "Flink Map-Matching -> Redis Tiles + ClickHouse",
+        "nodes": [
+          {
+            "id": "kfk",
+            "label": "Kafka GPS Bus",
+            "sub": "200K batches/s",
+            "role": "Ingestion log"
+          },
+          {
+            "id": "flk",
+            "label": "Flink HMM + 60s Window",
+            "sub": "Map-match & harmonic mean",
+            "role": "Stream processor"
+          },
+          {
+            "id": "rds",
+            "label": "Redis H3 Tile Cache",
+            "sub": "60s TTL, <5ms reads",
+            "role": "Hot serving tier"
+          },
+          {
+            "id": "ch",
+            "label": "ClickHouse Spatial OLAP",
+            "sub": "90-day Zstd history",
+            "role": "Analytics lake"
+          }
+        ],
+        "edges": [
+          {
+            "from": "kfk",
+            "to": "flk",
+            "label": "Streams trajectories"
+          },
+          {
+            "from": "flk",
+            "to": "rds",
+            "label": "Pushes live tile speeds"
+          },
+          {
+            "from": "flk",
+            "to": "ch",
+            "label": "Appends historical rows"
+          }
+        ],
+        "cards": [
+          {
+            "label": "H3 Tile Grouping",
+            "detail": "Grouping segment speeds into one Redis Hash per H3 Res-6 cell fetches an entire map tile in 1 RTT."
+          },
+          {
+            "label": "90-Day OLAP",
+            "detail": "ClickHouse answers city-wide bottleneck queries across months in seconds."
+          }
+        ],
+        "summary": "Redis H3 tile hashes power <5ms map overlays while ClickHouse retains 90-day spatial history.",
+        "caption": "Packing segment speeds by H3 Res-6 parent cell lets map clients fetch whole viewport tiles in one call."
+      },
+      "decisionFramework": {
+        "problem": "How to implement Design a Real-Time Geospatial Road Congestion Analytics System (1M Pings/sec) without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "If 10M active vehicles each send 1 ping every 10s, raw ingress is 1M pings/sec, batch GPS pings at the mobile SDK, ingest via gRPC into Kafka, run stateful Flink HMM map-matching + 60s tumbling windows, and serve Redis H3 tiles alongside ClickHouse spatial analytics.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Design a Real-Time Geospatial Road Congestion Analytics System (1M Pings/sec) experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-3",
+      "stageNumber": 3,
+      "level": "intermediate",
+      "title": "Flink Map-Matching with Local OSM Tile Caching",
+      "purpose": "Execute 1M HMM snaps/sec in Flink without hitting an external spatial database.",
+      "explanation": {
+        "foundation": "Think of **Flink Map-Matching with Local OSM Tile Caching** as the intuition layer for Design a Real-Time Geospatial Road Congestion Analytics System (1M Pings/sec): Execute 1M HMM snaps/sec in Flink without hitting an external spatial database.",
+        "core": "Querying PostGIS over the network 1M times/sec is impossible. Each Flink TaskManager memory-maps a compact binary OSM road-graph tile (~4 GB per continent) or lazy-loads H3 Res-6 OSM tiles into local RocksDB/RAM, snapping pings in <50 microseconds.",
+        "deepDive": "Under heavy load or partial failure, flink map-matching with local osm tile caching becomes a critical lever for predictable latency and correctness. Production traffic analytics blueprint with 15-min ephemeral session IDs, 200m endpoint privacy stripping, and 2-minute Z-score incident detection."
+      },
+      "codeExample": "def snap_ping_local(osm_tile_cache, lat, lon, heading):\n    h3_r6 = h3_encode(lat, lon, res=6)\n    osm_tile = osm_tile_cache.get_or_load_mmap(h3_r6)\n    candidates = osm_tile.rtree_query(lat, lon, radius_m=50)\n    return viterbi_step(candidates, lat, lon, heading)",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "In-Process OSM",
+        "title": "Flink TaskManager Local Mmap OSM Tile Cache",
+        "nodes": [
+          {
+            "id": "s3",
+            "label": "Versioned OSM Tiles (S3)",
+            "sub": "Weekly H3-sharded graph",
+            "role": "Map artifact"
+          },
+          {
+            "id": "mm",
+            "label": "TaskManager Mmap Cache",
+            "sub": "Zero-network R-tree",
+            "role": "Local geometry"
+          },
+          {
+            "id": "vit",
+            "label": "Viterbi HMM Operator",
+            "sub": "<50us per ping",
+            "role": "In-memory snap"
+          },
+          {
+            "id": "out",
+            "label": "Snapped Speed Stream",
+            "sub": "Re-keyed by H3 Res-6",
+            "role": "Window input"
+          }
+        ],
+        "edges": [
+          {
+            "from": "s3",
+            "to": "mm",
+            "label": "Syncs weekly map tiles"
+          },
+          {
+            "from": "mm",
+            "to": "vit",
+            "label": "Returns 50m candidates"
+          },
+          {
+            "from": "vit",
+            "to": "out",
+            "label": "Emits segment speed"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Zero DB Hops",
+            "detail": "Memory-mapped local R-trees eliminate network latency during map-matching."
+          },
+          {
+            "label": "Weekly Map Sync",
+            "detail": "New roads and turn restrictions roll out via versioned S3 tile broadcasts."
+          }
+        ],
+        "summary": "Memory-mapped H3-sharded OSM tiles inside Flink TaskManagers enable 1M snaps/sec with zero DB calls.",
+        "caption": "Co-locating road geometry in worker memory removes the #1 bottleneck in streaming map-matching."
+      }
+    },
+    {
+      "id": "stage-4",
+      "stageNumber": 4,
+      "level": "intermediate",
+      "title": "60-Second Tumbling Windows & Late-Ping Watermarks",
+      "purpose": "Handle cellular tunnel dropouts without skewing live congestion tiles.",
+      "explanation": {
+        "foundation": "Cars entering tunnels lose cellular signal and flush buffered pings 30–60 seconds later.",
+        "core": "Flink uses a 60-second tumbling window with a 20-second event-time watermark.",
+        "deepDive": "Pings arriving >20s late are routed to ClickHouse for historical accuracy without polluting live traffic tiles."
+      },
+      "codeExample": "def classify_ping_timeliness(event_ts, watermark_ts, max_lateness_s=20):\n    if event_ts >= watermark_ts - max_lateness_s:\n        return 'LIVE_WINDOW_AND_ARCHIVE'\n    return 'ARCHIVE_ONLY_LATE'",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Tunnel Dropouts",
+        "title": "20s Watermark & Late-Ping Side-Output",
+        "nodes": [
+          {
+            "id": "tun",
+            "label": "Tunnel Buffered Pings",
+            "sub": "30-60s delayed arrival",
+            "role": "Late telemetry"
+          },
+          {
+            "id": "wm",
+            "label": "Flink 20s Watermark",
+            "sub": "Event-time clock",
+            "role": "Freshness gate"
+          },
+          {
+            "id": "rds",
+            "label": "Redis Live Tile",
+            "sub": "Timely 60s speeds only",
+            "role": "Current traffic"
+          },
+          {
+            "id": "ch",
+            "label": "ClickHouse Side-Output",
+            "sub": "Accepts all late pings",
+            "role": "Complete history"
+          }
+        ],
+        "edges": [
+          {
+            "from": "tun",
+            "to": "wm",
+            "label": "Evaluates event_ts"
+          },
+          {
+            "from": "wm",
+            "to": "rds",
+            "label": "Emits timely windows"
+          },
+          {
+            "from": "wm",
+            "to": "ch",
+            "label": "Diverts >20s late pings"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Fresh Live Maps",
+            "detail": "Excluding >20s stale tunnel pings prevents ghost traffic jams from appearing later."
+          },
+          {
+            "label": "Complete History",
+            "detail": "ClickHouse still receives every delayed ping for accurate rush-hour baselines."
+          }
+        ],
+        "summary": "Event-time watermarks keep live traffic maps fresh while preserving delayed tunnel pings in ClickHouse.",
+        "caption": "Routing >20s late pings to a ClickHouse side-output protects real-time heatmap accuracy."
+      }
+    },
+    {
+      "id": "stage-5",
+      "stageNumber": 5,
+      "level": "intermediate",
+      "title": "Live Traffic Heatmap & Dynamic ETA APIs",
+      "purpose": "Serve viewport traffic tiles and CCH shortest-time routes under 10ms p99.",
+      "explanation": {
+        "foundation": "Think of **Live Traffic Heatmap & Dynamic ETA APIs** as the intuition layer for Design a Real-Time Geospatial Road Congestion Analytics System (1M Pings/sec): Serve viewport traffic tiles and CCH shortest-time routes under 10ms p99.",
+        "core": "Map clients request traffic overlays by H3 Res-6 tile ID, hitting a CDN + Redis cluster (<5ms). Simultaneously, the Dynamic ETA Routing API pulls updated segment speeds from Redis every 1 second to customize CCH edge weights and answer routing queries in <10ms.",
+        "deepDive": "Under heavy load or partial failure, live traffic heatmap & dynamic eta apis becomes a critical lever for predictable latency and correctness. Production traffic analytics blueprint with 15-min ephemeral session IDs, 200m endpoint privacy stripping, and 2-minute Z-score incident detection."
+      },
+      "codeExample": "def get_traffic_tile(h3_res6_id):\n    tile_data = redis_client.hgetall(f'h3:tile:{h3_res6_id}')\n    if not tile_data:\n        return historical_prior_tile.get(h3_res6_id)\n    return tile_data",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Serving APIs",
+        "title": "CDN/Redis Tile Serving & 1s CCH Weight Refresh",
+        "nodes": [
+          {
+            "id": "map",
+            "label": "Map Viewport Client",
+            "sub": "Requests H3 Res-6 tiles",
+            "role": "Heatmap consumer"
+          },
+          {
+            "id": "cdn",
+            "label": "Edge CDN (15s TTL)",
+            "sub": "Absorbs metro commuters",
+            "role": "Read shield"
+          },
+          {
+            "id": "rds",
+            "label": "Redis H3 Tile Cache",
+            "sub": "Live 60s speeds",
+            "role": "Tile source"
+          },
+          {
+            "id": "cch",
+            "label": "Dynamic ETA Engine",
+            "sub": "1s CCH weight sync",
+            "role": "Routing API"
+          }
+        ],
+        "edges": [
+          {
+            "from": "map",
+            "to": "cdn",
+            "label": "Fetches tile"
+          },
+          {
+            "from": "cdn",
+            "to": "rds",
+            "label": "Cache miss <5ms"
+          },
+          {
+            "from": "rds",
+            "to": "cch",
+            "label": "Refreshes edge speeds"
+          }
+        ],
+        "cards": [
+          {
+            "label": "15s CDN Caching",
+            "detail": "Caching public H3 traffic tiles for 15s at the CDN absorbs 95% of rush-hour map loads."
+          },
+          {
+            "label": "Historical Fallback",
+            "detail": "Rural segments with zero live pings seamlessly fall back to time-of-day priors."
+          }
+        ],
+        "summary": "15-second CDN caching and Redis H3 tile hashes scale traffic overlays to millions of commuters.",
+        "caption": "Sharing the same Redis speed store for heatmaps and CCH routing guarantees visual-to-ETA consistency."
+      }
+    },
+    {
+      "id": "stage-6",
+      "stageNumber": 6,
+      "level": "advanced",
+      "title": "Privacy-Preserving Telemetry & Trajectory Stripping",
+      "purpose": "Prevent tracking individual commuters' home/work addresses.",
+      "explanation": {
+        "foundation": "Think of **Privacy-Preserving Telemetry & Trajectory Stripping** as the intuition layer for Design a Real-Time Geospatial Road Congestion Analytics System (1M Pings/sec): Prevent tracking individual commuters' home/work addresses.",
+        "core": "Raw GPS trajectories can reveal home addresses. The Ingestion API rotates ephemeral device_session_ids every 15 minutes (long enough for 5-ping HMM, too short for trip reconstruction) and strips the first/last 200 meters of trips before archiving to ClickHouse.",
+        "deepDive": "Under heavy load or partial failure, privacy-preserving telemetry & trajectory stripping becomes a critical lever for predictable latency and correctness. Production traffic analytics blueprint with 15-min ephemeral session IDs, 200m endpoint privacy stripping, and 2-minute Z-score incident detection."
+      },
+      "codeExample": "def anonymize_for_archive(ping, trip_dist_from_start_m, trip_dist_to_end_m):\n    if trip_dist_from_start_m < 200 or trip_dist_to_end_m < 200:\n        return None  # Strip home/work origin-destination endpoints\n    ping.pop('device_id', None)\n    return ping",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Location Privacy",
+        "title": "15-Min Ephemeral IDs & 200m Endpoint Fuzzing",
+        "nodes": [
+          {
+            "id": "ing",
+            "label": "gRPC Ingest Edge",
+            "sub": "Rotates 15m session ID",
+            "role": "Unlinkable ID"
+          },
+          {
+            "id": "hmm",
+            "label": "Flink HMM Snapper",
+            "sub": "Uses ephemeral ID only",
+            "role": "Anonymous match"
+          },
+          {
+            "id": "str",
+            "label": "200m Endpoint Stripper",
+            "sub": "Drops origin/dest tails",
+            "role": "Home/work guard"
+          },
+          {
+            "id": "ch",
+            "label": "ClickHouse Archive",
+            "sub": "Zero PII stored",
+            "role": "Compliant lake"
+          }
+        ],
+        "edges": [
+          {
+            "from": "ing",
+            "to": "hmm",
+            "label": "Passes ephemeral ID"
+          },
+          {
+            "from": "hmm",
+            "to": "str",
+            "label": "Filters trip endpoints"
+          },
+          {
+            "from": "str",
+            "to": "ch",
+            "label": "Stores anonymous speeds"
+          }
+        ],
+        "cards": [
+          {
+            "label": "15-Min Rotation",
+            "detail": "Short-lived session tokens support HMM continuity without enabling cross-day tracking."
+          },
+          {
+            "label": "200m Fuzzing",
+            "detail": "Dropping trip start/end tails prevents reverse-engineering home driveways."
+          }
+        ],
+        "summary": "Ephemeral 15-minute session IDs and 200m endpoint stripping protect commuter privacy without hurting traffic accuracy.",
+        "caption": "Privacy controls sit at ingestion and archival boundaries so raw PII never reaches ClickHouse."
+      }
+    },
+    {
+      "id": "stage-7",
+      "stageNumber": 7,
+      "level": "advanced",
+      "title": "Anomaly Detection for Incidents & Road Closures",
+      "purpose": "Detect accidents and sudden road closures within 2 minutes of occurrence.",
+      "explanation": {
+        "foundation": "Think of **Anomaly Detection for Incidents & Road Closures** as the intuition layer for Design a Real-Time Geospatial Road Congestion Analytics System (1M Pings/sec): Detect accidents and sudden road closures within 2 minutes of occurrence.",
+        "core": "A sudden 80% speed drop on a highway segment paired with zero downstream throughput signals an accident or closure. A Flink Z-score detector compares live segment speeds against ClickHouse 8-week same-hour priors, flagging incidents to routing engines within 120 seconds.",
+        "deepDive": "Under heavy load or partial failure, anomaly detection for incidents & road closures becomes a critical lever for predictable latency and correctness. Production traffic analytics blueprint with 15-min ephemeral session IDs, 200m endpoint privacy stripping, and 2-minute Z-score incident detection."
+      },
+      "codeExample": "def detect_road_incident(live_speed, hist_mean, hist_std, z_thresh=-3.0):\n    z = (live_speed - hist_mean) / max(hist_std, 1.0)\n    if z <= z_thresh and live_speed < 10.0:\n        return 'INCIDENT_ALERT'\n    return 'NORMAL'",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Incident Detection",
+        "title": "2-Minute Z-Score Congestion Anomaly Detector",
+        "nodes": [
+          {
+            "id": "liv",
+            "label": "60s Live Speed",
+            "sub": "From Flink window",
+            "role": "Current signal"
+          },
+          {
+            "id": "pri",
+            "label": "8-Week Hour Prior",
+            "sub": "Mean & std per segment",
+            "role": "Baseline norm"
+          },
+          {
+            "id": "zsc",
+            "label": "Flink Z-Score Detector",
+            "sub": "Flags Z <= -3.0 & <10km/h",
+            "role": "Incident trigger"
+          },
+          {
+            "id": "cch",
+            "label": "Routing Penalty Push",
+            "sub": "Reroutes commuters <2m",
+            "role": "Traffic relief"
+          }
+        ],
+        "edges": [
+          {
+            "from": "liv",
+            "to": "zsc",
+            "label": "Supplies live speed"
+          },
+          {
+            "from": "pri",
+            "to": "zsc",
+            "label": "Supplies historical norm"
+          },
+          {
+            "from": "zsc",
+            "to": "cch",
+            "label": "Applies closure penalty"
+          }
+        ],
+        "cards": [
+          {
+            "label": "2-Minute Detection",
+            "detail": "Automated Z-score triggers detect highway crashes faster than manual 911 feeds."
+          },
+          {
+            "label": "Cross-Check Quorum",
+            "detail": "Require >=5 independent vehicles reporting slowdowns to avoid false-positive closures."
+          }
+        ],
+        "summary": "Comparing live 60s speeds against 8-week priors detects accidents and closures within 2 minutes.",
+        "caption": "Requiring a 5-vehicle quorum prevents a single broken-down truck from falsely closing a highway."
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-1",
+        "question": "Why should the mobile/vehicle SDK batch 5 GPS pings into one Protobuf gRPC request instead of sending every ping immediately?",
+        "options": [
+          {
+            "id": "a",
+            "text": "It cuts ingress QPS by 5x (1M -> 200K QPS), saves battery/TLS overhead, and gives Flink's HMM instant multi-ping trajectory context",
+            "correct": true,
+            "feedback": "Correct! Edge batching reduces server load and provides ready-made trajectory windows for Viterbi snapping."
+          },
+          {
+            "id": "b",
+            "text": "Because Kafka cannot ingest more than 10,000 messages/sec",
+            "correct": false,
+            "feedback": "Kafka handles millions of messages/sec, but edge batching drastically cuts mobile and gateway overhead."
+          },
+          {
+            "id": "c",
+            "text": "Because H3 indices require 5 GPS points to compute",
+            "correct": false,
+            "feedback": "H3 encodes a single (lat, lon) pair."
+          },
+          {
+            "id": "d",
+            "text": "To disable Redis H3 tile caching",
+            "correct": false,
+            "feedback": "Batching has no impact on Redis caching."
+          }
+        ],
+        "explanation": "5-ping SDK batching improves mobile efficiency, cuts gateway QPS 5x, and feeds multi-point HMM trajectories."
+      },
+      {
+        "id": "kc-2",
+        "question": "How does Flink execute 1M HMM map-matching operations per second without saturating an external PostGIS database?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Each Flink TaskManager memory-maps H3-sharded OSM road-graph tiles locally for zero-network R-tree lookups",
+            "correct": true,
+            "feedback": "Correct! Local mmap OSM tiles keep candidate lookups under 50 microseconds with zero network hops."
+          },
+          {
+            "id": "b",
+            "text": "It skips map-matching and stores raw GPS coordinates in Redis",
+            "correct": false,
+            "feedback": "Skipping map-matching causes overpass/side-street speed corruption."
+          },
+          {
+            "id": "c",
+            "text": "It queries Google Maps REST API for every ping",
+            "correct": false,
+            "feedback": "External REST calls at 1M QPS are impossible."
+          },
+          {
+            "id": "d",
+            "text": "It stores road geometries inside Kafka topic headers",
+            "correct": false,
+            "feedback": "Kafka headers are for small metadata, not continental road graphs."
+          }
+        ],
+        "explanation": "Co-locating memory-mapped OSM tiles on Flink workers eliminates external spatial DB bottlenecks."
+      },
+      {
+        "id": "kc-3",
+        "question": "What is the best way to handle GPS pings delayed by 45 seconds due to a vehicle driving through a tunnel?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Set Flink's event-time watermark to 20s and route >20s late pings to a ClickHouse side-output so live traffic tiles stay fresh",
+            "correct": true,
+            "feedback": "Correct! Live heatmaps stay current while ClickHouse still records complete historical trajectories."
+          },
+          {
+            "id": "b",
+            "text": "Block all Flink windows for 10 minutes waiting for tunnel cars",
+            "correct": false,
+            "feedback": "Waiting 10 minutes would make live traffic maps uselessly stale."
+          },
+          {
+            "id": "c",
+            "text": "Drop all delayed pings permanently",
+            "correct": false,
+            "feedback": "Dropping them loses valuable historical data in ClickHouse."
+          },
+          {
+            "id": "d",
+            "text": "Reset the Redis cluster whenever a tunnel ping arrives",
+            "correct": false,
+            "feedback": "Resetting Redis would cause a full outage."
+          }
+        ],
+        "explanation": "Side-outputs preserve historical completeness in ClickHouse without delaying live Redis traffic updates."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Design a live traffic system that collects 1M GPS pings/sec, snaps cars onto roads, and powers live heatmaps and ETA routing.",
+      "keyTakeaway": "If 10M active vehicles each send 1 ping every 10s, raw ingress is 1M pings/sec, batch GPS pings at the mobile SDK, ingest via gRPC into Kafka, run stateful Flink HMM map-matching + 60s tumbling windows, and serve Redis H3 tiles alongside ClickHouse spatial analytics.",
+      "byteSummary": "Phones batch 5 GPS pings together and send them to Kafka.\n\nFlink snaps the paths to roads, averages speeds every 60 seconds into Redis for live maps and ETAs, and saves history to ClickHouse."
+    },
+    "intermediate": {
+      "summary": "Architect a 1M pings/sec geospatial pipeline using 5-ping Protobuf gRPC batches, local mmap OSM tiles in Flink, Redis H3 tile hashes, and ClickHouse.",
+      "keyTakeaway": "If 10M active vehicles each send 1 ping every 10s, raw ingress is 1M pings/sec, batch GPS pings at the mobile SDK, ingest via gRPC into Kafka, run stateful Flink HMM map-matching + 60s tumbling windows, and serve Redis H3 tiles alongside ClickHouse spatial analytics.",
+      "byteSummary": "To handle 1M pings/sec, batch 5 pings at the SDK, run HMM snapping against local mmap OSM tiles in Flink, pack 60s speeds into Redis H3 Res-6 hashes, and route >20s late tunnel pings to ClickHouse."
+    },
+    "advanced": {
+      "summary": "Production traffic analytics blueprint with 15-min ephemeral session IDs, 200m endpoint privacy stripping, and 2-minute Z-score incident detection.",
+      "keyTakeaway": "If 10M active vehicles each send 1 ping every 10s, raw ingress is 1M pings/sec, batch GPS pings at the mobile SDK, ingest via gRPC into Kafka, run stateful Flink HMM map-matching + 60s tumbling windows, and serve Redis H3 tiles alongside ClickHouse spatial analytics.",
+      "byteSummary": "Enterprise geospatial platforms enforce privacy at ingestion (15m rotating IDs, 200m endpoint stripping) while running 5-vehicle-quorum Z-score detectors to flag road closures within 120 seconds."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "prerequisites": [
+    {
+      "title": "H3 Hexagonal Spatial Indexing & HMM Map-Matching",
+      "summary": "H3 Hexagonal Spatial Indexing & HMM Map-Matching partitions the Earth into uniform hexagonal cells and uses a Viterbi Hidden Markov Model to snap noisy GPS pings onto exact OpenStreetMap road segments."
+    }
+  ],
+  "simulation": {
+    "title": "Design a Real-Time Geospatial Road Congestion Analytics System (1M Pings/sec) — Interactive Execution Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Workload & Budget"
+      },
+      {
+        "id": "router",
+        "label": "Gateway / Router",
+        "role": "Admission & Dispatch"
+      },
+      {
+        "id": "engine",
+        "label": "Core Engine",
+        "role": "Primary Execution"
+      },
+      {
+        "id": "replica",
+        "label": "Replica / Fallback",
+        "role": "Durability & Recovery"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "router",
+        "label": "request"
+      },
+      {
+        "from": "router",
+        "to": "engine",
+        "label": "route"
+      },
+      {
+        "from": "engine",
+        "to": "replica",
+        "label": "sync / fallback"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "1M GPS Pings/sec Scale & Edge Batching",
+        "actionLabel": "Dispatch nominal request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "router"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "Ingress",
+          "p99_ms": 8,
+          "error_rate": "0.0%"
+        },
+        "explanation": "Caller sends work into the gateway with explicit timeout and concurrency bounds (1M GPS Pings/sec Scale & Edge Batching)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Dual-Sink Serving & Spatial Analytics Topology",
+        "actionLabel": "Execute core invariant",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "Core Path",
+          "p99_ms": 18,
+          "in_flight": 124
+        },
+        "explanation": "The core engine processes the hot path while keeping state transitions deterministic (Dual-Sink Serving & Spatial Analytics Topology)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Flink Map-Matching with Local OSM Tile Caching",
+        "actionLabel": "Detect skew or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Degraded",
+          "p99_ms": 64,
+          "retries_capped": "true"
+        },
+        "explanation": "Under load or replica lag, bounded backoff and isolation prevent cascading saturation (Flink Map-Matching with Local OSM Tile Caching)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Anomaly Detection for Incidents & Road Closures",
+        "actionLabel": "Converge & restore SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 11,
+          "drift": 0
+        },
+        "explanation": "State converges cleanly and telemetry confirms the system returned within its SLO envelope (Anomaly Detection for Incidents & Road Closures)."
+      }
+    ]
+  }
+}

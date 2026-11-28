@@ -1,0 +1,784 @@
+{
+  "version": 3,
+  "slug": "design-adtech-ctr",
+  "title": "Design an AdTech CTR Prediction & Real-Time Bidding Engine (500K QPS)",
+  "domain": "system-design",
+  "spark": {
+    "summary": "Design a globally distributed AdTech DSP capable of handling 500K OpenRTB QPS at <50ms internal p99 latency, with Aerospike feature lookups, batched TensorRT CTR scoring, Redis budget pacing, and streaming FTRL updates.",
+    "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, colocate stateless bidder PoPs near Ad Exchanges, use Aerospike NVMe/RAM for sub-2ms feature reads, and decouple online learning via Kafka and Flink.",
+    "byteSummary": "At 500,000 BidRequests per second, cross-region network latency alone can blow a 100ms OpenRTB timeout. A production DSP deploys regional Bidder Edge clusters colocated in the same cloud regions as major Ad Exchanges.\n\nEach Bidder Edge reads user/ad features from a local Aerospike cluster (<2ms p99), filters eligible campaigns via an inverted targeting index, scores up to 50 candidate ads per request using batched ONNX/TensorRT inference, checks a token-bucket Redis budget pacer, and returns a shaded BidResponse.\n\nAsynchronously, win notices, impressions, and clicks flow into Kafka -> Flink Online Learning -> Parameter Server, pushing fresh model weights back to the edges every 60 seconds."
+  },
+  "learningJourney": [
+    {
+      "id": "stage-1",
+      "stageNumber": 1,
+      "level": "foundation",
+      "title": "500K QPS Scale & Regional Edge Sizing",
+      "purpose": "Size regional bidder PoPs, Aerospike IOPS, and network bandwidth.",
+      "explanation": {
+        "foundation": "500K QPS split across 4 global exchange regions equals ~125K QPS per region.",
+        "core": "With ~4 KB per OpenRTB request, ingress is 500 MB/s per region.",
+        "deepDive": "Each bidder pod handles ~2.5K QPS on 8 vCPUs + T4/L4 GPU, requiring ~50 pods per region with 30% headroom."
+      },
+      "codeExample": "def size_regional_cluster(region_qps=125_000, qps_per_pod=2500, headroom=1.3):\n    return math.ceil((region_qps / qps_per_pod) * headroom)  # 65 pods/region",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Scale & Sizing",
+        "title": "500K QPS Multi-Region Bidder Sizing",
+        "nodes": [
+          {
+            "id": "ex",
+            "label": "Global Ad Exchanges",
+            "sub": "500K QPS OpenRTB",
+            "role": "Traffic source"
+          },
+          {
+            "id": "pop",
+            "label": "4 Regional Bidder PoPs",
+            "sub": "125K QPS / region",
+            "role": "Edge compute"
+          },
+          {
+            "id": "aero",
+            "label": "Aerospike Local Cluster",
+            "sub": "125K reads/s <2ms p99",
+            "role": "Feature store"
+          },
+          {
+            "id": "gpu",
+            "label": "L4/T4 Inference Pool",
+            "sub": "65 pods / region",
+            "role": "CTR scorer"
+          }
+        ],
+        "edges": [
+          {
+            "from": "ex",
+            "to": "pop",
+            "label": "Geo-routed <15ms RTT"
+          },
+          {
+            "from": "pop",
+            "to": "aero",
+            "label": "Fetches user/ad state"
+          },
+          {
+            "from": "pop",
+            "to": "gpu",
+            "label": "Scores top 50 ads"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Regional Isolation",
+            "detail": "Each PoP operates autonomously; a regional outage never takes down global bidding."
+          },
+          {
+            "label": "Early Load Shedding",
+            "detail": "Drop low-floor or stale (>20ms queued) BidRequests before GPU scoring."
+          }
+        ],
+        "summary": "Colocating 4 regional PoPs keeps network RTT low and isolates regional traffic spikes.",
+        "caption": "Load shedding stale queued requests protects p99 latency during exchange traffic bursts."
+      }
+    },
+    {
+      "id": "stage-2",
+      "stageNumber": 2,
+      "level": "foundation",
+      "title": "Bidder Edge Request Lifecycle",
+      "purpose": "Trace the <50ms synchronous pipeline from BidRequest to BidResponse.",
+      "explanation": {
+        "foundation": "Think of **Bidder Edge Request Lifecycle** as the intuition layer for Design an AdTech CTR Prediction & Real-Time Bidding Engine (500K QPS): Trace the <50ms synchronous pipeline from BidRequest to BidResponse.",
+        "core": "On arrival, the Bidder Edge validates tmax, queries Aerospike for user segments and frequency caps, runs an in-memory Roaring Bitmap targeting index to pick <=50 eligible ads, scores them in one TensorRT batch, shades the top bid, and checks the Redis token-bucket pacer.",
+        "deepDive": "Under heavy load or partial failure, bidder edge request lifecycle becomes a critical lever for predictable latency and correctness. End-to-end 500K QPS RTB architecture with Kafka/Flink delayed attribution, FTRL-Proximal 60s delta pushes, and automated pCTR spend watchdogs."
+      },
+      "codeExample": "def process_bid_request(req):\n    if req.age_ms() > 15:\n        return NO_BID  # Shed stale requests early\n    user = aerospike.get_user(req.user_id, timeout_ms=3)\n    ads = targeting_index.match(req.geo, req.device, user.freq_caps)[:50]\n    if not ads:\n        return NO_BID\n    best_ad, bid = score_and_shade(req, user, ads)\n    return build_bid_response(best_ad, bid) if pacer.allow(best_ad.campaign_id) else NO_BID",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Synchronous Path",
+        "title": "50ms Bidder Edge Execution Flow",
+        "nodes": [
+          {
+            "id": "ing",
+            "label": "OpenRTB Parser",
+            "sub": "Validates tmax & floor",
+            "role": "Ingress gate"
+          },
+          {
+            "id": "aero",
+            "label": "Aerospike Lookup",
+            "sub": "User segments + freq cap",
+            "role": "State fetch"
+          },
+          {
+            "id": "idx",
+            "label": "Roaring Bitmap Index",
+            "sub": "Matches <=50 ads",
+            "role": "Targeting filter"
+          },
+          {
+            "id": "pac",
+            "label": "CTR + Shade + Pacer",
+            "sub": "TensorRT + Redis check",
+            "role": "Bid emitter"
+          }
+        ],
+        "edges": [
+          {
+            "from": "ing",
+            "to": "aero",
+            "label": "Async batch read"
+          },
+          {
+            "from": "aero",
+            "to": "idx",
+            "label": "Applies frequency caps"
+          },
+          {
+            "from": "idx",
+            "to": "pac",
+            "label": "Scores & paces top ad"
+          }
+        ],
+        "cards": [
+          {
+            "label": "In-Memory Targeting",
+            "detail": "Roaring Bitmaps intersect geo, device, and OS targeting in <0.5ms."
+          },
+          {
+            "label": "Graceful NO_BID",
+            "detail": "Returning HTTP 204 NO_BID cleanly is always better than timing out."
+          }
+        ],
+        "summary": "Bitset targeting and sub-3ms Aerospike reads leave ample headroom for TensorRT scoring.",
+        "caption": "Shedding stale requests early prevents cascading queue buildup."
+      },
+      "decisionFramework": {
+        "problem": "How to implement Design an AdTech CTR Prediction & Real-Time Bidding Engine (500K QPS) without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "To keep the architecture evolvable without sacrificing reliability, colocate stateless bidder PoPs near Ad Exchanges, use Aerospike NVMe/RAM for sub-2ms feature reads, and decouple online learning via Kafka and Flink.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Design an AdTech CTR Prediction & Real-Time Bidding Engine (500K QPS) experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-3",
+      "stageNumber": 3,
+      "level": "intermediate",
+      "title": "Aerospike Hybrid Memory Architecture",
+      "purpose": "Serve 500K QPS user profiles and frequency caps at <2ms p99 without huge RAM bills.",
+      "explanation": {
+        "foundation": "Think of **Aerospike Hybrid Memory Architecture** as the intuition layer for Design an AdTech CTR Prediction & Real-Time Bidding Engine (500K QPS): Serve 500K QPS user profiles and frequency caps at <2ms p99 without huge RAM bills.",
+        "core": "Storing 1B user profiles purely in Redis RAM would cost millions. Aerospike's Hybrid Memory Architecture (HMA) keeps primary 64-byte index pointers in DRAM while reading 1 KB user payloads directly from local NVMe SSDs in <1.5ms p99.",
+        "deepDive": "Under heavy load or partial failure, aerospike hybrid memory architecture becomes a critical lever for predictable latency and correctness. End-to-end 500K QPS RTB architecture with Kafka/Flink delayed attribution, FTRL-Proximal 60s delta pushes, and automated pCTR spend watchdogs."
+      },
+      "codeExample": "def get_user_profile_aerospike(client, user_id):\n    try:\n        _, _, record = client.get(('rtb', 'users', user_id), policy={'total_timeout': 3})\n        return record\n    except AerospikeTimeout:\n        return ANONYMOUS_USER_DEFAULT",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Low-Latency Storage",
+        "title": "Aerospike DRAM Index + NVMe Payload Store",
+        "nodes": [
+          {
+            "id": "cli",
+            "label": "Bidder Aerospike Client",
+            "sub": "Partition-aware routing",
+            "role": "1-hop lookup"
+          },
+          {
+            "id": "dram",
+            "label": "DRAM Primary Index",
+            "sub": "64B/key hash pointers",
+            "role": "Zero disk seek"
+          },
+          {
+            "id": "nvme",
+            "label": "Local NVMe SSDs",
+            "sub": "Direct block read <1.5ms",
+            "role": "1B user profiles"
+          },
+          {
+            "id": "def",
+            "label": "Anonymous Fallback",
+            "sub": "3ms timeout default",
+            "role": "Tail guard"
+          }
+        ],
+        "edges": [
+          {
+            "from": "cli",
+            "to": "dram",
+            "label": "Hashes user_id"
+          },
+          {
+            "from": "dram",
+            "to": "nvme",
+            "label": "Single NVMe read"
+          },
+          {
+            "from": "nvme",
+            "to": "def",
+            "label": "Falls back on timeout"
+          }
+        ],
+        "cards": [
+          {
+            "label": "5x Lower Cost",
+            "detail": "DRAM index + NVMe data cuts infrastructure cost by ~75% vs pure Redis."
+          },
+          {
+            "label": "1-Hop Routing",
+            "detail": "Partition maps in the client eliminate proxy hops."
+          }
+        ],
+        "summary": "Aerospike HMA delivers Redis-like sub-2ms reads at NVMe storage economics.",
+        "caption": "Direct NVMe block reads scale to 1B+ user profiles per region."
+      }
+    },
+    {
+      "id": "stage-4",
+      "stageNumber": 4,
+      "level": "intermediate",
+      "title": "Distributed Token-Bucket Budget Pacing",
+      "purpose": "Enforce strict daily spend caps across 65 regional pods without overspending.",
+      "explanation": {
+        "foundation": "Think of **Distributed Token-Bucket Budget Pacing** as the intuition layer for Design an AdTech CTR Prediction & Real-Time Bidding Engine (500K QPS): Enforce strict daily spend caps across 65 regional pods without overspending.",
+        "core": "If 65 pods each check Redis on every bid, Redis sees 500K write OPS. Instead, pods lease small local budget chunks (e.g., $2.00 every 5 seconds) from a regional Redis Token-Bucket Pacer, allowing zero-network-hop local spend checks.",
+        "deepDive": "Under heavy load or partial failure, distributed token-bucket budget pacing becomes a critical lever for predictable latency and correctness. End-to-end 500K QPS RTB architecture with Kafka/Flink delayed attribution, FTRL-Proximal 60s delta pushes, and automated pCTR spend watchdogs."
+      },
+      "codeExample": "class LocalBudgetLease:\n    def try_consume(self, amount):\n        if self.remaining >= amount:\n            self.remaining -= amount\n            return True\n        return False  # Trigger async lease renewal",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Budget Pacing",
+        "title": "Hierarchical Redis-to-Pod Budget Leasing",
+        "nodes": [
+          {
+            "id": "rds",
+            "label": "Regional Redis Pacer",
+            "sub": "Master campaign budget",
+            "role": "Global allocator"
+          },
+          {
+            "id": "lse",
+            "label": "5s Pod Budget Lease",
+            "sub": "$2.00 micro-batches",
+            "role": "Lock-free local"
+          },
+          {
+            "id": "pod",
+            "label": "Bidder Pod Check",
+            "sub": "0.001ms RAM decrement",
+            "role": "Synchronous gate"
+          },
+          {
+            "id": "rec",
+            "label": "Win-Price Reconciler",
+            "sub": "Refunds shaded surplus",
+            "role": "Exact accounting"
+          }
+        ],
+        "edges": [
+          {
+            "from": "rds",
+            "to": "lse",
+            "label": "Grants 5s lease"
+          },
+          {
+            "from": "lse",
+            "to": "pod",
+            "label": "Authorizes bid"
+          },
+          {
+            "from": "rec",
+            "to": "rds",
+            "label": "Credits unspent reserve"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Zero Sync Overhead",
+            "detail": "Bidders never block on Redis during the 50ms auction path."
+          },
+          {
+            "label": "Bounded Overspend",
+            "detail": "Max theoretical overspend is capped at 1 lease cycle across active pods."
+          }
+        ],
+        "summary": "Micro-budget leasing removes Redis from the critical bidding path while bounding overspend.",
+        "caption": "Reconciling actual clearing prices asynchronously keeps campaign budgets accurate."
+      }
+    },
+    {
+      "id": "stage-5",
+      "stageNumber": 5,
+      "level": "intermediate",
+      "title": "Batched ONNX / TensorRT CTR Inference",
+      "purpose": "Score 50 candidate ads per request in under 10ms using dynamic GPU batching.",
+      "explanation": {
+        "foundation": "Think of **Batched ONNX / TensorRT CTR Inference** as the intuition layer for Design an AdTech CTR Prediction & Real-Time Bidding Engine (500K QPS): Score 50 candidate ads per request in under 10ms using dynamic GPU batching.",
+        "core": "Ad requests arrive at 2.5K QPS per pod, each needing 50 ad scores (125K scores/sec/pod). Dynamic micro-batching accumulates requests for 2ms (grouping ~5 requests = 250 ads) into one TensorRT FP16 forward pass, achieving <8ms p99 scoring latency.",
+        "deepDive": "Under heavy load or partial failure, batched onnx / tensorrt ctr inference becomes a critical lever for predictable latency and correctness. End-to-end 500K QPS RTB architecture with Kafka/Flink delayed attribution, FTRL-Proximal 60s delta pushes, and automated pCTR spend watchdogs."
+      },
+      "codeExample": "def dynamic_batch_score(queue, max_wait_ms=2.0, max_items=512):\n    batch = queue.drain(timeout_ms=max_wait_ms, limit=max_items)\n    if not batch:\n        return []\n    return tensorrt_engine.execute_fp16(batch)",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Inference Engine",
+        "title": "2ms Dynamic Micro-Batch TensorRT Pipeline",
+        "nodes": [
+          {
+            "id": "q",
+            "label": "Lock-Free Batch Queue",
+            "sub": "2ms / 512-item trigger",
+            "role": "Request coalescer"
+          },
+          {
+            "id": "emb",
+            "label": "Embedding Cache",
+            "sub": "Pinned GPU VRAM tables",
+            "role": "Zero-copy lookup"
+          },
+          {
+            "id": "trt",
+            "label": "TensorRT FP16 Engine",
+            "sub": "<6ms forward pass",
+            "role": "DCNv2 scorer"
+          },
+          {
+            "id": "cal",
+            "label": "Isotonic Calibrator",
+            "sub": "Piecewise linear LUT",
+            "role": "pCTR output"
+          }
+        ],
+        "edges": [
+          {
+            "from": "q",
+            "to": "emb",
+            "label": "Gathers sparse IDs"
+          },
+          {
+            "from": "emb",
+            "to": "trt",
+            "label": "Runs fused MLP/Cross"
+          },
+          {
+            "from": "trt",
+            "to": "cal",
+            "label": "Maps logits to pCTR"
+          }
+        ],
+        "cards": [
+          {
+            "label": "2ms Coalescing",
+            "detail": "Waiting 2ms triples GPU utilization while keeping p99 under 8ms."
+          },
+          {
+            "label": "VRAM Pinning",
+            "detail": "Hot ad embeddings stay pinned in GPU VRAM to avoid PCIe transfers."
+          }
+        ],
+        "summary": "Dynamic 2ms micro-batching and pinned VRAM embeddings maximize GPU inference efficiency.",
+        "caption": "Combining FP16 TensorRT with a fast LUT calibrator keeps scoring deterministic."
+      }
+    },
+    {
+      "id": "stage-6",
+      "stageNumber": 6,
+      "level": "advanced",
+      "title": "Kafka Joiner & Flink Online Learning Loop",
+      "purpose": "Close the 60-second online learning loop from impressions to Parameter Server.",
+      "explanation": {
+        "foundation": "Think of **Kafka Joiner & Flink Online Learning Loop** as the intuition layer for Design an AdTech CTR Prediction & Real-Time Bidding Engine (500K QPS): Close the 60-second online learning loop from impressions to Parameter Server.",
+        "core": "Win notices, impressions, and IVT-scrubbed clicks stream into Kafka. Flink joins them by auction_id, computes mini-batch gradients, and pushes sparse FTRL updates to a sharded Parameter Server, which streams compact weight deltas to regional bidders every 60s.",
+        "deepDive": "Under heavy load or partial failure, kafka joiner & flink online learning loop becomes a critical lever for predictable latency and correctness. End-to-end 500K QPS RTB architecture with Kafka/Flink delayed attribution, FTRL-Proximal 60s delta pushes, and automated pCTR spend watchdogs."
+      },
+      "codeExample": "def apply_weight_delta(local_table, delta_packet):\n    if delta_packet['version'] <= local_table.version:\n        return  # Idempotent skip\n    local_table.atomic_patch(delta_packet['weights'])\n    local_table.version = delta_packet['version']",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Online Learning",
+        "title": "Kafka -> Flink -> Parameter Server 60s Sync",
+        "nodes": [
+          {
+            "id": "kfk",
+            "label": "Kafka Win/Imp/Click",
+            "sub": "Partitioned by auction_id",
+            "role": "Event backbone"
+          },
+          {
+            "id": "flk",
+            "label": "Flink Attribution Join",
+            "sub": "IVT filter + label emit",
+            "role": "Stream joiner"
+          },
+          {
+            "id": "ps",
+            "label": "Parameter Server",
+            "sub": "FTRL-Proximal weights",
+            "role": "Model master"
+          },
+          {
+            "id": "dlt",
+            "label": "60s Delta Push",
+            "sub": "Atomic hot-swap at edge",
+            "role": "Weight distributor"
+          }
+        ],
+        "edges": [
+          {
+            "from": "kfk",
+            "to": "flk",
+            "label": "Streams raw events"
+          },
+          {
+            "from": "flk",
+            "to": "ps",
+            "label": "Sends labeled gradients"
+          },
+          {
+            "from": "ps",
+            "to": "dlt",
+            "label": "Pushes 60s deltas"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Atomic Hot-Swap",
+            "detail": "Double-buffered weight tables swap pointers without pausing inference."
+          },
+          {
+            "label": "Version Guard",
+            "detail": "Monotonic version checks prevent out-of-order delta regressions."
+          }
+        ],
+        "summary": "A 60-second streaming learning loop keeps CTR weights aligned with live user behavior.",
+        "caption": "Double-buffered weight swaps let edge bidders ingest fresh weights with zero latency spikes."
+      }
+    },
+    {
+      "id": "stage-7",
+      "stageNumber": 7,
+      "level": "advanced",
+      "title": "Graceful Degradation & Model Rollback",
+      "purpose": "Survive GPU failures, Aerospike blips, or bad model weight pushes without losing revenue.",
+      "explanation": {
+        "foundation": "Think of **Graceful Degradation & Model Rollback** as the intuition layer for Design an AdTech CTR Prediction & Real-Time Bidding Engine (500K QPS): Survive GPU failures, Aerospike blips, or bad model weight pushes without losing revenue.",
+        "core": "If a bad online weight push causes predicted CTR to spike 3x (triggering budget burn), an automated Watchdog immediately rolls back the Parameter Server pointer to the last known-good hourly checkpoint. If GPUs saturate, bidders fall back to a lightweight CPU logistic regression model.",
+        "deepDive": "Under heavy load or partial failure, graceful degradation & model rollback becomes a critical lever for predictable latency and correctness. End-to-end 500K QPS RTB architecture with Kafka/Flink delayed attribution, FTRL-Proximal 60s delta pushes, and automated pCTR spend watchdogs."
+      },
+      "codeExample": "def watchdog_check(avg_pctr, baseline_pctr, budget_burn_rate):\n    if avg_pctr > baseline_pctr * 2.0 or budget_burn_rate > 1.8:\n        param_server.rollback_to_last_hourly_checkpoint()\n        return 'ROLLED_BACK'\n    return 'NOMINAL'",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Resilience",
+        "title": "Automated Weight Watchdog & CPU Fallback",
+        "nodes": [
+          {
+            "id": "wd",
+            "label": "Spend & pCTR Watchdog",
+            "sub": "10s anomaly window",
+            "role": "Safety monitor"
+          },
+          {
+            "id": "rb",
+            "label": "Checkpoint Rollback",
+            "sub": "Instant PS pointer revert",
+            "role": "Model guard"
+          },
+          {
+            "id": "cpu",
+            "label": "CPU Logistic Fallback",
+            "sub": "FTRL linear scorer",
+            "role": "GPU bypass"
+          },
+          {
+            "id": "sl",
+            "label": "Bid-Floor Shedder",
+            "sub": "Drops low-value QPS",
+            "role": "Overload shield"
+          }
+        ],
+        "edges": [
+          {
+            "from": "wd",
+            "to": "rb",
+            "label": "Reverts on 2x pCTR spike"
+          },
+          {
+            "from": "wd",
+            "to": "cpu",
+            "label": "Switches on GPU timeout"
+          },
+          {
+            "from": "sl",
+            "to": "cpu",
+            "label": "Preserves high-value slots"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Auto-Rollback",
+            "detail": "Reverting to an hourly checkpoint stops runaway spend within 10 seconds."
+          },
+          {
+            "label": "Linear Fallback",
+            "detail": "A CPU FTRL model keeps bidding profitably even if all GPUs throttle."
+          }
+        ],
+        "summary": "Automated spend watchdogs and CPU linear fallbacks protect revenue under failure.",
+        "caption": "In AdTech, automated rollback is mandatory because bad weights burn real cash in seconds."
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-1",
+        "question": "Why is Aerospike Hybrid Memory Architecture (DRAM index + NVMe data) preferred over pure in-memory Redis for storing 1B user profiles at 500K QPS?",
+        "options": [
+          {
+            "id": "a",
+            "text": "It delivers sub-2ms p99 reads while cutting hardware costs by ~75% compared to pure DRAM",
+            "correct": true,
+            "feedback": "Correct! Storing only 64-byte index pointers in DRAM and reading 1 KB payloads from NVMe slashes RAM cost."
+          },
+          {
+            "id": "b",
+            "text": "Aerospike executes TensorRT FP16 neural networks inside the database",
+            "correct": false,
+            "feedback": "Aerospike is a key-value store, not an ML inference engine."
+          },
+          {
+            "id": "c",
+            "text": "Redis cannot handle more than 1,000 QPS",
+            "correct": false,
+            "feedback": "Redis handles hundreds of thousands of QPS, but 1B profiles in pure DRAM is cost-prohibitive."
+          },
+          {
+            "id": "d",
+            "text": "Aerospike eliminates the need for OpenRTB timeouts",
+            "correct": false,
+            "feedback": "OpenRTB timeouts are enforced by the Ad Exchange."
+          }
+        ],
+        "explanation": "Aerospike HMA balances sub-2ms tail latency with NVMe storage density for billion-scale user profiles."
+      },
+      {
+        "id": "kc-2",
+        "question": "How do 65 regional bidder pods enforce a shared campaign daily budget without blocking on a synchronous Redis check on every single bid?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Let each pod spend unlimited money and reconcile at midnight",
+            "correct": false,
+            "feedback": "Unbounded spending would cause massive budget overruns."
+          },
+          {
+            "id": "b",
+            "text": "Each pod leases small 5-second micro-budget chunks from Redis and decrements them locally in RAM",
+            "correct": true,
+            "feedback": "Correct! Micro-budget leasing keeps the 50ms bid path lock-free while bounding worst-case overspend."
+          },
+          {
+            "id": "c",
+            "text": "Route all 500K QPS through a single master bidder pod",
+            "correct": false,
+            "feedback": "A single pod cannot handle 500K QPS."
+          },
+          {
+            "id": "d",
+            "text": "Store campaign budgets inside Apache Iceberg",
+            "correct": false,
+            "feedback": "Iceberg is an offline lakehouse, far too slow for real-time pacing."
+          }
+        ],
+        "explanation": "Hierarchical budget leasing removes network round-trips from the critical path while bounding overspend."
+      },
+      {
+        "id": "kc-3",
+        "question": "An automated online learning weight push causes predicted CTR to double across all campaigns. What should happen immediately?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Disable bid shading so the DSP bids full expected value",
+            "correct": false,
+            "feedback": "Disabling bid shading would make the overbidding even worse."
+          },
+          {
+            "id": "b",
+            "text": "Wait 24 hours for the next batch training run",
+            "correct": false,
+            "feedback": "Waiting 24 hours would burn entire monthly budgets in minutes."
+          },
+          {
+            "id": "c",
+            "text": "Trigger the Watchdog to roll back the Parameter Server to the last validated hourly checkpoint",
+            "correct": true,
+            "feedback": "Correct! Automated rollback within 10 seconds stops runaway spend caused by corrupted online gradients."
+          },
+          {
+            "id": "d",
+            "text": "Increase Aerospike client timeouts to 50ms",
+            "correct": false,
+            "feedback": "Increasing timeouts would cause OpenRTB deadline misses."
+          }
+        ],
+        "explanation": "Spend and pCTR watchdogs must automatically revert bad online model checkpoints within seconds."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Design a fast ad-bidding system that handles 500,000 requests per second in under 50ms using regional servers, fast storage, and live learning.",
+      "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, colocate stateless bidder PoPs near Ad Exchanges, use Aerospike NVMe/RAM for sub-2ms feature reads, and decouple online learning via Kafka and Flink.",
+      "byteSummary": "An AdTech bidder has 50ms to pick the best ad and price.\n\nRegional servers fetch user info from Aerospike, score candidate ads on GPUs, check local budget leases, and learn from clicks via Kafka."
+    },
+    "intermediate": {
+      "summary": "Architect a 500K QPS DSP using regional PoPs, Aerospike HMA, Roaring Bitmap targeting, dynamic TensorRT micro-batching, and Redis budget leasing.",
+      "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, colocate stateless bidder PoPs near Ad Exchanges, use Aerospike NVMe/RAM for sub-2ms feature reads, and decouple online learning via Kafka and Flink.",
+      "byteSummary": "At 500K QPS, edge colocation saves network RTT, Aerospike HMA stores 1B profiles cheaply, and 2ms TensorRT micro-batching maximizes GPU throughput."
+    },
+    "advanced": {
+      "summary": "End-to-end 500K QPS RTB architecture with Kafka/Flink delayed attribution, FTRL-Proximal 60s delta pushes, and automated pCTR spend watchdogs.",
+      "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, colocate stateless bidder PoPs near Ad Exchanges, use Aerospike NVMe/RAM for sub-2ms feature reads, and decouple online learning via Kafka and Flink.",
+      "byteSummary": "Resilient AdTech systems pair lock-free micro-budget leasing with 60s FTRL weight pushes, double-buffered edge weight swaps, and 10-second spend watchdogs."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "prerequisites": [
+    {
+      "title": "Real-Time Bidding (RTB), CTR Calibration & Bid Shading",
+      "summary": "Real-Time Bidding (RTB) & CTR Calibration converts raw neural click probabilities into profitable first-price auction bids within a strict 100ms OpenRTB round-trip."
+    }
+  ],
+  "simulation": {
+    "title": "Design an AdTech CTR Prediction & Real-Time Bidding Engine (500K QPS) — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Input Workload"
+      },
+      {
+        "id": "entry",
+        "label": "Router / API",
+        "role": "Admission Control"
+      },
+      {
+        "id": "worker",
+        "label": "Processor",
+        "role": "Domain Logic"
+      },
+      {
+        "id": "store",
+        "label": "State Layer",
+        "role": "Durable Store"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "entry",
+        "label": "request"
+      },
+      {
+        "from": "entry",
+        "to": "worker",
+        "label": "dispatch"
+      },
+      {
+        "from": "worker",
+        "to": "store",
+        "label": "read/write"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "500K QPS Scale & Regional Edge Sizing",
+        "actionLabel": "request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "entry"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "request",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Caller sends work to Router / API (500K QPS Scale & Regional Edge Sizing)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Bidder Edge Request Lifecycle",
+        "actionLabel": "dispatch",
+        "status": "healthy",
+        "activeNodeIds": [
+          "entry",
+          "worker"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "dispatch",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Router / API coordinates with Processor while preserving the core invariant (Bidder Edge Request Lifecycle)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Aerospike Hybrid Memory Architecture",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "worker",
+          "store"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, State Layer absorbs pressure without cascading (Aerospike Hybrid Memory Architecture)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Graceful Degradation & Model Rollback",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "entry",
+          "worker",
+          "store"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Graceful Degradation & Model Rollback)."
+      }
+    ]
+  }
+}

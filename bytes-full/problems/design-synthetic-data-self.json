@@ -1,0 +1,706 @@
+{
+  "id": "design-synthetic-data-self",
+  "slug": "design-synthetic-data-self",
+  "title": "Design a 100M-Trace/Day Enterprise Synthetic Data & Self-Play Pipeline",
+  "problemType": "system-design",
+  "difficulty": "hard",
+  "prompt": "Design an enterprise synthetic data generation and verifier-guided self-play pipeline producing 100M+ verified reasoning traces per day across 2,048 H100 GPUs, with <125ms isolated sandbox verification, zero benchmark contamination, step-level PRM filtering, and ACID dataset rollbacks.",
+  "spark": {
+    "summary": "Orchestrate 250M+ raw rollouts/day across 2,048 H100s (vLLM/SGLang FP8), verify in <125ms Firecracker microVMs, decontaminate via MinHash LSH + 13-gram Bloom filters, and commit 100M golden traces/day to Apache Iceberg.",
+    "keyTakeaway": "If latency budgets leave no room for synchronous retries, 40% end-to-end verification + PRM yield turns 420 TB/day raw rollouts into 140 TB/day high-signal ACID datasets with sub-second rollback.",
+    "byteSummary": "Scale & Yield Math: Producing 100M+ verified traces/day at 40% combined verifier + PRM yield requires 250M+ raw rollouts/day (2,894 sustained / 7,500 peak rollouts/sec) across 2,048 NVIDIA H100 80GB GPUs, compressing 420 TB/day raw Parquet ingress into 140 TB/day Apache Iceberg storage.\n\n6-Subsystem Pipeline: (1) Hierarchical 1B+ Seed-Persona DAG Mutator with KL >= 0.72 floor; (2) vLLM/SGLang FP8 Inference Fleet; (3) Firecracker microVM Farm (userfaultfd <125ms restore, zero-egress, Lean4/Pytest/Z3); (4) 128-perm MinHash LSH + 13-gram Bloom filter (<=4ms/1K tokens); (5) PRM Step Scorer (min_t >= 0.78, p95 <=35ms); (6) Apache Iceberg + ClickHouse Telemetry.\n\nResilience & Governance: Every persisted trace carries batch_id and iceberg_commit_id provenance so contaminated or poisoned batches can be rolled back atomically."
+  },
+  "learningJourney": [
+    {
+      "id": "stage-1",
+      "eyebrow": "Stage 1 · Foundation",
+      "title": "Throughput Math & 420 TB/Day -> 140 TB/Day Yield Funnel",
+      "level": "foundation",
+      "purpose": "Derive sustained/peak rollout QPS, H100 cluster sizing, and storage compression ratios from the 100M traces/day target.",
+      "explanation": {
+        "foundation": "With a 40% combined verification + PRM yield, 100M golden traces/day requires 250M raw rollouts/day (`250,000,000 / 86,400 = 2,894` rollouts/sec average, `7,500` peak with 2.6x burst headroom). Across 2,048 H100 GPUs (256x 8-GPU HGX nodes) running FP8 + PagedAttention, each GPU sustains ~1.4–3.7 rollouts/sec.",
+        "core": "```python\ndef pipeline_rates(target_golden_per_day: int = 100_000_000, yield_rate: float = 0.40) -> dict[str, float]:\n    if not (0.0 < yield_rate <= 1.0):\n        raise ValueError(\"yield_rate must be in (0, 1]\")\n    raw_per_day = target_golden_per_day / yield_rate\n    return {\n        \"raw_rollouts_per_sec\": round(raw_per_day / 86_400, 1),\n        \"golden_commits_per_sec\": round(target_golden_per_day / 86_400, 1),\n    }\n```",
+        "deepDive": "In production deployments of Design a 100M-Trace/Day Enterprise Synthetic Data & Self-Play Pipeline, watch how throughput math & 420 tb/day -> 140 tb/day yield funnel interacts with tail latency, retry amplification, and partial failures. Industrial self-play at 420 TB/day raw -> 140 TB/day Iceberg relies on KL >= 0.72 curriculum mutation, blind property-based sandbox tests, early PRM pruning, and instant snapshot rollbacks."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Capacity Funnel",
+        "title": "250M Raw Rollouts -> 100M Golden Traces / Day",
+        "nodes": [
+          {
+            "id": "raw",
+            "label": "250M Raw/Day (420 TB)",
+            "sub": "2,894 avg / 7,500 peak QPS",
+            "role": "source"
+          },
+          {
+            "id": "ver",
+            "label": "Sandbox + Decontam",
+            "sub": "Drops failures & duplicates",
+            "role": "process"
+          },
+          {
+            "id": "gold",
+            "label": "100M Golden/Day (140 TB)",
+            "sub": "1,157 commits/s (40% yield)",
+            "role": "store"
+          }
+        ],
+        "edges": [
+          {
+            "from": "raw",
+            "to": "ver",
+            "label": "2,048 H100s"
+          },
+          {
+            "from": "ver",
+            "to": "gold",
+            "label": "PRM >= 0.78"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Burst Provisioning",
+            "detail": "Size verifier and network queues for 7,500 peak rollouts/sec (2.6x average)."
+          },
+          {
+            "label": "Storage Savings",
+            "detail": "Pruning 60% low-signal traces before Iceberg commit saves 280 TB/day of S3 writes."
+          }
+        ],
+        "summary": "Caption: A 40% end-to-end yield funnel turns 250M raw rollouts into 100M verified Iceberg traces daily.",
+        "caption": "Caption: A 40% end-to-end yield funnel turns 250M raw rollouts into 100M verified Iceberg traces daily."
+      }
+    },
+    {
+      "id": "stage-2",
+      "eyebrow": "Stage 2 · Foundation",
+      "title": "Typed gRPC Contracts Between Generators, Verifiers & PRMs",
+      "level": "foundation",
+      "purpose": "Decouple GPU inference fleets from CPU sandbox farms with strict protobuf schemas and backpressure.",
+      "explanation": {
+        "foundation": "Think of **Typed gRPC Contracts Between Generators, Verifiers & PRMs** as the intuition layer for Design a 100M-Trace/Day Enterprise Synthetic Data & Self-Play Pipeline: Decouple GPU inference fleets from CPU sandbox farms with strict protobuf schemas and backpressure.",
+        "core": "Decoupling the H100 generation fleet from the CPU Firecracker verifier farm via typed gRPC (`SubmitSelfPlayBatch`, `VerifyTrajectory`) and bounded Kafka/NATS queues prevents slow Lean4/Pytest executions from stalling GPU KV-cache scheduling.",
+        "deepDive": "Under heavy load or partial failure, typed grpc contracts between generators, verifiers & prms becomes a critical lever for predictable latency and correctness. Industrial self-play at 420 TB/day raw -> 140 TB/day Iceberg relies on KL >= 0.72 curriculum mutation, blind property-based sandbox tests, early PRM pruning, and instant snapshot rollbacks."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Service Boundaries",
+        "title": "Typed gRPC Contracts & Async Queue Decoupling",
+        "nodes": [
+          {
+            "id": "gen",
+            "label": "BatchSpec -> H100 Fleet",
+            "sub": "Domain, L1-L5, min_entropy",
+            "role": "source"
+          },
+          {
+            "id": "q",
+            "label": "Bounded Trajectory Queue",
+            "sub": "Backpressure on verifier lag",
+            "role": "process"
+          },
+          {
+            "id": "ver",
+            "label": "VerifyTrajectory -> Verdict",
+            "sub": "Status, step_scores, commit_id",
+            "role": "store"
+          }
+        ],
+        "edges": [
+          {
+            "from": "gen",
+            "to": "q",
+            "label": "TrajectoryPayload"
+          },
+          {
+            "from": "q",
+            "to": "ver",
+            "label": "VerdictResult"
+          }
+        ],
+        "cards": [
+          {
+            "label": "GPU Utilization",
+            "detail": "Async queuing keeps H100 Tensor Cores >85% utilized even when verifiers spike to 1.8s p95."
+          },
+          {
+            "label": "Explicit Verdicts",
+            "detail": "Structured enums distinguish EXECUTION_FAIL, TIMEOUT, DECONTAM_FAIL, and PRM_REJECT."
+          }
+        ],
+        "summary": "Caption: Async gRPC boundaries insulate H100 inference throughput from variable sandbox verification latencies.",
+        "caption": "Caption: Async gRPC boundaries insulate H100 inference throughput from variable sandbox verification latencies."
+      },
+      "decisionFramework": {
+        "problem": "How to implement Design a 100M-Trace/Day Enterprise Synthetic Data & Self-Play Pipeline without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "If latency budgets leave no room for synchronous retries, 40% end-to-end verification + PRM yield turns 420 TB/day raw rollouts into 140 TB/day high-signal ACID datasets with sub-second rollback.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Design a 100M-Trace/Day Enterprise Synthetic Data & Self-Play Pipeline experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-3",
+      "eyebrow": "Stage 3 · Intermediate",
+      "title": "2,048-GPU Self-Play Fleet: vLLM/SGLang + Speculative Decoding",
+      "level": "intermediate",
+      "purpose": "Maximize token/sec across 256 HGX H100 nodes using FP8 KV-caches, prefix sharing, and draft-model speculation.",
+      "explanation": {
+        "foundation": "Think of **2,048-GPU Self-Play Fleet: vLLM/SGLang + Speculative Decoding** as the intuition layer for Design a 100M-Trace/Day Enterprise Synthetic Data & Self-Play Pipeline: Maximize token/sec across 256 HGX H100 nodes using FP8 KV-caches, prefix sharing, and draft-model speculation.",
+        "core": "Self-play rollouts share long system prompts and curriculum prefixes across `k` parallel completions per seed. Using SGLang RadixAttention / vLLM PagedAttention with FP8 KV-caching shares prefix KV blocks across all `k` rollouts, while auxiliary draft models accelerate autoregressive reasoning chains by 1.8–2.4x.",
+        "deepDive": "Under heavy load or partial failure, 2,048-gpu self-play fleet: vllm/sglang + speculative decoding becomes a critical lever for predictable latency and correctness. Industrial self-play at 420 TB/day raw -> 140 TB/day Iceberg relies on KL >= 0.72 curriculum mutation, blind property-based sandbox tests, early PRM pruning, and instant snapshot rollbacks."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Inference Fleet",
+        "title": "256x 8-H100 HGX Nodes with RadixAttention & FP8",
+        "nodes": [
+          {
+            "id": "pref",
+            "label": "Shared Seed Prefix",
+            "sub": "Zero-copy KV block reuse",
+            "role": "source"
+          },
+          {
+            "id": "fp8",
+            "label": "vLLM / SGLang FP8",
+            "sub": "Continuous batching + draft",
+            "role": "process"
+          },
+          {
+            "id": "out",
+            "label": "250M Rollouts / Day",
+            "sub": "k parallel paths/seed",
+            "role": "store"
+          }
+        ],
+        "edges": [
+          {
+            "from": "pref",
+            "to": "fp8",
+            "label": "k=8..32 fan-out"
+          },
+          {
+            "from": "fp8",
+            "to": "out",
+            "label": "Stream trajectories"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Prefix Sharing",
+            "detail": "Sharing prompt KV blocks across k rollouts cuts HBM bandwidth pressure dramatically."
+          },
+          {
+            "label": "Speculative Draft",
+            "detail": "Draft models boost decode tokens/sec on repetitive code/math syntax."
+          }
+        ],
+        "summary": "Caption: Prefix-shared FP8 continuous batching lets 2,048 H100s sustain 250M+ daily rollouts.",
+        "caption": "Caption: Prefix-shared FP8 continuous batching lets 2,048 H100s sustain 250M+ daily rollouts."
+      }
+    },
+    {
+      "id": "stage-4",
+      "eyebrow": "Stage 4 · Intermediate",
+      "title": "Firecracker Sandbox Farm: <125ms Restore & Fork-Bomb Defense",
+      "level": "intermediate",
+      "purpose": "Safely run untrusted code and Lean4 proofs at 2,894+ req/s with sub-125ms cold starts.",
+      "explanation": {
+        "foundation": "Think of **Firecracker Sandbox Farm: <125ms Restore & Fork-Bomb Defense** as the intuition layer for Design a 100M-Trace/Day Enterprise Synthetic Data & Self-Play Pipeline: Safely run untrusted code and Lean4 proofs at 2,894+ req/s with sub-125ms cold starts.",
+        "core": "Each bare-metal verifier host maintains a warm pool of Firecracker microVM snapshots pre-booted with Lean4, GCC 13.2, Rust 1.75, Pytest, SymPy, and Z3. Using `userfaultfd` lazy page restoration hits `<125 ms` startup, while `cgroups v2` (`pids.max`, CPU quota, memory max), `seccomp-bpf`, and zero-egress TAP interfaces neutralize fork bombs and exfiltration.",
+        "deepDive": "Under heavy load or partial failure, firecracker sandbox farm: <125ms restore & fork-bomb defense becomes a critical lever for predictable latency and correctness. Industrial self-play at 420 TB/day raw -> 140 TB/day Iceberg relies on KL >= 0.72 curriculum mutation, blind property-based sandbox tests, early PRM pruning, and instant snapshot rollbacks."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Sandbox Isolation",
+        "title": "Warm Firecracker Pool with userfaultfd & cgroups v2",
+        "nodes": [
+          {
+            "id": "pool",
+            "label": "Warm Snapshot Pool",
+            "sub": "Lean4 / Pytest / Z3 preloaded",
+            "role": "source"
+          },
+          {
+            "id": "uffd",
+            "label": "userfaultfd <125ms",
+            "sub": "Copy-on-write page fault",
+            "role": "process"
+          },
+          {
+            "id": "jail",
+            "label": "seccomp + Zero-Egress",
+            "sub": "p95 <= 1.8s execution",
+            "role": "store"
+          }
+        ],
+        "edges": [
+          {
+            "from": "pool",
+            "to": "uffd",
+            "label": "Clone microVM"
+          },
+          {
+            "from": "uffd",
+            "to": "jail",
+            "label": "Run untrusted trace"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Fork-Bomb Cap",
+            "detail": "cgroups v2 pids.max=64 stops process-exhaustion attacks inside the guest."
+          },
+          {
+            "label": "Zero Network Egress",
+            "detail": "Dropping all external routes prevents generated code from calling external APIs or benchmarks."
+          }
+        ],
+        "summary": "Caption: userfaultfd snapshot cloning and cgroups v2 isolation deliver <125ms microVM starts at 2,894+ req/s.",
+        "caption": "Caption: userfaultfd snapshot cloning and cgroups v2 isolation deliver <125ms microVM starts at 2,894+ req/s."
+      }
+    },
+    {
+      "id": "stage-5",
+      "eyebrow": "Stage 5 · Intermediate",
+      "title": "Streaming MinHash LSH & 13-Gram Decontamination",
+      "level": "intermediate",
+      "purpose": "Filter semantic near-duplicates and benchmark contamination at 1,157+ traces/sec with <=4ms p99 latency.",
+      "explanation": {
+        "foundation": "Think of **Streaming MinHash LSH & 13-Gram Decontamination** as the intuition layer for Design a 100M-Trace/Day Enterprise Synthetic Data & Self-Play Pipeline: Filter semantic near-duplicates and benchmark contamination at 1,157+ traces/sec with <=4ms p99 latency.",
+        "core": "Stateless decontamination workers hold an immutable, memory-mapped 13-gram Bloom filter containing all held-out evaluation benchmarks (MMLU, HumanEval, SWE-bench, GSM8K, MATH) alongside a distributed 128-perm MinHash LSH index (32 bands x 4 rows, `J >= 0.80` drop threshold).",
+        "deepDive": "Under heavy load or partial failure, streaming minhash lsh & 13-gram decontamination becomes a critical lever for predictable latency and correctness. Industrial self-play at 420 TB/day raw -> 140 TB/day Iceberg relies on KL >= 0.72 curriculum mutation, blind property-based sandbox tests, early PRM pruning, and instant snapshot rollbacks."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Decontamination",
+        "title": "Dual-Stage LSH + 13-Gram Bloom Filter",
+        "nodes": [
+          {
+            "id": "in",
+            "label": "Verified Traces",
+            "sub": "From Firecracker farm",
+            "role": "source"
+          },
+          {
+            "id": "lsh",
+            "label": "MinHash LSH (32x4)",
+            "sub": "Drop Jaccard >= 0.80",
+            "role": "process"
+          },
+          {
+            "id": "bf",
+            "label": "13-Gram Bloom Filter",
+            "sub": "p99 <= 4ms / 1K tokens",
+            "role": "store"
+          }
+        ],
+        "edges": [
+          {
+            "from": "in",
+            "to": "lsh",
+            "label": "128-perm signature"
+          },
+          {
+            "from": "lsh",
+            "to": "bf",
+            "label": "Rolling Rabin-Karp"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Zero Eval Leakage",
+            "detail": "Any 13-gram overlap with held-out benchmarks immediately quarantines the trace."
+          },
+          {
+            "label": "Hot-Reloadable Filter",
+            "detail": "New benchmark releases are compiled into a shadow Bloom filter and swapped atomically."
+          }
+        ],
+        "summary": "Caption: Streaming LSH and 13-gram Bloom checks purge duplicates and benchmark leaks in under 4ms.",
+        "caption": "Caption: Streaming LSH and 13-gram Bloom checks purge duplicates and benchmark leaks in under 4ms."
+      }
+    },
+    {
+      "id": "stage-6",
+      "eyebrow": "Stage 6 · Advanced",
+      "title": "PRM Rejection Sampling & Early-Stop Tree Search",
+      "level": "advanced",
+      "purpose": "Score intermediate reasoning steps at <=35ms p95 and prune low-reward branches mid-generation.",
+      "explanation": {
+        "foundation": "Think of **PRM Rejection Sampling & Early-Stop Tree Search** as the intuition layer for Design a 100M-Trace/Day Enterprise Synthetic Data & Self-Play Pipeline: Score intermediate reasoning steps at <=35ms p95 and prune low-reward branches mid-generation.",
+        "core": "A dedicated PRM inference tier evaluates step-level reward `r_t in [0, 1]` at `<= 35 ms` p95 per step. During multi-path tree search, partial trajectories dropping below `0.78` are pruned immediately, and full traces must satisfy `min_t(r_t) >= 0.78` before entering Apache Iceberg.",
+        "deepDive": "Under heavy load or partial failure, prm rejection sampling & early-stop tree search becomes a critical lever for predictable latency and correctness. Industrial self-play at 420 TB/day raw -> 140 TB/day Iceberg relies on KL >= 0.72 curriculum mutation, blind property-based sandbox tests, early PRM pruning, and instant snapshot rollbacks."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "PRM Gate",
+        "title": "Step-Level Scoring & Early Branch Pruning",
+        "nodes": [
+          {
+            "id": "clean",
+            "label": "Clean Traces",
+            "sub": "Decontaminated",
+            "role": "source"
+          },
+          {
+            "id": "prm",
+            "label": "PRM Step Scorer",
+            "sub": "p95 <= 35ms/step",
+            "role": "process"
+          },
+          {
+            "id": "keep",
+            "label": "min_t(r_t) >= 0.78",
+            "sub": "Persist to Iceberg",
+            "role": "store"
+          }
+        ],
+        "edges": [
+          {
+            "from": "clean",
+            "to": "prm",
+            "label": "Score steps t=1..T"
+          },
+          {
+            "from": "prm",
+            "to": "keep",
+            "label": "Accept golden traces"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Early Pruning",
+            "detail": "Killing dead-end reasoning branches mid-rollout saves ~25–35% of H100 decode FLOPs."
+          },
+          {
+            "label": "Calibration Audit",
+            "detail": "Log score histograms to ClickHouse to detect PRM drift across domains."
+          }
+        ],
+        "summary": "Caption: PRM step scoring enforces high reasoning quality and cuts wasted decode compute via early pruning.",
+        "caption": "Caption: PRM step scoring enforces high reasoning quality and cuts wasted decode compute via early pruning."
+      }
+    },
+    {
+      "id": "stage-7",
+      "eyebrow": "Stage 7 · Advanced",
+      "title": "Poison-Batch Rollbacks via Apache Iceberg & ClickHouse",
+      "level": "advanced",
+      "purpose": "Detect model collapse or contaminated batches in real time and roll back 10M+ traces atomically.",
+      "explanation": {
+        "foundation": "Think of **Poison-Batch Rollbacks via Apache Iceberg & ClickHouse** as the intuition layer for Design a 100M-Trace/Day Enterprise Synthetic Data & Self-Play Pipeline: Detect model collapse or contaminated batches in real time and roll back 10M+ traces atomically.",
+        "core": "ClickHouse ingests per-batch telemetry (pass@k, KL divergence, lexical diversity, decontam drop rate, PRM distribution). If an anomaly alert fires (e.g., KL drops below `0.72` or eval-leak rate spikes), an automated runbook pauses downstream SFT/RL readers and executes an Apache Iceberg snapshot rollback to the last clean `iceberg_commit_id`.",
+        "deepDive": "Under heavy load or partial failure, poison-batch rollbacks via apache iceberg & clickhouse becomes a critical lever for predictable latency and correctness. Industrial self-play at 420 TB/day raw -> 140 TB/day Iceberg relies on KL >= 0.72 curriculum mutation, blind property-based sandbox tests, early PRM pruning, and instant snapshot rollbacks."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Observability & Rollback",
+        "title": "ClickHouse Collapse Alerts + Iceberg Atomic Revert",
+        "nodes": [
+          {
+            "id": "ch",
+            "label": "ClickHouse Telemetry",
+            "sub": "KL, pass@k, PRM drift",
+            "role": "source"
+          },
+          {
+            "id": "alert",
+            "label": "Anomaly Detected",
+            "sub": "KL < 0.72 or leak spike",
+            "role": "warning"
+          },
+          {
+            "id": "rb",
+            "label": "Iceberg Rollback",
+            "sub": "Revert commit pointer in <1s",
+            "role": "store"
+          }
+        ],
+        "edges": [
+          {
+            "from": "ch",
+            "to": "alert",
+            "label": "Threshold breach"
+          },
+          {
+            "from": "alert",
+            "to": "rb",
+            "label": "Quarantine batch_id"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Time-Travel Queries",
+            "detail": "Downstream training jobs pin an immutable Iceberg snapshot ID for full reproducibility."
+          },
+          {
+            "label": "Zero Data Loss",
+            "detail": "Compaction retains prior snapshots for 30 days so rollbacks never lose earlier clean data."
+          }
+        ],
+        "summary": "Caption: ClickHouse anomaly telemetry paired with Apache Iceberg snapshots enables sub-second dataset rollbacks.",
+        "caption": "Caption: ClickHouse anomaly telemetry paired with Apache Iceberg snapshots enables sub-second dataset rollbacks."
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-1",
+        "question": "At 40% combined verification + PRM yield, how many raw rollouts/sec must the 2,048-GPU H100 fleet sustain on average to persist 100M golden traces/day?",
+        "options": [
+          {
+            "id": "a",
+            "text": "~1,157 rollouts/sec.",
+            "correct": false,
+            "feedback": "Incorrect: 1,157/sec is the net golden commit rate (100M / 86,400), not the raw rollout rate."
+          },
+          {
+            "id": "b",
+            "text": "~2,894 rollouts/sec (250M raw rollouts/day).",
+            "correct": true,
+            "feedback": "Correct: 100M / 0.40 = 250M raw rollouts/day, which equals 250,000,000 / 86,400 = ~2,894 rollouts/sec average."
+          },
+          {
+            "id": "c",
+            "text": "~40,000 rollouts/sec.",
+            "correct": false,
+            "feedback": "Incorrect: 40,000/sec would produce ~3.45B raw rollouts/day."
+          },
+          {
+            "id": "d",
+            "text": "~250 rollouts/sec.",
+            "correct": false,
+            "feedback": "Incorrect: 250/sec is more than 10x too low for 250M/day."
+          }
+        ],
+        "explanation": "100M verified traces/day at 40% yield requires 250M raw rollouts/day, or ~2,894 rollouts/sec sustained average."
+      },
+      {
+        "id": "kc-2",
+        "question": "Why should untrusted model-generated Python/Lean4 code run in userfaultfd-restored Firecracker microVMs rather than standard Docker containers?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Docker cannot run Python.",
+            "correct": false,
+            "feedback": "Incorrect: Docker runs Python, but shares the host Linux kernel."
+          },
+          {
+            "id": "b",
+            "text": "Firecracker automatically proves Lean4 theorems without Lean4.",
+            "correct": false,
+            "feedback": "Incorrect: Firecracker provides hardware virtualization, while Lean4 runs inside the guest."
+          },
+          {
+            "id": "c",
+            "text": "Firecracker provides hardware KVM kernel isolation against escapes and restores pre-warmed snapshots via userfaultfd in <125 ms.",
+            "correct": true,
+            "feedback": "Correct: KVM microVMs isolate untrusted syscalls from the host kernel while userfaultfd hits <125ms cold starts."
+          },
+          {
+            "id": "d",
+            "text": "Firecracker disables all memory limits.",
+            "correct": false,
+            "feedback": "Incorrect: MicroVMs run with strict cgroups v2 memory and PID limits."
+          }
+        ],
+        "explanation": "Firecracker combines KVM kernel isolation (blocking container-escape exploits) with <125ms userfaultfd snapshot restoration."
+      },
+      {
+        "id": "kc-3",
+        "question": "How does the pipeline simultaneously deduplicate 250M daily rollouts and block benchmark leakage without O(N^2) comparisons?",
+        "options": [
+          {
+            "id": "a",
+            "text": "128-permutation MinHash LSH (32x4 bands, J >= 0.80) for near-duplicates plus a rolling-hash 13-gram Bloom filter against held-out eval sets.",
+            "correct": true,
+            "feedback": "Correct: LSH handles near-duplicate clustering in sub-linear time while the 13-gram Bloom filter flags eval overlap in <=4ms/1K tokens."
+          },
+          {
+            "id": "b",
+            "text": "Exact string equality against every trace in S3.",
+            "correct": false,
+            "feedback": "Incorrect: Exact string matching misses paraphrases and scales poorly."
+          },
+          {
+            "id": "c",
+            "text": "Manual human review of all 250M rollouts.",
+            "correct": false,
+            "feedback": "Incorrect: Manual review is impossible at 250M traces/day."
+          },
+          {
+            "id": "d",
+            "text": "Disabling temperature sampling in vLLM.",
+            "correct": false,
+            "feedback": "Incorrect: Disabling temperature worsens duplication and causes mode collapse."
+          }
+        ],
+        "explanation": "Combining 128-permutation MinHash LSH with a 13-gram Bloom filter catches both paraphrases and exact benchmark overlaps at streaming speed."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "A 100M-trace/day synthetic data factory uses 2,048 H100 GPUs to generate answers, microVMs to test them, filters to remove leaked test questions, and Iceberg to save clean data safely.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, 40% end-to-end verification + PRM yield turns 420 TB/day raw rollouts into 140 TB/day high-signal ACID datasets with sub-second rollback.",
+      "byteSummary": "The pipeline generates 250M candidate solutions per day, runs each one in a fast isolated microVM, removes duplicates and benchmark overlaps, scores each reasoning step, and saves the best 100M traces into versioned Iceberg tables."
+    },
+    "intermediate": {
+      "summary": "The 6-subsystem architecture decouples vLLM/SGLang H100 inference from <125ms Firecracker verifiers, MinHash/13-gram decontamination, PRM scoring, and Apache Iceberg.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, 40% end-to-end verification + PRM yield turns 420 TB/day raw rollouts into 140 TB/day high-signal ACID datasets with sub-second rollback.",
+      "byteSummary": "Sustaining 2,894 raw rollouts/sec (7,500 peak) requires RadixAttention prefix sharing, userfaultfd microVM pools with zero-egress cgroups, LSH + Bloom decontamination (<=4ms/1K tok), and min_t(r_t) >= 0.78 PRM gating."
+    },
+    "advanced": {
+      "summary": "Industrial self-play at 420 TB/day raw -> 140 TB/day Iceberg relies on KL >= 0.72 curriculum mutation, blind property-based sandbox tests, early PRM pruning, and instant snapshot rollbacks.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, 40% end-to-end verification + PRM yield turns 420 TB/day raw rollouts into 140 TB/day high-signal ACID datasets with sub-second rollback.",
+      "byteSummary": "At 2,048-GPU scale, bottlenecks shift to verifier tail latency (mitigated via async gRPC + userfaultfd), Goodhart reward hacking (mitigated via hidden tests + PRM recalibration), and lineage recovery (mitigated via Iceberg commit pointers)."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "prerequisites": [
+    {
+      "title": "Verifier-Guided Self-Play & Synthetic Data Pipelines",
+      "summary": "Verifier-guided self-play pairs an entropy-bounded curriculum mutator with deterministic execution sandboxes (Lean4, Pytest, Z3), 13-gram/MinHash decontamination, and step-level Process Reward Models (PRM)."
+    },
+    {
+      "title": "Distributed Diffusion Inference: Ring Attention & LCM Distillation",
+      "summary": "Ring Attention shards long spatio-temporal DiT token sequences across an NVLink GPU ring, overlapping P2P KV transfers with FP8 FlashAttention compute, while LCM distillation reduces denoising from 50 steps to 4–8."
+    }
+  ],
+  "simulation": {
+    "title": "Design a 100M-Trace/Day Enterprise Synthetic Data & Self-Play Pipeline — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Input Workload"
+      },
+      {
+        "id": "entry",
+        "label": "Router / API",
+        "role": "Admission Control"
+      },
+      {
+        "id": "worker",
+        "label": "Processor",
+        "role": "Domain Logic"
+      },
+      {
+        "id": "store",
+        "label": "State Layer",
+        "role": "Durable Store"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "entry",
+        "label": "request"
+      },
+      {
+        "from": "entry",
+        "to": "worker",
+        "label": "dispatch"
+      },
+      {
+        "from": "worker",
+        "to": "store",
+        "label": "read/write"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Throughput Math & 420 TB/Day -> 140 TB/Day Yield Funnel",
+        "actionLabel": "request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "entry"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "request",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Caller sends work to Router / API (Throughput Math & 420 TB/Day -> 140 TB/Day Yield Funnel)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Typed gRPC Contracts Between Generators, Verifiers & PRMs",
+        "actionLabel": "dispatch",
+        "status": "healthy",
+        "activeNodeIds": [
+          "entry",
+          "worker"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "dispatch",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Router / API coordinates with Processor while preserving the core invariant (Typed gRPC Contracts Between Generators, Verifiers & PRMs)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "2,048-GPU Self-Play Fleet: vLLM/SGLang + Speculative Decoding",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "worker",
+          "store"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, State Layer absorbs pressure without cascading (2,048-GPU Self-Play Fleet: vLLM/SGLang + Speculative Decoding)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Poison-Batch Rollbacks via Apache Iceberg & ClickHouse",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "entry",
+          "worker",
+          "store"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Poison-Batch Rollbacks via Apache Iceberg & ClickHouse)."
+      }
+    ]
+  }
+}

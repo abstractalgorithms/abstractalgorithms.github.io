@@ -1,0 +1,898 @@
+{
+  "id": "problem-preventing-kafka-consumer-rebalance-storms",
+  "slug": "preventing-kafka-consumer-rebalance-storms",
+  "title": "Preventing Kafka Consumer Rebalance Storms",
+  "problemType": "system-design",
+  "difficulty": "hard",
+  "prompt": "A 24-pod Java payment-ledger consumer group reading 48 partitions at 18,000 msg/s enters a continuous rebalance loop whenever the downstream PostgreSQL ledger experiences a 90s lock spike. Each poll() fetches 500 records, pushing batch processing past max.poll.interval.ms=300000, causing LeaveGroup/rebalance storms and zero net commit progress.",
+  "spark": {
+    "summary": "A slow downstream dependency stalls batch processing beyond 300s, triggering GroupCoordinator eviction, stop-the-world rebalances, and duplicate redelivery across all 48 partitions.",
+    "keyTakeaway": "If latency budgets leave no room for synchronous retries, decouple poll() liveness from slow processing via small max.poll.records, bounded worker queues with pause()/resume(), and CooperativeStickyAssignor.",
+    "byteSummary": "**Core Mechanics:** A 24-pod Java payment-ledger consumer group reading **48 partitions at 18,000 msg/s** (1 GiB heap, 2 vCPU) enters a continuous rebalance loop whenever Postgres p99 write latency spikes from **12 ms to 450 ms**.\n\n**Visual & Structural Flow:** Depicts max.poll.interval.ms Eviction vs. pause()/resume() Backpressure (Kafka Broker (48p) -> Poll Thread -> Bounded Queue -> Postgres (450ms)); Active Polling vs. Paused Heartbeat Preservation (ACTIVE POLL -> PAUSED (LIVENESS) -> COMMIT & RESUME).\n\n**Trade-Offs & Production:** Raising `max.poll.interval.ms` to 30 minutes hides genuinely deadlocked consumers for half an hour before recovery. Decouple Kafka group liveness from downstream Postgres latency: **Bound Batch Size**: Lower `max.poll.records` from 500 to `50–100` so worst-case 450 ms DB batches finish well within `max.poll.interval.ms`.\n\n**Failure Modes & Application:** Poll-liveness decoupling is essential in high-throughput Kafka consumers: **Database & External API Sinks**: Protects consumer groups when downstream Postgres, Elasticsearch, or payment APIs experience transient latency spikes."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why Preventing Kafka Consumer Rebalance Storms Matters",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "Think of **Why Preventing Kafka Consumer Rebalance Storms Matters** as the intuition layer for Preventing Kafka Consumer Rebalance Storms: The mechanism: understand how Why Preventing Kafka Consumer Rebalance Storms Matters works from first principles.",
+        "core": "A 24-pod Java payment-ledger consumer group reading **48 partitions at 18,000 msg/s** (1 GiB heap, 2 vCPU) enters a continuous rebalance loop whenever Postgres p99 write latency spikes from **12 ms to 450 ms**. Because each `poll()` fetches **500 records**, batch processing exceeds `max.poll.interval.ms = 300000`, triggering `LeaveGroup` and stop-the-world rebalances that stall all 48 partitions.",
+        "deepDive": "Under heavy load or partial failure, why preventing kafka consumer rebalance storms matters becomes a critical lever for predictable latency and correctness. A slow downstream dependency stalls batch processing beyond 300s, triggering GroupCoordinator eviction, stop-the-world rebalances, and duplicate redelivery across all 48 partitions."
+      },
+      "purpose": "The mechanism: understand how Why Preventing Kafka Consumer Rebalance Storms Matters works from first principles.",
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "Stage 1 Lifecycle",
+        "title": "Why Preventing Kafka Consumer Rebalance Storms Matters",
+        "states": [
+          {
+            "id": "init",
+            "label": "Ready / Idle",
+            "tone": "neutral"
+          },
+          {
+            "id": "active",
+            "label": "In-Flight",
+            "tone": "info"
+          },
+          {
+            "id": "verified",
+            "label": "Committed",
+            "tone": "good"
+          },
+          {
+            "id": "degraded",
+            "label": "Fallback / Retry",
+            "tone": "warn"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "init",
+            "to": "active",
+            "label": "acquire"
+          },
+          {
+            "from": "active",
+            "to": "verified",
+            "label": "quorum ok"
+          },
+          {
+            "from": "active",
+            "to": "degraded",
+            "label": "timeout / skew"
+          },
+          {
+            "from": "degraded",
+            "to": "init",
+            "label": "backoff reset"
+          }
+        ]
+      }
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "Real-World Impact of Poll-Interval Rebalance Storms",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Mixing slow DB I/O with eager `poll()` loops triggers a self-sustaining storm:",
+        "core": "1. **Ejected Healthy Consumers**: Exceeding `max.poll.interval.ms` makes the coordinator evict the pod even though its background heartbeat thread is alive.\n2. **Duplicate Reprocessing**: Uncommitted batches on the evicted pod are re-delivered to the new owner, piling *more* duplicate work onto the struggling Postgres DB.\n3. **Stop-the-World Rebalances**: Default `RangeAssignor` revokes all 48 partitions across all 24 pods on every rebalance.",
+        "deepDive": "In production deployments of Preventing Kafka Consumer Rebalance Storms, watch how real-world impact of poll-interval rebalance storms interacts with tail latency, retry amplification, and partial failures. A slow downstream dependency stalls batch processing beyond 300s, triggering GroupCoordinator eviction, stop-the-world rebalances, and duplicate redelivery across all 48 partitions."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Decoupled Poll Liveness & Cooperative Rebalance",
+        "title": "max.poll.interval.ms Eviction vs. pause()/resume() Backpressure",
+        "actors": [
+          {
+            "id": "brk",
+            "label": "Kafka Broker (48p)"
+          },
+          {
+            "id": "pol",
+            "label": "Poll Thread"
+          },
+          {
+            "id": "q",
+            "label": "Bounded Queue"
+          },
+          {
+            "id": "pg",
+            "label": "Postgres (450ms)"
+          }
+        ],
+        "events": [
+          {
+            "from": "brk",
+            "to": "pol",
+            "label": "poll(max.poll.records=100)",
+            "status": "ok"
+          },
+          {
+            "from": "pol",
+            "to": "q",
+            "label": "Enqueue batch -> queue hits high watermark",
+            "status": "warn"
+          },
+          {
+            "from": "pol",
+            "to": "brk",
+            "label": "consumer.pause(assigned) + keep calling poll(0)!",
+            "status": "ok"
+          },
+          {
+            "from": "q",
+            "to": "pg",
+            "label": "Workers drain DB safely -> consumer.resume()",
+            "status": "ok"
+          }
+        ],
+        "summary": "Calling pause() and continuing lightweight poll() keeps heartbeats and max.poll.interval.ms alive during 90s DB lock spikes."
+      },
+      "purpose": "The problem: see what breaks without Real-World Impact of Poll-Interval Rebalance Storms under real concurrency or scale.",
+      "decisionFramework": {
+        "problem": "How to implement Preventing Kafka Consumer Rebalance Storms without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "If latency budgets leave no room for synchronous retries, decouple poll() liveness from slow processing via small max.poll.records, bounded worker queues with pause()/resume(), and CooperativeStickyAssignor.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Preventing Kafka Consumer Rebalance Storms experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Naive Solution (and Why It Breaks)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Think of **Naive Solution (and Why It Breaks)** as the intuition layer for Preventing Kafka Consumer Rebalance Storms: The problem: see what breaks without Naive Solution under real concurrency or scale.",
+        "core": "Raising `max.poll.interval.ms` to 30 minutes hides genuinely deadlocked consumers for half an hour before recovery. Spawning unbounded async threads inside `poll()` without `pause()` causes 1 GiB JVM OOMs and commits offsets out of order before DB writes succeed.",
+        "deepDive": "Under heavy load or partial failure, naive solution (and why it breaks) becomes a critical lever for predictable latency and correctness. A slow downstream dependency stalls batch processing beyond 300s, triggering GroupCoordinator eviction, stop-the-world rebalances, and duplicate redelivery across all 48 partitions."
+      },
+      "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "Stage 3 Lifecycle",
+        "title": "Naive Solution (and Why It Breaks)",
+        "states": [
+          {
+            "id": "init",
+            "label": "Ready / Idle",
+            "tone": "neutral"
+          },
+          {
+            "id": "active",
+            "label": "In-Flight",
+            "tone": "info"
+          },
+          {
+            "id": "verified",
+            "label": "Committed",
+            "tone": "good"
+          },
+          {
+            "id": "degraded",
+            "label": "Fallback / Retry",
+            "tone": "warn"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "init",
+            "to": "active",
+            "label": "acquire"
+          },
+          {
+            "from": "active",
+            "to": "verified",
+            "label": "quorum ok"
+          },
+          {
+            "from": "active",
+            "to": "degraded",
+            "label": "timeout / skew"
+          },
+          {
+            "from": "degraded",
+            "to": "init",
+            "label": "backoff reset"
+          }
+        ]
+      }
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise Solution: `max.poll.records=100`, `pause()/resume()` & `CooperativeStickyAssignor`",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": {
+        "foundation": "Decouple Kafka group liveness from downstream Postgres latency:",
+        "core": "- **Bound Batch Size**: Lower `max.poll.records` from 500 to `50–100` so worst-case 450 ms DB batches finish well within `max.poll.interval.ms`.\n- **Decoupled Worker Queue + `pause()`/`resume()`**: Dispatch polled records to a bounded per-partition worker queue. When the queue fills during a 90s DB lock spike, call `consumer.pause(assignment)` and keep calling `consumer.poll(Duration.ZERO)` so `max.poll.interval.ms` never expires—then `resume()` and commit contiguous offsets once drained.\n- **Cooperative Rebalancing + Static Membership**: Set `partition.assignment.strategy=CooperativeStickyAssignor` and `group.instance.id` so rolling deploys move only affected partitions without stopping healthy pods.",
+        "deepDive": "In production deployments of Preventing Kafka Consumer Rebalance Storms, watch how enterprise solution: `max.poll.records=100`, `pause()/resume()` & `cooperativestickyassignor` interacts with tail latency, retry amplification, and partial failures. A slow downstream dependency stalls batch processing beyond 300s, triggering GroupCoordinator eviction, stop-the-world rebalances, and duplicate redelivery across all 48 partitions."
+      },
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "Consumer Backpressure State Machine",
+        "title": "Active Polling vs. Paused Heartbeat Preservation",
+        "states": [
+          {
+            "id": "act",
+            "label": "ACTIVE POLL",
+            "sublabel": "max.poll.records=100",
+            "tone": "green"
+          },
+          {
+            "id": "pau",
+            "label": "PAUSED (LIVENESS)",
+            "sublabel": "queue full -> poll(0) only",
+            "tone": "amber"
+          },
+          {
+            "id": "res",
+            "label": "COMMIT & RESUME",
+            "sublabel": "contiguous offset commit",
+            "tone": "blue"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "act",
+            "to": "pau",
+            "label": "DB spike -> queue >= 80%"
+          },
+          {
+            "from": "pau",
+            "to": "res",
+            "label": "queue <= 30% drained"
+          },
+          {
+            "from": "res",
+            "to": "act",
+            "label": "resume(partitions)"
+          }
+        ],
+        "summary": "Pausing partition fetch while keeping poll() spinning prevents rebalance storms without risking OOM."
+      },
+      "markdownContent": "```yaml\nmax.poll.records: 500\nmax.poll.interval.ms: 300000\nsession.timeout.ms: 45000\n```\n\n```java\nif (queue.size() >= 160) consumer.pause(List.of(tp));\n// worker completes batch -> completedOffsets.put(tp, nextOffset);\nif (queue.size() <= 80 && consumer.paused().contains(tp)) consumer.resume(List.of(tp));\n\npublic void onPartitionsRevoked(Collection<TopicPartition> partitions) {\n    Map<TopicPartition, OffsetAndMetadata> toCommit = workers.drainAndCancel(partitions, Duration.ofSeconds(10));\n    if (!toCommit.isEmpty()) consumer.commitSync(toCommit);\n}\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where Rebalance-Storm Prevention Applies in System Design",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Poll-liveness decoupling is essential in high-throughput Kafka consumers:",
+        "core": "- **Database & External API Sinks**: Protects consumer groups when downstream Postgres, Elasticsearch, or payment APIs experience transient latency spikes.\n- **Large Stateful Fleet Upgrades**: `CooperativeStickyAssignor` + `group.instance.id` eliminates stop-the-world pauses during Kubernetes rolling restarts.\n- **Bounded-Memory Containers**: Keeps 1 GiB heap pods safe under backpressure.",
+        "deepDive": "In production deployments of Preventing Kafka Consumer Rebalance Storms, watch how where rebalance-storm prevention applies in system design interacts with tail latency, retry amplification, and partial failures. A slow downstream dependency stalls batch processing beyond 300s, triggering GroupCoordinator eviction, stop-the-world rebalances, and duplicate redelivery across all 48 partitions."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "message-queues",
+          "title": "Concept: Message Queues",
+          "kind": "concept"
+        },
+        {
+          "slug": "backpressure-flow-control",
+          "title": "Concept: Backpressure & Flow Control",
+          "kind": "concept"
+        },
+        {
+          "slug": "replicated-logs-sequencing",
+          "title": "Concept: Replicated Logs & Sequencing",
+          "kind": "concept"
+        },
+        {
+          "slug": "handling-kafka-poison-pill-messages",
+          "title": "Problem: Handling Kafka Poison-Pill Messages",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "Stage 5 Topology",
+        "title": "Where Rebalance-Storm Prevention Applies in System Design",
+        "nodes": [
+          {
+            "id": "edge",
+            "label": "Edge Router",
+            "tier": "ingress"
+          },
+          {
+            "id": "worker",
+            "label": "Preventing Kafka Con Worker",
+            "tier": "compute"
+          },
+          {
+            "id": "state",
+            "label": "Primary State",
+            "tier": "storage"
+          },
+          {
+            "id": "obs",
+            "label": "Telemetry & Audit",
+            "tier": "control"
+          }
+        ],
+        "edges": [
+          {
+            "from": "edge",
+            "to": "worker",
+            "label": "route"
+          },
+          {
+            "from": "worker",
+            "to": "state",
+            "label": "read / mutate"
+          },
+          {
+            "from": "worker",
+            "to": "obs",
+            "label": "emit metrics"
+          }
+        ]
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why does calling `consumer.pause(assignment)` while continuing to call `consumer.poll()` prevent a rebalance storm during a 90s Postgres slowdown?",
+      "options": [
+        {
+          "id": "a",
+          "text": "It stops fetching new records (preventing OOM) while still calling `poll()` to reset the `max.poll.interval.ms` timer and maintain group membership",
+          "correct": true,
+          "feedback": "Correct: `pause()` applies backpressure without letting the coordinator evict the consumer."
+        },
+        {
+          "id": "b",
+          "text": "It tells Kafka brokers to delete uncommitted messages from partition 0..47",
+          "correct": false,
+          "feedback": "Messages remain safely in Kafka until the consumer resumes and commits offsets."
+        },
+        {
+          "id": "c",
+          "text": "It disables `CooperativeStickyAssignor` during the DB spike",
+          "correct": false,
+          "feedback": "`CooperativeStickyAssignor` remains active and only governs partition assignment."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why does calling `consumer.pause(assignment)` while continuing to call `consumer.poll()` prevent a rebalance storm during a 90s Postgres slowdown?",
+        "options": [
+          {
+            "id": "a",
+            "text": "It stops fetching new records (preventing OOM) while still calling `poll()` to reset the `max.poll.interval.ms` timer and maintain group membership",
+            "correct": true,
+            "feedback": "Correct: `pause()` applies backpressure without letting the coordinator evict the consumer."
+          },
+          {
+            "id": "b",
+            "text": "It tells Kafka brokers to delete uncommitted messages from partition 0..47",
+            "correct": false,
+            "feedback": "Messages remain safely in Kafka until the consumer resumes and commits offsets."
+          },
+          {
+            "id": "c",
+            "text": "It disables `CooperativeStickyAssignor` during the DB spike",
+            "correct": false,
+            "feedback": "`CooperativeStickyAssignor` remains active and only governs partition assignment."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why Preventing Kafka Consumer Rebalance Storms Matters', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "A 24-pod Java payment-ledger consumer group reading **48 partitions at 18,000 msg/s** (1 GiB heap, 2 vCPU) enters a continuous rebalance loop whenever Postgres p99 write…",
+            "correct": true,
+            "feedback": "Correct: A 24-pod Java payment-ledger consumer group reading **48 partitions at 18,000 msg/s** (1 GiB heap, 2 vCPU) enters a continuous rebalance loop whenever Postgres p99 write…"
+          },
+          {
+            "id": "b",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "c",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Real-World Impact of Poll-Interval Rebalance Storms', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Mixing slow DB I/O with eager poll() loops triggers a self-sustaining storm: 1.",
+            "correct": true,
+            "feedback": "Correct: Mixing slow DB I/O with eager poll() loops triggers a self-sustaining storm: 1."
+          },
+          {
+            "id": "b",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "c",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** A 24-pod Java payment-ledger consumer group reading **48 partitions at 18,000 msg/s** (1 GiB heap, 2 vCPU) enters a continuous rebalance loop whenever Postgres p99 write latency spikes from **12 ms to 450 ms**.\n\n**How It Flows:** Think of Preventing Kafka Consumer Rebalance Storms as a clear step-by-step chain: Kafka Broker (48p) -> Poll Thread -> Bounded Queue -> Postgres (450ms) -> ACTIVE POLL.\n\n**Why Beginners Should Care:** Decouple poll() liveness from slow processing via small max.poll.records, bounded worker queues with pause()/resume(), and CooperativeStickyAssignor.",
+      "spark": {
+        "summary": "A 24-pod Java payment-ledger consumer group reading **48 partitions at 18,000 msg/s** (1 GiB heap, 2 vCPU) enters a continuous rebalance loop whenever Postgres p99 write latency spikes from **12 ms to 450 ms**.",
+        "keyTakeaway": "Decouple poll() liveness from slow processing via small max.poll.records, bounded worker queues with pause()/resume(), and CooperativeStickyAssignor."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why Preventing Kafka Consumer Rebalance Storms Matters",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why Preventing Kafka Consumer Rebalance Storms Matters works from first principles.",
+          "explanation": "A 24-pod Java payment-ledger consumer group reading **48 partitions at 18,000 msg/s** (1 GiB heap, 2 vCPU) enters a continuous rebalance loop whenever Postgres p99 write latency spikes from **12 ms to 450 ms**. Because each `poll()` fetches **500 records**, batch processing exceeds `max.poll.interval.ms = 300000`, triggering `LeaveGroup` and stop-the-world rebalances that stall all 48 partitions.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Real-World Impact of Poll-Interval Rebalance Storms",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without Real-World Impact of Poll-Interval Rebalance Storms under real concurrency or scale.",
+          "explanation": "Mixing slow DB I/O with eager `poll()` loops triggers a self-sustaining storm: 1. **Ejected Healthy Consumers**: Exceeding `max.poll.interval.ms` makes the coordinator evict the pod even though its background heartbeat thread is alive. 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Decoupled Poll Liveness & Cooperative Rebalance",
+            "title": "max.poll.interval.ms Eviction vs. pause()/resume() Backpressure",
+            "actors": [
+              {
+                "id": "brk",
+                "label": "Kafka Broker (48p)"
+              },
+              {
+                "id": "pol",
+                "label": "Poll Thread"
+              },
+              {
+                "id": "q",
+                "label": "Bounded Queue"
+              },
+              {
+                "id": "pg",
+                "label": "Postgres (450ms)"
+              }
+            ],
+            "events": [
+              {
+                "from": "brk",
+                "to": "pol",
+                "label": "poll(max.poll.records=100)",
+                "status": "ok"
+              },
+              {
+                "from": "pol",
+                "to": "q",
+                "label": "Enqueue batch -> queue hits high watermark",
+                "status": "warn"
+              },
+              {
+                "from": "pol",
+                "to": "brk",
+                "label": "consumer.pause(assigned) + keep calling poll(0)!",
+                "status": "ok"
+              },
+              {
+                "from": "q",
+                "to": "pg",
+                "label": "Workers drain DB safely -> consumer.resume()",
+                "status": "ok"
+              }
+            ],
+            "summary": "Calling pause() and continuing lightweight poll() keeps heartbeats and max.poll.interval.ms alive during 90s DB lock spikes."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive Solution (and Why It Breaks)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+          "explanation": "Raising `max.poll.interval.ms` to 30 minutes hides genuinely deadlocked consumers for half an hour before recovery. Spawning unbounded async threads inside `poll()` without `pause()` causes 1 GiB JVM OOMs and commits offsets out of order before DB writes succeed.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise Solution: `max.poll.records=100`, `pause()/resume()` & `CooperativeStickyAssignor`",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Decouple Kafka group liveness from downstream Postgres latency: **Bound Batch Size**: Lower `max.poll.records` from 500 to `50–100` so worst-case 450 ms DB batches finish well within `max.poll.interval.ms`. **Decoupled Worker Queue + `pause()`/`resume()`**: Dispatch polled records to a bounded per-partition worker queue.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "state-machine",
+            "eyebrow": "Consumer Backpressure State Machine",
+            "title": "Active Polling vs. Paused Heartbeat Preservation",
+            "states": [
+              {
+                "id": "act",
+                "label": "ACTIVE POLL",
+                "sublabel": "max.poll.records=100",
+                "tone": "green"
+              },
+              {
+                "id": "pau",
+                "label": "PAUSED (LIVENESS)",
+                "sublabel": "queue full -> poll(0) only",
+                "tone": "amber"
+              },
+              {
+                "id": "res",
+                "label": "COMMIT & RESUME",
+                "sublabel": "contiguous offset commit",
+                "tone": "blue"
+              }
+            ],
+            "transitions": [
+              {
+                "from": "act",
+                "to": "pau",
+                "label": "DB spike -> queue >= 80%"
+              },
+              {
+                "from": "pau",
+                "to": "res",
+                "label": "queue <= 30% drained"
+              },
+              {
+                "from": "res",
+                "to": "act",
+                "label": "resume(partitions)"
+              }
+            ],
+            "summary": "Pausing partition fetch while keeping poll() spinning prevents rebalance storms without risking OOM."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Decouple poll() liveness from slow processing via small max.poll.records, bounded worker queues with pause()/resume(), and CooperativeStickyAssignor.",
+      "summary": "A slow downstream dependency stalls batch processing beyond 300s, triggering GroupCoordinator eviction, stop-the-world rebalances, and duplicate redelivery across all 48 partitions.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, decouple poll() liveness from slow processing via small max.poll.records, bounded worker queues with pause()/resume(), and CooperativeStickyAssignor."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** A 24-pod Java payment-ledger consumer group reading **48 partitions at 18,000 msg/s** (1 GiB heap, 2 vCPU) enters a continuous rebalance loop whenever Postgres p99 write latency spikes from **12 ms to 450 ms**.\n\n**Visual & Structural Flow:** Depicts max.poll.interval.ms Eviction vs. pause()/resume() Backpressure (Kafka Broker (48p) -> Poll Thread -> Bounded Queue -> Postgres (450ms)); Active Polling vs. Paused Heartbeat Preservation (ACTIVE POLL -> PAUSED (LIVENESS) -> COMMIT & RESUME).\n\n**Trade-Offs & Production:** Raising `max.poll.interval.ms` to 30 minutes hides genuinely deadlocked consumers for half an hour before recovery. Decouple Kafka group liveness from downstream Postgres latency: **Bound Batch Size**: Lower `max.poll.records` from 500 to `50–100` so worst-case 450 ms DB batches finish well within `max.poll.interval.ms`.\n\n**Failure Modes & Application:** Poll-liveness decoupling is essential in high-throughput Kafka consumers: **Database & External API Sinks**: Protects consumer groups when downstream Postgres, Elasticsearch, or payment APIs experience transient latency spikes.",
+      "spark": {
+        "summary": "A slow downstream dependency stalls batch processing beyond 300s, triggering GroupCoordinator eviction, stop-the-world rebalances, and duplicate redelivery across all 48 partitions.",
+        "keyTakeaway": "Decouple poll() liveness from slow processing via small max.poll.records, bounded worker queues with pause()/resume(), and CooperativeStickyAssignor."
+      },
+      "summary": "A slow downstream dependency stalls batch processing beyond 300s, triggering GroupCoordinator eviction, stop-the-world rebalances, and duplicate redelivery across all 48 partitions.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, decouple poll() liveness from slow processing via small max.poll.records, bounded worker queues with pause()/resume(), and CooperativeStickyAssignor."
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** A slow downstream dependency stalls batch processing beyond 300s, triggering GroupCoordinator eviction, stop-the-world rebalances, and duplicate redelivery across all 48 partitions.\n\n**Production Trade-Offs:** Raising `max.poll.interval.ms` to 30 minutes hides genuinely deadlocked consumers for half an hour before recovery.\n\n**Failure Modes & Edge Cases:** Poll-liveness decoupling is essential in high-throughput Kafka consumers: **Database & External API Sinks**: Protects consumer groups when downstream Postgres, Elasticsearch, or payment APIs experience transient latency spikes.\n\n**Principal Takeaway:** Decouple poll() liveness from slow processing via small max.poll.records, bounded worker queues with pause()/resume(), and CooperativeStickyAssignor.",
+      "spark": {
+        "summary": "A slow downstream dependency stalls batch processing beyond 300s, triggering GroupCoordinator eviction, stop-the-world rebalances, and duplicate redelivery across all 48 partitions.",
+        "keyTakeaway": "Decouple poll() liveness from slow processing via small max.poll.records, bounded worker queues with pause()/resume(), and CooperativeStickyAssignor."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why Preventing Kafka Consumer Rebalance Storms Matters",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why Preventing Kafka Consumer Rebalance Storms Matters works from first principles.",
+          "explanation": "A 24-pod Java payment-ledger consumer group reading **48 partitions at 18,000 msg/s** (1 GiB heap, 2 vCPU) enters a continuous rebalance loop whenever Postgres p99 write latency spikes from **12 ms to 450 ms**. Because each `poll()` fetches **500 records**, batch processing exceeds `max.poll.interval.ms = 300000`, triggering `LeaveGroup` and stop-the-world rebalances that stall all 48 partitions.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Real-World Impact of Poll-Interval Rebalance Storms",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without Real-World Impact of Poll-Interval Rebalance Storms under real concurrency or scale.",
+          "explanation": "Mixing slow DB I/O with eager `poll()` loops triggers a self-sustaining storm:\n\n1. **Ejected Healthy Consumers**: Exceeding `max.poll.interval.ms` makes the coordinator evict the pod even though its background heartbeat thread is alive.\n2. **Duplicate Reprocessing**: Uncommitted batches on the evicted pod are re-delivered to the new owner, piling *more* duplicate work onto the struggling Postgres DB.\n3. **Stop-the-World Rebalances**: Default `RangeAssignor` revokes all 48 partitions across all 24 pods on every rebalance.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Decoupled Poll Liveness & Cooperative Rebalance",
+            "title": "max.poll.interval.ms Eviction vs. pause()/resume() Backpressure",
+            "actors": [
+              {
+                "id": "brk",
+                "label": "Kafka Broker (48p)"
+              },
+              {
+                "id": "pol",
+                "label": "Poll Thread"
+              },
+              {
+                "id": "q",
+                "label": "Bounded Queue"
+              },
+              {
+                "id": "pg",
+                "label": "Postgres (450ms)"
+              }
+            ],
+            "events": [
+              {
+                "from": "brk",
+                "to": "pol",
+                "label": "poll(max.poll.records=100)",
+                "status": "ok"
+              },
+              {
+                "from": "pol",
+                "to": "q",
+                "label": "Enqueue batch -> queue hits high watermark",
+                "status": "warn"
+              },
+              {
+                "from": "pol",
+                "to": "brk",
+                "label": "consumer.pause(assigned) + keep calling poll(0)!",
+                "status": "ok"
+              },
+              {
+                "from": "q",
+                "to": "pg",
+                "label": "Workers drain DB safely -> consumer.resume()",
+                "status": "ok"
+              }
+            ],
+            "summary": "Calling pause() and continuing lightweight poll() keeps heartbeats and max.poll.interval.ms alive during 90s DB lock spikes."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive Solution (and Why It Breaks)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+          "explanation": "Raising `max.poll.interval.ms` to 30 minutes hides genuinely deadlocked consumers for half an hour before recovery. Spawning unbounded async threads inside `poll()` without `pause()` causes 1 GiB JVM OOMs and commits offsets out of order before DB writes succeed.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise Solution: `max.poll.records=100`, `pause()/resume()` & `CooperativeStickyAssignor`",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Decouple Kafka group liveness from downstream Postgres latency:\n\n- **Bound Batch Size**: Lower `max.poll.records` from 500 to `50–100` so worst-case 450 ms DB batches finish well within `max.poll.interval.ms`.\n- **Decoupled Worker Queue + `pause()`/`resume()`**: Dispatch polled records to a bounded per-partition worker queue. When the queue fills during a 90s DB lock spike, call `consumer.pause(assignment)` and keep calling `consumer.poll(Duration.ZERO)` so `max.poll.interval.ms` never expires—then `resume()` and commit contiguous offsets once drained.\n- **Cooperative Rebalancing + Static Membership**: Set `partition.assignment.strategy=CooperativeStickyAssignor` and `group.instance.id` so rolling deploys move only affected partitions without stopping healthy pods.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "state-machine",
+            "eyebrow": "Consumer Backpressure State Machine",
+            "title": "Active Polling vs. Paused Heartbeat Preservation",
+            "states": [
+              {
+                "id": "act",
+                "label": "ACTIVE POLL",
+                "sublabel": "max.poll.records=100",
+                "tone": "green"
+              },
+              {
+                "id": "pau",
+                "label": "PAUSED (LIVENESS)",
+                "sublabel": "queue full -> poll(0) only",
+                "tone": "amber"
+              },
+              {
+                "id": "res",
+                "label": "COMMIT & RESUME",
+                "sublabel": "contiguous offset commit",
+                "tone": "blue"
+              }
+            ],
+            "transitions": [
+              {
+                "from": "act",
+                "to": "pau",
+                "label": "DB spike -> queue >= 80%"
+              },
+              {
+                "from": "pau",
+                "to": "res",
+                "label": "queue <= 30% drained"
+              },
+              {
+                "from": "res",
+                "to": "act",
+                "label": "resume(partitions)"
+              }
+            ],
+            "summary": "Pausing partition fetch while keeping poll() spinning prevents rebalance storms without risking OOM."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where Rebalance-Storm Prevention Applies in System Design",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Poll-liveness decoupling is essential in high-throughput Kafka consumers:\n\n- **Database & External API Sinks**: Protects consumer groups when downstream Postgres, Elasticsearch, or payment APIs experience transient latency spikes.\n- **Large Stateful Fleet Upgrades**: `CooperativeStickyAssignor` + `group.instance.id` eliminates stop-the-world pauses during Kubernetes rolling restarts.\n- **Bounded-Memory Containers**: Keeps 1 GiB heap pods safe under backpressure.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Decouple poll() liveness from slow processing via small max.poll.records, bounded worker queues with pause()/resume(), and CooperativeStickyAssignor.",
+      "summary": "A slow downstream dependency stalls batch processing beyond 300s, triggering GroupCoordinator eviction, stop-the-world rebalances, and duplicate redelivery across all 48 partitions.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, decouple poll() liveness from slow processing via small max.poll.records, bounded worker queues with pause()/resume(), and CooperativeStickyAssignor."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "simulation": {
+    "title": "Preventing Kafka Consumer Rebalance Storms — Interactive Execution Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Workload & Budget"
+      },
+      {
+        "id": "router",
+        "label": "Gateway / Router",
+        "role": "Admission & Dispatch"
+      },
+      {
+        "id": "engine",
+        "label": "Core Engine",
+        "role": "Primary Execution"
+      },
+      {
+        "id": "replica",
+        "label": "Replica / Fallback",
+        "role": "Durability & Recovery"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "router",
+        "label": "request"
+      },
+      {
+        "from": "router",
+        "to": "engine",
+        "label": "route"
+      },
+      {
+        "from": "engine",
+        "to": "replica",
+        "label": "sync / fallback"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why Preventing Kafka Consumer Rebalance Storms Matters",
+        "actionLabel": "Dispatch nominal request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "router"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "Ingress",
+          "p99_ms": 8,
+          "error_rate": "0.0%"
+        },
+        "explanation": "Caller sends work into the gateway with explicit timeout and concurrency bounds (Why Preventing Kafka Consumer Rebalance Storms Matters)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Real-World Impact of Poll-Interval Rebalance Storms",
+        "actionLabel": "Execute core invariant",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "Core Path",
+          "p99_ms": 18,
+          "in_flight": 124
+        },
+        "explanation": "The core engine processes the hot path while keeping state transitions deterministic (Real-World Impact of Poll-Interval Rebalance Storms)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Naive Solution (and Why It Breaks)",
+        "actionLabel": "Detect skew or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Degraded",
+          "p99_ms": 64,
+          "retries_capped": "true"
+        },
+        "explanation": "Under load or replica lag, bounded backoff and isolation prevent cascading saturation (Naive Solution (and Why It Breaks))."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Where Rebalance-Storm Prevention Applies in System Design",
+        "actionLabel": "Converge & restore SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 11,
+          "drift": 0
+        },
+        "explanation": "State converges cleanly and telemetry confirms the system returned within its SLO envelope (Where Rebalance-Storm Prevention Applies in System Design)."
+      }
+    ]
+  }
+}

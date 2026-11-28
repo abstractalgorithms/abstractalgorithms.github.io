@@ -1,0 +1,810 @@
+{
+  "id": "concept-llm-prefix-caching-radix-attention",
+  "slug": "llm-prefix-caching-radix-attention",
+  "name": "AI/LLM Prefix Caching & RadixAttention (Zero-Copy KV Sharing)",
+  "domain": "AI & Machine Learning Systems",
+  "tagline": "Reuse GPU KV-cache tensors across prompts sharing system instructions, few-shot examples, or multi-turn history via a Radix Tree.",
+  "purpose": "Eliminate redundant quadratic prefill compute and cut Time-To-First-Token (TTFT) by sharing immutable KV-cache pages in a reference-counted Radix Tree.",
+  "spark": {
+    "summary": "RadixAttention indexes cached GPU KV-cache blocks in a compressed prefix trie (Radix Tree) with LRU eviction, enabling zero-copy prefix sharing across concurrent and sequential LLM requests.",
+    "keyTakeaway": "To keep serving pipelines predictable under bursty prompts, because causal self-attention only depends on preceding tokens, any two prompts sharing a prefix of N tokens can share the exact same physical GPU KV-cache pages—cutting prefill FLOPs and TTFT by 5x–10x.",
+    "byteSummary": "In production LLM workloads—multi-turn chat, RAG pipelines, agent tool-use loops, and few-shot prompting—requests repeatedly share long token prefixes (e.g., a 4,000-token system prompt + tool schema). Recomputing the Key-Value (KV) tensors for those prefix tokens on every request wastes massive GPU HBM bandwidth and inflates Time-To-First-Token (TTFT).\n\nRadixAttention (pioneered in SGLang and vLLM Automatic Prefix Caching) replaces per-request ephemeral KV buffers with a persistent **Radix Tree (compressed prefix trie)** in GPU HBM. Each edge represents a sequence of token IDs pointing to physical PagedAttention KV blocks, annotated with a reference count (`ref_count`) and last-access timestamp.\n\nWhen a new prompt arrives, the scheduler traverses the Radix Tree to find the longest matching prefix in O(prompt_len), increments `ref_count` on those shared physical pages (zero-copy!), and only runs prefill compute on the divergent user suffix. Completed pages with `ref_count == 0` remain cached in HBM and are evicted lazily via leaf-first LRU only when GPU memory is needed."
+  },
+  "learningJourney": [
+    {
+      "id": "01-causal-attention-invariance",
+      "eyebrow": "STAGE 01 · CAUSAL INVARIANCE",
+      "title": "Why Identical Token Prefixes Produce Bit-Identical KV Tensors",
+      "level": "foundation",
+      "purpose": "Exploit causal Transformer prefix invariance so requests sharing a prompt prefix reuse identical KV tensors.",
+      "explanation": {
+        "foundation": "In a causal decoder-only Transformer, token `i`'s Key and Value vectors (`K_i, V_i`) depend strictly on tokens `0..i` and never on tokens `> i`.",
+        "core": "Therefore, if Request A and Request B share an identical prefix of 2,048 tokens (with identical LoRA adapter and positional encoding), their first 2,048 KV vectors are mathematically identical—allowing 100% zero-copy reuse.",
+        "deepDive": "In production deployments of AI/LLM Prefix Caching & RadixAttention (Zero-Copy KV Sharing), watch how why identical token prefixes produce bit-identical kv tensors interacts with tail latency, retry amplification, and partial failures. Production RadixAttention systems combine tenant-salted Radix Trees, LPF-with-aging schedulers, 16-token block alignment, and async CPU DRAM offloading."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 01 · CAUSAL INVARIANCE",
+        "title": "Why Identical Token Prefixes Produce Bit-Identical KV Tensors",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "Req A: [Sys + Docs] + Q1",
+            "sub": "Prefills Tokens 0..2048",
+            "role": "Cold Compute"
+          },
+          {
+            "id": "n2",
+            "label": "Causal KV Invariance",
+            "sub": "K_i, V_i Depend on 0..i",
+            "role": "Bit-Identical"
+          },
+          {
+            "id": "n3",
+            "label": "Req B: [Sys + Docs] + Q2",
+            "sub": "Matches 0..2048 Prefix",
+            "role": "Zero Re-Prefill"
+          },
+          {
+            "id": "n4",
+            "label": "TTFT Drops 85%",
+            "sub": "Prefill Only Suffix Q2",
+            "role": "Compute Saved"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "produces"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "reused by"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "delivers"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Causal Mask Property",
+            "detail": "In decoder-only Transformers, token i never attends to tokens > i, making prefix KV states pure functions of 0..i."
+          },
+          {
+            "label": "Zero Quality Loss",
+            "detail": "Reusing cached KV pages is mathematically identical to recomputing the prefix from scratch."
+          },
+          {
+            "label": "Massive Savings",
+            "detail": "System prompts, few-shot examples, and RAG documents often make up 80-95% of prompt tokens."
+          }
+        ],
+        "summary": "Causal attention guarantees identical token prefixes produce bit-identical KV tensors that can be shared with zero quality loss.",
+        "caption": "Causal attention guarantees identical token prefixes produce bit-identical KV tensors that can be shared with zero quality loss."
+      }
+    },
+    {
+      "id": "02-radix-tree-structure",
+      "eyebrow": "STAGE 02 · RADIX TREE INDEX",
+      "title": "Compressed Prefix Trie Mapping Token Edges to Physical KV Pages",
+      "level": "foundation",
+      "purpose": "Index cached token spans in a compressed Radix Tree that splits edges dynamically when new prompts diverge.",
+      "explanation": {
+        "foundation": "Think of **Compressed Prefix Trie Mapping Token Edges to Physical KV Pages** as the intuition layer for AI/LLM Prefix Caching & RadixAttention (Zero-Copy KV Sharing): Index cached token spans in a compressed Radix Tree that splits edges dynamically when new prompts diverge.",
+        "core": "Each node in the Radix Tree represents a contiguous span of cached tokens mapped to fixed-size GPU KV pages (e.g., 16 tokens/page). When a new prompt diverges mid-edge (e.g., matching 1,000 of 1,500 tokens on an edge), the engine **splits the edge** at token 1,000 into a shared parent node and two child branches—without copying any GPU tensors.",
+        "deepDive": "Under heavy load or partial failure, compressed prefix trie mapping token edges to physical kv pages becomes a critical lever for predictable latency and correctness. Production RadixAttention systems combine tenant-salted Radix Trees, LPF-with-aging schedulers, 16-token block alignment, and async CPU DRAM offloading."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 02 · RADIX TREE INDEX",
+        "title": "Compressed Prefix Trie Mapping Token Edges to Physical KV Pages",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "Radix Root",
+            "sub": "Tenant / Model Salt",
+            "role": "Tree Entry"
+          },
+          {
+            "id": "n2",
+            "label": "Compressed Edge",
+            "sub": "Tokens [0..1500] -> Pages",
+            "role": "Contiguous Span"
+          },
+          {
+            "id": "n3",
+            "label": "Mid-Edge Divergence",
+            "sub": "Split at Token 1000",
+            "role": "Branch Node"
+          },
+          {
+            "id": "n4",
+            "label": "PagedAttention Blocks",
+            "sub": "16 Tokens / Physical Page",
+            "role": "GPU HBM"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "traverses"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "splits on diff"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "pins KV pages"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Compressed Edges",
+            "detail": "Storing variable-length token spans on edges keeps tree depth proportional to branch points, not prompt length."
+          },
+          {
+            "label": "Dynamic Edge Splitting",
+            "detail": "When a new prompt diverges at token 1,000 of a 1,500-token edge, split into [0..1000] + two child branches."
+          },
+          {
+            "label": "Zero-Copy Mapping",
+            "detail": "Multiple active requests point directly to the same physical PagedAttention HBM blocks."
+          }
+        ],
+        "summary": "A compressed Radix Tree maps variable-length token spans to physical 16-token KV pages and splits edges on divergence.",
+        "caption": "A compressed Radix Tree maps variable-length token spans to physical 16-token KV pages and splits edges on divergence."
+      },
+      "decisionFramework": {
+        "problem": "How to implement AI/LLM Prefix Caching & RadixAttention (Zero-Copy KV Sharing) without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "To keep serving pipelines predictable under bursty prompts, because causal self-attention only depends on preceding tokens, any two prompts sharing a prefix of N tokens can share the exact same physical GPU KV-cache pages—cutting prefill FLOPs and TTFT by 5x–10x.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When AI/LLM Prefix Caching & RadixAttention (Zero-Copy KV Sharing) experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-refcount-and-lru-eviction",
+      "eyebrow": "STAGE 03 · EVICTION & SCHEDULING",
+      "title": "Reference Counting & Leaf-First LRU Eviction",
+      "level": "intermediate",
+      "purpose": "Protect active generations with reference counting and reclaim HBM via leaf-first LRU eviction.",
+      "explanation": {
+        "foundation": "Active requests pin their matched prefix path by incrementing `ref_count += 1` on every ancestor node, preventing eviction mid-generation. When a request finishes, `ref_count` decrements.",
+        "core": "Only **leaf nodes** with `ref_count == 0` sit in the LRU eviction queue; evicting a leaf frees its KV pages and may turn its parent into an evictable leaf.",
+        "deepDive": "In production deployments of AI/LLM Prefix Caching & RadixAttention (Zero-Copy KV Sharing), watch how reference counting & leaf-first lru eviction interacts with tail latency, retry amplification, and partial failures. Production RadixAttention systems combine tenant-salted Radix Trees, LPF-with-aging schedulers, 16-token block alignment, and async CPU DRAM offloading."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 03 · EVICTION & SCHEDULING",
+        "title": "Reference Counting & Leaf-First LRU Eviction",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "Active Request Pin",
+            "sub": "ref_count += 1 Path",
+            "role": "Eviction Lock"
+          },
+          {
+            "id": "n2",
+            "label": "Generation Done",
+            "sub": "ref_count -= 1",
+            "role": "Release Path"
+          },
+          {
+            "id": "n3",
+            "label": "Leaf-First LRU Heap",
+            "sub": "Only ref_count == 0",
+            "role": "Safe Candidate"
+          },
+          {
+            "id": "n4",
+            "label": "Reclaim KV Pages",
+            "sub": "Free GPU HBM Blocks",
+            "role": "Memory Reuse"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "unpins on end"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "exposes leaves"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "evicts oldest"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Ancestors Stay Pinned",
+            "detail": "Internal nodes cannot be evicted while any descendant leaf is still referenced or cached."
+          },
+          {
+            "label": "Leaf-First Eviction",
+            "detail": "Evicting cold leaves preserves shared root system-prompt KV pages used by many tenants."
+          },
+          {
+            "label": "Zero Race Conditions",
+            "detail": "Increment ref_count before scheduling prefill so concurrent batches never evict needed KV blocks."
+          }
+        ],
+        "summary": "Reference counting pins active prefix paths while leaf-first LRU evicts cold suffixes without disturbing hot shared roots.",
+        "caption": "Reference counting pins active prefix paths while leaf-first LRU evicts cold suffixes without disturbing hot shared roots."
+      }
+    },
+    {
+      "id": "04-reference-implementation",
+      "eyebrow": "STAGE 04 · RADIX MATCHER",
+      "title": "Implementing Longest-Prefix Match & Node Splitting",
+      "level": "intermediate",
+      "purpose": "Implement longest-prefix matching and mid-edge node splitting in the RadixPrefixCache.",
+      "explanation": {
+        "foundation": "```python\nfrom dataclasses import dataclass, field",
+        "core": "@dataclass\nclass RadixNode:\n    tokens: tuple[int, ...]\n    kv_page_ids: list[int]\n    ref_count: int = 0\n    children: dict[int, 'RadixNode'] = field(default_factory=dict)\n\nclass RadixPrefixCache:\n    def __init__(self) -> None:\n        self.root = RadixNode(tokens=(), kv_page_ids=[])",
+        "deepDive": "def match_prefix(self, prompt_tokens: tuple[int, ...]) -> tuple[list[int], int, list[RadixNode]]:\n        if not prompt_tokens:\n            return [], 0, []\n        node = self.root\n        idx = 0\n        matched_pages: list[int] = []\n        pinned_nodes: list[RadixNode] = []\n        while idx < len(prompt_tokens):\n            first_tok = prompt_tokens[idx]\n            child = node.children.get(first_tok)\n            if child is None:\n                break\n            common = 0\n            limit = min(len(child.tokens), len(prompt_tokens) - idx)\n            while common < limit and child.tokens[common] == prompt_tokens[idx + common]:\n                common += 1\n            if common < len(child.tokens):\n                # Partial edge match: caller stops at split boundary\n                break\n            matched_pages.extend(child.kv_page_ids)\n            child.ref_count += 1\n            pinned_nodes.append(child)\n            idx += common\n            node = child\n        return matched_pages, idx, pinned_nodes\n```"
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 04 · RADIX MATCHER",
+        "title": "Implementing Longest-Prefix Match & Node Splitting",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "Longest-Prefix Walk",
+            "sub": "Match Edge Tokens",
+            "role": "Trie Traversal"
+          },
+          {
+            "id": "n2",
+            "label": "Partial Match Split",
+            "sub": "Create Intermediate Node",
+            "role": "Edge Split"
+          },
+          {
+            "id": "n3",
+            "label": "Collect kv_page_ids",
+            "sub": "Zero-Copy Page List",
+            "role": "Cache Hit"
+          },
+          {
+            "id": "n4",
+            "label": "Prefill Uncached Tail",
+            "sub": "Insert New Leaf Edge",
+            "role": "Cache Populate"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "splits if partial"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "returns pages"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "appends suffix"
+          }
+        ],
+        "cards": [
+          {
+            "label": "O(MatchLen) Lookup",
+            "detail": "Hashing/comparing token prefixes on edges executes in microseconds on CPU before GPU kernel launch."
+          },
+          {
+            "label": "Page Alignment",
+            "detail": "Align splits or pad partial trailing blocks cleanly to 16-token PagedAttention boundaries."
+          },
+          {
+            "label": "Prefix Hit Ratio",
+            "detail": "Returning both matched page IDs and unmatched suffix tokens seamlessly drives partial prefill."
+          }
+        ],
+        "summary": "Longest-prefix traversal returns cached KV page IDs for the matched head and splits edges cleanly for the uncached tail.",
+        "caption": "Longest-prefix traversal returns cached KV page IDs for the matched head and splits edges cleanly for the uncached tail."
+      }
+    },
+    {
+      "id": "05-cache-aware-batch-scheduling",
+      "eyebrow": "STAGE 05 · CACHE-AWARE SCHEDULING",
+      "title": "Longest-Prefix-First Scheduling vs. FCFS Starvation",
+      "level": "advanced",
+      "purpose": "Prevent LRU cache thrashing with Longest-Prefix-First (LPF) scheduling bounded by starvation limits.",
+      "explanation": {
+        "foundation": "In a busy queue, FCFS execution can thrash the LRU cache if unrelated prompts interleave. **Longest-Prefix-First (LPF)** scheduling batches requests sharing the same active Radix branch together, maximizing KV reuse.",
+        "core": "To prevent starvation of unique prompts, pair LPF with an **aging boost** so requests waiting > `max_wait_ms` promote to the front.",
+        "deepDive": "In production deployments of AI/LLM Prefix Caching & RadixAttention (Zero-Copy KV Sharing), watch how longest-prefix-first scheduling vs. fcfs starvation interacts with tail latency, retry amplification, and partial failures. Production RadixAttention systems combine tenant-salted Radix Trees, LPF-with-aging schedulers, 16-token block alignment, and async CPU DRAM offloading."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 05 · CACHE-AWARE SCHEDULING",
+        "title": "Longest-Prefix-First Scheduling vs. FCFS Starvation",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "Waiting Request Queue",
+            "sub": "Mixed Prefix Branches",
+            "role": "Scheduler Input"
+          },
+          {
+            "id": "n2",
+            "label": "Longest-Prefix-First",
+            "sub": "Group Shared Branches",
+            "role": "Cache Locality"
+          },
+          {
+            "id": "n3",
+            "label": "Max-Wait Aging Guard",
+            "sub": "Prevent Starvation",
+            "role": "Fairness Cap"
+          },
+          {
+            "id": "n4",
+            "label": "Coalesced Prefill",
+            "sub": "High HBM Hit Rate",
+            "role": "Throughput Win"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "reorders"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "bounded by"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "dispatches"
+          }
+        ],
+        "cards": [
+          {
+            "label": "FCFS Thrashing",
+            "detail": "Interleaving unrelated prompts in strict FCFS evicts warm branches before follow-up turns arrive."
+          },
+          {
+            "label": "LPF Grouping",
+            "detail": "Running requests sharing a Radix branch back-to-back maximizes KV reuse before eviction."
+          },
+          {
+            "label": "Starvation Guard",
+            "detail": "Promote any queued request exceeding max_wait_ms regardless of prefix match length."
+          }
+        ],
+        "summary": "Longest-Prefix-First scheduling groups requests on shared Radix branches while aging caps prevent tail starvation.",
+        "caption": "Longest-Prefix-First scheduling groups requests on shared Radix branches while aging caps prevent tail starvation."
+      }
+    },
+    {
+      "id": "06-block-alignment-and-kv-offload",
+      "eyebrow": "STAGE 06 · BLOCK ALIGNMENT & CPU OFFLOAD",
+      "title": "Page-Boundary Alignment & Tiered CPU-DRAM Offloading",
+      "level": "advanced",
+      "purpose": "Extend KV capacity beyond GPU HBM by offloading cold leaf pages asynchronously to CPU DRAM over PCIe.",
+      "explanation": {
+        "foundation": "PagedAttention aligns KV blocks to fixed sizes (e.g., 16 tokens). Partial trailing tokens (< 16) are either recomputed or padded at system-prompt boundaries.",
+        "core": "When GPU HBM fills, hot evicted KV pages can asynchronously offload over PCIe/NVLink to **CPU DRAM (L2 KV Cache)** rather than discarding them, reloading 5x faster than cold prefill.",
+        "deepDive": "In production deployments of AI/LLM Prefix Caching & RadixAttention (Zero-Copy KV Sharing), watch how page-boundary alignment & tiered cpu-dram offloading interacts with tail latency, retry amplification, and partial failures. Production RadixAttention systems combine tenant-salted Radix Trees, LPF-with-aging schedulers, 16-token block alignment, and async CPU DRAM offloading."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 06 · BLOCK ALIGNMENT & CPU OFFLOAD",
+        "title": "Page-Boundary Alignment & Tiered CPU-DRAM Offloading",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "GPU HBM L1 (>85%)",
+            "sub": "Hot Radix Leaves",
+            "role": "Tier 1 Cache"
+          },
+          {
+            "id": "n2",
+            "label": "Async PCIe Gen5 DMA",
+            "sub": "~64 GB/s Offload",
+            "role": "Non-Blocking"
+          },
+          {
+            "id": "n3",
+            "label": "512 GB CPU DRAM L2",
+            "sub": "Cold KV Page Pool",
+            "role": "Tier 2 Cache"
+          },
+          {
+            "id": "n4",
+            "label": "Reload on Cache Hit",
+            "sub": "Faster Than Re-Prefill",
+            "role": "Warm Restore"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "evicts to"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "stores in"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "reloads on hit"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Offload vs. Recompute",
+            "detail": "Reloading 1.3 GB of 8K-token KV from CPU DRAM over PCIe takes ~20 ms vs. ~300 ms to recompute on GPU."
+          },
+          {
+            "label": "Block Alignment",
+            "detail": "Fixed 16-token KV pages make DMA scatter-gather transfers simple and fragmentation-free."
+          },
+          {
+            "label": "Async Background",
+            "detail": "Start offloading cold ref_count==0 leaves at 85% HBM before allocation stalls occur."
+          }
+        ],
+        "summary": "Async PCIe Gen5 offloading to CPU DRAM L2 retains 10x more KV prefixes and reloads faster than GPU recomputation.",
+        "caption": "Async PCIe Gen5 offloading to CPU DRAM L2 retains 10x more KV prefixes and reloads faster than GPU recomputation."
+      }
+    },
+    {
+      "id": "07-security-and-timing-attacks",
+      "eyebrow": "STAGE 07 · MULTI-TENANT SECURITY",
+      "title": "Preventing Cross-Tenant Cache Leaks & Timing Side Channels",
+      "level": "advanced",
+      "purpose": "Eliminate cross-tenant TTFT timing side channels by salting Radix roots with tenant and model identity.",
+      "explanation": {
+        "foundation": "Think of **Preventing Cross-Tenant Cache Leaks & Timing Side Channels** as the intuition layer for AI/LLM Prefix Caching & RadixAttention (Zero-Copy KV Sharing): Eliminate cross-tenant TTFT timing side channels by salting Radix roots with tenant and model identity.",
+        "core": "Sharing a global Radix Tree without tenant isolation exposes a subtle **TTFT timing side channel**: Tenant B can probe whether Tenant A recently sent a secret system prompt by measuring faster TTFT on a cache hit! Always salt every Radix Tree root or block hash with `tenant_id` (and `lora_id`) so cross-tenant sharing is strictly disabled.",
+        "deepDive": "Under heavy load or partial failure, preventing cross-tenant cache leaks & timing side channels becomes a critical lever for predictable latency and correctness. Production RadixAttention systems combine tenant-salted Radix Trees, LPF-with-aging schedulers, 16-token block alignment, and async CPU DRAM offloading."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 07 · MULTI-TENANT SECURITY",
+        "title": "Preventing Cross-Tenant Cache Leaks & Timing Side Channels",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "Timing Side Channel",
+            "sub": "Shared Global Root",
+            "role": "Leak Hazard"
+          },
+          {
+            "id": "n2",
+            "label": "Root Key Salt",
+            "sub": "(tenant, model, lora)",
+            "role": "Hard Isolation"
+          },
+          {
+            "id": "n3",
+            "label": "Per-Tenant HBM Cap",
+            "sub": "Max 25% HBM / Tenant",
+            "role": "Noisy Neighbor"
+          },
+          {
+            "id": "n4",
+            "label": "Monitor Hit & Evict",
+            "sub": "hit_ratio / ttft_p99",
+            "role": "SLO Telemetry"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "eliminated by"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "bounded by"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "tracked by"
+          }
+        ],
+        "cards": [
+          {
+            "label": "TTFT Probe Attack",
+            "detail": "Without tenant salting, Tenant B can detect whether Tenant A used a secret prompt by measuring faster TTFT."
+          },
+          {
+            "label": "Zero Cross-Tenant Hits",
+            "detail": "Keying Radix roots by (tenant_id, model_version, lora_id) makes cross-tenant sharing impossible."
+          },
+          {
+            "label": "Quota Enforcement",
+            "detail": "Per-tenant HBM soft caps prevent one tenant's 32K prompts from evicting everyone else's caches."
+          }
+        ],
+        "summary": "Salting Radix roots by (tenant_id, model, lora) and enforcing per-tenant HBM caps eliminate timing side channels.",
+        "caption": "Salting Radix roots by (tenant_id, model, lora) and enforcing per-tenant HBM caps eliminate timing side channels."
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-1",
+        "question": "Why must only leaf nodes with `ref_count == 0` be evicted from the RadixAttention LRU queue?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Causal attention requires evicting the root first.",
+            "correct": false,
+            "feedback": "Incorrect: Child branches depend on all ancestor prefix blocks; leaf-first eviction preserves tree integrity."
+          },
+          {
+            "id": "b",
+            "text": "Internal nodes hold prefix KV blocks still depended upon by active child branches or running requests.",
+            "correct": true,
+            "feedback": "Correct: Child branches depend on all ancestor prefix blocks; leaf-first eviction preserves tree integrity."
+          },
+          {
+            "id": "c",
+            "text": "Internal nodes do not store any KV pages.",
+            "correct": false,
+            "feedback": "Incorrect: Child branches depend on all ancestor prefix blocks; leaf-first eviction preserves tree integrity."
+          },
+          {
+            "id": "d",
+            "text": "Leaf nodes are always larger than internal nodes.",
+            "correct": false,
+            "feedback": "Incorrect: Child branches depend on all ancestor prefix blocks; leaf-first eviction preserves tree integrity."
+          }
+        ],
+        "explanation": "Child branches depend on all ancestor prefix blocks; leaf-first eviction preserves tree integrity."
+      },
+      {
+        "id": "kc-2",
+        "question": "Why is sharing a global un-salted Radix prefix cache across multiple tenants a security risk?",
+        "options": [
+          {
+            "id": "a",
+            "text": "It disables PagedAttention.",
+            "correct": false,
+            "feedback": "Incorrect: TTFT latency differences leak prompt-prefix presence unless cache keys are salted per tenant."
+          },
+          {
+            "id": "b",
+            "text": "It forces all tenants to use the same temperature parameter.",
+            "correct": false,
+            "feedback": "Incorrect: TTFT latency differences leak prompt-prefix presence unless cache keys are salted per tenant."
+          },
+          {
+            "id": "c",
+            "text": "An attacker can infer another tenant's recent prompts by measuring faster Time-To-First-Token (TTFT) on cache hits.",
+            "correct": true,
+            "feedback": "Correct: TTFT latency differences leak prompt-prefix presence unless cache keys are salted per tenant."
+          },
+          {
+            "id": "d",
+            "text": "It causes floating-point NaN errors in attention.",
+            "correct": false,
+            "feedback": "Incorrect: TTFT latency differences leak prompt-prefix presence unless cache keys are salted per tenant."
+          }
+        ],
+        "explanation": "TTFT latency differences leak prompt-prefix presence unless cache keys are salted per tenant."
+      },
+      {
+        "id": "kc-3",
+        "question": "How does Longest-Prefix-First (LPF) scheduling improve LLM cluster throughput?",
+        "options": [
+          {
+            "id": "a",
+            "text": "It skips decoding output tokens.",
+            "correct": false,
+            "feedback": "Incorrect: LPF maximizes prefix cache hits while aging prevents starvation of non-matching requests."
+          },
+          {
+            "id": "b",
+            "text": "It runs prefill on the CPU instead of the GPU.",
+            "correct": false,
+            "feedback": "Incorrect: LPF maximizes prefix cache hits while aging prevents starvation of non-matching requests."
+          },
+          {
+            "id": "c",
+            "text": "It forces every prompt to have the same length.",
+            "correct": false,
+            "feedback": "Incorrect: LPF maximizes prefix cache hits while aging prevents starvation of non-matching requests."
+          },
+          {
+            "id": "d",
+            "text": "It batches queued prompts sharing the same Radix branch together before their KV blocks are evicted by unrelated requests.",
+            "correct": true,
+            "feedback": "Correct: LPF maximizes prefix cache hits while aging prevents starvation of non-matching requests."
+          }
+        ],
+        "explanation": "LPF maximizes prefix cache hits while aging prevents starvation of non-matching requests."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Prefix Caching saves the AI model's processed memory for common system prompts so new user questions skip re-reading the same instructions.",
+      "keyTakeaway": "To keep serving pipelines predictable under bursty prompts, because causal self-attention only depends on preceding tokens, any two prompts sharing a prefix of N tokens can share the exact same physical GPU KV-cache pages—cutting prefill FLOPs and TTFT by 5x–10x.",
+      "byteSummary": "Imagine giving an AI a 4,000-word handbook before every question. Normally, the GPU re-reads that entire handbook for every single user.\n\nRadixAttention stores the processed handbook in a prefix tree so every new question reuses it instantly and only reads the new user message."
+    },
+    "intermediate": {
+      "summary": "RadixAttention organizes PagedAttention KV blocks in a reference-counted Radix Tree with leaf-first LRU eviction and longest-prefix matching.",
+      "keyTakeaway": "To keep serving pipelines predictable under bursty prompts, because causal self-attention only depends on preceding tokens, any two prompts sharing a prefix of N tokens can share the exact same physical GPU KV-cache pages—cutting prefill FLOPs and TTFT by 5x–10x.",
+      "byteSummary": "Because causal attention is prefix-invariant, identical leading tokens produce identical KV tensors. A Radix Tree indexes token spans to physical GPU pages.\n\nRequests pin matched paths (`ref_count > 0`) during execution, and idle leaves evict via LRU."
+    },
+    "advanced": {
+      "summary": "Production RadixAttention systems combine tenant-salted Radix Trees, LPF-with-aging schedulers, 16-token block alignment, and async CPU DRAM offloading.",
+      "keyTakeaway": "To keep serving pipelines predictable under bursty prompts, because causal self-attention only depends on preceding tokens, any two prompts sharing a prefix of N tokens can share the exact same physical GPU KV-cache pages—cutting prefill FLOPs and TTFT by 5x–10x.",
+      "byteSummary": "At multi-tenant scale, RadixAttention requires strict `tenant_id` key salting to eliminate TTFT timing side channels. Pairing Longest-Prefix-First scheduling with wait-time aging maximizes HBM hit rates without starving tail traffic.\n\nOffloading evicted GPU pages asynchronously to CPU DRAM extends effective prefix capacity across PCIe."
+    }
+  },
+  "pedagogicalFramework": "PRIME",
+  "prerequisites": [
+    {
+      "title": "Disaggregated LLM Serving (Prefill vs. Decode Pools)",
+      "summary": "Disaggregated LLM serving separates prompt prefill (compute-bound TTFT) and autoregressive token decode (HBM-bandwidth-bound ITL) onto independent GPU pools, transferring computed KV-cache blocks over RDMA or NVLink without stalling in-flight decode batches."
+    },
+    {
+      "title": "CNN, RNN & Transformer Architectures",
+      "summary": "Neural architectures encode distinct inductive biases: CNNs exploit local spatial translation invariance, RNNs/LSTMs process sequential recurrence with O(1) inference state, and Transformers use parallel self-attention over global context."
+    }
+  ],
+  "simulation": {
+    "title": "AI/LLM Prefix Caching & RadixAttention (Zero-Copy KV Sharing) — Interactive Execution Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Workload & Budget"
+      },
+      {
+        "id": "router",
+        "label": "Gateway / Router",
+        "role": "Admission & Dispatch"
+      },
+      {
+        "id": "engine",
+        "label": "Core Engine",
+        "role": "Primary Execution"
+      },
+      {
+        "id": "replica",
+        "label": "Replica / Fallback",
+        "role": "Durability & Recovery"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "router",
+        "label": "request"
+      },
+      {
+        "from": "router",
+        "to": "engine",
+        "label": "route"
+      },
+      {
+        "from": "engine",
+        "to": "replica",
+        "label": "sync / fallback"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why Identical Token Prefixes Produce Bit-Identical KV Tensor",
+        "actionLabel": "Dispatch nominal request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "router"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "Ingress",
+          "p99_ms": 8,
+          "error_rate": "0.0%"
+        },
+        "explanation": "Caller sends work into the gateway with explicit timeout and concurrency bounds (Why Identical Token Prefixes Produce Bit-Identical KV Tensors)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Compressed Prefix Trie Mapping Token Edges to Physical KV Pa",
+        "actionLabel": "Execute core invariant",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "Core Path",
+          "p99_ms": 18,
+          "in_flight": 124
+        },
+        "explanation": "The core engine processes the hot path while keeping state transitions deterministic (Compressed Prefix Trie Mapping Token Edges to Physical KV Pages)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Reference Counting & Leaf-First LRU Eviction",
+        "actionLabel": "Detect skew or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Degraded",
+          "p99_ms": 64,
+          "retries_capped": "true"
+        },
+        "explanation": "Under load or replica lag, bounded backoff and isolation prevent cascading saturation (Reference Counting & Leaf-First LRU Eviction)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Preventing Cross-Tenant Cache Leaks & Timing Side Channels",
+        "actionLabel": "Converge & restore SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 11,
+          "drift": 0
+        },
+        "explanation": "State converges cleanly and telemetry confirms the system returned within its SLO envelope (Preventing Cross-Tenant Cache Leaks & Timing Side Channels)."
+      }
+    ]
+  }
+}

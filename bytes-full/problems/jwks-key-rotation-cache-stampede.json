@@ -1,0 +1,780 @@
+{
+  "id": "problem-jwks-key-rotation-cache-stampede",
+  "slug": "jwks-key-rotation-cache-stampede",
+  "title": "JWKS Key Rotation Outages & Auth Cache Stampedes",
+  "problemType": "architecture",
+  "difficulty": "hard",
+  "prompt": "Your API Gateway fleet (500 stateless pods handling 60,000 QPS) caches your Identity Provider's `/.well-known/jwks.json` public keys for 24 hours. During a routine signing key rotation (`kid: k1 -> k2`), 40% of user requests immediately fail with `401 Unauthorized` for 15 minutes, and when pods attempt an uncoordinated fallback fetch on unknown `kid`, the 500 pods stampede the IdP and knock it offline. Design a zero-downtime JWKS key rotation protocol and stampede-proof gateway verifier.",
+  "spark": {
+    "summary": "Prevent key-rotation 401 storms and IdP stampedes by using a 3-phase overlap rotation (publish k2 before signing with it) paired with singleflight JWKS refresh and a bounded unknown-kid cooldown.",
+    "keyTakeaway": "When an IdP generates `k2`, replaces `k1` in `/, never sign JWTs with a new kid until every verifier cache has expired past the publish window, and coalesce unknown-kid refreshes with singleflight + negative cooldowns.",
+    "byteSummary": "JWT verification outages during key rotation happen when an Identity Provider (IdP) immediately starts signing tokens with a new private key (`kid: k2`) before downstream API Gateways have refreshed their cached JWKS public key set (`[k1]`). Gateways reject valid `k2` tokens with `401 Unauthorized` until their 24-hour TTL expires.\n\nAdding a naive 'fetch JWKS whenever an unknown `kid` arrives' fallback creates an even worse failure mode: all 500 gateway pods (and potentially attacker-forged random `kid` headers) simultaneously hammer `/.well-known/jwks.json` at 60,000 QPS, triggering a thundering-herd DoS against the IdP.\n\nThe zero-downtime solution has two halves. On the IdP side, enforce **3-Phase Overlap Rotation**: (1) publish `[k1, k2]` in JWKS while still signing with `k1`, (2) wait longer than the max gateway cache TTL + clock skew, (3) switch signing to `k2` while keeping `k1` published until max JWT `exp` passes, then retire `k1`. On the Gateway side, honor HTTP `Cache-Control: max-age=300` with background proactive refresh, use **singleflight** request coalescing per pod, and enforce a **30-second unknown-kid cooldown** (plus `kid` allowlist/format checks) so forged `kid` headers never trigger IdP fetches.\n\nThe core trade-off is revocation speed versus IdP resilience: a 5-minute `max-age` plus 30-second cooldown caps IdP load to <2 QPS across 500 pods while requiring emergency key revocations to use a short-lived token blacklist or immediate push invalidation."
+  },
+  "learningJourney": [
+    {
+      "id": "stage-1-rotation-race",
+      "eyebrow": "Stage 1 • Triage",
+      "title": "Why Abrupt Key Rotation Causes 401 Storms",
+      "level": "foundation",
+      "purpose": "Trace the timing gap between IdP key activation and gateway JWKS cache expiration.",
+      "explanation": {
+        "foundation": "When an IdP generates `k2`, replaces `k1` in `/.well-known/jwks.json`, and immediately signs new access tokens with `kid: k2`, two failures happen simultaneously:",
+        "core": "- **Cached Pods Reject `k2`**: Pods holding `[k1]` in a 24-hour cache fail signature lookup for `k2` and return `401 Unauthorized`.\n- **Refreshed Pods Reject `k1`**: If `k1` was removed from JWKS too early, pods that *did* refresh `[k2]` reject still-valid `k1` tokens issued 5 minutes earlier (until their `exp` expires).",
+        "deepDive": "In production deployments of JWKS Key Rotation Outages & Auth Cache Stampedes, watch how why abrupt key rotation causes 401 storms interacts with tail latency, retry amplification, and partial failures. Prevent key-rotation 401 storms and IdP stampedes by using a 3-phase overlap rotation (publish k2 before signing with it) paired with singleflight JWKS refresh and a bounded unknown-kid cooldown."
+      },
+      "sectionDiagram": {
+        "kind": "flow",
+        "eyebrow": "Rotation Race",
+        "title": "Abrupt k1 -> k2 Switch Breaks Both Old & New Tokens",
+        "nodes": [
+          {
+            "id": "idp",
+            "label": "IdP Signs with k2",
+            "sublabel": "Removes k1 too early"
+          },
+          {
+            "id": "stale",
+            "label": "Stale Pod [k1]",
+            "sublabel": "Rejects new k2 tokens (401)"
+          },
+          {
+            "id": "fresh",
+            "label": "Fresh Pod [k2]",
+            "sublabel": "Rejects in-flight k1 tokens (401)"
+          }
+        ],
+        "edges": [
+          {
+            "from": "idp",
+            "to": "stale",
+            "label": "Cache TTL mismatch"
+          },
+          {
+            "from": "idp",
+            "to": "fresh",
+            "label": "No overlap window"
+          }
+        ],
+        "cards": [
+          {
+            "title": "Two-Sided Outage",
+            "body": "Dropping k1 immediately breaks valid un-expired JWTs; signing with k2 immediately breaks stale caches."
+          },
+          {
+            "title": "24h TTL Hazard",
+            "body": "Long static JWKS TTLs amplify stale-cache windows during unplanned rotations."
+          }
+        ],
+        "summary": "Caption: Switching signing keys without an overlap window causes stale gateway pods to reject new k2 tokens and refreshed pods to reject still-valid k1 tokens."
+      }
+    },
+    {
+      "id": "stage-2-stampede-dos",
+      "eyebrow": "Stage 2 • Failure Mode",
+      "title": "How Unbounded Unknown-kid Fallbacks Create an IdP DoS",
+      "level": "foundation",
+      "purpose": "Explain why naive cache-miss refreshes turn key rotation—or forged JWT headers—into a thundering herd.",
+      "explanation": {
+        "foundation": "To avoid 401s, teams often add: *'If `kid` is not in cache, fetch `/.well-known/jwks.json` immediately.'* This fails catastrophically in two ways:",
+        "core": "1. **Rotation Stampede**: At 60,000 QPS across 500 pods (each with ~100 concurrent worker coroutines/threads), every incoming `k2` request triggers a parallel HTTPS fetch to the IdP before the first fetch finishes.\n2. **Forged `kid` Amplification Attack**: An unauthenticated attacker sends 10,000 requests/sec with `{\"kid\": \"random-uuid\"}` in the JWT header. Every request misses the cache and forces the gateway to hammer the IdP.",
+        "deepDive": "In production deployments of JWKS Key Rotation Outages & Auth Cache Stampedes, watch how how unbounded unknown-kid fallbacks create an idp dos interacts with tail latency, retry amplification, and partial failures. Prevent key-rotation 401 storms and IdP stampedes by using a 3-phase overlap rotation (publish k2 before signing with it) paired with singleflight JWKS refresh and a bounded unknown-kid cooldown."
+      },
+      "sectionDiagram": {
+        "kind": "flow",
+        "eyebrow": "Thundering Herd",
+        "title": "Uncoordinated Cache-Miss Amplification",
+        "nodes": [
+          {
+            "id": "atk",
+            "label": "Unknown kid Storm",
+            "sublabel": "k2 rollout or forged header"
+          },
+          {
+            "id": "pods",
+            "label": "500 Gateway Pods",
+            "sublabel": "No singleflight / cooldown"
+          },
+          {
+            "id": "idp",
+            "label": "IdP /.well-known/jwks.json",
+            "sublabel": "Saturated & offline"
+          }
+        ],
+        "edges": [
+          {
+            "from": "atk",
+            "to": "pods",
+            "label": "60,000 QPS"
+          },
+          {
+            "from": "pods",
+            "to": "idp",
+            "label": "Thousands of concurrent TLS fetches"
+          }
+        ],
+        "cards": [
+          {
+            "title": "Attacker Triggered",
+            "body": "Forged JWT headers are parsed BEFORE signature verification, making unknown-kid fetches an easy DoS vector."
+          },
+          {
+            "title": "Cascading Failure",
+            "body": "IdP collapse also blocks new user logins and token refreshes."
+          }
+        ],
+        "summary": "Caption: Without singleflight coalescing and an unknown-kid cooldown, a key rotation or forged JWT kid header amplifies into a thundering-herd DoS against the IdP."
+      },
+      "decisionFramework": {
+        "problem": "How to implement JWKS Key Rotation Outages & Auth Cache Stampedes without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "When an IdP generates `k2`, replaces `k1` in `/, never sign JWTs with a new kid until every verifier cache has expired past the publish window, and coalesce unknown-kid refreshes with singleflight + negative cooldowns.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When JWKS Key Rotation Outages & Auth Cache Stampedes experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-3-three-phase-rotation",
+      "eyebrow": "Stage 3 • IdP Protocol",
+      "title": "3-Phase Overlap Key Rotation Protocol",
+      "level": "intermediate",
+      "purpose": "Define the exact sequence and wait intervals for zero-downtime JWKS key rotation.",
+      "explanation": {
+        "foundation": "Zero-downtime rotation decouples **key publication** from **key activation** and **key retirement**:",
+        "core": "1. **Phase 1 — Publish (`[k1, k2]`)**: Add `k2`'s public key to `/.well-known/jwks.json` while *continuing to sign* all new tokens with `k1`. Wait `T_wait >= max_jwks_cache_ttl + 5 min` (e.g., 15 minutes when `Cache-Control: max-age=300`).\n2. **Phase 2 — Activate (`sign with k2`)**: Switch IdP signing to `k2`, keeping both `k1` and `k2` in JWKS. Wait `T_retire >= max_jwt_lifetime + clock_skew` (e.g., 1 hour for 1h access tokens).\n3. **Phase 3 — Retire (`[k2]`)**: Remove `k1` from JWKS once all `k1`-signed tokens have expired.",
+        "deepDive": "In production deployments of JWKS Key Rotation Outages & Auth Cache Stampedes, watch how 3-phase overlap key rotation protocol interacts with tail latency, retry amplification, and partial failures. Prevent key-rotation 401 storms and IdP stampedes by using a 3-phase overlap rotation (publish k2 before signing with it) paired with singleflight JWKS refresh and a bounded unknown-kid cooldown."
+      },
+      "sectionDiagram": {
+        "kind": "flow",
+        "eyebrow": "Overlap Protocol",
+        "title": "Publish -> Wait Cache TTL -> Sign -> Wait JWT Exp -> Retire",
+        "nodes": [
+          {
+            "id": "p1",
+            "label": "1. Publish [k1, k2]",
+            "sublabel": "Sign k1 • Wait 15m"
+          },
+          {
+            "id": "p2",
+            "label": "2. Sign with k2",
+            "sublabel": "Keep k1 • Wait 1h"
+          },
+          {
+            "id": "p3",
+            "label": "3. Retire k1",
+            "sublabel": "Publish [k2] only"
+          }
+        ],
+        "edges": [
+          {
+            "from": "p1",
+            "to": "p2",
+            "label": "All pods cache k2 proactively"
+          },
+          {
+            "from": "p2",
+            "to": "p3",
+            "label": "All k1 JWTs expired"
+          }
+        ],
+        "cards": [
+          {
+            "title": "Zero Cache-Misses",
+            "body": "Because k2 is published 15 minutes before signing starts, pods already have k2 in RAM."
+          },
+          {
+            "title": "Clean Rollback",
+            "body": "If k2 has issues in Phase 2, switch signing back to k1 instantly with zero 401s."
+          }
+        ],
+        "summary": "Caption: Publishing k2 ahead of signing and keeping k1 until all existing tokens expire guarantees zero 401 errors across every gateway pod."
+      }
+    },
+    {
+      "id": "stage-4-gateway-singleflight-cooldown",
+      "eyebrow": "Stage 4 • Gateway Defense",
+      "title": "Singleflight Refresh, Stale-While-Revalidate, and Unknown-kid Cooldown",
+      "level": "intermediate",
+      "purpose": "Protect the IdP during emergency rotations and block forged-kid DoS attacks.",
+      "explanation": {
+        "foundation": "Even with 3-phase rotation, emergency key compromises require immediate rotation. Harden every API Gateway pod with three layers:",
+        "core": "- **Proactive Background Refresh (`max-age=300` + jitter)**: Refresh JWKS asynchronously at 80% of `max-age` (`240s +/- 30s` jitter) so 500 pods don't synchronize.\n- **In-Process Singleflight Lock**: Only **1** goroutine/thread per pod may fetch `/.well-known/jwks.json` at a time; concurrent callers await the same future.\n- **30s Unknown-`kid` Negative Cooldown**: After any JWKS refresh, refuse to trigger another on-demand refresh for 30 seconds even if unknown `kid`s keep arriving.",
+        "deepDive": "In production deployments of JWKS Key Rotation Outages & Auth Cache Stampedes, watch how singleflight refresh, stale-while-revalidate, and unknown-kid cooldown interacts with tail latency, retry amplification, and partial failures. Prevent key-rotation 401 storms and IdP stampedes by using a 3-phase overlap rotation (publish k2 before signing with it) paired with singleflight JWKS refresh and a bounded unknown-kid cooldown."
+      },
+      "sectionDiagram": {
+        "kind": "flow",
+        "eyebrow": "Gateway Verifier",
+        "title": "Singleflight + 30s Cooldown Gate",
+        "nodes": [
+          {
+            "id": "miss",
+            "label": "Unknown kid",
+            "sublabel": "Validate kid format"
+          },
+          {
+            "id": "cool",
+            "label": "30s Cooldown Check",
+            "sublabel": "Reject forged floods"
+          },
+          {
+            "id": "sf",
+            "label": "Singleflight Fetch",
+            "sublabel": "1 HTTP call per pod"
+          }
+        ],
+        "edges": [
+          {
+            "from": "miss",
+            "to": "cool",
+            "label": "Rate-limit refreshes"
+          },
+          {
+            "from": "cool",
+            "to": "sf",
+            "label": "Coalesce concurrent misses"
+          }
+        ],
+        "cards": [
+          {
+            "title": "Bounded IdP QPS",
+            "body": "500 pods x (1 fetch / 30s) = <=17 QPS worst-case under active attack."
+          },
+          {
+            "title": "Serve Stale on IdP Blip",
+            "body": "If IdP returns 5xx during background refresh, keep serving cached keys and alert."
+          }
+        ],
+        "summary": "Caption: Singleflight coalescing and a 30-second unknown-kid cooldown cap worst-case IdP traffic while enabling fast emergency key pickup."
+      }
+    },
+    {
+      "id": "stage-5-implementation",
+      "eyebrow": "Stage 5 • Implementation",
+      "title": "Stampede-Proof Python JWKS Cache with Singleflight & Backoff",
+      "level": "intermediate",
+      "purpose": "Provide thread-safe Python code implementing singleflight JWKS refresh, 30s cooldown, and bounded retry.",
+      "explanation": {
+        "foundation": "Below is a production-safe JWKS key resolver using `threading.Lock` for singleflight coalescing, `time.monotonic()` for skew-immune TTL/cooldown tracking, and bounded exponential backoff:",
+        "core": "```python\nimport random, re, threading, time\nfrom typing import Callable\n\nKID_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')\n\nclass StampedeProofJWKSCache:\n    def __init__(self, fetcher: Callable[[], dict[str, str]], ttl_s: float = 300.0, cooldown_s: float = 30.0):\n        self._fetcher = fetcher\n        self._ttl_s = ttl_s\n        self._cooldown_s = cooldown_s\n        self._keys: dict[str, str] = {}\n        self._fetched_at = 0.0\n        self._last_miss_refresh = 0.0\n        self._lock = threading.Lock()\n\ndef get_key(self, kid: str) -> str:\n        if not KID_RE.match(kid):\n            raise ValueError('Malformed kid header')\n        now = time.monotonic()\n        if kid in self._keys and (now - self._fetched_at) < self._ttl_s:\n            return self._keys[kid]\n\nwith self._lock:  # Singleflight per pod\n            now = time.monotonic()\n            if kid in self._keys and (now - self._fetched_at) < self._ttl_s:\n                return self._keys[kid]\n            if (now - self._last_miss_refresh) < self._cooldown_s and self._keys:\n                raise KeyError(f'Unknown kid {kid} within cooldown')\n            self._last_miss_refresh = now\n            self._keys = self._fetch_with_retry()\n            self._fetched_at = time.monotonic()\n            if kid not in self._keys:\n                raise KeyError(f'Unknown kid {kid}')\n            return self._keys[kid]",
+        "deepDive": "def _fetch_with_retry(self, max_retries: int = 3) -> dict[str, str]:\n        for attempt in range(max_retries):\n            try:\n                return self._fetcher()\n            except Exception as exc:\n                if attempt == max_retries - 1:\n                    if self._keys:\n                        return self._keys  # Stale-if-error fallback\n                    raise RuntimeError('JWKS fetch failed with empty cache') from exc\n                time.sleep((0.1 * (2 ** attempt)) + random.uniform(0, 0.05))\n        return self._keys\n```"
+      },
+      "sectionDiagram": {
+        "kind": "flow",
+        "eyebrow": "Reference Code",
+        "title": "Thread-Safe Singleflight + Stale-If-Error Fallback",
+        "nodes": [
+          {
+            "id": "re",
+            "label": "Regex Validate kid",
+            "sublabel": "Block injection/bloat"
+          },
+          {
+            "id": "lock",
+            "label": "Singleflight Lock",
+            "sublabel": "Double-checked + 30s cooldown"
+          },
+          {
+            "id": "stale",
+            "label": "Stale-If-Error",
+            "sublabel": "Preserve keys on IdP 5xx"
+          }
+        ],
+        "edges": [
+          {
+            "from": "re",
+            "to": "lock",
+            "label": "Fast-path RAM hit"
+          },
+          {
+            "from": "lock",
+            "to": "stale",
+            "label": "Bounded retry on miss"
+          }
+        ],
+        "cards": [
+          {
+            "title": "Monotonic TTLs",
+            "body": "Using time.monotonic() prevents NTP backward jumps from freezing cache refreshes."
+          },
+          {
+            "title": "Stale-If-Error",
+            "body": "Retaining prior valid keys during an IdP blip prevents a total auth outage."
+          }
+        ],
+        "summary": "Caption: Double-checked singleflight locking, kid format validation, monotonic cooldowns, and stale-if-error fallback keep JWT verification resilient."
+      }
+    },
+    {
+      "id": "stage-6-cdn-edge-caching",
+      "eyebrow": "Stage 6 • Edge Architecture",
+      "title": "CDN / Sidecar Shielding & Emergency Key Revocation",
+      "level": "advanced",
+      "purpose": "Add an edge/CDN cache in front of the IdP and handle emergency compromised-key revocation.",
+      "explanation": {
+        "foundation": "At 500+ pods (or multi-region fleets), place `/.well-known/jwks.json` behind a **CDN or regional sidecar cache** (e.g., CloudFront/Cloudflare with `Cache-Control: public, max-age=300, stale-while-revalidate=60`). That absorbs even coordinated pod restarts at the edge.",
+        "core": "For **emergency key compromise** (where waiting 1 hour for `k1` JWTs to expire is unacceptable):\n- Immediately purge the CDN cache for `/jwks.json` and remove `k1`.\n- Wait at most `30s` (cooldown) for all pods to drop `k1`, forcing compromised tokens to re-authenticate.",
+        "deepDive": "In production deployments of JWKS Key Rotation Outages & Auth Cache Stampedes, watch how cdn / sidecar shielding & emergency key revocation interacts with tail latency, retry amplification, and partial failures. Prevent key-rotation 401 storms and IdP stampedes by using a 3-phase overlap rotation (publish k2 before signing with it) paired with singleflight JWKS refresh and a bounded unknown-kid cooldown."
+      },
+      "sectionDiagram": {
+        "kind": "comparison",
+        "eyebrow": "Edge Shielding",
+        "title": "Direct IdP Fetch vs CDN + 30s Emergency Purge",
+        "nodes": [
+          {
+            "id": "cdn",
+            "label": "CDN / Edge Cache",
+            "sublabel": "max-age=300, SWR=60"
+          },
+          {
+            "id": "purge",
+            "label": "Emergency Purge",
+            "sublabel": "Drop k1 in <=30s globally"
+          }
+        ],
+        "edges": [
+          {
+            "from": "cdn",
+            "to": "purge",
+            "label": "Protects IdP origin at 0 QPS"
+          }
+        ],
+        "cards": [
+          {
+            "title": "Cold-Start Protection",
+            "body": "Autoscaling 200 new pods hits the CDN edge rather than the IdP database."
+          },
+          {
+            "title": "Fast Revocation",
+            "body": "CDN purge + 30s pod cooldown bounds emergency key removal to under a minute."
+          }
+        ],
+        "summary": "Caption: Fronting JWKS with a CDN edge cache shields the IdP from pod autoscaling bursts while supporting sub-minute emergency key purges."
+      }
+    },
+    {
+      "id": "stage-7-observability-testing",
+      "eyebrow": "Stage 7 • Verification",
+      "title": "Chaos-Testing Rotations & Monitoring JWKS Metrics",
+      "level": "advanced",
+      "purpose": "Verify zero-401 rotations in staging and define key Prometheus alerts.",
+      "explanation": {
+        "foundation": "Validate your rotation pipeline with automated chaos drills and three metrics:",
+        "core": "- **`jwks_refresh_total{status}`**: Alert if `error` rate spikes or refresh QPS per pod exceeds `0.05/sec`.\n- **`jwt_unknown_kid_total`**: Sudden spikes reveal either an unannounced IdP rotation or an active forged-`kid` probe.\n- **Automated Monthly Drill**: Run the 3-phase rotation automatically in staging under 10,000 QPS synthetic traffic and assert `401_rate == 0%`.",
+        "deepDive": "In production deployments of JWKS Key Rotation Outages & Auth Cache Stampedes, watch how chaos-testing rotations & monitoring jwks metrics interacts with tail latency, retry amplification, and partial failures. Prevent key-rotation 401 storms and IdP stampedes by using a 3-phase overlap rotation (publish k2 before signing with it) paired with singleflight JWKS refresh and a bounded unknown-kid cooldown."
+      },
+      "sectionDiagram": {
+        "kind": "comparison",
+        "eyebrow": "Before vs After",
+        "title": "Outage Metrics vs Hardened Rotation",
+        "nodes": [
+          {
+            "id": "before",
+            "label": "Before",
+            "sublabel": "40% 401s • IdP offline"
+          },
+          {
+            "id": "after",
+            "label": "After",
+            "sublabel": "0% 401s • <1 IdP QPS"
+          }
+        ],
+        "edges": [
+          {
+            "from": "before",
+            "to": "after",
+            "label": "3-phase overlap + singleflight"
+          }
+        ],
+        "cards": [
+          {
+            "title": "Automate Rotation",
+            "body": "Monthly automated rotation drills catch stale-cache bugs before real emergencies."
+          },
+          {
+            "title": "Algorithm Pinning",
+            "body": "Always pin expected alg (e.g., RS256/ES256) and never trust the JWT header's alg=none."
+          }
+        ],
+        "summary": "Caption: Automated 3-phase rotation drills and unknown-kid telemetry keep 401 error rates at 0% and IdP load flat."
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "In a 3-phase JWKS key rotation, why must the IdP publish the new public key k2 in /.well-known/jwks.json BEFORE signing any tokens with k2?",
+      "options": [
+        "So all API Gateway pods refresh their caches and hold [k1, k2] before the first k2-signed JWT arrives, preventing 401 errors",
+        "Because JWTs cannot contain a kid header until k2 is published twice",
+        "To force all users to log out and re-enter passwords",
+        "Because TLS 1.3 requires two RSA keys per certificate"
+      ],
+      "correctIndex": 0,
+      "explanation": "Publishing k2 ahead of signing for at least max_cache_ttl ensures every verifier already has k2 cached when k2-signed tokens start arriving."
+    },
+    "knowledgeChecks": [
+      {
+        "id": "kc-jwks-forged-kid",
+        "question": "Why is an unthrottled 'fetch JWKS on unknown kid' fallback dangerous even when the IdP is not rotating keys?",
+        "options": [
+          {
+            "id": "a",
+            "text": "An unauthenticated attacker can send requests with random kid headers (parsed before signature verification) and trigger a DoS stampede against the IdP",
+            "correct": true,
+            "feedback": "Correct! Gateways read the JWT header's kid before verifying the signature; without a cooldown and singleflight lock, forged kid values trigger outbound IdP fetches on every request."
+          },
+          {
+            "id": "b",
+            "text": "It converts RS256 tokens into HS256 tokens",
+            "correct": false,
+            "feedback": "Gateways read the JWT header's kid before verifying the signature; without a cooldown and singleflight lock, forged kid values trigger outbound IdP fetches on every request."
+          },
+          {
+            "id": "c",
+            "text": "It bypasses HTTPS certificate validation",
+            "correct": false,
+            "feedback": "Gateways read the JWT header's kid before verifying the signature; without a cooldown and singleflight lock, forged kid values trigger outbound IdP fetches on every request."
+          },
+          {
+            "id": "d",
+            "text": "It deletes all valid keys from Redis",
+            "correct": false,
+            "feedback": "Gateways read the JWT header's kid before verifying the signature; without a cooldown and singleflight lock, forged kid values trigger outbound IdP fetches on every request."
+          }
+        ],
+        "correctIndex": 0,
+        "explanation": "Gateways read the JWT header's kid before verifying the signature; without a cooldown and singleflight lock, forged kid values trigger outbound IdP fetches on every request."
+      },
+      {
+        "id": "kc-jwks-retire-timing",
+        "question": "After the IdP switches from signing with k1 to signing with k2, how long must it keep k1's public key in /.well-known/jwks.json?",
+        "options": [
+          {
+            "id": "a",
+            "text": "At least the maximum JWT lifetime (exp) plus clock-skew allowance, so valid k1 tokens already in clients don't fail verification",
+            "correct": true,
+            "feedback": "Correct! Users holding already-issued k1 tokens continue sending them until their exp timestamp; removing k1 early causes 401s for legitimate active sessions."
+          },
+          {
+            "id": "b",
+            "text": "0 seconds—k1 should be deleted immediately once k2 starts signing",
+            "correct": false,
+            "feedback": "Users holding already-issued k1 tokens continue sending them until their exp timestamp; removing k1 early causes 401s for legitimate active sessions."
+          },
+          {
+            "id": "c",
+            "text": "5 seconds",
+            "correct": false,
+            "feedback": "Users holding already-issued k1 tokens continue sending them until their exp timestamp; removing k1 early causes 401s for legitimate active sessions."
+          },
+          {
+            "id": "d",
+            "text": "Until the next Kubernetes pod restart",
+            "correct": false,
+            "feedback": "Users holding already-issued k1 tokens continue sending them until their exp timestamp; removing k1 early causes 401s for legitimate active sessions."
+          }
+        ],
+        "correctIndex": 0,
+        "explanation": "Users holding already-issued k1 tokens continue sending them until their exp timestamp; removing k1 early causes 401s for legitimate active sessions."
+      },
+      {
+        "id": "kc-jwks-stale-error",
+        "question": "What should an API Gateway pod do if its background JWKS refresh fails with an IdP 503 error?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Retain the existing cached JWKS keys (stale-if-error), log an alert, and retry with bounded exponential backoff",
+            "correct": true,
+            "feedback": "Correct! Keeping the last valid JWKS set on transient 5xx errors prevents an IdP control-plane blip from taking down all authenticated API traffic."
+          },
+          {
+            "id": "b",
+            "text": "Clear its in-memory JWKS cache immediately and return 401 to all users",
+            "correct": false,
+            "feedback": "Keeping the last valid JWKS set on transient 5xx errors prevents an IdP control-plane blip from taking down all authenticated API traffic."
+          },
+          {
+            "id": "c",
+            "text": "Disable JWT signature verification until the IdP recovers",
+            "correct": false,
+            "feedback": "Keeping the last valid JWKS set on transient 5xx errors prevents an IdP control-plane blip from taking down all authenticated API traffic."
+          },
+          {
+            "id": "d",
+            "text": "Spin in a tight 0ms while-loop until the IdP responds",
+            "correct": false,
+            "feedback": "Keeping the last valid JWKS set on transient 5xx errors prevents an IdP control-plane blip from taking down all authenticated API traffic."
+          }
+        ],
+        "correctIndex": 0,
+        "explanation": "Keeping the last valid JWKS set on transient 5xx errors prevents an IdP control-plane blip from taking down all authenticated API traffic."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "If an auth server switches to a new signing key too fast, API servers with old cached keys reject users with 401 errors—or flood the auth server asking for the new key. Fix it by publishing the new key early, waiting for caches to update, and limiting how often servers refetch keys.",
+      "spark": {
+        "summary": "Publish new JWT keys before using them, and add a cooldown + singleflight lock so pods never stampede the auth server.",
+        "keyTakeaway": "Overlap old and new keys during rotation, and limit unknown-key refreshes to once per 30 seconds per pod."
+      },
+      "learningJourney": [
+        {
+          "stageId": "stage-1-rotation-race",
+          "summary": "Switching keys abruptly breaks both old and new user tokens."
+        },
+        {
+          "stageId": "stage-2-stampede-dos",
+          "summary": "500 pods refetching keys at once can crash your auth server."
+        },
+        {
+          "stageId": "stage-3-three-phase-rotation",
+          "summary": "Publish k2 first, wait, sign with k2, wait, then remove k1."
+        },
+        {
+          "stageId": "stage-4-gateway-singleflight-cooldown",
+          "summary": "Use one lock and a 30s cooldown per pod to stop floods."
+        },
+        {
+          "stageId": "stage-5-implementation",
+          "summary": "Keep old keys if a refresh fails so users stay logged in."
+        },
+        {
+          "stageId": "stage-6-cdn-edge-caching",
+          "summary": "Put a CDN in front of /.well-known/jwks.json."
+        },
+        {
+          "stageId": "stage-7-observability-testing",
+          "summary": "Test key rotations monthly in staging with zero 401s."
+        }
+      ],
+      "finalSummary": "Overlapping key publication and rate-limited gateway refreshes make JWT key rotation invisible to users.",
+      "summary": "Prevent key-rotation 401 storms and IdP stampedes by using a 3-phase overlap rotation (publish k2 before signing with it) paired with singleflight JWKS refresh and a bounded unknown-kid cooldown.",
+      "keyTakeaway": "When an IdP generates `k2`, replaces `k1` in `/, never sign JWTs with a new kid until every verifier cache has expired past the publish window, and coalesce unknown-kid refreshes with singleflight + negative cooldowns."
+    },
+    "intermediate": {
+      "byteSummary": "Abrupt JWKS rotations trigger 401s from stale 24h caches, while naive unknown-kid fallbacks enable thundering-herd DoS attacks. Solve both with 3-phase overlap rotation (publish [k1, k2] -> wait max TTL -> sign k2 -> wait max exp -> retire k1), max-age=300 caching, singleflight locking, and 30s unknown-kid cooldowns.",
+      "spark": {
+        "summary": "Combine 3-phase JWKS overlap rotation with singleflight gateway caching, 30s unknown-kid cooldowns, and CDN shielding.",
+        "keyTakeaway": "Decouple key publication from signing activation, and protect the IdP with singleflight + monotonic cooldowns."
+      },
+      "learningJourney": [
+        {
+          "stageId": "stage-1-rotation-race",
+          "summary": "Stale caches reject k2 while early k1 removal breaks in-flight JWTs."
+        },
+        {
+          "stageId": "stage-2-stampede-dos",
+          "summary": "Forged kid headers and 500-pod misses overwhelm /.well-known/jwks.json."
+        },
+        {
+          "stageId": "stage-3-three-phase-rotation",
+          "summary": "3-phase publish, activate, and retire timeline."
+        },
+        {
+          "stageId": "stage-4-gateway-singleflight-cooldown",
+          "summary": "Proactive jittered refresh, singleflight lock, and 30s cooldown."
+        },
+        {
+          "stageId": "stage-5-implementation",
+          "summary": "Python singleflight JWKS cache with stale-if-error fallback."
+        },
+        {
+          "stageId": "stage-6-cdn-edge-caching",
+          "summary": "CDN max-age=300 shielding and sub-minute emergency purges."
+        },
+        {
+          "stageId": "stage-7-observability-testing",
+          "summary": "Monthly rotation chaos drills and unknown-kid alerting."
+        }
+      ],
+      "finalSummary": "3-phase overlap rotation and singleflight cooldown-protected caches eliminate both rotation 401s and IdP stampedes.",
+      "summary": "Prevent key-rotation 401 storms and IdP stampedes by using a 3-phase overlap rotation (publish k2 before signing with it) paired with singleflight JWKS refresh and a bounded unknown-kid cooldown.",
+      "keyTakeaway": "When an IdP generates `k2`, replaces `k1` in `/, never sign JWTs with a new kid until every verifier cache has expired past the publish window, and coalesce unknown-kid refreshes with singleflight + negative cooldowns."
+    },
+    "advanced": {
+      "byteSummary": "Eliminating JWKS rotation outages at 60,000 QPS requires aligning IdP lifecycle state machines with stampede-proof verifier caches. The IdP executes a 3-phase overlap window bounded by max_cache_ttl and max_jwt_exp, while gateway pods enforce regex kid validation, monotonic singleflight coalescing, 30s negative cooldowns, stale-if-error retention, and CDN edge shielding.",
+      "spark": {
+        "summary": "Zero-downtime JWKS lifecycle: 3-phase overlap windows, monotonic singleflight verifiers, forged-kid DoS cooldowns, and CDN edge shielding.",
+        "keyTakeaway": "Bound worst-case IdP QPS with singleflight + 30s cooldowns + CDN caching while retaining stale-if-error key sets."
+      },
+      "learningJourney": [
+        {
+          "stageId": "stage-1-rotation-race",
+          "summary": "Dual-sided 401 windows from coupled publication and signing."
+        },
+        {
+          "stageId": "stage-2-stampede-dos",
+          "summary": "Pre-signature header parsing as a forged-kid DoS amplification vector."
+        },
+        {
+          "stageId": "stage-3-three-phase-rotation",
+          "summary": "TTL- and exp-bounded 3-phase overlap rotation state machine."
+        },
+        {
+          "stageId": "stage-4-gateway-singleflight-cooldown",
+          "summary": "Jittered background refresh, singleflight, and 30s cooldowns."
+        },
+        {
+          "stageId": "stage-5-implementation",
+          "summary": "Monotonic singleflight cache with bounded retry and stale-if-error."
+        },
+        {
+          "stageId": "stage-6-cdn-edge-caching",
+          "summary": "Edge SWR shielding and 30s emergency key revocation."
+        },
+        {
+          "stageId": "stage-7-observability-testing",
+          "summary": "Algorithm pinning, unknown-kid telemetry, and chaos drills."
+        }
+      ],
+      "finalSummary": "Coupling 3-phase overlap rotation with CDN-shielded, singleflight-protected verifiers sustains 0% 401s across routine and emergency rotations.",
+      "summary": "Prevent key-rotation 401 storms and IdP stampedes by using a 3-phase overlap rotation (publish k2 before signing with it) paired with singleflight JWKS refresh and a bounded unknown-kid cooldown.",
+      "keyTakeaway": "When an IdP generates `k2`, replaces `k1` in `/, never sign JWTs with a new kid until every verifier cache has expired past the publish window, and coalesce unknown-kid refreshes with singleflight + negative cooldowns."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "prerequisites": [
+    {
+      "title": "SPIFFE & SPIRE Cryptographic Workload Identity",
+      "summary": "SPIFFE defines a universal URI-based workload identity standard, while SPIRE attests running processes via kernel and cloud metadata to issue short-lived X.509/JWT SVIDs over a local Unix Domain Socket."
+    },
+    {
+      "title": "API Security: OAuth 2.1, JWT & mTLS",
+      "summary": "Modern API security pairs OAuth 2.0 (for delegated user/client authorization), signed JWTs (for stateless, verifiable claims), and Mutual TLS (mTLS) (for cryptographic workload and high-assurance client identity)."
+    },
+    {
+      "title": "Circuit Breaker Pattern",
+      "summary": "A stateful proxy that monitors downstream failures and slow calls over a sliding window, tripping open to fail fast in microseconds instead of letting 2,000ms+ timeouts exhaust caller thread pools."
+    }
+  ],
+  "simulation": {
+    "title": "JWKS Key Rotation Outages & Auth Cache Stampedes — Interactive Execution Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Workload & Budget"
+      },
+      {
+        "id": "router",
+        "label": "Gateway / Router",
+        "role": "Admission & Dispatch"
+      },
+      {
+        "id": "engine",
+        "label": "Core Engine",
+        "role": "Primary Execution"
+      },
+      {
+        "id": "replica",
+        "label": "Replica / Fallback",
+        "role": "Durability & Recovery"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "router",
+        "label": "request"
+      },
+      {
+        "from": "router",
+        "to": "engine",
+        "label": "route"
+      },
+      {
+        "from": "engine",
+        "to": "replica",
+        "label": "sync / fallback"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why Abrupt Key Rotation Causes 401 Storms",
+        "actionLabel": "Dispatch nominal request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "router"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "Ingress",
+          "p99_ms": 8,
+          "error_rate": "0.0%"
+        },
+        "explanation": "Caller sends work into the gateway with explicit timeout and concurrency bounds (Why Abrupt Key Rotation Causes 401 Storms)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "How Unbounded Unknown-kid Fallbacks Create an IdP DoS",
+        "actionLabel": "Execute core invariant",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "Core Path",
+          "p99_ms": 18,
+          "in_flight": 124
+        },
+        "explanation": "The core engine processes the hot path while keeping state transitions deterministic (How Unbounded Unknown-kid Fallbacks Create an IdP DoS)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "3-Phase Overlap Key Rotation Protocol",
+        "actionLabel": "Detect skew or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Degraded",
+          "p99_ms": 64,
+          "retries_capped": "true"
+        },
+        "explanation": "Under load or replica lag, bounded backoff and isolation prevent cascading saturation (3-Phase Overlap Key Rotation Protocol)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Chaos-Testing Rotations & Monitoring JWKS Metrics",
+        "actionLabel": "Converge & restore SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 11,
+          "drift": 0
+        },
+        "explanation": "State converges cleanly and telemetry confirms the system returned within its SLO envelope (Chaos-Testing Rotations & Monitoring JWKS Metrics)."
+      }
+    ]
+  }
+}

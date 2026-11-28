@@ -1,0 +1,815 @@
+{
+  "id": "design-llm-prefix-cache",
+  "slug": "design-llm-prefix-cache",
+  "title": "Design a Multi-Tenant LLM Inference Router with Zero-Copy RadixAttention Prefix Caching",
+  "problemType": "ai-systems",
+  "difficulty": "hard",
+  "prompt": "Design a multi-tenant LLM inference routing and serving architecture across 64 H100 GPUs handling 2,000 req/sec where 80% of requests carry 4K–16K token system prompts + RAG context, targeting < 250 ms p99 TTFT, > 85% prefix cache hit rate, strict tenant isolation, and graceful degradation under GPU pod overload.",
+  "spark": {
+    "summary": "Route requests via a Prefix-Aware Consistent-Hash Router keyed by `(tenant_id, prefix_block_hash)` to GPU Worker Pods running local RadixAttention + CPU-DRAM L2 KV offload.",
+    "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, random or round-robin load balancing destroys prefix cache hit rates across 64 GPUs; prefix-aware consistent hashing with bounded-load fallback preserves > 85% hit rates while preventing single-GPU hot spots.",
+    "byteSummary": "Even with RadixAttention enabled inside every GPU worker pod, standard round-robin load balancing across 64 H100s drops prefix cache hit rates to ~1/64 (1.5%), forcing every pod to redundantly prefill the same 8K-token system prompts.\n\nA Prefix-Aware Router solves this by hashing the leading prefix blocks (e.g., first 512 tokens salted with `tenant_id`) onto a consistent-hash ring with **bounded load** (Consistent Hashing with Bounded Loads, max 1.25x average queue depth). Requests for the same tenant and system prompt consistently land on the same GPU worker, hitting its local Radix Tree in GPU HBM—or its CPU-DRAM L2 KV cache.\n\nIf a celebrity tenant saturates its primary GPU pod beyond the bounded-load threshold, the router spills overflow requests to the next healthy replica on the ring (cold-prefill fallback) rather than letting TTFT spike past 250 ms."
+  },
+  "learningJourney": [
+    {
+      "id": "01-kv-and-prefill-math",
+      "eyebrow": "STAGE 01 · COMPUTE & HBM MATH",
+      "title": "Why Prefix Caching Is Mandatory at 2,000 Req/Sec",
+      "level": "foundation",
+      "purpose": "Quantify why 2,000 req/sec on a 70B model requires RadixAttention prefix sharing to fit 8K-token prefixes in HBM.",
+      "explanation": {
+        "foundation": "Assume a 70B-parameter model (GQA, ~320 KB KV/token in FP16, or ~160 KB in FP8). An 8K-token prefix occupies `8,192 * 160 KB ≈ 1.3 GB` per copy.",
+        "core": "With 80% prefix sharing, RadixAttention stores that 1.3 GB **once** per active tenant/prompt instead of duplicating it per concurrent request, freeing 40+ GB HBM per GPU for higher batch sizes and cutting prefill compute by ~85%.",
+        "deepDive": "In production deployments of Design a Multi-Tenant LLM Inference Router with Zero-Copy RadixAttention Prefix Caching, watch how why prefix caching is mandatory at 2,000 req/sec interacts with tail latency, retry amplification, and partial failures. Production multi-tenant LLM routers pair bounded-load prefix rings with disaggregated Prefill/Decode pods, per-tenant HBM quotas, and RDMA KV transfer."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 01 · COMPUTE & HBM MATH",
+        "title": "Why Prefix Caching Is Mandatory at 2,000 Req/Sec",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "2,000 Req / Sec",
+            "sub": "70B GQA (160 KB/tok FP8)",
+            "role": "Workload Scale"
+          },
+          {
+            "id": "n2",
+            "label": "8K Prefix = 1.3 GB",
+            "sub": "Unshared = 2.6 TB / Sec",
+            "role": "HBM Bottleneck"
+          },
+          {
+            "id": "n3",
+            "label": "80% Shared Radix KV",
+            "sub": "1.3 GB Stored Once/Pod",
+            "role": "Zero-Copy Reuse"
+          },
+          {
+            "id": "n4",
+            "label": "5x Lower Prefill FLOPs",
+            "sub": "Meet <200ms TTFT p99",
+            "role": "Latency SLA"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "without cache"
+          },
+          {
+            "from": "n1",
+            "to": "n3",
+            "label": "with Radix"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "achieves"
+          }
+        ],
+        "cards": [
+          {
+            "label": "KV Memory Math",
+            "detail": "8,192 tokens x 160 KB/token (FP8) = ~1.3 GB per prompt prefix."
+          },
+          {
+            "label": "Prefill Bottleneck",
+            "detail": "Recomputing 8K prefixes at 2,000 req/sec would saturate dozens of extra H100s on redundant prefill."
+          },
+          {
+            "label": "Sharing Multiplier",
+            "detail": "Storing one physical 1.3 GB Radix prefix per active pod lets hundreds of requests reuse it zero-copy."
+          }
+        ],
+        "summary": "RadixAttention shares 1.3 GB 8K-token prefixes zero-copy across requests, cutting prefill FLOPs 5x at 2,000 req/sec.",
+        "caption": "RadixAttention shares 1.3 GB 8K-token prefixes zero-copy across requests, cutting prefill FLOPs 5x at 2,000 req/sec."
+      }
+    },
+    {
+      "id": "02-prefix-aware-routing",
+      "eyebrow": "STAGE 02 · PREFIX-AWARE ROUTER",
+      "title": "Consistent Hashing with Bounded Loads on `(tenant_id, prefix_hash)`",
+      "level": "foundation",
+      "purpose": "Route requests by consistent hashing on (tenant_id, prefix_hash) with bounded-load spillover to protect pod queues.",
+      "explanation": {
+        "foundation": "At the API gateway/router, tokenize (or hash normalized UTF-8 chunks) of the leading `K=512` tokens combined with `tenant_id`. Look up the target GPU pod on a consistent-hash ring.",
+        "core": "Before forwarding, check the pod's real-time `active_prefill_tokens` telemetry: if overloaded (> 1.25x cluster average), walk clockwise on the ring to the secondary replica.",
+        "deepDive": "In production deployments of Design a Multi-Tenant LLM Inference Router with Zero-Copy RadixAttention Prefix Caching, watch how consistent hashing with bounded loads on `(tenant_id, prefix_hash)` interacts with tail latency, retry amplification, and partial failures. Production multi-tenant LLM routers pair bounded-load prefix rings with disaggregated Prefill/Decode pods, per-tenant HBM quotas, and RDMA KV transfer."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 02 · PREFIX-AWARE ROUTER",
+        "title": "Consistent Hashing with Bounded Loads on `(tenant_id, prefix_hash)`",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "API Gateway",
+            "sub": "Hash (tenant, 512-tok)",
+            "role": "Prefix Key"
+          },
+          {
+            "id": "n2",
+            "label": "Consistent-Hash Ring",
+            "sub": "Locate Warm GPU Pod",
+            "role": "Cache Affinity"
+          },
+          {
+            "id": "n3",
+            "label": "load <= 1.25 * avg?",
+            "sub": "Bounded-Load Check",
+            "role": "Hot-Key Guard"
+          },
+          {
+            "id": "n4",
+            "label": "Target GPU Worker",
+            "sub": "High Radix Hit Rate",
+            "role": "Optimal Route"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "hashes to"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "checks queue"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "routes or spills"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Bounded-Load Routing",
+            "detail": "If the primary warm pod's queue exceeds 1.25x cluster average, spill to the next ring node."
+          },
+          {
+            "label": "Tenant Salt in Hash",
+            "detail": "Including tenant_id in the routing key prevents cross-tenant cache affinity probing."
+          },
+          {
+            "label": "512-Token Prefix Key",
+            "detail": "Hashing the first 512 tokens balances cache hit affinity with multi-turn conversation growth."
+          }
+        ],
+        "summary": "Consistent hashing with 1.25x bounded-load spillover preserves prefix cache affinity without overloading hot pods.",
+        "caption": "Consistent hashing with 1.25x bounded-load spillover preserves prefix cache affinity without overloading hot pods."
+      },
+      "decisionFramework": {
+        "problem": "How to implement Design a Multi-Tenant LLM Inference Router with Zero-Copy RadixAttention Prefix Caching without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "To keep the architecture evolvable without sacrificing reliability, random or round-robin load balancing destroys prefix cache hit rates across 64 GPUs; prefix-aware consistent hashing with bounded-load fallback preserves > 85% hit rates while preventing single-GPU hot spots.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Design a Multi-Tenant LLM Inference Router with Zero-Copy RadixAttention Prefix Caching experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-router-implementation",
+      "eyebrow": "STAGE 03 · ROUTER LOGIC",
+      "title": "Implementing Tenant-Isolated Prefix-Aware Routing",
+      "level": "intermediate",
+      "purpose": "Implement PrefixAwareRouter.select_pod to hash (tenant_id, prefix) and walk the ring until a non-overloaded pod is found.",
+      "explanation": {
+        "foundation": "```python\nimport hashlib",
+        "core": "class PrefixAwareRouter:\n    def __init__(self, ring, max_load_factor: float = 1.25) -> None:\n        self.ring = ring\n        self.max_load_factor = max_load_factor",
+        "deepDive": "def select_pod(self, tenant_id: str, prefix_bytes: bytes, pod_loads: dict[str, float], avg_load: float) -> str:\n        if not tenant_id:\n            raise ValueError('tenant_id is required for cache isolation')\n        salted_key = hashlib.blake2b(\n            tenant_id.encode('utf-8') + b':' + prefix_bytes[:2048],\n            digest_size=16,\n        ).hexdigest()\n        candidates = self.ring.get_candidates(salted_key, count=3)\n        if not candidates:\n            raise RuntimeError('No healthy GPU worker pods available')\n        cap = max(1.0, avg_load * self.max_load_factor)\n        for pod_id in candidates:\n            if pod_loads.get(pod_id, 0.0) <= cap:\n                return pod_id\n        # All candidates busy: pick least-loaded among candidates to bound TTFT\n        return min(candidates, key=lambda p: pod_loads.get(p, 0.0))\n```"
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 03 · ROUTER LOGIC",
+        "title": "Implementing Tenant-Isolated Prefix-Aware Routing",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "(tenant_id, prefix)",
+            "sub": "SHA-256 Routing Key",
+            "role": "Router Input"
+          },
+          {
+            "id": "n2",
+            "label": "Walk Ring Candidates",
+            "sub": "Primary -> Next Vnodes",
+            "role": "Candidate Scan"
+          },
+          {
+            "id": "n3",
+            "label": "pod.load <= max_load",
+            "sub": "1.25x Cap Check",
+            "role": "Load Gate"
+          },
+          {
+            "id": "n4",
+            "label": "Least-Loaded Fallback",
+            "sub": "If All Above Cap",
+            "role": "Safe Selection"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "looks up"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "filters"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "falls back"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Deterministic Ring Walk",
+            "detail": "Walking the ring in deterministic clockwise order concentrates spilled traffic on warm backups."
+          },
+          {
+            "label": "No Infinite Loop",
+            "detail": "If every candidate exceeds max_load_factor, pick the least-loaded pod or shed with 429."
+          },
+          {
+            "label": "Sub-Millisecond Route",
+            "detail": "SHA-256 + binary search over ring vnodes executes in <50 microseconds."
+          }
+        ],
+        "summary": "Clockwise ring walking with 1.25x bounded-load checks keeps routing sub-millisecond and queues balanced.",
+        "caption": "Clockwise ring walking with 1.25x bounded-load checks keeps routing sub-millisecond and queues balanced."
+      }
+    },
+    {
+      "id": "04-worker-radix-and-kv-tiering",
+      "eyebrow": "STAGE 04 · WORKER KV TIERING",
+      "title": "GPU HBM Radix Tree + Async CPU DRAM L2 Cache",
+      "level": "intermediate",
+      "purpose": "Tier GPU HBM Radix Trees with async PCIe Gen5 offloading to a 512 GB CPU-DRAM L2 KV cache.",
+      "explanation": {
+        "foundation": "Each GPU worker runs a local Radix Tree over PagedAttention blocks. When HBM utilization crosses 85%, leaf nodes with `ref_count == 0` offload asynchronously over PCIe Gen5 (~64 GB/s) to a 512 GB CPU-DRAM L2 pool.",
+        "core": "Reloading an 8K prefix (1.3 GB) from CPU DRAM takes ~20 ms—over 10x faster than cold GPU prefill.",
+        "deepDive": "In production deployments of Design a Multi-Tenant LLM Inference Router with Zero-Copy RadixAttention Prefix Caching, watch how gpu hbm radix tree + async cpu dram l2 cache interacts with tail latency, retry amplification, and partial failures. Production multi-tenant LLM routers pair bounded-load prefix rings with disaggregated Prefill/Decode pods, per-tenant HBM quotas, and RDMA KV transfer."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 04 · WORKER KV TIERING",
+        "title": "GPU HBM Radix Tree + Async CPU DRAM L2 Cache",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "GPU HBM L1 (85% Cap)",
+            "sub": "Hot Radix Branches",
+            "role": "Tier 1 KV"
+          },
+          {
+            "id": "n2",
+            "label": "PCIe Gen5 Async DMA",
+            "sub": "~64 GB/s Transfer",
+            "role": "Background Evict"
+          },
+          {
+            "id": "n3",
+            "label": "512 GB CPU DRAM L2",
+            "sub": "Warm Cold-Leaf KV",
+            "role": "Tier 2 KV"
+          },
+          {
+            "id": "n4",
+            "label": "Reload in ~20 ms",
+            "sub": "vs. 300ms Re-Prefill",
+            "role": "15x Faster Hit"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "offloads >85%"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "stores pages"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "reloads on hit"
+          }
+        ],
+        "cards": [
+          {
+            "label": "85% Watermark",
+            "detail": "Start background PCIe offloading at 85% HBM so active decodes never stall waiting for free pages."
+          },
+          {
+            "label": "16-Token Page Granularity",
+            "detail": "Fixed PagedAttention blocks transfer cleanly over pinned DMA buffers."
+          },
+          {
+            "label": "Leaf-First Eviction",
+            "detail": "Evict unreferenced leaf suffixes first, keeping shared system-prompt roots in HBM."
+          }
+        ],
+        "summary": "Async PCIe Gen5 offloading to 512 GB CPU DRAM retains 10x more KV prefixes and reloads 15x faster than recompute.",
+        "caption": "Async PCIe Gen5 offloading to 512 GB CPU DRAM retains 10x more KV prefixes and reloads 15x faster than recompute."
+      }
+    },
+    {
+      "id": "05-disaggregated-prefill-integration",
+      "eyebrow": "STAGE 05 · PREFILL-DECODE SPLIT",
+      "title": "Integrating RadixAttention with Disaggregated Prefill/Decode Pods",
+      "level": "advanced",
+      "purpose": "Disaggregate Prefill and Decode pods so heavy 16K-token prefills never cause inter-token latency spikes on decode.",
+      "explanation": {
+        "foundation": "Think of **Integrating RadixAttention with Disaggregated Prefill/Decode Pods** as the intuition layer for Design a Multi-Tenant LLM Inference Router with Zero-Copy RadixAttention Prefix Caching: Disaggregate Prefill and Decode pods so heavy 16K-token prefills never cause inter-token latency spikes on decode.",
+        "core": "At 2,000 req/sec, mixing 16K-token prefills with active decode batches causes inter-token latency (ITL) spikes. Route cache misses and partial suffix prefills to dedicated **Prefill Pods** (which own the Radix Tree), then RDMA/NVLink-transfer only the final KV blocks to **Decode Pods** for smooth token streaming.",
+        "deepDive": "Under heavy load or partial failure, integrating radixattention with disaggregated prefill/decode pods becomes a critical lever for predictable latency and correctness. Production multi-tenant LLM routers pair bounded-load prefix rings with disaggregated Prefill/Decode pods, per-tenant HBM quotas, and RDMA KV transfer."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 05 · PREFILL-DECODE SPLIT",
+        "title": "Integrating RadixAttention with Disaggregated Prefill/Decode Pods",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "Prefill Pod Pool",
+            "sub": "Owns Radix KV Tree",
+            "role": "Compute-Bound"
+          },
+          {
+            "id": "n2",
+            "label": "RDMA / NVLink KV Push",
+            "sub": "Transfer Matched KV",
+            "role": "State Handoff"
+          },
+          {
+            "id": "n3",
+            "label": "Decode Pod Pool",
+            "sub": "Continuous Batching",
+            "role": "Memory-Bound"
+          },
+          {
+            "id": "n4",
+            "label": "Flat ITL < 20 ms",
+            "sub": "Zero Prefill Stalls",
+            "role": "Smooth Stream"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "transfers KV"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "starts decode"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "sustains"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Why Disaggregate",
+            "detail": "A single 16K-token prefill stalls all co-located decode streams for ~250 ms if run on the same GPU."
+          },
+          {
+            "label": "Prefill Owns Radix",
+            "detail": "Prefill pods maintain the Radix Tree and only transfer the active request's KV blocks to Decode."
+          },
+          {
+            "label": "Independent Scaling",
+            "detail": "Scale Prefill GPUs for TTFT and Decode GPUs for token throughput independently."
+          }
+        ],
+        "summary": "Disaggregating Prefill (Radix-owning) and Decode pods over RDMA eliminates prefill-induced decode jitter.",
+        "caption": "Disaggregating Prefill (Radix-owning) and Decode pods over RDMA eliminates prefill-induced decode jitter."
+      }
+    },
+    {
+      "id": "06-eviction-and-security-isolation",
+      "eyebrow": "STAGE 06 · TENANT ISOLATION",
+      "title": "Enforcing Tenant Quotas & Zero Cross-Tenant Leakage",
+      "level": "advanced",
+      "purpose": "Enforce zero cross-tenant leakage and noisy-neighbor isolation via salted Radix roots and per-tenant HBM quotas.",
+      "explanation": {
+        "foundation": "Think of **Enforcing Tenant Quotas & Zero Cross-Tenant Leakage** as the intuition layer for Design a Multi-Tenant LLM Inference Router with Zero-Copy RadixAttention Prefix Caching: Enforce zero cross-tenant leakage and noisy-neighbor isolation via salted Radix roots and per-tenant HBM quotas.",
+        "core": "Salt every Radix Tree root with `(tenant_id, model_version, lora_id)` so cross-tenant hits are impossible. Pair global LRU with **per-tenant HBM soft caps** (e.g., max 25% of HBM per tenant) so a single tenant's 16K-token sweep cannot thrash other tenants' warm caches.",
+        "deepDive": "Under heavy load or partial failure, enforcing tenant quotas & zero cross-tenant leakage becomes a critical lever for predictable latency and correctness. Production multi-tenant LLM routers pair bounded-load prefix rings with disaggregated Prefill/Decode pods, per-tenant HBM quotas, and RDMA KV transfer."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 06 · TENANT ISOLATION",
+        "title": "Enforcing Tenant Quotas & Zero Cross-Tenant Leakage",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "Root Salt Key",
+            "sub": "(tenant, model, lora)",
+            "role": "Hard Isolation"
+          },
+          {
+            "id": "n2",
+            "label": "Per-Tenant HBM Cap",
+            "sub": "Max 25% HBM / Tenant",
+            "role": "Quota Wall"
+          },
+          {
+            "id": "n3",
+            "label": "Tenant-Scoped LRU",
+            "sub": "Evict Own Cold Leaves",
+            "role": "Fair Cache"
+          },
+          {
+            "id": "n4",
+            "label": "Zero Timing Leakage",
+            "sub": "No Cross-Tenant Hits",
+            "role": "Security Proof"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "paired with"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "enforces"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "guarantees"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Side-Channel Closure",
+            "detail": "Salting every Radix root with tenant_id ensures Tenant B can never probe Tenant A's TTFT."
+          },
+          {
+            "label": "25% Soft Quota",
+            "detail": "One tenant flooding 32K-token prompts only evicts its own older leaves once above 25% HBM."
+          },
+          {
+            "label": "LoRA / Version Safety",
+            "detail": "Including model_version and lora_id prevents corrupt KV reuse across adapter switches."
+          }
+        ],
+        "summary": "Salted Radix roots and 25% per-tenant HBM caps eliminate timing side channels and noisy-neighbor cache eviction.",
+        "caption": "Salted Radix roots and 25% per-tenant HBM caps eliminate timing side channels and noisy-neighbor cache eviction."
+      }
+    },
+    {
+      "id": "07-observability-and-autoscaling",
+      "eyebrow": "STAGE 07 · TELEMETRY & SCALING",
+      "title": "Scaling on Prefix Hit Rate, TTFT & KV Eviction Churn",
+      "level": "advanced",
+      "purpose": "Track prefix hit ratio, TTFT p99, bounded-load spill rate, and graceful virtual-node draining during scale-in.",
+      "explanation": {
+        "foundation": "Think of **Scaling on Prefix Hit Rate, TTFT & KV Eviction Churn** as the intuition layer for Design a Multi-Tenant LLM Inference Router with Zero-Copy RadixAttention Prefix Caching: Track prefix hit ratio, TTFT p99, bounded-load spill rate, and graceful virtual-node draining during scale-in.",
+        "core": "Monitor `prefix_cache_hit_ratio`, `ttft_p99_ms`, `hbm_to_dram_offload_rate`, and `bounded_load_spill_rate`. Use **consistent-hash virtual-node draining** during scale-in so only `1/N` keys remap, and pre-warm newly added pods from a shared NIXL/RDMA KV store when traffic ramps.",
+        "deepDive": "Under heavy load or partial failure, scaling on prefix hit rate, ttft & kv eviction churn becomes a critical lever for predictable latency and correctness. Production multi-tenant LLM routers pair bounded-load prefix rings with disaggregated Prefill/Decode pods, per-tenant HBM quotas, and RDMA KV transfer."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 07 · TELEMETRY & SCALING",
+        "title": "Scaling on Prefix Hit Rate, TTFT & KV Eviction Churn",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "prefix_cache_hit_ratio",
+            "sub": "Per-Tenant & Global",
+            "role": "Efficiency KPI"
+          },
+          {
+            "id": "n2",
+            "label": "ttft_p99_ms < 200ms",
+            "sub": "Prefill SLA",
+            "role": "Latency KPI"
+          },
+          {
+            "id": "n3",
+            "label": "bounded_load_spill_rate",
+            "sub": "Hot-Pod Pressure",
+            "role": "Balance Signal"
+          },
+          {
+            "id": "n4",
+            "label": "Graceful Vnode Drain",
+            "sub": "1/N Remap on Scale",
+            "role": "Deploy Guard"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "drives"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "correlates"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "protected by"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Spill-Rate Tuning",
+            "detail": "High bounded_load_spill_rate signals a hot tenant needs more vnode replicas or dedicated pods."
+          },
+          {
+            "label": "Graceful Scale-In",
+            "detail": "Drain departing pods' vnodes gradually so only 1/N prefixes cold-miss during autoscaling."
+          },
+          {
+            "label": "DRAM Offload Alert",
+            "detail": "Alert if PCIe offload bandwidth saturates, indicating HBM working set exceeded pod capacity."
+          }
+        ],
+        "summary": "Tracking prefix hit ratios, spill rates, and graceful vnode draining keeps multi-tenant TTFT fast during scaling.",
+        "caption": "Tracking prefix hit ratios, spill rates, and graceful vnode draining keeps multi-tenant TTFT fast during scaling."
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-1",
+        "question": "Why does standard round-robin load balancing ruin RadixAttention prefix cache hit rates across 64 GPUs?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Round-robin causes out-of-memory crashes immediately.",
+            "correct": false,
+            "feedback": "Incorrect: Prefix-aware consistent hashing is required so matching prefixes land on the same GPU worker."
+          },
+          {
+            "id": "b",
+            "text": "Successive requests for the same system prompt scatter across all 64 GPUs, forcing each GPU to cold-prefill independently.",
+            "correct": true,
+            "feedback": "Correct: Prefix-aware consistent hashing is required so matching prefixes land on the same GPU worker."
+          },
+          {
+            "id": "c",
+            "text": "Round-robin routers strip system prompts from requests.",
+            "correct": false,
+            "feedback": "Incorrect: Prefix-aware consistent hashing is required so matching prefixes land on the same GPU worker."
+          },
+          {
+            "id": "d",
+            "text": "GPUs cannot run RadixAttention behind a load balancer.",
+            "correct": false,
+            "feedback": "Incorrect: Prefix-aware consistent hashing is required so matching prefixes land on the same GPU worker."
+          }
+        ],
+        "explanation": "Prefix-aware consistent hashing is required so matching prefixes land on the same GPU worker."
+      },
+      {
+        "id": "kc-2",
+        "question": "How does Consistent Hashing with Bounded Loads prevent a popular tenant from overloading one GPU?",
+        "options": [
+          {
+            "id": "a",
+            "text": "It disables prefix caching for the entire cluster.",
+            "correct": false,
+            "feedback": "Incorrect: Bounded-load spillover trades a small cold-prefill rate on overflow for strict p99 TTFT protection."
+          },
+          {
+            "id": "b",
+            "text": "It moves the GPU to a different availability zone.",
+            "correct": false,
+            "feedback": "Incorrect: Bounded-load spillover trades a small cold-prefill rate on overflow for strict p99 TTFT protection."
+          },
+          {
+            "id": "c",
+            "text": "When the primary GPU exceeds 1.25x average load, the router spills overflow requests to the next replica on the ring.",
+            "correct": true,
+            "feedback": "Correct: Bounded-load spillover trades a small cold-prefill rate on overflow for strict p99 TTFT protection."
+          },
+          {
+            "id": "d",
+            "text": "It drops all requests from the popular tenant.",
+            "correct": false,
+            "feedback": "Incorrect: Bounded-load spillover trades a small cold-prefill rate on overflow for strict p99 TTFT protection."
+          }
+        ],
+        "explanation": "Bounded-load spillover trades a small cold-prefill rate on overflow for strict p99 TTFT protection."
+      },
+      {
+        "id": "kc-3",
+        "question": "How do you stop one noisy tenant from evicting every other tenant's cached prefixes from GPU HBM?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Run all tenants on a single shared Radix node.",
+            "correct": false,
+            "feedback": "Incorrect: Per-tenant soft quotas bound noisy-neighbor eviction while salting prevents cross-tenant leaks."
+          },
+          {
+            "id": "b",
+            "text": "Disable LRU eviction completely.",
+            "correct": false,
+            "feedback": "Incorrect: Per-tenant soft quotas bound noisy-neighbor eviction while salting prevents cross-tenant leaks."
+          },
+          {
+            "id": "c",
+            "text": "Use a 1-token block size.",
+            "correct": false,
+            "feedback": "Incorrect: Per-tenant soft quotas bound noisy-neighbor eviction while salting prevents cross-tenant leaks."
+          },
+          {
+            "id": "d",
+            "text": "Enforce per-tenant HBM soft caps alongside tenant-salted Radix Tree keys.",
+            "correct": true,
+            "feedback": "Correct: Per-tenant soft quotas bound noisy-neighbor eviction while salting prevents cross-tenant leaks."
+          }
+        ],
+        "explanation": "Per-tenant soft quotas bound noisy-neighbor eviction while salting prevents cross-tenant leaks."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Send requests with the same tenant and system prompt to the same GPU so it can reuse cached prefix memory instead of recomputing it.",
+      "keyTakeaway": "If one GPU gets too busy, spill extra requests to a backup GPU so response times stay fast.",
+      "byteSummary": "Across 64 GPUs, random routing wastes prefix caching because each GPU has to re-read the same system prompt. A smart router hashes the tenant ID and prompt start so matching requests hit the same GPU.\n\nIf that GPU gets crowded, overflow traffic routes to a backup GPU."
+    },
+    "intermediate": {
+      "summary": "Use a `(tenant_id, prefix_hash)` consistent-hash router with bounded-load spillover, local HBM Radix Trees, and CPU-DRAM L2 KV offload.",
+      "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, random or round-robin load balancing destroys prefix cache hit rates across 64 GPUs; prefix-aware consistent hashing with bounded-load fallback preserves > 85% hit rates while preventing single-GPU hot spots.",
+      "byteSummary": "Hashing the salted prefix onto a consistent-hash ring keeps warm prefixes localized on specific H100s. Bounded-load checks (1.25x cap) prevent hot-GPU queuing.\n\nOffloading evicted GPU pages to 512 GB CPU DRAM cuts reload latency 10x compared to cold prefill."
+    },
+    "advanced": {
+      "summary": "Production multi-tenant LLM routers pair bounded-load prefix rings with disaggregated Prefill/Decode pods, per-tenant HBM quotas, and RDMA KV transfer.",
+      "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, random or round-robin load balancing destroys prefix cache hit rates across 64 GPUs; prefix-aware consistent hashing with bounded-load fallback preserves > 85% hit rates while preventing single-GPU hot spots.",
+      "byteSummary": "At 2,000 req/sec, isolating prefill bursts from decode streaming requires disaggregated Prefill Pods owning the Radix Tree and transferring KV blocks over RDMA to Decode Pods.\n\nTenant salting blocks TTFT timing side channels, while per-tenant HBM quotas prevent noisy-neighbor cache thrashing."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "prerequisites": [
+    {
+      "title": "AI/LLM Prefix Caching & RadixAttention (Zero-Copy KV Sharing)",
+      "summary": "RadixAttention indexes cached GPU KV-cache blocks in a compressed prefix trie (Radix Tree) with LRU eviction, enabling zero-copy prefix sharing across concurrent and sequential LLM requests."
+    },
+    {
+      "title": "Consistent Hashing & Virtual Nodes",
+      "summary": "Consistent hashing assigns data keys to servers in a way that limits how many keys move when servers are added or removed. This helps avoid widespread cache misses and sudden load on databases."
+    },
+    {
+      "title": "Disaggregated LLM Serving (Prefill vs. Decode Pools)",
+      "summary": "Disaggregated LLM serving separates prompt prefill (compute-bound TTFT) and autoregressive token decode (HBM-bandwidth-bound ITL) onto independent GPU pools, transferring computed KV-cache blocks over RDMA or NVLink without stalling in-flight decode batches."
+    }
+  ],
+  "simulation": {
+    "title": "Design a Multi-Tenant LLM Inference Router with Zero-Copy RadixAttention Prefix Caching — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "app",
+        "label": "App Servers",
+        "role": "Concurrent Reads"
+      },
+      {
+        "id": "sf",
+        "label": "Singleflight",
+        "role": "In-Flight Coalescer"
+      },
+      {
+        "id": "redis",
+        "label": "Redis L2",
+        "role": "Hot Key Store"
+      },
+      {
+        "id": "db",
+        "label": "Primary DB",
+        "role": "Origin Source"
+      }
+    ],
+    "edges": [
+      {
+        "from": "app",
+        "to": "sf",
+        "label": "GET hot_key"
+      },
+      {
+        "from": "sf",
+        "to": "redis",
+        "label": "L2 lookup"
+      },
+      {
+        "from": "redis",
+        "to": "db",
+        "label": "1x origin fetch"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why Prefix Caching Is Mandatory at 2,000 Req/Sec",
+        "actionLabel": "GET hot_key",
+        "status": "healthy",
+        "activeNodeIds": [
+          "app",
+          "sf"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "GET hot_key",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "App Servers sends work to Singleflight (Why Prefix Caching Is Mandatory at 2,000 Req/Sec)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Consistent Hashing with Bounded Loads on `(tenant_id, prefix_hash)`",
+        "actionLabel": "L2 lookup",
+        "status": "healthy",
+        "activeNodeIds": [
+          "sf",
+          "redis"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "L2 lookup",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Singleflight coordinates with Redis L2 while preserving the core invariant (Consistent Hashing with Bounded Loads on `(tenant_id, prefix_hash)`)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Implementing Tenant-Isolated Prefix-Aware Routing",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "redis",
+          "db"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, Primary DB absorbs pressure without cascading (Implementing Tenant-Isolated Prefix-Aware Routing)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Scaling on Prefix Hit Rate, TTFT & KV Eviction Churn",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "app",
+          "sf",
+          "redis",
+          "db"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Scaling on Prefix Hit Rate, TTFT & KV Eviction Churn)."
+      }
+    ]
+  }
+}

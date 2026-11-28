@@ -1,0 +1,950 @@
+{
+  "id": "problem-idempotent-apis-preventing-duplicate-charges",
+  "slug": "idempotent-apis-preventing-duplicate-charges",
+  "title": "Designing Idempotent APIs to Prevent Duplicate Billing",
+  "problemType": "system-design",
+  "difficulty": "hard",
+  "prompt": "Your `billing-service` (Java 21 + PostgreSQL 16 + Redis) processes 2,500 `POST /v1/charges` requests/sec. On flaky 4G mobile networks, a payment succeeds at the card processor (taking 2.1s), but the HTTP response drops before reaching the client. The mobile SDK and Envoy ingress automatically retry `POST /v1/charges` up to 3 times. Because `billing-service` has no idempotency-key enforcement, **0.4% of transactions (10/sec)** are double- or triple-charged, causing $180,000/day in chargebacks and support tickets. Design a strictly consistent, crash-safe idempotency layer that guarantees at-most-once charging even under concurrent identical retries, server crashes mid-flight, and payload-mismatch bugs.",
+  "spark": {
+    "summary": "Mobile SDKs and Envoy auto-retry timed-out `POST /v1/charges` requests, creating duplicate Stripe/card charges because the payment API lacks atomic idempotency enforcement.",
+    "keyTakeaway": "If latency budgets leave no room for synchronous retries, require client-generated `Idempotency-Key` (UUIDv4) persisted with a unique DB constraint `(merchant_id, idempotency_key)` + payload SHA-256 hash inside the initial transaction, caching the exact response for safe replays.",
+    "byteSummary": "**Core Mechanics:** A `billing-service` (Java 21 + PostgreSQL 16 + Redis) processing **2,500 `POST /v1/charges` req/s** sees mobile SDKs and Envoy auto-retry when a 2.1s card processor response drops on flaky 4G networks.\n\n**Visual & Structural Flow:** Depicts Two-Phase Claim & Finalize vs. Concurrent Retry (Mobile / Envoy -> Billing API -> Postgres 16 -> Stripe / Adyen); PostgreSQL Authoritative Claim + Partitioned Cache (API + UUIDv4 -> Postgres Tx1/Tx2 -> Redis Read-Through -> Daily Partitions).\n\n**Trade-Offs & Production:** Checking `SELECT * FROM charges WHERE idempotency_key = $1` before calling Stripe suffers from a classic TOCTOU race: two retries arriving 5 ms apart both see 0 rows and both charge the card. Implement crash-safe atomic idempotency using PostgreSQL unique constraints and short transactions: **Tx 1 (Atomic Claim)**: `INSERT INTO idempotency_keys (merchant_id, key.\n\n**Failure Modes & Application:** Idempotency keys are a core building block for reliable distributed mutations: **Payment Gateways & Fintech Ledgers**: Prevents duplicate card captures and ledger postings across mobile retries."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why Idempotent Payment APIs Matter",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "A `billing-service` (Java 21 + PostgreSQL 16 + Redis) processing **2,500 `POST /v1/charges` req/s** sees mobile SDKs and Envoy auto-retry when a 2.1s card processor response drops on flaky 4G networks. Without idempotency enforcement, **0.4% of transactions (10/sec)** are double- or triple-charged—costing **$180,000/day** in chargebacks.",
+        "core": "**Constraints:**\n- PostgreSQL 16 handles OLTP ledger writes; Redis is not durable across failover.\n- External PSP (Stripe/Adyen) accepts our `idempotency_key`.\n- Zero TOCTOU race conditions (`SELECT` then `INSERT` without unique constraints is forbidden); retain ~216M keys/day for 24h at `< 3 ms` p99.",
+        "deepDive": "In production deployments of Designing Idempotent APIs to Prevent Duplicate Billing, watch how why idempotent payment apis matter interacts with tail latency, retry amplification, and partial failures. Mobile SDKs and Envoy auto-retry timed-out `POST /v1/charges` requests, creating duplicate Stripe/card charges because the payment API lacks atomic idempotency enforcement."
+      },
+      "purpose": "The mechanism: understand how Why Idempotent Payment APIs Matter works from first principles.",
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "Stage 1 Topology",
+        "title": "Why Idempotent Payment APIs Matter",
+        "nodes": [
+          {
+            "id": "edge",
+            "label": "Edge Router",
+            "tier": "ingress"
+          },
+          {
+            "id": "worker",
+            "label": "Designing Idempotent Worker",
+            "tier": "compute"
+          },
+          {
+            "id": "state",
+            "label": "Primary State",
+            "tier": "storage"
+          },
+          {
+            "id": "obs",
+            "label": "Telemetry & Audit",
+            "tier": "control"
+          }
+        ],
+        "edges": [
+          {
+            "from": "edge",
+            "to": "worker",
+            "label": "route"
+          },
+          {
+            "from": "worker",
+            "to": "state",
+            "label": "read / mutate"
+          },
+          {
+            "from": "worker",
+            "to": "obs",
+            "label": "emit metrics"
+          }
+        ]
+      }
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "Real-World Impact of Non-Idempotent Retries",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Without atomic idempotency keys, retries cause three severe production failures:",
+        "core": "1. **Duplicate Charges**: Concurrent retries arriving 5 ms apart both pass a naive `SELECT` check and charge the card twice.\n2. **Connection Pool Starvation**: Holding a PostgreSQL transaction open during a 2.1s external PSP HTTP call exhausts HikariCP connections under load.\n3. **Payload Reuse Bugs**: Reusing the same `Idempotency-Key` with a different amount or currency silently returns a stale receipt instead of `422 Unprocessable Entity`.",
+        "deepDive": "In production deployments of Designing Idempotent APIs to Prevent Duplicate Billing, watch how real-world impact of non-idempotent retries interacts with tail latency, retry amplification, and partial failures. Mobile SDKs and Envoy auto-retry timed-out `POST /v1/charges` requests, creating duplicate Stripe/card charges because the payment API lacks atomic idempotency enforcement."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Atomic Idempotency Protocol",
+        "title": "Two-Phase Claim & Finalize vs. Concurrent Retry",
+        "actors": [
+          {
+            "id": "client",
+            "label": "Mobile / Envoy"
+          },
+          {
+            "id": "api",
+            "label": "Billing API"
+          },
+          {
+            "id": "pg",
+            "label": "Postgres 16"
+          },
+          {
+            "id": "psp",
+            "label": "Stripe / Adyen"
+          }
+        ],
+        "events": [
+          {
+            "from": "client",
+            "to": "api",
+            "label": "POST /charges (Idempotency-Key: K)",
+            "status": "ok"
+          },
+          {
+            "from": "api",
+            "to": "pg",
+            "label": "Tx1: INSERT (K, sha256, IN_PROGRESS)",
+            "status": "ok"
+          },
+          {
+            "from": "client",
+            "to": "api",
+            "label": "Concurrent retry (K) 5ms later",
+            "status": "warn"
+          },
+          {
+            "from": "api",
+            "to": "client",
+            "label": "Unique violation -> 409 Retry-After",
+            "status": "warn"
+          },
+          {
+            "from": "api",
+            "to": "psp",
+            "label": "Call PSP with K (outside DB Tx!)",
+            "status": "ok"
+          },
+          {
+            "from": "api",
+            "to": "pg",
+            "label": "Tx2: UPDATE COMPLETED + body",
+            "status": "ok"
+          }
+        ],
+        "summary": "Claiming the unique key in a fast Tx1 before calling the PSP prevents concurrent duplicate charges without holding DB locks for 2.1s."
+      },
+      "purpose": "The problem: see what breaks without Real-World Impact of Non-Idempotent Retries under real concurrency or scale.",
+      "decisionFramework": {
+        "problem": "How to implement Designing Idempotent APIs to Prevent Duplicate Billing without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "If latency budgets leave no room for synchronous retries, require client-generated `Idempotency-Key` (UUIDv4) persisted with a unique DB constraint `(merchant_id, idempotency_key)` + payload SHA-256 hash inside the initial transaction, caching the exact response for safe replays.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Designing Idempotent APIs to Prevent Duplicate Billing experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Naive Solution (and Why It Breaks)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Think of **Naive Solution (and Why It Breaks)** as the intuition layer for Designing Idempotent APIs to Prevent Duplicate Billing: The problem: see what breaks without Naive Solution under real concurrency or scale.",
+        "core": "Checking `SELECT * FROM charges WHERE idempotency_key = $1` before calling Stripe suffers from a classic TOCTOU race: two retries arriving 5 ms apart both see 0 rows and both charge the card. Relying solely on Redis `SETNX` loses keys during failover, while holding a Postgres transaction open across the 2.1s PSP call exhausts the DB connection pool.",
+        "deepDive": "Under heavy load or partial failure, naive solution (and why it breaks) becomes a critical lever for predictable latency and correctness. Mobile SDKs and Envoy auto-retry timed-out `POST /v1/charges` requests, creating duplicate Stripe/card charges because the payment API lacks atomic idempotency enforcement."
+      },
+      "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "Stage 3 Lifecycle",
+        "title": "Naive Solution (and Why It Breaks)",
+        "states": [
+          {
+            "id": "init",
+            "label": "Ready / Idle",
+            "tone": "neutral"
+          },
+          {
+            "id": "active",
+            "label": "In-Flight",
+            "tone": "info"
+          },
+          {
+            "id": "verified",
+            "label": "Committed",
+            "tone": "good"
+          },
+          {
+            "id": "degraded",
+            "label": "Fallback / Retry",
+            "tone": "warn"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "init",
+            "to": "active",
+            "label": "acquire"
+          },
+          {
+            "from": "active",
+            "to": "verified",
+            "label": "quorum ok"
+          },
+          {
+            "from": "active",
+            "to": "degraded",
+            "label": "timeout / skew"
+          },
+          {
+            "from": "degraded",
+            "to": "init",
+            "label": "backoff reset"
+          }
+        ]
+      }
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise Solution: Two-Phase DB Claim + SHA-256 Guard + Redis Fast Path",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": {
+        "foundation": "Implement crash-safe atomic idempotency using PostgreSQL unique constraints and short transactions:",
+        "core": "- **Tx 1 (Atomic Claim)**: `INSERT INTO idempotency_keys (merchant_id, key, req_hash, status) VALUES (...) ON CONFLICT DO NOTHING`. If inserted, proceed; if conflict, compare `req_hash` (`422` on mismatch), return `409 Conflict` (`Retry-After: 1`) if `IN_PROGRESS`, or replay the cached `http_status` + `response_body` if `COMPLETED`.\n- **External PSP Call (No DB Lock Held)**: Forward `idempotency_key` to Stripe/Adyen so even a mid-flight pod crash cannot double-charge on recovery.\n- **Tx 2 (Finalize) & Partitioned Retention**: Update status to `COMPLETED` (or release key on guaranteed non-execution) and populate Redis as a read-through cache. Partition `idempotency_keys` by hour/day for instant `DROP TABLE` TTL cleanup of 216M keys/day.",
+        "deepDive": "In production deployments of Designing Idempotent APIs to Prevent Duplicate Billing, watch how enterprise solution: two-phase db claim + sha-256 guard + redis fast path interacts with tail latency, retry amplification, and partial failures. Mobile SDKs and Envoy auto-retry timed-out `POST /v1/charges` requests, creating duplicate Stripe/card charges because the payment API lacks atomic idempotency enforcement."
+      },
+      "sectionDiagram": {
+        "kind": "wal-mvcc",
+        "eyebrow": "Two-Phase Idempotency Storage",
+        "title": "PostgreSQL Authoritative Claim + Partitioned Cache",
+        "nodes": [
+          {
+            "label": "API + UUIDv4",
+            "role": "SHA-256 payload check"
+          },
+          {
+            "label": "Postgres Tx1/Tx2",
+            "role": "UNIQUE(merchant, key)"
+          },
+          {
+            "label": "Redis Read-Through",
+            "role": "<3ms replay cache"
+          },
+          {
+            "label": "Daily Partitions",
+            "role": "216M keys/day TTL drop"
+          }
+        ],
+        "edges": [
+          {
+            "label": "Fast claim & finalize"
+          },
+          {
+            "label": "No lock held during PSP"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Unique Constraint",
+            "detail": "Eliminates TOCTOU races without table-level locks."
+          },
+          {
+            "label": "Payload Hash",
+            "detail": "SHA-256 check returns 422 if key is reused with different body."
+          },
+          {
+            "label": "Crash Recovery",
+            "detail": "Stale IN_PROGRESS keys (>30s) re-query PSP using same key."
+          },
+          {
+            "label": "Partitioned TTL",
+            "detail": "Drop daily partitions instead of running expensive DELETEs."
+          }
+        ],
+        "summary": "PostgreSQL provides durable atomic locking via unique constraints while Redis accelerates <3 ms replay lookups."
+      },
+      "markdownContent": "```java\nif (idempotencyKey == null || !UUID_REGEX.matcher(idempotencyKey).matches()) {\n    return ResponseEntity.badRequest().body(\"Missing or invalid Idempotency-Key\");\n}\n\nClaimResult claim = repo.claimKey(merchantId, key, sha256(body));\nif (claim.isDuplicate()) {\n    if (!Arrays.equals(claim.hash(), sha256(body))) throw new UnprocessableEntityException();\n    if (claim.status() == IN_PROGRESS) throw new ConflictException(\"Retry-After: 1\");\n    return ResponseEntity.status(claim.httpStatus()).body(claim.responseBody());\n}\n// Execute PSP call with key, then Tx 2 finalize()\n\nif (pspResponse.isTerminal()) {\n    repo.complete(key, pspResponse.status(), pspResponse.body());\n} else if (pspResponse.isGuaranteedNotProcessed()) {\n    repo.releaseKey(key);\n}\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where Idempotent APIs Apply in System Design",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Idempotency keys are a core building block for reliable distributed mutations:",
+        "core": "- **Payment Gateways & Fintech Ledgers**: Prevents duplicate card captures and ledger postings across mobile retries.\n- **Order & Inventory Reservation APIs**: Ensures checkout retries return the same `order_id` instead of double-decrementing stock.\n- **Webhook & Saga Orchestrators**: Makes at-least-once message delivery behave as exactly-once state transitions.",
+        "deepDive": "In production deployments of Designing Idempotent APIs to Prevent Duplicate Billing, watch how where idempotent apis apply in system design interacts with tail latency, retry amplification, and partial failures. Mobile SDKs and Envoy auto-retry timed-out `POST /v1/charges` requests, creating duplicate Stripe/card charges because the payment API lacks atomic idempotency enforcement."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "idempotency-and-deduplication",
+          "title": "Concept: Idempotency & Deduplication",
+          "kind": "concept"
+        },
+        {
+          "slug": "acid-transaction-fundamentals",
+          "title": "Concept: ACID Transaction Fundamentals",
+          "kind": "concept"
+        },
+        {
+          "slug": "transactional-outbox-pattern",
+          "title": "Concept: Transactional Outbox Pattern",
+          "kind": "concept"
+        },
+        {
+          "slug": "design-ticketmaster-flash-sale-system",
+          "title": "System Design: Ticketmaster Flash Sale",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "Stage 5 Topology",
+        "title": "Where Idempotent APIs Apply in System Design",
+        "nodes": [
+          {
+            "id": "edge",
+            "label": "Edge Router",
+            "tier": "ingress"
+          },
+          {
+            "id": "worker",
+            "label": "Designing Idempotent Worker",
+            "tier": "compute"
+          },
+          {
+            "id": "state",
+            "label": "Primary State",
+            "tier": "storage"
+          },
+          {
+            "id": "obs",
+            "label": "Telemetry & Audit",
+            "tier": "control"
+          }
+        ],
+        "edges": [
+          {
+            "from": "edge",
+            "to": "worker",
+            "label": "route"
+          },
+          {
+            "from": "worker",
+            "to": "state",
+            "label": "read / mutate"
+          },
+          {
+            "from": "worker",
+            "to": "obs",
+            "label": "emit metrics"
+          }
+        ]
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why should an idempotent payment API commit a short `IN_PROGRESS` row before calling the external card processor instead of holding one DB transaction open during the 2.1s HTTP call?",
+      "options": [
+        {
+          "id": "a",
+          "text": "Holding a DB transaction open across slow external HTTP calls exhausts the database connection pool and holds row locks under load",
+          "correct": true,
+          "feedback": "Correct: two short transactions (claim before PSP call, finalize after) keep DB connection hold times under a few milliseconds."
+        },
+        {
+          "id": "b",
+          "text": "PostgreSQL automatically aborts any transaction that lasts longer than 1 second",
+          "correct": false,
+          "feedback": "PostgreSQL does not abort 2.1s transactions by default, though long-held connections exhaust the pool."
+        },
+        {
+          "id": "c",
+          "text": "It allows the API to skip validating the request payload SHA-256 hash",
+          "correct": false,
+          "feedback": "Payload hash validation is still required to reject mismatched retries with 422."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why should an idempotent payment API commit a short `IN_PROGRESS` row before calling the external card processor instead of holding one DB transaction open during the 2.1s HTTP call?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Holding a DB transaction open across slow external HTTP calls exhausts the database connection pool and holds row locks under load",
+            "correct": true,
+            "feedback": "Correct: two short transactions (claim before PSP call, finalize after) keep DB connection hold times under a few milliseconds."
+          },
+          {
+            "id": "b",
+            "text": "PostgreSQL automatically aborts any transaction that lasts longer than 1 second",
+            "correct": false,
+            "feedback": "PostgreSQL does not abort 2.1s transactions by default, though long-held connections exhaust the pool."
+          },
+          {
+            "id": "c",
+            "text": "It allows the API to skip validating the request payload SHA-256 hash",
+            "correct": false,
+            "feedback": "Payload hash validation is still required to reject mismatched retries with 422."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why Idempotent Payment APIs Matter', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "b",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "c",
+            "text": "A billing-service (Java 21 + PostgreSQL 16 + Redis) processing **2,500 POST /v1/charges req/s** sees mobile SDKs and Envoy auto-retry when a 2.1s card processor response…",
+            "correct": true,
+            "feedback": "Correct: A billing-service (Java 21 + PostgreSQL 16 + Redis) processing **2,500 POST /v1/charges req/s** sees mobile SDKs and Envoy auto-retry when a 2.1s card processor response…"
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Real-World Impact of Non-Idempotent Retries', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "b",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "c",
+            "text": "Without atomic idempotency keys, retries cause three severe production failures: 1.",
+            "correct": true,
+            "feedback": "Correct: Without atomic idempotency keys, retries cause three severe production failures: 1."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** A `billing-service` (Java 21 + PostgreSQL 16 + Redis) processing **2,500 `POST /v1/charges` req/s** sees mobile SDKs and Envoy auto-retry when a 2.1s card processor response drops on flaky 4G networks.\n\n**How It Flows:** Think of Designing Idempotent APIs to Prevent Duplicate Billing as a clear step-by-step chain: Mobile / Envoy -> Billing API -> Postgres 16 -> Stripe / Adyen -> API + UUIDv4.\n\n**Why Beginners Should Care:** Require client-generated `Idempotency-Key` (UUIDv4) persisted with a unique DB constraint `(merchant_id, idempotency_key)` + payload SHA-256 hash inside the initial transaction.",
+      "spark": {
+        "summary": "A `billing-service` (Java 21 + PostgreSQL 16 + Redis) processing **2,500 `POST /v1/charges` req/s** sees mobile SDKs and Envoy auto-retry when a 2.1s card processor response drops on flaky 4G networks.",
+        "keyTakeaway": "Require client-generated `Idempotency-Key` (UUIDv4) persisted with a unique DB constraint `(merchant_id, idempotency_key)` + payload SHA-256 hash inside the initial transaction."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why Idempotent Payment APIs Matter",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why Idempotent Payment APIs Matter works from first principles.",
+          "explanation": "A `billing-service` (Java 21 + PostgreSQL 16 + Redis) processing **2,500 `POST /v1/charges` req/s** sees mobile SDKs and Envoy auto-retry when a 2.1s card processor response drops on flaky 4G networks. Without idempotency enforcement, **0.4% of transactions (10/sec)** are double- or triple-charged—costing **$180,000/day** in chargebacks.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Real-World Impact of Non-Idempotent Retries",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without Real-World Impact of Non-Idempotent Retries under real concurrency or scale.",
+          "explanation": "Without atomic idempotency keys, retries cause three severe production failures: 1. **Duplicate Charges**: Concurrent retries arriving 5 ms apart both pass a naive `SELECT` check and charge the card twice. 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Atomic Idempotency Protocol",
+            "title": "Two-Phase Claim & Finalize vs. Concurrent Retry",
+            "actors": [
+              {
+                "id": "client",
+                "label": "Mobile / Envoy"
+              },
+              {
+                "id": "api",
+                "label": "Billing API"
+              },
+              {
+                "id": "pg",
+                "label": "Postgres 16"
+              },
+              {
+                "id": "psp",
+                "label": "Stripe / Adyen"
+              }
+            ],
+            "events": [
+              {
+                "from": "client",
+                "to": "api",
+                "label": "POST /charges (Idempotency-Key: K)",
+                "status": "ok"
+              },
+              {
+                "from": "api",
+                "to": "pg",
+                "label": "Tx1: INSERT (K, sha256, IN_PROGRESS)",
+                "status": "ok"
+              },
+              {
+                "from": "client",
+                "to": "api",
+                "label": "Concurrent retry (K) 5ms later",
+                "status": "warn"
+              },
+              {
+                "from": "api",
+                "to": "client",
+                "label": "Unique violation -> 409 Retry-After",
+                "status": "warn"
+              },
+              {
+                "from": "api",
+                "to": "psp",
+                "label": "Call PSP with K (outside DB Tx!)",
+                "status": "ok"
+              },
+              {
+                "from": "api",
+                "to": "pg",
+                "label": "Tx2: UPDATE COMPLETED + body",
+                "status": "ok"
+              }
+            ],
+            "summary": "Claiming the unique key in a fast Tx1 before calling the PSP prevents concurrent duplicate charges without holding DB locks for 2.1s."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive Solution (and Why It Breaks)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+          "explanation": "Checking `SELECT * FROM charges WHERE idempotency_key = $1` before calling Stripe suffers from a classic TOCTOU race: two retries arriving 5 ms apart both see 0 rows and both charge the card. Relying solely on Redis `SETNX` loses keys during failover, while holding a Postgres transaction open across the 2.1s PSP call exhausts the DB connection pool.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise Solution: Two-Phase DB Claim + SHA-256 Guard + Redis Fast Path",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Implement crash-safe atomic idempotency using PostgreSQL unique constraints and short transactions: **Tx 1 (Atomic Claim)**: `INSERT INTO idempotency_keys (merchant_id, key, req_hash, status) VALUES (...) ON CONFLICT DO NOTHING`.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "wal-mvcc",
+            "eyebrow": "Two-Phase Idempotency Storage",
+            "title": "PostgreSQL Authoritative Claim + Partitioned Cache",
+            "nodes": [
+              {
+                "label": "API + UUIDv4",
+                "role": "SHA-256 payload check"
+              },
+              {
+                "label": "Postgres Tx1/Tx2",
+                "role": "UNIQUE(merchant, key)"
+              },
+              {
+                "label": "Redis Read-Through",
+                "role": "<3ms replay cache"
+              },
+              {
+                "label": "Daily Partitions",
+                "role": "216M keys/day TTL drop"
+              }
+            ],
+            "edges": [
+              {
+                "label": "Fast claim & finalize"
+              },
+              {
+                "label": "No lock held during PSP"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Unique Constraint",
+                "detail": "Eliminates TOCTOU races without table-level locks."
+              },
+              {
+                "label": "Payload Hash",
+                "detail": "SHA-256 check returns 422 if key is reused with different body."
+              },
+              {
+                "label": "Crash Recovery",
+                "detail": "Stale IN_PROGRESS keys (>30s) re-query PSP using same key."
+              },
+              {
+                "label": "Partitioned TTL",
+                "detail": "Drop daily partitions instead of running expensive DELETEs."
+              }
+            ],
+            "summary": "PostgreSQL provides durable atomic locking via unique constraints while Redis accelerates <3 ms replay lookups."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Require client-generated `Idempotency-Key` (UUIDv4) persisted with a unique DB constraint `(merchant_id, idempotency_key)` + payload SHA-256 hash inside the initial transaction.",
+      "summary": "Mobile SDKs and Envoy auto-retry timed-out `POST /v1/charges` requests, creating duplicate Stripe/card charges because the payment API lacks atomic idempotency enforcement.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, require client-generated `Idempotency-Key` (UUIDv4) persisted with a unique DB constraint `(merchant_id, idempotency_key)` + payload SHA-256 hash inside the initial transaction, caching the exact response for safe replays."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** A `billing-service` (Java 21 + PostgreSQL 16 + Redis) processing **2,500 `POST /v1/charges` req/s** sees mobile SDKs and Envoy auto-retry when a 2.1s card processor response drops on flaky 4G networks.\n\n**Visual & Structural Flow:** Depicts Two-Phase Claim & Finalize vs. Concurrent Retry (Mobile / Envoy -> Billing API -> Postgres 16 -> Stripe / Adyen); PostgreSQL Authoritative Claim + Partitioned Cache (API + UUIDv4 -> Postgres Tx1/Tx2 -> Redis Read-Through -> Daily Partitions).\n\n**Trade-Offs & Production:** Checking `SELECT * FROM charges WHERE idempotency_key = $1` before calling Stripe suffers from a classic TOCTOU race: two retries arriving 5 ms apart both see 0 rows and both charge the card. Implement crash-safe atomic idempotency using PostgreSQL unique constraints and short transactions: **Tx 1 (Atomic Claim)**: `INSERT INTO idempotency_keys (merchant_id, key.\n\n**Failure Modes & Application:** Idempotency keys are a core building block for reliable distributed mutations: **Payment Gateways & Fintech Ledgers**: Prevents duplicate card captures and ledger postings across mobile retries.",
+      "spark": {
+        "summary": "Mobile SDKs and Envoy auto-retry timed-out `POST /v1/charges` requests, creating duplicate Stripe/card charges because the payment API lacks atomic idempotency enforcement.",
+        "keyTakeaway": "Require client-generated `Idempotency-Key` (UUIDv4) persisted with a unique DB constraint `(merchant_id, idempotency_key)` + payload SHA-256 hash inside the initial transaction, caching the exact response for safe replays."
+      },
+      "summary": "Mobile SDKs and Envoy auto-retry timed-out `POST /v1/charges` requests, creating duplicate Stripe/card charges because the payment API lacks atomic idempotency enforcement.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, require client-generated `Idempotency-Key` (UUIDv4) persisted with a unique DB constraint `(merchant_id, idempotency_key)` + payload SHA-256 hash inside the initial transaction, caching the exact response for safe replays."
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** Mobile SDKs and Envoy auto-retry timed-out `POST /v1/charges` requests, creating duplicate Stripe/card charges because the payment API lacks atomic idempotency enforcement.\n\n**Production Trade-Offs:** Checking `SELECT * FROM charges WHERE idempotency_key = $1` before calling Stripe suffers from a classic TOCTOU race: two retries arriving 5 ms apart both see 0 rows and both charge the card.\n\n**Failure Modes & Edge Cases:** Idempotency keys are a core building block for reliable distributed mutations: **Payment Gateways & Fintech Ledgers**: Prevents duplicate card captures and ledger postings across mobile retries.\n\n**Principal Takeaway:** Require client-generated `Idempotency-Key` (UUIDv4) persisted with a unique DB constraint `(merchant_id, idempotency_key)` + payload SHA-256 hash inside the initial transaction, caching the exact response for safe replays.",
+      "spark": {
+        "summary": "Mobile SDKs and Envoy auto-retry timed-out `POST /v1/charges` requests, creating duplicate Stripe/card charges because the payment API lacks atomic idempotency enforcement.",
+        "keyTakeaway": "Require client-generated `Idempotency-Key` (UUIDv4) persisted with a unique DB constraint `(merchant_id, idempotency_key)` + payload SHA-256 hash inside the initial transaction, caching the exact response for safe replays."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why Idempotent Payment APIs Matter",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why Idempotent Payment APIs Matter works from first principles.",
+          "explanation": "A `billing-service` (Java 21 + PostgreSQL 16 + Redis) processing **2,500 `POST /v1/charges` req/s** sees mobile SDKs and Envoy auto-retry when a 2.1s card processor response drops on flaky 4G networks. Without idempotency enforcement, **0.4% of transactions (10/sec)** are double- or triple-charged—costing **$180,000/day** in chargebacks.\n\n**Constraints:**\n- PostgreSQL 16 handles OLTP ledger writes; Redis is not durable across failover.\n- External PSP (Stripe/Adyen) accepts our `idempotency_key`.\n- Zero TOCTOU race conditions (`SELECT` then `INSERT` without unique constraints is forbidden); retain ~216M keys/day for 24h at `< 3 ms` p99.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Real-World Impact of Non-Idempotent Retries",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without Real-World Impact of Non-Idempotent Retries under real concurrency or scale.",
+          "explanation": "Without atomic idempotency keys, retries cause three severe production failures:\n\n1. **Duplicate Charges**: Concurrent retries arriving 5 ms apart both pass a naive `SELECT` check and charge the card twice.\n2. **Connection Pool Starvation**: Holding a PostgreSQL transaction open during a 2.1s external PSP HTTP call exhausts HikariCP connections under load.\n3. **Payload Reuse Bugs**: Reusing the same `Idempotency-Key` with a different amount or currency silently returns a stale receipt instead of `422 Unprocessable Entity`.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Atomic Idempotency Protocol",
+            "title": "Two-Phase Claim & Finalize vs. Concurrent Retry",
+            "actors": [
+              {
+                "id": "client",
+                "label": "Mobile / Envoy"
+              },
+              {
+                "id": "api",
+                "label": "Billing API"
+              },
+              {
+                "id": "pg",
+                "label": "Postgres 16"
+              },
+              {
+                "id": "psp",
+                "label": "Stripe / Adyen"
+              }
+            ],
+            "events": [
+              {
+                "from": "client",
+                "to": "api",
+                "label": "POST /charges (Idempotency-Key: K)",
+                "status": "ok"
+              },
+              {
+                "from": "api",
+                "to": "pg",
+                "label": "Tx1: INSERT (K, sha256, IN_PROGRESS)",
+                "status": "ok"
+              },
+              {
+                "from": "client",
+                "to": "api",
+                "label": "Concurrent retry (K) 5ms later",
+                "status": "warn"
+              },
+              {
+                "from": "api",
+                "to": "client",
+                "label": "Unique violation -> 409 Retry-After",
+                "status": "warn"
+              },
+              {
+                "from": "api",
+                "to": "psp",
+                "label": "Call PSP with K (outside DB Tx!)",
+                "status": "ok"
+              },
+              {
+                "from": "api",
+                "to": "pg",
+                "label": "Tx2: UPDATE COMPLETED + body",
+                "status": "ok"
+              }
+            ],
+            "summary": "Claiming the unique key in a fast Tx1 before calling the PSP prevents concurrent duplicate charges without holding DB locks for 2.1s."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive Solution (and Why It Breaks)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+          "explanation": "Checking `SELECT * FROM charges WHERE idempotency_key = $1` before calling Stripe suffers from a classic TOCTOU race: two retries arriving 5 ms apart both see 0 rows and both charge the card. Relying solely on Redis `SETNX` loses keys during failover, while holding a Postgres transaction open across the 2.1s PSP call exhausts the DB connection pool.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise Solution: Two-Phase DB Claim + SHA-256 Guard + Redis Fast Path",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Implement crash-safe atomic idempotency using PostgreSQL unique constraints and short transactions:\n\n- **Tx 1 (Atomic Claim)**: `INSERT INTO idempotency_keys (merchant_id, key, req_hash, status) VALUES (...) ON CONFLICT DO NOTHING`. If inserted, proceed; if conflict, compare `req_hash` (`422` on mismatch), return `409 Conflict` (`Retry-After: 1`) if `IN_PROGRESS`, or replay the cached `http_status` + `response_body` if `COMPLETED`.\n- **External PSP Call (No DB Lock Held)**: Forward `idempotency_key` to Stripe/Adyen so even a mid-flight pod crash cannot double-charge on recovery.\n- **Tx 2 (Finalize) & Partitioned Retention**: Update status to `COMPLETED` (or release key on guaranteed non-execution) and populate Redis as a read-through cache. Partition `idempotency_keys` by hour/day for instant `DROP TABLE` TTL cleanup of 216M keys/day.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "wal-mvcc",
+            "eyebrow": "Two-Phase Idempotency Storage",
+            "title": "PostgreSQL Authoritative Claim + Partitioned Cache",
+            "nodes": [
+              {
+                "label": "API + UUIDv4",
+                "role": "SHA-256 payload check"
+              },
+              {
+                "label": "Postgres Tx1/Tx2",
+                "role": "UNIQUE(merchant, key)"
+              },
+              {
+                "label": "Redis Read-Through",
+                "role": "<3ms replay cache"
+              },
+              {
+                "label": "Daily Partitions",
+                "role": "216M keys/day TTL drop"
+              }
+            ],
+            "edges": [
+              {
+                "label": "Fast claim & finalize"
+              },
+              {
+                "label": "No lock held during PSP"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Unique Constraint",
+                "detail": "Eliminates TOCTOU races without table-level locks."
+              },
+              {
+                "label": "Payload Hash",
+                "detail": "SHA-256 check returns 422 if key is reused with different body."
+              },
+              {
+                "label": "Crash Recovery",
+                "detail": "Stale IN_PROGRESS keys (>30s) re-query PSP using same key."
+              },
+              {
+                "label": "Partitioned TTL",
+                "detail": "Drop daily partitions instead of running expensive DELETEs."
+              }
+            ],
+            "summary": "PostgreSQL provides durable atomic locking via unique constraints while Redis accelerates <3 ms replay lookups."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where Idempotent APIs Apply in System Design",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Idempotency keys are a core building block for reliable distributed mutations:\n\n- **Payment Gateways & Fintech Ledgers**: Prevents duplicate card captures and ledger postings across mobile retries.\n- **Order & Inventory Reservation APIs**: Ensures checkout retries return the same `order_id` instead of double-decrementing stock.\n- **Webhook & Saga Orchestrators**: Makes at-least-once message delivery behave as exactly-once state transitions.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Require client-generated `Idempotency-Key` (UUIDv4) persisted with a unique DB constraint `(merchant_id, idempotency_key)` + payload SHA-256 hash inside the initial transaction, caching the exact response for safe replays.",
+      "summary": "Mobile SDKs and Envoy auto-retry timed-out `POST /v1/charges` requests, creating duplicate Stripe/card charges because the payment API lacks atomic idempotency enforcement.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, require client-generated `Idempotency-Key` (UUIDv4) persisted with a unique DB constraint `(merchant_id, idempotency_key)` + payload SHA-256 hash inside the initial transaction, caching the exact response for safe replays."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "simulation": {
+    "title": "Designing Idempotent APIs to Prevent Duplicate Billing — Interactive Execution Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Workload & Budget"
+      },
+      {
+        "id": "router",
+        "label": "Gateway / Router",
+        "role": "Admission & Dispatch"
+      },
+      {
+        "id": "engine",
+        "label": "Core Engine",
+        "role": "Primary Execution"
+      },
+      {
+        "id": "replica",
+        "label": "Replica / Fallback",
+        "role": "Durability & Recovery"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "router",
+        "label": "request"
+      },
+      {
+        "from": "router",
+        "to": "engine",
+        "label": "route"
+      },
+      {
+        "from": "engine",
+        "to": "replica",
+        "label": "sync / fallback"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why Idempotent Payment APIs Matter",
+        "actionLabel": "Dispatch nominal request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "router"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "Ingress",
+          "p99_ms": 8,
+          "error_rate": "0.0%"
+        },
+        "explanation": "Caller sends work into the gateway with explicit timeout and concurrency bounds (Why Idempotent Payment APIs Matter)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Real-World Impact of Non-Idempotent Retries",
+        "actionLabel": "Execute core invariant",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "Core Path",
+          "p99_ms": 18,
+          "in_flight": 124
+        },
+        "explanation": "The core engine processes the hot path while keeping state transitions deterministic (Real-World Impact of Non-Idempotent Retries)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Naive Solution (and Why It Breaks)",
+        "actionLabel": "Detect skew or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Degraded",
+          "p99_ms": 64,
+          "retries_capped": "true"
+        },
+        "explanation": "Under load or replica lag, bounded backoff and isolation prevent cascading saturation (Naive Solution (and Why It Breaks))."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Where Idempotent APIs Apply in System Design",
+        "actionLabel": "Converge & restore SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 11,
+          "drift": 0
+        },
+        "explanation": "State converges cleanly and telemetry confirms the system returned within its SLO envelope (Where Idempotent APIs Apply in System Design)."
+      }
+    ]
+  }
+}

@@ -1,0 +1,586 @@
+{
+  "id": "design-cron-scheduler",
+  "slug": "design-cron-scheduler",
+  "title": "Design a Fault-Tolerant Distributed Cron & Job Scheduler",
+  "problemType": "system-design",
+  "difficulty": "hard",
+  "prompt": "Design a distributed cron and delayed-job scheduler supporting 10M recurring schedules, 50,000 job triggers/sec at peak, <2s trigger drift, and strict protection against duplicate execution during worker crashes or GC pauses.",
+  "spark": {
+    "summary": "Scaling a distributed cron scheduler to 50,000 triggers/sec requires partitioning schedules into time-bucketed shards, issuing monotonic fencing tokens via etcd/Raft leases, and enforcing idempotency keys at target executors.",
+    "keyTakeaway": "If latency budgets leave no room for synchronous retries, never rely on a single SQL polling loop or unfenced distributed locks; pair time-bucketed shards with monotonic fencing tokens (epoch) and target-side idempotency keys.",
+    "byteSummary": "**Core Mechanics:** Polling a single `SELECT ... FOR UPDATE` table at `50,000` triggers/sec collapses under index lock contention, while unfenced worker leases allow GC-paused zombie workers to double-execute jobs.\n\n**Visual & Structural Flow:** Depicts a `Hashed Time-Wheel (Minute Buckets)` feeding a `Partitioned Job Store (shard by bucket)`, an `etcd Coordinator Lease` issuing `Fencing Token (epoch=42)` to the active `Worker Pool`, while a `Zombie Worker (GC Pause, epoch=41)` is blocked by a `Storage Fence Check (epoch >= 42)` before reaching `Target Executor + Idempotency Key` and `Retry + DLQ`.\n\n**Trade-Offs & Production:** Partitioning by `(minute_bucket, shard_id)` keeps scans bounded in RAM/SSD, while monotonic fencing tokens + deterministic `(job_id, scheduled_at)` idempotency keys guarantee at-most-once side effects.\n\n**Failure Modes & Application:** Isolate slow webhook targets with per-tenant worker bulkheads and route exhausted retries to a Dead Letter Queue (DLQ)."
+  },
+  "learningJourney": [
+    {
+      "id": "01-requirements-and-scale",
+      "eyebrow": "STAGE 01 · REQUIREMENTS & MATH",
+      "title": "Clarify Scale, Drift SLO & Execution Semantics",
+      "level": "L5 · APPLIED DESIGN",
+      "purpose": "The problem: size storage, peak trigger QPS, and exact execution guarantees.",
+      "explanation": {
+        "foundation": "Think of **Clarify Scale, Drift SLO & Execution Semantics** as the intuition layer for Design a Fault-Tolerant Distributed Cron & Job Scheduler: The problem: size storage, peak trigger QPS, and exact execution guarantees.",
+        "core": "With **10M active schedules** (~1 KB metadata each = ~10 GB), metadata fits easily in a sharded database, while **50,000 triggers/sec** at top-of-minute spikes demands horizontal partitioning. Target `<2s` trigger drift, `at-least-once` dispatch with `idempotency_key = hash(job_id, fire_ts)`, and zero split-brain double execution when workers pause or partition.",
+        "deepDive": "Under heavy load or partial failure, clarify scale, drift slo & execution semantics becomes a critical lever for predictable latency and correctness. Scaling a distributed cron scheduler to 50,000 triggers/sec requires partitioning schedules into time-bucketed shards, issuing monotonic fencing tokens via etcd/Raft leases, and enforcing idempotency keys at target executors."
+      },
+      "sectionDiagram": {
+        "kind": "behavior-transition",
+        "eyebrow": "Design Trade-Off",
+        "title": "Clarify Scale, Drift SLO & Execution Semantics",
+        "before": {
+          "label": "Unbounded Coupling",
+          "metrics": [
+            "No backpressure on spikes",
+            "Implicit shared state",
+            "Cascading tail latency"
+          ]
+        },
+        "after": {
+          "label": "Bounded & Observable",
+          "metrics": [
+            "Explicit capacity budgets",
+            "Isolated failure domains",
+            "Predictable p99 latency"
+          ]
+        }
+      }
+    },
+    {
+      "id": "02-naive-failure-modes",
+      "eyebrow": "STAGE 02 · NAIVE BOTTLENECKS",
+      "title": "Why Central Polling & Unfenced Locks Fail",
+      "level": "L5 · APPLIED DESIGN",
+      "purpose": "The failure mode: see how single-table polling and GC-paused workers corrupt job state.",
+      "explanation": {
+        "foundation": "Think of **Why Central Polling & Unfenced Locks Fail** as the intuition layer for Design a Fault-Tolerant Distributed Cron & Job Scheduler: The failure mode: see how single-table polling and GC-paused workers corrupt job state.",
+        "core": "A single `SELECT * FROM jobs WHERE next_run <= NOW() FOR UPDATE SKIP LOCKED` creates severe B-Tree hot-page contention at top-of-minute boundaries. Worse, if Worker A acquires a 10s Redis lock, hits a 12s stop-the-world GC pause, and wakes up after Worker B took over, both workers fire the same billing webhook unless downstream storage checks a monotonic fencing token.",
+        "deepDive": "Under heavy load or partial failure, why central polling & unfenced locks fail becomes a critical lever for predictable latency and correctness. Scaling a distributed cron scheduler to 50,000 triggers/sec requires partitioning schedules into time-bucketed shards, issuing monotonic fencing tokens via etcd/Raft leases, and enforcing idempotency keys at target executors."
+      },
+      "decisionFramework": {
+        "problem": "How to implement Design a Fault-Tolerant Distributed Cron & Job Scheduler without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "If latency budgets leave no room for synchronous retries, never rely on a single SQL polling loop or unfenced distributed locks; pair time-bucketed shards with monotonic fencing tokens (epoch) and target-side idempotency keys.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Design a Fault-Tolerant Distributed Cron & Job Scheduler experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-enterprise-solution",
+      "eyebrow": "STAGE 03 · ENTERPRISE ARCHITECTURE",
+      "title": "Time-Bucket Sharding + Etcd Fencing Tokens + Idempotent Executors",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "purpose": "The mechanism: partition by time bucket and guard execution with monotonic epochs.",
+      "explanation": {
+        "foundation": "Shard schedules by `(minute_bucket, shard_id)` so each scheduler node owns disjoint time-bucket partitions via an **etcd lease**.",
+        "core": "When Worker B takes over a partition, etcd increments the monotonic **fencing token** (`epoch=42`).",
+        "deepDive": "Every state update and executor dispatch includes `(epoch, idempotency_key)`, rejecting stale `epoch=41` zombie writes."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Scheduler Data & Control Flow",
+        "title": "Time-Bucket Sharded Cron & Fencing Pipeline",
+        "nodes": [
+          {
+            "label": "Time-Wheel Buckets",
+            "role": "Shard by (min, id)"
+          },
+          {
+            "label": "Etcd Lease + Fence",
+            "role": "Monotonic epoch=42"
+          },
+          {
+            "label": "Worker Pool",
+            "role": "Bounded + bulkhead"
+          },
+          {
+            "label": "Executor + DLQ",
+            "role": "Idempotency key"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Bucket Sharding",
+            "detail": "Eliminates top-of-minute full-table index contention."
+          },
+          {
+            "label": "Fencing Token",
+            "detail": "Rejects delayed zombie worker writes with epoch < max_seen_epoch."
+          },
+          {
+            "label": "Idempotent Dispatch",
+            "detail": "Deterministic (job_id, scheduled_epoch) key deduplicates retries."
+          }
+        ],
+        "summary": "Caption: Combining time-bucket sharding with monotonic fencing tokens and idempotent executors prevents both hot-shard stalls and GC-pause double execution."
+      },
+      "markdownContent": "```python\ndef execute_fenced_job(db_conn, job_id: str, scheduled_ts: int, epoch: int, webhook_fn) -> str:\n    \"\"\"Assumes db_conn enforces epoch >= last_epoch atomically before side effects.\"\"\"\n    cur = db_conn.execute(\n        \"UPDATE scheduled_runs SET status = 'RUNNING', last_epoch = %s \"\n        \"WHERE job_id = %s AND scheduled_ts = %s AND status = 'PENDING' AND last_epoch < %s\",\n        (epoch, job_id, scheduled_ts, epoch),\n    )\n    if cur.rowcount != 1:\n        db_conn.rollback()\n        return \"SKIPPED_STALE_OR_DUPLICATE\"\n    db_conn.commit()\n\n    idem_key = f\"{job_id}:{scheduled_ts}\"\n    return webhook_fn(job_id=job_id, idempotency_key=idem_key)\n```"
+    },
+    {
+      "id": "04-top-of-minute-thundering-herd",
+      "eyebrow": "STAGE 04 · SCALE & BURST CONTROL",
+      "title": "Absorbing Top-of-Minute Spikes & Slow Webhook Targets",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "purpose": "Operational control: smooth cron alignment bursts and isolate slow targets.",
+      "explanation": {
+        "foundation": "Think of **Absorbing Top-of-Minute Spikes & Slow Webhook Targets** as the intuition layer for Design a Fault-Tolerant Distributed Cron & Job Scheduler: Operational control: smooth cron alignment bursts and isolate slow targets.",
+        "core": "When 1M users schedule `0 * * * *`, all jobs fire at `:00` seconds. Apply deterministic **jitter** (`hash(job_id) % 5s`) for non-strict jobs, pre-fetch upcoming 60s buckets into an in-memory **hashed time wheel**, and dispatch through Kafka/SQS with per-tenant concurrency bulkheads and a **Dead Letter Queue (DLQ)** for failing webhooks.",
+        "deepDive": "Under heavy load or partial failure, absorbing top-of-minute spikes & slow webhook targets becomes a critical lever for predictable latency and correctness. Scaling a distributed cron scheduler to 50,000 triggers/sec requires partitioning schedules into time-bucketed shards, issuing monotonic fencing tokens via etcd/Raft leases, and enforcing idempotency keys at target executors."
+      }
+    },
+    {
+      "id": "05-follow-ups",
+      "eyebrow": "STAGE 05 · INTERVIEW FOLLOW-UPS",
+      "title": "Multi-Region Failover & Catch-Up Policies",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "purpose": "Applied problems: handle missed runs during outages and cross-region promotion.",
+      "explanation": {
+        "foundation": "Think of **Multi-Region Failover & Catch-Up Policies** as the intuition layer for Design a Fault-Tolerant Distributed Cron & Job Scheduler: Applied problems: handle missed runs during outages and cross-region promotion.",
+        "core": "Support explicit per-job misfire policies (`SKIP_MISSED`, `FIRE_ONCE`, `BACKFILL_ALL`) so a 10-minute outage does not accidentally fire 10x duplicate billing runs on recovery.",
+        "deepDive": "Under heavy load or partial failure, multi-region failover & catch-up policies becomes a critical lever for predictable latency and correctness. Scaling a distributed cron scheduler to 50,000 triggers/sec requires partitioning schedules into time-bucketed shards, issuing monotonic fencing tokens via etcd/Raft leases, and enforcing idempotency keys at target executors."
+      },
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "Lifecycle & Failure Recovery",
+        "title": "Multi-Region Failover & Catch-Up Policies",
+        "states": [
+          {
+            "id": "init",
+            "label": "Initialized",
+            "tone": "neutral"
+          },
+          {
+            "id": "active",
+            "label": "Processing",
+            "tone": "info"
+          },
+          {
+            "id": "stable",
+            "label": "Invariant Met",
+            "tone": "good"
+          },
+          {
+            "id": "fallback",
+            "label": "Degraded Fallback",
+            "tone": "warn"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "init",
+            "to": "active",
+            "label": "admit"
+          },
+          {
+            "from": "active",
+            "to": "stable",
+            "label": "succeed"
+          },
+          {
+            "from": "active",
+            "to": "fallback",
+            "label": "budget exceeded"
+          }
+        ]
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "question": "Worker A holds a 10s Redis lease for job J, pauses for 15s due to JVM GC, and wakes up after Worker B already took over J. What prevents Worker A from double-executing J?",
+        "options": [
+          {
+            "id": "a",
+            "text": "A monotonic fencing token (epoch) checked atomically by the job store before execution",
+            "correct": true,
+            "feedback": "Correct: Worker B receives epoch=42 while Worker A still carries epoch=41; the job store rejects epoch=41."
+          },
+          {
+            "id": "b",
+            "text": "Setting a longer 60s Redis TTL",
+            "correct": false,
+            "feedback": "Incorrect: a longer TTL only delays failover and still breaks if a pause exceeds 60s."
+          },
+          {
+            "id": "c",
+            "text": "Using READ UNCOMMITTED isolation",
+            "correct": false,
+            "feedback": "Incorrect: weaker isolation worsens race conditions."
+          }
+        ]
+      },
+      {
+        "question": "Why do distributed cron schedulers partition jobs by (minute_bucket, shard_id) instead of polling a single global `next_run` index?",
+        "options": [
+          {
+            "id": "a",
+            "text": "It distributes top-of-minute read/update bursts across independent shards and lets each worker own disjoint buckets",
+            "correct": true,
+            "feedback": "Correct: time-bucket sharding prevents single-index lock contention at :00 boundaries."
+          },
+          {
+            "id": "b",
+            "text": "It removes the need for idempotency keys",
+            "correct": false,
+            "feedback": "Incorrect: retries after network timeouts still require idempotency keys."
+          },
+          {
+            "id": "c",
+            "text": "It guarantees zero clock skew across servers",
+            "correct": false,
+            "feedback": "Incorrect: sharding scales throughput; NTP/chrony bounds clock skew."
+          }
+        ]
+      },
+      {
+        "question": "A third-party webhook target stalls for 30s per request during a cron spike. How do you prevent it from starving other tenants' jobs?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Isolate dispatches behind per-tenant concurrency bulkheads, bounded timeouts, and an async retry + DLQ queue",
+            "correct": true,
+            "feedback": "Correct: bulkheads and timeouts cap blast radius so slow targets cannot exhaust the global worker pool."
+          },
+          {
+            "id": "b",
+            "text": "Run webhook HTTP calls synchronously inside the scheduler's DB transaction",
+            "correct": false,
+            "feedback": "Incorrect: holding DB transactions over 30s HTTP calls exhausts DB connection pools immediately."
+          },
+          {
+            "id": "c",
+            "text": "Disable retries globally",
+            "correct": false,
+            "feedback": "Incorrect: transient failures need bounded jittered retries + DLQ, not zero retries."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** Scaling a distributed cron scheduler to 50,000 triggers/sec requires partitioning schedules into time-bucketed shards, issuing monotonic fencing tokens via etcd/Raft leases, and enforcing idempotency keys at target executors.\n\n**Key Takeaway:** Never rely on a single SQL polling loop or unfenced distributed locks; pair time-bucketed shards with monotonic fencing tokens (epoch) and target-side idempotency keys.",
+      "spark": {
+        "summary": "Scaling a distributed cron scheduler to 50,000 triggers/sec requires partitioning schedules into time-bucketed shards, issuing monotonic fencing tokens via etcd/Raft leases, and enforcing idempotency keys at target executors.",
+        "keyTakeaway": "Never rely on a single SQL polling loop or unfenced distributed locks; pair time-bucketed shards with monotonic fencing tokens (epoch) and target-side idempotency keys.",
+        "byteSummary": "**Core Mechanics:** Polling a single `SELECT ... FOR UPDATE` table at `50,000` triggers/sec collapses under index lock contention, while unfenced worker leases allow GC-paused zombie workers to double-execute jobs.\n\n**Visual & Structural Flow:** Depicts a `Hashed Time-Wheel (Minute Buckets)` feeding a `Partitioned Job Store (shard by bucket)`, an `etcd Coordinator Lease` issuing `Fencing Token (epoch=42)` to the active `Worker Pool`, while a `Zombie Worker (GC Pause, epoch=41)` is blocked by a `Storage Fence Check (epoch >= 42)` before reaching `Target Executor + Idempotency Key` and `Retry + DLQ`.\n\n**Trade-Offs & Production:** Partitioning by `(minute_bucket, shard_id)` keeps scans bounded in RAM/SSD, while monotonic fencing tokens + deterministic `(job_id, scheduled_at)` idempotency keys guarantee at-most-once side effects.\n\n**Failure Modes & Application:** Isolate slow webhook targets with per-tenant worker bulkheads and route exhausted retries to a Dead Letter Queue (DLQ)."
+      },
+      "learningJourney": [
+        {
+          "id": "01-requirements-and-scale",
+          "eyebrow": "STAGE 01 · REQUIREMENTS & MATH",
+          "title": "Clarify Scale, Drift SLO & Execution Semantics",
+          "level": "L5 · APPLIED DESIGN",
+          "purpose": "The problem: size storage, peak trigger QPS, and exact execution guarantees.",
+          "explanation": "With **10M active schedules** (~1 KB metadata each = ~10 GB), metadata fits easily in a sharded database, while **50,000 triggers/sec** at top-of-minute spikes demands horizontal partitioning. Target `<2s` trigger drift, `at-least-once` dispatch with `idempotency_key = hash(job_id, fire_ts)`, and zero split-brain double execution when workers pause or partition."
+        },
+        {
+          "id": "02-naive-failure-modes",
+          "eyebrow": "STAGE 02 · NAIVE BOTTLENECKS",
+          "title": "Why Central Polling & Unfenced Locks Fail",
+          "level": "L5 · APPLIED DESIGN",
+          "purpose": "The failure mode: see how single-table polling and GC-paused workers corrupt job state.",
+          "explanation": "A single `SELECT * FROM jobs WHERE next_run <= NOW() FOR UPDATE SKIP LOCKED` creates severe B-Tree hot-page contention at top-of-minute boundaries. Worse, if Worker A acquires a 10s Redis lock, hits a 12s stop-the-world GC pause, and wakes up after Worker B took over, both workers fire the same billing webhook unless downstream storage checks a monotonic fencing token."
+        },
+        {
+          "id": "03-enterprise-solution",
+          "eyebrow": "STAGE 03 · ENTERPRISE ARCHITECTURE",
+          "title": "Time-Bucket Sharding + Etcd Fencing Tokens + Idempotent Executors",
+          "level": "L6 · SCALE & TRADE-OFFS",
+          "purpose": "The mechanism: partition by time bucket and guard execution with monotonic epochs.",
+          "explanation": "Shard schedules by `(minute_bucket, shard_id)` so each scheduler node owns disjoint time-bucket partitions via an **etcd lease**. When Worker B takes over a partition, etcd increments the monotonic **fencing token** (`epoch=42`). Every state update and executor dispatch includes `(epoch, idempotency_key)`, rejecting stale `epoch=41` zombie writes.",
+          "sectionDiagram": {
+            "kind": "pipeline",
+            "eyebrow": "Scheduler Data & Control Flow",
+            "title": "Time-Bucket Sharded Cron & Fencing Pipeline",
+            "nodes": [
+              {
+                "label": "Time-Wheel Buckets",
+                "role": "Shard by (min, id)"
+              },
+              {
+                "label": "Etcd Lease + Fence",
+                "role": "Monotonic epoch=42"
+              },
+              {
+                "label": "Worker Pool",
+                "role": "Bounded + bulkhead"
+              },
+              {
+                "label": "Executor + DLQ",
+                "role": "Idempotency key"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Bucket Sharding",
+                "detail": "Eliminates top-of-minute full-table index contention."
+              },
+              {
+                "label": "Fencing Token",
+                "detail": "Rejects delayed zombie worker writes with epoch < max_seen_epoch."
+              },
+              {
+                "label": "Idempotent Dispatch",
+                "detail": "Deterministic (job_id, scheduled_epoch) key deduplicates retries."
+              }
+            ],
+            "summary": "Caption: Combining time-bucket sharding with monotonic fencing tokens and idempotent executors prevents both hot-shard stalls and GC-pause double execution."
+          },
+          "markdownContent": "```python\ndef execute_fenced_job(db_conn, job_id: str, scheduled_ts: int, epoch: int, webhook_fn) -> str:\n    \"\"\"Assumes db_conn enforces epoch >= last_epoch atomically before side effects.\"\"\"\n    cur = db_conn.execute(\n        \"UPDATE scheduled_runs SET status = 'RUNNING', last_epoch = %s \"\n        \"WHERE job_id = %s AND scheduled_ts = %s AND status = 'PENDING' AND last_epoch < %s\",\n        (epoch, job_id, scheduled_ts, epoch),\n    )\n    if cur.rowcount != 1:\n        db_conn.rollback()\n        return \"SKIPPED_STALE_OR_DUPLICATE\"\n    db_conn.commit()\n\n    idem_key = f\"{job_id}:{scheduled_ts}\"\n    return webhook_fn(job_id=job_id, idempotency_key=idem_key)\n```"
+        }
+      ],
+      "finalSummary": "Never rely on a single SQL polling loop or unfenced distributed locks; pair time-bucketed shards with monotonic fencing tokens (epoch) and target-side idempotency keys.",
+      "summary": "Scaling a distributed cron scheduler to 50,000 triggers/sec requires partitioning schedules into time-bucketed shards, issuing monotonic fencing tokens via etcd/Raft leases, and enforcing idempotency keys at target executors.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, never rely on a single SQL polling loop or unfenced distributed locks; pair time-bucketed shards with monotonic fencing tokens (epoch) and target-side idempotency keys."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** Polling a single `SELECT ... FOR UPDATE` table at `50,000` triggers/sec collapses under index lock contention, while unfenced worker leases allow GC-paused zombie workers to double-execute jobs.\n\n**Visual & Structural Flow:** Depicts a `Hashed Time-Wheel (Minute Buckets)` feeding a `Partitioned Job Store (shard by bucket)`, an `etcd Coordinator Lease` issuing `Fencing Token (epoch=42)` to the active `Worker Pool`, while a `Zombie Worker (GC Pause, epoch=41)` is blocked by a `Storage Fence Check (epoch >= 42)` before reaching `Target Executor + Idempotency Key` and `Retry + DLQ`.\n\n**Trade-Offs & Production:** Partitioning by `(minute_bucket, shard_id)` keeps scans bounded in RAM/SSD, while monotonic fencing tokens + deterministic `(job_id, scheduled_at)` idempotency keys guarantee at-most-once side effects.\n\n**Failure Modes & Application:** Isolate slow webhook targets with per-tenant worker bulkheads and route exhausted retries to a Dead Letter Queue (DLQ).",
+      "spark": {
+        "summary": "Scaling a distributed cron scheduler to 50,000 triggers/sec requires partitioning schedules into time-bucketed shards, issuing monotonic fencing tokens via etcd/Raft leases, and enforcing idempotency keys at target executors.",
+        "keyTakeaway": "Never rely on a single SQL polling loop or unfenced distributed locks; pair time-bucketed shards with monotonic fencing tokens (epoch) and target-side idempotency keys.",
+        "byteSummary": "**Core Mechanics:** Polling a single `SELECT ... FOR UPDATE` table at `50,000` triggers/sec collapses under index lock contention, while unfenced worker leases allow GC-paused zombie workers to double-execute jobs.\n\n**Visual & Structural Flow:** Depicts a `Hashed Time-Wheel (Minute Buckets)` feeding a `Partitioned Job Store (shard by bucket)`, an `etcd Coordinator Lease` issuing `Fencing Token (epoch=42)` to the active `Worker Pool`, while a `Zombie Worker (GC Pause, epoch=41)` is blocked by a `Storage Fence Check (epoch >= 42)` before reaching `Target Executor + Idempotency Key` and `Retry + DLQ`.\n\n**Trade-Offs & Production:** Partitioning by `(minute_bucket, shard_id)` keeps scans bounded in RAM/SSD, while monotonic fencing tokens + deterministic `(job_id, scheduled_at)` idempotency keys guarantee at-most-once side effects.\n\n**Failure Modes & Application:** Isolate slow webhook targets with per-tenant worker bulkheads and route exhausted retries to a Dead Letter Queue (DLQ)."
+      },
+      "summary": "Scaling a distributed cron scheduler to 50,000 triggers/sec requires partitioning schedules into time-bucketed shards, issuing monotonic fencing tokens via etcd/Raft leases, and enforcing idempotency keys at target executors.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, never rely on a single SQL polling loop or unfenced distributed locks; pair time-bucketed shards with monotonic fencing tokens (epoch) and target-side idempotency keys."
+    },
+    "advanced": {
+      "byteSummary": "**Core Mechanics:** Polling a single `SELECT ... FOR UPDATE` table at `50,000` triggers/sec collapses under index lock contention, while unfenced worker leases allow GC-paused zombie workers to double-execute jobs.\n\n**Visual & Structural Flow:** Depicts a `Hashed Time-Wheel (Minute Buckets)` feeding a `Partitioned Job Store (shard by bucket)`, an `etcd Coordinator Lease` issuing `Fencing Token (epoch=42)` to the active `Worker Pool`, while a `Zombie Worker (GC Pause, epoch=41)` is blocked by a `Storage Fence Check (epoch >= 42)` before reaching `Target Executor + Idempotency Key` and `Retry + DLQ`.\n\n**Trade-Offs & Production:** Partitioning by `(minute_bucket, shard_id)` keeps scans bounded in RAM/SSD, while monotonic fencing tokens + deterministic `(job_id, scheduled_at)` idempotency keys guarantee at-most-once side effects.\n\n**Failure Modes & Application:** Isolate slow webhook targets with per-tenant worker bulkheads and route exhausted retries to a Dead Letter Queue (DLQ).",
+      "spark": {
+        "summary": "Scaling a distributed cron scheduler to 50,000 triggers/sec requires partitioning schedules into time-bucketed shards, issuing monotonic fencing tokens via etcd/Raft leases, and enforcing idempotency keys at target executors.",
+        "keyTakeaway": "Never rely on a single SQL polling loop or unfenced distributed locks; pair time-bucketed shards with monotonic fencing tokens (epoch) and target-side idempotency keys.",
+        "byteSummary": "**Core Mechanics:** Polling a single `SELECT ... FOR UPDATE` table at `50,000` triggers/sec collapses under index lock contention, while unfenced worker leases allow GC-paused zombie workers to double-execute jobs.\n\n**Visual & Structural Flow:** Depicts a `Hashed Time-Wheel (Minute Buckets)` feeding a `Partitioned Job Store (shard by bucket)`, an `etcd Coordinator Lease` issuing `Fencing Token (epoch=42)` to the active `Worker Pool`, while a `Zombie Worker (GC Pause, epoch=41)` is blocked by a `Storage Fence Check (epoch >= 42)` before reaching `Target Executor + Idempotency Key` and `Retry + DLQ`.\n\n**Trade-Offs & Production:** Partitioning by `(minute_bucket, shard_id)` keeps scans bounded in RAM/SSD, while monotonic fencing tokens + deterministic `(job_id, scheduled_at)` idempotency keys guarantee at-most-once side effects.\n\n**Failure Modes & Application:** Isolate slow webhook targets with per-tenant worker bulkheads and route exhausted retries to a Dead Letter Queue (DLQ)."
+      },
+      "learningJourney": [
+        {
+          "id": "01-requirements-and-scale",
+          "eyebrow": "STAGE 01 · REQUIREMENTS & MATH",
+          "title": "Clarify Scale, Drift SLO & Execution Semantics",
+          "level": "L5 · APPLIED DESIGN",
+          "purpose": "The problem: size storage, peak trigger QPS, and exact execution guarantees.",
+          "explanation": "With **10M active schedules** (~1 KB metadata each = ~10 GB), metadata fits easily in a sharded database, while **50,000 triggers/sec** at top-of-minute spikes demands horizontal partitioning. Target `<2s` trigger drift, `at-least-once` dispatch with `idempotency_key = hash(job_id, fire_ts)`, and zero split-brain double execution when workers pause or partition."
+        },
+        {
+          "id": "02-naive-failure-modes",
+          "eyebrow": "STAGE 02 · NAIVE BOTTLENECKS",
+          "title": "Why Central Polling & Unfenced Locks Fail",
+          "level": "L5 · APPLIED DESIGN",
+          "purpose": "The failure mode: see how single-table polling and GC-paused workers corrupt job state.",
+          "explanation": "A single `SELECT * FROM jobs WHERE next_run <= NOW() FOR UPDATE SKIP LOCKED` creates severe B-Tree hot-page contention at top-of-minute boundaries. Worse, if Worker A acquires a 10s Redis lock, hits a 12s stop-the-world GC pause, and wakes up after Worker B took over, both workers fire the same billing webhook unless downstream storage checks a monotonic fencing token."
+        },
+        {
+          "id": "03-enterprise-solution",
+          "eyebrow": "STAGE 03 · ENTERPRISE ARCHITECTURE",
+          "title": "Time-Bucket Sharding + Etcd Fencing Tokens + Idempotent Executors",
+          "level": "L6 · SCALE & TRADE-OFFS",
+          "purpose": "The mechanism: partition by time bucket and guard execution with monotonic epochs.",
+          "explanation": "Shard schedules by `(minute_bucket, shard_id)` so each scheduler node owns disjoint time-bucket partitions via an **etcd lease**. When Worker B takes over a partition, etcd increments the monotonic **fencing token** (`epoch=42`). Every state update and executor dispatch includes `(epoch, idempotency_key)`, rejecting stale `epoch=41` zombie writes.",
+          "sectionDiagram": {
+            "kind": "pipeline",
+            "eyebrow": "Scheduler Data & Control Flow",
+            "title": "Time-Bucket Sharded Cron & Fencing Pipeline",
+            "nodes": [
+              {
+                "label": "Time-Wheel Buckets",
+                "role": "Shard by (min, id)"
+              },
+              {
+                "label": "Etcd Lease + Fence",
+                "role": "Monotonic epoch=42"
+              },
+              {
+                "label": "Worker Pool",
+                "role": "Bounded + bulkhead"
+              },
+              {
+                "label": "Executor + DLQ",
+                "role": "Idempotency key"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Bucket Sharding",
+                "detail": "Eliminates top-of-minute full-table index contention."
+              },
+              {
+                "label": "Fencing Token",
+                "detail": "Rejects delayed zombie worker writes with epoch < max_seen_epoch."
+              },
+              {
+                "label": "Idempotent Dispatch",
+                "detail": "Deterministic (job_id, scheduled_epoch) key deduplicates retries."
+              }
+            ],
+            "summary": "Caption: Combining time-bucket sharding with monotonic fencing tokens and idempotent executors prevents both hot-shard stalls and GC-pause double execution."
+          },
+          "markdownContent": "```python\ndef execute_fenced_job(db_conn, job_id: str, scheduled_ts: int, epoch: int, webhook_fn) -> str:\n    \"\"\"Assumes db_conn enforces epoch >= last_epoch atomically before side effects.\"\"\"\n    cur = db_conn.execute(\n        \"UPDATE scheduled_runs SET status = 'RUNNING', last_epoch = %s \"\n        \"WHERE job_id = %s AND scheduled_ts = %s AND status = 'PENDING' AND last_epoch < %s\",\n        (epoch, job_id, scheduled_ts, epoch),\n    )\n    if cur.rowcount != 1:\n        db_conn.rollback()\n        return \"SKIPPED_STALE_OR_DUPLICATE\"\n    db_conn.commit()\n\n    idem_key = f\"{job_id}:{scheduled_ts}\"\n    return webhook_fn(job_id=job_id, idempotency_key=idem_key)\n```"
+        },
+        {
+          "id": "04-top-of-minute-thundering-herd",
+          "eyebrow": "STAGE 04 · SCALE & BURST CONTROL",
+          "title": "Absorbing Top-of-Minute Spikes & Slow Webhook Targets",
+          "level": "L6 · SCALE & TRADE-OFFS",
+          "purpose": "Operational control: smooth cron alignment bursts and isolate slow targets.",
+          "explanation": "When 1M users schedule `0 * * * *`, all jobs fire at `:00` seconds. Apply deterministic **jitter** (`hash(job_id) % 5s`) for non-strict jobs, pre-fetch upcoming 60s buckets into an in-memory **hashed time wheel**, and dispatch through Kafka/SQS with per-tenant concurrency bulkheads and a **Dead Letter Queue (DLQ)** for failing webhooks."
+        },
+        {
+          "id": "05-follow-ups",
+          "eyebrow": "STAGE 05 · INTERVIEW FOLLOW-UPS",
+          "title": "Multi-Region Failover & Catch-Up Policies",
+          "level": "L7 · STAFF / PRINCIPAL",
+          "purpose": "Applied problems: handle missed runs during outages and cross-region promotion.",
+          "explanation": "Support explicit per-job misfire policies (`SKIP_MISSED`, `FIRE_ONCE`, `BACKFILL_ALL`) so a 10-minute outage does not accidentally fire 10x duplicate billing runs on recovery."
+        }
+      ],
+      "finalSummary": "Never rely on a single SQL polling loop or unfenced distributed locks; pair time-bucketed shards with monotonic fencing tokens (epoch) and target-side idempotency keys.",
+      "summary": "Scaling a distributed cron scheduler to 50,000 triggers/sec requires partitioning schedules into time-bucketed shards, issuing monotonic fencing tokens via etcd/Raft leases, and enforcing idempotency keys at target executors.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, never rely on a single SQL polling loop or unfenced distributed locks; pair time-bucketed shards with monotonic fencing tokens (epoch) and target-side idempotency keys."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "prerequisites": [
+    {
+      "title": "Distributed Cron & Scheduling",
+      "summary": "Distributed cron and scheduling systems execute time-based and delayed jobs reliably across a fleet of stateless workers without single-point-of-failure downtime or duplicate runs."
+    },
+    {
+      "title": "Distributed Locking & Redlock Algorithm",
+      "summary": "Distributed locking coordinates mutually exclusive access to a shared resource across independent processes that share no memory, using a network-accessible lease store such as Redis, etcd, or ZooKeeper."
+    },
+    {
+      "title": "Dead Letter Queues",
+      "summary": "A secondary quarantine queue that captures messages a consumer repeatedly fails to process after a bounded number of retries, preventing poison pills from blocking healthy traffic."
+    }
+  ],
+  "simulation": {
+    "title": "Design a Fault-Tolerant Distributed Cron & Job Scheduler — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Input Workload"
+      },
+      {
+        "id": "entry",
+        "label": "Router / API",
+        "role": "Admission Control"
+      },
+      {
+        "id": "worker",
+        "label": "Processor",
+        "role": "Domain Logic"
+      },
+      {
+        "id": "store",
+        "label": "State Layer",
+        "role": "Durable Store"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "entry",
+        "label": "request"
+      },
+      {
+        "from": "entry",
+        "to": "worker",
+        "label": "dispatch"
+      },
+      {
+        "from": "worker",
+        "to": "store",
+        "label": "read/write"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Clarify Scale, Drift SLO & Execution Semantics",
+        "actionLabel": "request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "entry"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "request",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Caller sends work to Router / API (Clarify Scale, Drift SLO & Execution Semantics)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Why Central Polling & Unfenced Locks Fail",
+        "actionLabel": "dispatch",
+        "status": "healthy",
+        "activeNodeIds": [
+          "entry",
+          "worker"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "dispatch",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Router / API coordinates with Processor while preserving the core invariant (Why Central Polling & Unfenced Locks Fail)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Time-Bucket Sharding + Etcd Fencing Tokens + Idempotent Executors",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "worker",
+          "store"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, State Layer absorbs pressure without cascading (Time-Bucket Sharding + Etcd Fencing Tokens + Idempotent Executors)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Multi-Region Failover & Catch-Up Policies",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "entry",
+          "worker",
+          "store"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Multi-Region Failover & Catch-Up Policies)."
+      }
+    ]
+  }
+}

@@ -1,0 +1,596 @@
+{
+  "id": "mitigating-tcp-time-wait-port-exhaustion",
+  "slug": "mitigating-tcp-time-wait-port-exhaustion",
+  "title": "Mitigating 40K/s TCP TIME_WAIT Ephemeral Port Exhaustion in API Gateways",
+  "domain": "distributed-systems",
+  "spark": {
+    "summary": "Resolve a 35% EADDRNOTAVAIL / 502 Bad Gateway outage on a 40,000 req/s API gateway caused by unpooled upstream TCP sockets exhausting all 28,232 Linux ephemeral ports in 60s TIME_WAIT.",
+    "keyTakeaway": "Switch to a 256-socket HTTP Keep-Alive / HTTP/2 upstream pool, widen ip_local_port_range to 1024..65535, enable tcp_tw_reuse=1, and add multi-IP SNAT diversity.",
+    "byteSummary": "In Production Scenario #29, an NGINX/Envoy API gateway handling 40,000 outbound req/s suffered 35% `EADDRNOTAVAIL` failures and 502 Bad Gateways while host CPU sat at just 30%. Inspection via `ss -s` showed 28,232 sockets pinned in `TIME_WAIT`\u2014exhausting the entire default `32768..60999` ephemeral port pool.\n\nThe root cause was misconfigured upstream proxying (missing `proxy_http_version 1.1` / `Connection \"\"`), forcing the gateway to open and close a fresh TCP socket per request and capping throughput at `28,232 / 60 = 470 req/s` per upstream tuple.\n\nRemediation restores persistent HTTP Keep-Alive pooling (reducing open sockets to ~256), widens `ip_local_port_range` to `1024..65535`, enables `tcp_tw_reuse=1` with timestamps, and adds multi-IP SNAT + `TCP_tw` alerting to sustain 40,000+ req/s with zero 502s."
+  },
+  "learningJourney": [
+    {
+      "level": "foundation",
+      "title": "Stage 1: Incident Triage \u2014 35% EADDRNOTAVAIL at 30% CPU",
+      "purpose": "Diagnose ephemeral port exhaustion using ss -s, netstat, and gateway error logs.",
+      "explanation": "When a gateway logs `connect() failed (99: Cannot assign requested address)` (`EADDRNOTAVAIL`) while CPU is 30%, run `ss -s` and `ss -tan state time-wait | wc -l`. Seeing ~28,232 `TIME_WAIT` sockets targeting the same upstream VIP confirms ephemeral port exhaustion.",
+      "codeExample": "def diagnose_port_exhaustion(tw_sockets: int, port_cap: int = 28232, eaddrnotavail_pct: float = 0.0) -> str:\n    if tw_sockets >= int(port_cap * 0.90) and eaddrnotavail_pct > 0.0:\n        return 'EPHEMERAL_PORT_EXHAUSTION_TIME_WAIT_STORM'\n    return 'CHECK_OTHER_UPSTREAM_FAILURE'\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "FOUNDATION \u00b7 INCIDENT TRIAGE",
+        "title": "Identifying a 28,232-Socket TIME_WAIT Storm at 30% CPU",
+        "nodes": [
+          {
+            "id": "log",
+            "label": "502 + EADDRNOTAVAIL (35%)",
+            "sub": "Gateway CPU only 30%",
+            "role": "Alert Symptom"
+          },
+          {
+            "id": "ss",
+            "label": "ss -s / ss -tan",
+            "sub": "28,232 sockets in TIME_WAIT",
+            "role": "Kernel Proof"
+          },
+          {
+            "id": "rng",
+            "label": "ip_local_port_range",
+            "sub": "32768..60999 exhausted",
+            "role": "Pool Limit"
+          },
+          {
+            "id": "fix",
+            "label": "Unpooled Upstream HTTP",
+            "sub": "New socket per request",
+            "role": "Root Cause"
+          }
+        ],
+        "edges": [
+          {
+            "from": "log",
+            "to": "ss",
+            "label": "Inspect socket states"
+          },
+          {
+            "from": "ss",
+            "to": "rng",
+            "label": "Compare vs port range"
+          },
+          {
+            "from": "rng",
+            "to": "fix",
+            "label": "Confirm 470 req/s cap"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Check Inside Pod Netns",
+            "detail": "In Kubernetes, run ss -s inside the gateway pod's network namespace rather than the host node."
+          },
+          {
+            "label": "Check Conntrack Too",
+            "detail": "Verify dmesg for 'nf_conntrack: table full, dropping packet' if NAT/kube-proxy is in the path."
+          }
+        ],
+        "summary": "35% EADDRNOTAVAIL at 30% CPU with ~28,232 TIME_WAIT sockets in ss -s confirms unpooled outbound port exhaustion.",
+        "caption": "502 EADDRNOTAVAIL errors at 30% CPU with 28,232 TIME_WAIT sockets in ss -s pinpoint unpooled HTTP churn."
+      }
+    },
+    {
+      "level": "foundation",
+      "title": "Stage 2: Fixing NGINX / Envoy Upstream Keep-Alive Pools",
+      "purpose": "Eliminate per-request socket teardown by enabling HTTP/1.1 Keep-Alive or HTTP/2 upstream pools.",
+      "explanation": "In NGINX, setting `upstream { keepalive 256; }` alone STILL closes connections unless `proxy_http_version 1.1;` and `proxy_set_header Connection \"\";` are configured (since HTTP/1.0 defaults to `Connection: close`). Enabling Keep-Alive reduces 40,000 req/s from 40,000 new sockets/sec down to 256 persistent reused sockets.",
+      "codeExample": "NGINX_UPSTREAM_KEEPALIVE = '''\nupstream backend_pool {\n    server 10.0.2.10:8080;\n    keepalive 256;\n    keepalive_requests 10000;\n    keepalive_timeout 55s;\n}\n'''\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "FOUNDATION \u00b7 KEEP-ALIVE POOL",
+        "title": "Fixing HTTP/1.1 Keep-Alive Headers & Upstream Pool Sizing",
+        "nodes": [
+          {
+            "id": "cfg",
+            "label": "proxy_http_version 1.1",
+            "sub": "Clear Connection: close",
+            "role": "Header Fix"
+          },
+          {
+            "id": "pool",
+            "label": "keepalive 256 Pool",
+            "sub": "keepalive_timeout = 55s",
+            "role": "Socket Pool"
+          },
+          {
+            "id": "srv",
+            "label": "Upstream Timeout = 65s",
+            "sub": "Client closes before server",
+            "role": "Race Guard"
+          },
+          {
+            "id": "ok",
+            "label": "40K req/s on 256 Sockets",
+            "sub": "Zero TIME_WAIT churn",
+            "role": "Resolved"
+          }
+        ],
+        "edges": [
+          {
+            "from": "cfg",
+            "to": "pool",
+            "label": "Keep sockets open"
+          },
+          {
+            "from": "pool",
+            "to": "srv",
+            "label": "Align idle timeouts"
+          },
+          {
+            "from": "srv",
+            "to": "ok",
+            "label": "Sustain 40K+ req/s"
+          }
+        ],
+        "cards": [
+          {
+            "label": "HTTP/2 Multiplexing",
+            "detail": "Upgrading upstream links to HTTP/2 or gRPC multiplexes hundreds of concurrent requests per TCP socket."
+          },
+          {
+            "label": "Keepalive_requests Cap",
+            "detail": "Rotating a pooled socket every 10,000 requests balances load across newly scaled upstream pods."
+          }
+        ],
+        "summary": "Enabling HTTP/1.1 Keep-Alive headers and a 256-socket pool cuts 40K/s socket churn to near zero.",
+        "caption": "Fixing proxy_http_version 1.1 and keepalive 256 sustains 40K req/s over 256 persistent sockets."
+      }
+    },
+    {
+      "level": "intermediate",
+      "title": "Stage 3: Sysctl Hardening (Port Range & tcp_tw_reuse)",
+      "purpose": "Configure kernel sysctls safely for bursty fallback traffic and Kubernetes pod namespaces.",
+      "explanation": "Apply `net.ipv4.ip_local_port_range = 1024 65535` (64,511 ports), `net.ipv4.tcp_timestamps = 1`, and `net.ipv4.tcp_tw_reuse = 1` via DaemonSet or pod `securityContext.sysctls` (for safe namespaced sysctls). Also set `ip_local_reserved_ports` for any daemon listen ports in the 1024..65535 range.",
+      "codeExample": "def validate_port_range(low: int, high: int, reserved: list[int]) -> int:\n    if low < 1024 or high > 65535 or low >= high:\n        raise ValueError('Port range must lie within [1024, 65535]')\n    reserved_in_range = sum(1 for p in set(reserved) if low <= p <= high)\n    return (high - low + 1) - reserved_in_range\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "INTERMEDIATE \u00b7 KERNEL SYSCTLS",
+        "title": "Pod-Safe Sysctl Hardening for 64,511 Ephemeral Ports",
+        "nodes": [
+          {
+            "id": "rng",
+            "label": "ip_local_port_range=1024..65535",
+            "sub": "2.3x more ephemeral ports",
+            "role": "Port Pool"
+          },
+          {
+            "id": "res",
+            "label": "ip_local_reserved_ports",
+            "sub": "Protect 8080, 9090, 9100",
+            "role": "Listen Guard"
+          },
+          {
+            "id": "reu",
+            "label": "tcp_tw_reuse=1 + timestamps=1",
+            "sub": "Safe outbound >1s reuse",
+            "role": "Reuse Policy"
+          },
+          {
+            "id": "k8s",
+            "label": "Pod Netns Sysctl Init",
+            "sub": "Apply per-pod namespace",
+            "role": "K8s Rollout"
+          }
+        ],
+        "edges": [
+          {
+            "from": "rng",
+            "to": "res",
+            "label": "Carve out server ports"
+          },
+          {
+            "from": "res",
+            "to": "reu",
+            "label": "Enable PAWS reuse"
+          },
+          {
+            "from": "reu",
+            "to": "k8s",
+            "label": "Roll out via K8s"
+          }
+        ],
+        "cards": [
+          {
+            "label": "2.3x Burst Runway",
+            "detail": "64,511 ports sustain ~1,075 unpooled req/s per tuple during fallback bursts."
+          },
+          {
+            "label": "No Root-Only Unsafe Flags",
+            "detail": "ip_local_port_range is a namespaced sysctl allowed in Kubernetes pods once whitelisted on kubelet."
+          }
+        ],
+        "summary": "Widening ip_local_port_range with reserved listen ports and tcp_tw_reuse=1 adds safe kernel headroom in pod namespaces.",
+        "caption": "Pod-namespaced sysctls widen ip_local_port_range to 1024..65535, reserve listen ports, and enable tcp_tw_reuse=1."
+      }
+    },
+    {
+      "level": "intermediate",
+      "title": "Stage 4: Multi-IP SNAT Pool for > 64K Concurrent Connections",
+      "purpose": "Scale beyond 64,511 sockets to a single upstream VIP using multiple source IPs.",
+      "explanation": "If long-lived WebSocket/SSE fan-out requires 200,000 concurrent connections to one upstream VIP, a single `src_ip` hits the 64,511-port ceiling. Attaching 4 secondary SNAT IPs (`M = 4`) expands unique 4-tuples to `4 * 64,511 = 258,044` sockets, using round-robin source IP selection.",
+      "codeExample": "def min_snat_ips_needed(target_concurrent_conns: int, ports_per_ip: int = 64511, headroom: float = 1.25) -> int:\n    if target_concurrent_conns <= 0:\n        raise ValueError('target_concurrent_conns must be positive')\n    import math\n    return math.ceil((target_concurrent_conns * headroom) / ports_per_ip)\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "INTERMEDIATE \u00b7 MULTI-IP SNAT",
+        "title": "Scaling Past 64K Concurrent Sockets via 4-IP SNAT Diversity",
+        "nodes": [
+          {
+            "id": "ws",
+            "label": "200K Concurrent Sockets",
+            "sub": "Exceeds 64,511 single-IP cap",
+            "role": "Scale Target"
+          },
+          {
+            "id": "ips",
+            "label": "4 Secondary SNAT IPs",
+            "sub": "4 * 64,511 = 258K tuples",
+            "role": "IP Pool"
+          },
+          {
+            "id": "nb",
+            "label": "IP_BIND_ADDRESS_NO_PORT",
+            "sub": "Per-tuple port allocation",
+            "role": "Socket Option"
+          },
+          {
+            "id": "up",
+            "label": "Single Upstream VIP",
+            "sub": "Zero EADDRNOTAVAIL",
+            "role": "Target"
+          }
+        ],
+        "edges": [
+          {
+            "from": "ws",
+            "to": "ips",
+            "label": "Shard across 4 src_ips"
+          },
+          {
+            "from": "ips",
+            "to": "nb",
+            "label": "Bind IP without port=0 lock"
+          },
+          {
+            "from": "nb",
+            "to": "up",
+            "label": "Establish 200K conns"
+          }
+        ],
+        "cards": [
+          {
+            "label": "25% Safety Headroom",
+            "detail": "Provisioning 4 IPs for 200K connections leaves 22% headroom for rolling restarts and uneven hashing."
+          },
+          {
+            "label": "Multiple Upstream VIPs",
+            "detail": "Alternatively, resolving 4 upstream pod IPs directly (headless service) multiplies 4-tuples without extra SNAT IPs."
+          }
+        ],
+        "summary": "Multi-IP SNAT pools (or direct pod-IP load balancing) multiply 4-tuple capacity past 64,511 sockets per gateway.",
+        "caption": "4 SNAT source IPs paired with IP_BIND_ADDRESS_NO_PORT expand capacity to 258K concurrent sockets."
+      }
+    },
+    {
+      "level": "intermediate",
+      "title": "Stage 5: Conntrack Table Sizing & Bypass for High-Churn Nodes",
+      "purpose": "Prevent nf_conntrack table exhaustion when gateway pods sit behind Linux iptables/IPVS NAT.",
+      "explanation": "Every TCP connection (including `TIME_WAIT` entries held for `nf_conntrack_tcp_timeout_time_wait = 120s`) consumes ~320 bytes in `nf_conntrack`. Scaling `nf_conntrack_max` to `1,048,576` (with `hashsize = max / 4`) or enabling eBPF/Cilium DSR or `NOTRACK` on high-rate internal VIPs prevents silent conntrack packet drops.",
+      "codeExample": "def conntrack_ram_mb(max_entries: int, bytes_per_entry: int = 320) -> float:\n    if max_entries <= 0:\n        raise ValueError('max_entries must be positive')\n    return round((max_entries * bytes_per_entry) / 1e6, 2)\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "INTERMEDIATE \u00b7 CONNTRACK GUARD",
+        "title": "Preventing Silent nf_conntrack Table Drops on NAT Nodes",
+        "nodes": [
+          {
+            "id": "nat",
+            "label": "iptables / kube-proxy NAT",
+            "sub": "Tracks every 4-tuple",
+            "role": "NAT Layer"
+          },
+          {
+            "id": "ct",
+            "label": "nf_conntrack_max = 1M",
+            "sub": "hashsize=262144 (~320 MB)",
+            "role": "Table Cap"
+          },
+          {
+            "id": "twt",
+            "label": "conntrack_tw_timeout = 30s",
+            "sub": "Reclaim NAT entries faster",
+            "role": "GC Tuning"
+          },
+          {
+            "id": "ebpf",
+            "label": "Or eBPF / NOTRACK Bypass",
+            "sub": "Zero conntrack overhead",
+            "role": "Fast Path"
+          }
+        ],
+        "edges": [
+          {
+            "from": "nat",
+            "to": "ct",
+            "label": "Insert tracked flow"
+          },
+          {
+            "from": "ct",
+            "to": "twt",
+            "label": "Expire TIME_WAIT flows"
+          },
+          {
+            "from": "nat",
+            "to": "ebpf",
+            "label": "Bypass for internal VIPs"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Silent Drop Hazard",
+            "detail": "When nf_conntrack fills, Linux drops new SYN packets silently\u2014looking like mysterious 1s-3s TCP retransmit stalls."
+          },
+          {
+            "label": "320 MB for 1M Entries",
+            "detail": "Raising nf_conntrack_max to 1M costs only ~320 MB of kernel slab memory."
+          }
+        ],
+        "summary": "Sizing nf_conntrack_max=1M with matching hashsize or using eBPF bypass prevents silent NAT packet drops.",
+        "caption": "Raising nf_conntrack_max to 1M (hashsize=262K) or bypassing via eBPF prevents silent NAT SYN drops."
+      }
+    },
+    {
+      "level": "advanced",
+      "title": "Stage 6: Graceful Draining & Avoiding Keep-Alive Race EOFs",
+      "purpose": "Coordinate upstream pod shutdowns and idle timeouts so pooled sockets never hit stale 502s.",
+      "explanation": "When an upstream pod scales down or closes an idle Keep-Alive socket at the exact millisecond the gateway writes a new request onto it, the gateway receives an `RST`/EOF and returns HTTP 502. Setting gateway `keepalive_timeout` (55s) < upstream `keepalive_timeout` (65s) and enabling idempotent-only retry on `GET`/`HEAD` eliminates race 502s.",
+      "codeExample": "def is_idempotent_retry_safe(http_method: str, bytes_sent_to_upstream: int) -> bool:\n    if bytes_sent_to_upstream == 0:\n        return True\n    return http_method.upper() in {'GET', 'HEAD', 'OPTIONS', 'PUT', 'DELETE'}\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "ADVANCED \u00b7 KEEP-ALIVE RACE",
+        "title": "Eliminating Stale-Socket 502s with Asymmetric Timeouts & Safe Retries",
+        "nodes": [
+          {
+            "id": "gw",
+            "label": "Gateway Pool (55s Idle)",
+            "sub": "Closes idle socket first",
+            "role": "Client Timer"
+          },
+          {
+            "id": "up",
+            "label": "Upstream Server (65s Idle)",
+            "sub": "Never races gateway write",
+            "role": "Server Timer"
+          },
+          {
+            "id": "drn",
+            "label": "SIGTERM preStop Drain",
+            "sub": "Send Connection: close",
+            "role": "Graceful Exit"
+          },
+          {
+            "id": "ret",
+            "label": "Idempotent Socket Retry",
+            "sub": "Retry GET/0-byte EOF once",
+            "role": "Zero 502s"
+          }
+        ],
+        "edges": [
+          {
+            "from": "gw",
+            "to": "up",
+            "label": "55s < 65s timeout margin"
+          },
+          {
+            "from": "drn",
+            "to": "gw",
+            "label": "Signal graceful drain"
+          },
+          {
+            "from": "up",
+            "to": "ret",
+            "label": "Recover rare EOF"
+          }
+        ],
+        "cards": [
+          {
+            "label": "10-Second Timeout Gap",
+            "detail": "A 10s gap (55s client vs 65s server) prevents simultaneous close/write race conditions."
+          },
+          {
+            "label": "Never Retry Non-Idempotent POSTs",
+            "detail": "Only retry a broken Keep-Alive socket on POST if 0 bytes were written or an Idempotency-Key is present."
+          }
+        ],
+        "summary": "Asymmetric idle timeouts (55s < 65s), graceful Connection: close draining, and safe EOF retries eliminate Keep-Alive 502s.",
+        "caption": "55s gateway vs 65s upstream idle timeouts, graceful draining, and safe EOF retries prevent Keep-Alive race 502s."
+      }
+    },
+    {
+      "level": "advanced",
+      "title": "Stage 7: Load-Test Verification & Continuous Port SLOs",
+      "purpose": "Validate 40K+ req/s stability in staging and alert on TIME_WAIT regressions in production.",
+      "explanation": "Before shipping, run a 10-minute 40K req/s soak test while asserting `ss -tan state time-wait | wc -l < 500`, zero `EADDRNOTAVAIL`, and `< 1%` new-connections-per-request ratio. In production, alert when `TCP_tw / ip_local_port_range > 0.60` or `TCPTimeWaitOverflow > 0`.",
+      "codeExample": "def verify_soak_test(rps: int, tw_sockets: int, new_conns_per_sec: int, eaddr_errors: int) -> bool:\n    if eaddr_errors > 0:\n        return False\n    if tw_sockets >= 500:\n        return False\n    return (new_conns_per_sec / max(1, rps)) < 0.01\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "ADVANCED \u00b7 VERIFICATION & SLOS",
+        "title": "40K Req/Sec Soak Verification & Production Port-Churn Alerts",
+        "nodes": [
+          {
+            "id": "soak",
+            "label": "40K Req/Sec Soak Test",
+            "sub": "10-min sustained load",
+            "role": "Staging Gate"
+          },
+          {
+            "id": "cnt",
+            "label": "Assert TIME_WAIT < 500",
+            "sub": "New conns < 1% of RPS",
+            "role": "Reuse Check"
+          },
+          {
+            "id": "prom",
+            "label": "node_sockstat_TCP_tw",
+            "sub": "Alert > 60% port range",
+            "role": "Prod Telemetry"
+          },
+          {
+            "id": "zero",
+            "label": "Zero EADDRNOTAVAIL",
+            "sub": "Sub-5ms gateway P99",
+            "role": "SLO Met"
+          }
+        ],
+        "edges": [
+          {
+            "from": "soak",
+            "to": "cnt",
+            "label": "Sample ss -s every 5s"
+          },
+          {
+            "from": "cnt",
+            "to": "zero",
+            "label": "Pass CI release gate"
+          },
+          {
+            "from": "prom",
+            "to": "zero",
+            "label": "Guard production"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Regression Detection",
+            "detail": "A single NGINX config refactor dropping proxy_http_version 1.1 spikes new_conns/RPS to 100% immediately in staging."
+          },
+          {
+            "label": "Zero 502s at 40K+ RPS",
+            "detail": "Persistent pooling + tuned sysctls keep open sockets < 500 and eliminate EADDRNOTAVAIL."
+          }
+        ],
+        "summary": "40K req/s soak assertions (TIME_WAIT < 500) and >60% port-range alerts prevent Keep-Alive regressions from reaching production.",
+        "caption": "40K req/s soak checks and node_sockstat_TCP_tw alerts verify < 500 open sockets and zero EADDRNOTAVAIL."
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "prob-tw-1",
+        "question": "You added `keepalive 256;` to an NGINX `upstream` block, but `ss -s` still shows 28,000 `TIME_WAIT` sockets and `EADDRNOTAVAIL` errors. Why?",
+        "options": [
+          {
+            "id": "a",
+            "text": "NGINX defaults to HTTP/1.0 (`Connection: close`) to upstreams unless `proxy_http_version 1.1;` and `proxy_set_header Connection \"\";` are also set.",
+            "correct": true,
+            "feedback": "Correct. Without HTTP/1.1 and clearing the Connection header, NGINX closes every upstream socket after 1 request."
+          },
+          {
+            "id": "b",
+            "text": "Because `keepalive 256;` only works for UDP traffic.",
+            "correct": false,
+            "feedback": "Incorrect. NGINX upstream keepalive is specifically for TCP/HTTP connections."
+          },
+          {
+            "id": "c",
+            "text": "Because 256 sockets is larger than 65,535.",
+            "correct": false,
+            "feedback": "Incorrect. 256 is tiny compared to 65,535."
+          },
+          {
+            "id": "d",
+            "text": "Because Linux forbids Keep-Alive on port 8080.",
+            "correct": false,
+            "feedback": "Incorrect. Keep-Alive works on any TCP port."
+          }
+        ],
+        "explanation": "NGINX proxy_pass uses HTTP/1.0 by default, which sends Connection: close unless proxy_http_version 1.1 and empty Connection header are set."
+      },
+      {
+        "id": "prob-tw-2",
+        "question": "Why should the gateway's Keep-Alive idle timeout (55s) be set slightly SHORTER than the upstream server's Keep-Alive timeout (65s)?",
+        "options": [
+          {
+            "id": "a",
+            "text": "So the gateway closes idle sockets cleanly on its own schedule rather than racing with an upstream close and hitting EOF/502.",
+            "correct": true,
+            "feedback": "Correct. Asymmetric timeouts prevent the gateway from writing a request onto a socket the upstream just closed."
+          },
+          {
+            "id": "b",
+            "text": "To force the upstream server to enter `TIME_WAIT` instead of the gateway.",
+            "correct": false,
+            "feedback": "Incorrect. Only idle sockets (after 55s) are closed, which is negligible churn."
+          },
+          {
+            "id": "c",
+            "text": "Because TCP `TIME_WAIT` is 55 seconds.",
+            "correct": false,
+            "feedback": "Incorrect. Linux TIME_WAIT is 60 seconds."
+          },
+          {
+            "id": "d",
+            "text": "To disable `nf_conntrack`.",
+            "correct": false,
+            "feedback": "Incorrect. Idle timeouts do not disable conntrack."
+          }
+        ],
+        "explanation": "Making client idle timeout < server idle timeout avoids close/write race conditions that cause sporadic 502s."
+      },
+      {
+        "id": "prob-tw-3",
+        "question": "What happens if `nf_conntrack` fills up on a Kubernetes NAT node during a `TIME_WAIT` storm?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Linux silently drops new incoming/outbound SYN packets, causing 1s-3s TCP retransmit stalls or timeouts.",
+            "correct": true,
+            "feedback": "Correct. Raising nf_conntrack_max (or using eBPF/NOTRACK) prevents silent conntrack drops."
+          },
+          {
+            "id": "b",
+            "text": "Linux automatically doubles `ip_local_port_range`.",
+            "correct": false,
+            "feedback": "Incorrect. Kernel sysctls do not auto-scale on conntrack exhaustion."
+          },
+          {
+            "id": "c",
+            "text": "TCP switches to UDP automatically.",
+            "correct": false,
+            "feedback": "Incorrect. TCP never falls back to UDP."
+          },
+          {
+            "id": "d",
+            "text": "All existing Keep-Alive sockets gain 2x bandwidth.",
+            "correct": false,
+            "feedback": "Incorrect. Conntrack exhaustion drops new connections."
+          }
+        ],
+        "explanation": "A full nf_conntrack table drops new SYNs silently, requiring higher nf_conntrack_max or eBPF bypass."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Fix 502 Bad Gateway port-exhaustion errors by turning on HTTP Keep-Alive connection pooling so the gateway reuses 256 sockets instead of opening new ones.",
+      "keyTakeaway": "Reusing persistent connections drops open sockets from 28,232 in `TIME_WAIT` to under 500.",
+      "byteSummary": "If an API gateway opens a new TCP connection for every request, it runs out of ports at 470 req/s and returns 502 errors.\n\nTurning on HTTP Keep-Alive connection pooling lets 40,000+ req/s share 256 open sockets."
+    },
+    "intermediate": {
+      "summary": "Fix NGINX/Envoy Keep-Alive headers (`proxy_http_version 1.1`), widen `ip_local_port_range` to `1024..65535`, and enable `tcp_tw_reuse=1` in pod namespaces.",
+      "keyTakeaway": "256-socket Keep-Alive pooling + 64,511 ephemeral ports + `tcp_tw_reuse=1` eliminates `EADDRNOTAVAIL` at 40K+ req/s.",
+      "byteSummary": "Production Scenario #29's 35% `EADDRNOTAVAIL` failure was caused by missing HTTP/1.1 Keep-Alive headers pinning 28,232 ports in 60s `TIME_WAIT`.\n\nEnabling 256-socket Keep-Alive pooling, widening `ip_local_port_range` to `1024..65535`, and setting `tcp_tw_reuse=1` eliminates port exhaustion."
+    },
+    "advanced": {
+      "summary": "Scale >64K concurrent sockets with multi-IP SNAT + `IP_BIND_ADDRESS_NO_PORT`, size `nf_conntrack_max=1M`, align 55s<65s idle timeouts, and alert on `TCP_tw`.",
+      "keyTakeaway": "Asymmetric idle timeouts (55s < 65s) prevent Keep-Alive race 502s, while `nf_conntrack_max=1M` and `TCP_tw` alerts protect NAT nodes.",
+      "byteSummary": "For >64K concurrent sockets to one VIP, use 4-IP SNAT + `IP_BIND_ADDRESS_NO_PORT` and size `nf_conntrack_max=1M` (`hashsize=262K`) to prevent silent SYN drops.\n\nKeep gateway idle timeout (55s) below upstream (65s), run 40K/s soak checks (`TIME_WAIT < 500`), and alert at 60% `TCP_tw`."
+    }
+  }
+}

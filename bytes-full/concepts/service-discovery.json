@@ -1,0 +1,539 @@
+{
+  "id": "concept-service-discovery",
+  "slug": "service-discovery",
+  "name": "Service Discovery, Lease Heartbeats & Control-Plane Resilience",
+  "domain": "Distributed Systems & Storage",
+  "tagline": "Why hardcoded IPs break on autoscaling and DNS caching routes traffic to dead pods\u2014and how ephemeral leases, xDS watch streams, and panic-mode thresholds prevent discovery outages.",
+  "purpose": "Choose between client-side xDS/watch discovery and server-side load balancers, size heartbeat TTLs without thundering herds, and survive registry outages via static stability.",
+  "pedagogicalFramework": "PRIME",
+  "prerequisites": [
+    {
+      "title": "Client-Side vs. Server-Side Discovery",
+      "summary": "Server-side discovery routes through a dedicated load balancer (ALB/kube-proxy) that queries the registry; client-side discovery (gRPC xDS / Eureka) pushes live endpoint lists directly to callers."
+    },
+    {
+      "title": "Ephemeral Session Leases & TTLs",
+      "summary": "Instances register with a time-bounded lease renewed via heartbeats; crashed nodes expire automatically when heartbeats stop, while registries require panic thresholds to avoid mass eviction during network blips."
+    }
+  ],
+  "spark": {
+    "summary": "Relying on OS-level DNS caching (`networkaddress.cache.ttl`) leaves JVM and Python clients sending traffic to terminated pod IPs for minutes after autoscaling scale-down, while aggressive 1-second registry polling hammers etcd/Consul CPUs at 10,000-pod scale. Production service discovery uses push-based streaming watches (gRPC xDS / EndpointSlices), monotonic lease heartbeats with jitter, and Envoy-style panic-mode fallbacks so control-plane partitions never drop healthy data-plane traffic.",
+    "keyTakeaway": "When routing traffic across dynamic, autoscaling fleets, pair push-based endpoint watch streams with local last-known-good endpoint caching and a panic-mode eviction floor so dead instances drain within seconds while control-plane outages never wipe out healthy routing tables.",
+    "byteSummary": "Static IP config files fail the moment containers autoscale or fail over across Availability Zones. Yet naive DNS-based service discovery introduces two classic production bugs: sticky client DNS caches that ignore short TTLs, and synchronous DNS lookup storms on every unpooled connection.\n\nModern microservice meshes solve this with streaming watch protocols (such as Envoy xDS or Kubernetes EndpointSlices) that push incremental endpoint diffs in milliseconds, paired with active outlier detection (ejecting instances returning consecutive 5xxs).\n\nJust as critical is protecting the registry itself: if a transient network partition causes 60% of healthy pods to miss a heartbeat simultaneously, purging all 60% overloads the remaining 40%. A 50% panic-mode threshold keeps routing across all endpoints until control-plane health recovers."
+  },
+  "learningJourney": [
+    {
+      "id": "01-dns-caching-and-polling-traps",
+      "eyebrow": "STAGE 01 \u00b7 PROBLEM & DISCOVERY FAILURE MODES",
+      "title": "Why DNS TTLs & Registry Polling Loops Break Dynamic Fleets",
+      "level": "foundation",
+      "purpose": "Diagnose stale DNS caching, connection-pool pinning, and registry CPU storms.",
+      "explanation": {
+        "foundation": "When an autoscaler terminates 20 pods during scale-down or rolling deploy, three discovery failure modes hit naive clients:\n1. **Stale DNS Cache**: Older JVM runtimes defaulted to caching positive DNS lookups indefinitely (or for 30-60s), routing thousands of requests into dead IPs (`ConnectTimeoutException`).\n2. **HTTP/2 & gRPC Connection Pinning**: Even when DNS updates in 1 second, a client holding open a single multiplexed HTTP/2 or gRPC TCP socket keeps sending 100% of RPCs to one existing pod, ignoring newly scaled-out pods.\n3. **Polling Thundering Herd**: 5,000 pods polling `/v1/catalog/service/payments` every 2 seconds generates 2,500 full-payload reads/sec against the registry.",
+        "core": "Production discovery replaces blind polling with **long-lived streaming watches** (gRPC xDS ADS or etcd/Consul blocking queries with `X-Consul-Index` wait-index) and **L7 load-aware connection pools** that rebalance streams across newly added endpoints.",
+        "deepDive": "**AP vs. CP Registry Trade-Off**: CP registries (etcd, ZooKeeper, Consul Raft) guarantee linearizable endpoint lists and fencing leases\u2014ideal for leader election and database primaries, but stall writes if quorum is lost. AP registries (Netflix Eureka) keep serving stale endpoint lists during network partitions\u2014prioritizing availability because an active health check on the caller catches a dead IP faster than blocking discovery. [INSERT YOUR BENCHMARK / PROD NOTE]"
+      },
+      "sectionDiagram": {
+        "kind": "behavior-transition",
+        "eyebrow": "POLLING DNS VS. STREAMING XDS DISCOVERY",
+        "title": "Eliminating Stale IP Routing & Registry Polling Storms",
+        "before": {
+          "label": "Naive DNS + Periodic Polling",
+          "metrics": [
+            "30-60s stale IP blackholes",
+            "O(N^2) polling load",
+            "HTTP/2 pinned to old pods"
+          ],
+          "steps": [
+            "Pod terminates -> DNS record lingers in cache",
+            "Client keeps sending traffic to dead IP",
+            "5,000 clients poll full service catalog every 2s"
+          ]
+        },
+        "after": {
+          "label": "Streaming Watch + Outlier Ejection",
+          "metrics": [
+            "<500 ms incremental diff push",
+            "Static last-known-good cache",
+            "L7 EWMA + outlier ejection"
+          ],
+          "steps": [
+            "Pod receives SIGTERM -> deregisters immediately",
+            "Control plane pushes delta over gRPC xDS stream",
+            "Client drains old socket & balances across new pods"
+          ]
+        }
+      }
+    },
+    {
+      "id": "02-client-vs-server-discovery",
+      "eyebrow": "STAGE 02 \u00b7 REPRESENTATION & TOPOLOGY",
+      "title": "Client-Side Discovery (xDS) vs. Server-Side Load Balancers",
+      "level": "core",
+      "purpose": "Compare direct client-side routing against L4/L7 proxy discovery across hop latency and polyglot support.",
+      "explanation": {
+        "foundation": "- **Server-Side Discovery**: Clients send requests to a stable VIP/DNS name backed by an ALB, NLB, or Envoy ingress gateway. The load balancer queries the service registry and forwards traffic. Simple for polyglot clients, adds 1 network hop (~0.5-1 ms).\n- **Client-Side Discovery**: Service instances register in etcd/Consul, and a lightweight SDK or local sidecar (Envoy) subscribes to endpoint updates and routes directly to backend pods with zero extra proxy hop.",
+        "core": "**Graceful Deregistration Sequence**: When Kubernetes terminates a pod, endpoint removal from iptables/xDS happens *asynchronously* in parallel with `SIGTERM`. Always configure a `preStop: sleep 5` hook and drain in-flight HTTP/gRPC requests before closing the listening socket so zero in-flight requests hit `Connection reset by peer`.",
+        "deepDive": "Combining registry watch streams with **Passive Outlier Detection** (ejecting an endpoint locally for 15s if it returns 3 consecutive 502/503s) masks registry propagation delays sub-second."
+      },
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "CONTROL-PLANE & DATA-PLANE SPLIT",
+        "title": "Streaming Endpoint Updates With Local Static Cache & Outlier Detection",
+        "graphNodes": [
+          {
+            "id": "reg",
+            "label": "Service Registry (etcd / Consul)"
+          },
+          {
+            "id": "xds",
+            "label": "xDS Control Plane"
+          },
+          {
+            "id": "cli",
+            "label": "Caller SDK / Sidecar (Local Cache)"
+          },
+          {
+            "id": "p1",
+            "label": "Payment Pod 1 (Healthy)"
+          },
+          {
+            "id": "p2",
+            "label": "Payment Pod 2 (Draining)"
+          }
+        ],
+        "graphEdges": [
+          {
+            "from": "reg",
+            "to": "xds",
+            "label": "Watch lease & health events"
+          },
+          {
+            "from": "xds",
+            "to": "cli",
+            "label": "Incremental delta stream"
+          },
+          {
+            "from": "cli",
+            "to": "p1",
+            "label": "Direct L7 RPC (EWMA)"
+          },
+          {
+            "from": "cli",
+            "to": "p2",
+            "label": "Stop new RPCs on drain"
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-lease-registry-panic-mode",
+      "eyebrow": "STAGE 03 \u00b7 INVARIANT & SAFE IMPLEMENTATION",
+      "title": "Lease-Bounded Service Directory With Panic-Mode Threshold in Java",
+      "level": "core",
+      "purpose": "Implement a thread-safe endpoint resolver with monotonic lease expiry and Envoy-style 50% panic-mode protection.",
+      "explanation": {
+        "foundation": "If a transient switch flap causes 70% of backend instances to miss one heartbeat window, purging all 70% concentrates 100% of cluster traffic onto the surviving 30%\u2014triggering an immediate cascading overload.",
+        "core": "```java\nimport java.time.Instant;\nimport java.util.*;\nimport java.util.concurrent.ConcurrentHashMap;\n\npublic final class ResilientServiceDirectory {\n    public record ServiceEndpoint(String instanceId, String host, int port, long leaseExpiresAtMillis, boolean outlierEjected) {}\n\n    private final ConcurrentHashMap<String, ServiceEndpoint> endpoints = new ConcurrentHashMap<>();\n    private final double panicThresholdRatio; // e.g. 0.50: if <50% healthy, route to all known endpoints\n\n    public ResilientServiceDirectory(double panicThresholdRatio) {\n        if (panicThresholdRatio <= 0.0 || panicThresholdRatio > 1.0) {\n            throw new IllegalArgumentException(\"panicThresholdRatio must be in (0.0, 1.0]\");\n        }\n        this.panicThresholdRatio = panicThresholdRatio;\n    }\n\n    public void heartbeat(String instanceId, String host, int port, long ttlMillis) {\n        long expiresAt = Instant.now().toEpochMilli() + Math.max(1_000L, ttlMillis);\n        endpoints.put(instanceId, new ServiceEndpoint(instanceId, host, port, expiresAt, false));\n    }\n\n    public List<ServiceEndpoint> resolveRoutableEndpoints() {\n        long now = Instant.now().toEpochMilli();\n        List<ServiceEndpoint> all = List.copyOf(endpoints.values());\n        if (all.isEmpty()) return List.of();\n\n        List<ServiceEndpoint> healthy = all.stream()\n                .filter(ep -> ep.leaseExpiresAtMillis() > now && !ep.outlierEjected())\n                .toList();\n\n        double healthyRatio = (double) healthy.size() / all.size();\n        if (healthyRatio < panicThresholdRatio) {\n            // Panic mode: assume control-plane heartbeat partition and keep routing across all known endpoints\n            return all;\n        }\n        return healthy;\n    }\n}\n```",
+        "deepDive": "Notice how `healthyRatio < panicThresholdRatio` implements Envoy's exact panic-mode invariant: when mass lease expiry indicates a monitoring or network partition rather than simultaneous hardware death, routing across all cached endpoints prevents self-inflicted overload."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "ZERO-DOWNTIME POD DRAIN",
+        "title": "Coordinating SIGTERM, Registry Deregistration & Connection Draining",
+        "actors": [
+          "Orchestrator",
+          "Pod Instance",
+          "Registry / xDS",
+          "Caller Client"
+        ],
+        "events": [
+          {
+            "from": "Orchestrator",
+            "to": "Pod Instance",
+            "label": "1. Send SIGTERM & mark Terminating"
+          },
+          {
+            "from": "Orchestrator",
+            "to": "Registry / xDS",
+            "label": "2. Push endpoint removal delta (<300 ms)"
+          },
+          {
+            "from": "Pod Instance",
+            "to": "Pod Instance",
+            "label": "3. Sleep 5s preStop while finishing active RPCs"
+          },
+          {
+            "from": "Registry / xDS",
+            "to": "Caller Client",
+            "label": "4. Client removes pod from pool & closes idle sockets"
+          }
+        ],
+        "summary": "Parallel deregistration plus a preStop drain window eliminates 502 errors during rolling deployments."
+      }
+    },
+    {
+      "id": "04-scale-and-decision",
+      "eyebrow": "STAGE 04 \u00b7 MECHANICS AT SCALE",
+      "title": "Large-Cluster Watch Fan-Out & When Managed LBs Beat Service Meshes",
+      "level": "deepDive",
+      "purpose": "Prevent O(Pods * Services) watch amplification in huge clusters and avoid unnecessary sidecar complexity.",
+      "explanation": {
+        "foundation": "In a 5,000-node Kubernetes cluster where every pod runs an Envoy sidecar watching all 800 services, a single pod restart triggers $5,000 \\times 800$ watch notifications\u2014saturating kube-apiserver and control-plane CPU.",
+        "core": "Scope sidecar/SDK watches strictly to declared **explicit upstream dependencies** (`Sidecar` egress allowlists) and coalesce rapid endpoint churn into 100-250 ms debounce windows.\n\n**When NOT to Build Client-Side xDS Discovery**: For teams running < 50 microservices on AWS/GCP or standard Kubernetes, managed ALBs/NLBs or native Kubernetes `Service` + `EndpointSlices` with gRPC round-robin load balancing ship with zero control-plane maintenance toil.",
+        "deepDive": "Keep service discovery data planes statically stable: persist the last valid endpoint snapshot on local disk/RAM so pods rebooting during a registry outage still know how to reach core dependencies."
+      },
+      "decisionFramework": {
+        "problem": "How to route internal RPCs across 300 autoscaling microservices with sub-second failover and zero extra proxy hops.",
+        "naiveSolution": "Use standard OS DNS lookups with a 60-second TTL and single persistent HTTP/2 connections.",
+        "whyItFails": "60-second DNS TTLs blackhole traffic into terminated pods, while single HTTP/2 connections pin load onto old pods after scale-out.",
+        "alternatives": "Compare standard OS DNS, internal L7 ALB server-side discovery, and gRPC xDS client-side watch discovery.",
+        "decision": "Use internal L7 ALBs for heterogeneous HTTP REST services where +1 ms proxy hop is acceptable, and gRPC xDS watch streams with outlier detection and panic-mode thresholds for ultra-low-latency internal RPC meshes.",
+        "tradeOffs": "Eliminates extra proxy hops and stale DNS caches in exchange for control-plane xDS operational management."
+      },
+      "decisionExercise": {
+        "prompt": "During a brief control-plane network glitch, 65% of your healthy payment pods fail to renew their Consul TTL heartbeats within the 10-second window. Without a panic-mode threshold, Consul marks 65% of pods unhealthy and routes 100% of live traffic to the remaining 35%, crashing them from overload. What prevents this cascade?",
+        "options": [
+          {
+            "id": "panic-threshold",
+            "label": "Enforce a 50% panic-mode threshold: when healthy endpoints drop below 50%, ignore health-check filtering and load-balance across all known endpoints.",
+            "isCorrect": true,
+            "explanation": "Correct: mass simultaneous lease expiry signals a control-plane or network monitoring failure rather than 65% simultaneous hardware death."
+          },
+          {
+            "id": "shorten-ttl-1s",
+            "label": "Shorten heartbeat TTL from 10 seconds to 1 second so pods re-register faster.",
+            "isCorrect": false,
+            "explanation": "A 1-second TTL makes false-positive mass evictions during brief network jitter 10x more frequent and increases registry write load 10x."
+          },
+          {
+            "id": "disable-health-checks",
+            "label": "Disable all TTL heartbeats permanently so pods are never removed.",
+            "isCorrect": false,
+            "explanation": "Without heartbeats, crashed or terminated pods remain in the routing table forever."
+          }
+        ]
+      },
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "ENDPOINT LEASE & PANIC-MODE STATES",
+        "title": "Transitioning Between Healthy Filtering and Control-Plane Panic Fallback",
+        "states": [
+          {
+            "id": "healthy",
+            "label": "HEALTHY_ACTIVE"
+          },
+          {
+            "id": "outlier",
+            "label": "OUTLIER_EJECTED"
+          },
+          {
+            "id": "expired",
+            "label": "LEASE_EXPIRED"
+          },
+          {
+            "id": "panic",
+            "label": "PANIC_MODE_ALL_ROUTABLE"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "healthy",
+            "to": "outlier",
+            "label": "3 consecutive 5xxs (local 15s eject)"
+          },
+          {
+            "from": "healthy",
+            "to": "expired",
+            "label": "Heartbeat TTL missed"
+          },
+          {
+            "from": "expired",
+            "to": "panic",
+            "label": "Healthy ratio < 50% threshold"
+          },
+          {
+            "from": "panic",
+            "to": "healthy",
+            "label": "Heartbeats recover >= 50%"
+          }
+        ]
+      }
+    },
+    {
+      "id": "05-assumptions-glossary",
+      "eyebrow": "STAGE 05 \u00b7 ASSUMPTIONS, LIMITATIONS & GLOSSARY",
+      "title": "Registry Assumptions & Canonical Service Discovery Glossary",
+      "level": "deepDive",
+      "purpose": "Summarize heartbeat jitter assumptions and canonical service discovery terms.",
+      "explanation": {
+        "foundation": "**Assumptions & Limitations**:\n- **Jittered Heartbeat Intervals**: Assumes heartbeat timers include +/-20% random jitter so synchronized pod startups do not hammer the registry at identical millisecond ticks.\n- **Active Outlier Detection**: Assumes callers track transport/5xx errors locally so dead instances are ejected within milliseconds rather than waiting for full lease TTL expiry.",
+        "core": "**Canonical Glossary**:\n- **Client-Side Discovery**: Pattern where callers query/watch the service registry directly and execute load balancing locally.\n- **Server-Side Discovery**: Pattern where callers hit a dedicated load balancer or router that resolves backend endpoints.\n- **Panic Mode**: Load-balancer safety mechanism that routes to all configured endpoints when the healthy fraction falls below a critical threshold (typically 50%).\n- **Outlier Detection**: Passive data-plane health checking that temporarily ejects endpoints returning consecutive errors or latency spikes.",
+        "deepDive": "Combining push watches, local static caches, and panic thresholds keeps service routing resilient even when the registry itself degrades."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "RESILIENT DISCOVERY STACK",
+        "title": "Four Safeguards for Dynamic Service Routing",
+        "nodes": [
+          {
+            "id": "d1",
+            "label": "1. Jittered Leases",
+            "detail": "Prevents synchronized heartbeat storms"
+          },
+          {
+            "id": "d2",
+            "label": "2. Incremental Watches",
+            "detail": "Pushes endpoint diffs in <500 ms"
+          },
+          {
+            "id": "d3",
+            "label": "3. Local Outlier Ejection",
+            "detail": "Drops failing nodes on first 5xx burst"
+          },
+          {
+            "id": "d4",
+            "label": "4. 50% Panic Threshold",
+            "detail": "Prevents mass eviction during partitions"
+          }
+        ],
+        "cards": [
+          {
+            "title": "Sub-Second Failover",
+            "body": "Outlier detection reacts in milliseconds without waiting for lease TTLs."
+          },
+          {
+            "title": "Static Stability",
+            "body": "Cached endpoint snapshots survive complete control-plane outages."
+          }
+        ],
+        "summary": "Layered control-plane watches and data-plane health checks eliminate stale routing and cascade risks."
+      }
+    }
+  ],
+  "simulation": {
+    "title": "Service Discovery Lease Expiry & Panic-Mode Simulator",
+    "nodes": [
+      {
+        "id": "reg",
+        "label": "Discovery Registry",
+        "role": "Tracks TTL Leases"
+      },
+      {
+        "id": "lb",
+        "label": "Client Router",
+        "role": "50% Panic Threshold"
+      },
+      {
+        "id": "p1",
+        "label": "Pod 1",
+        "role": "Heartbeat OK"
+      },
+      {
+        "id": "p2",
+        "label": "Pods 2-4",
+        "role": "Heartbeat Delayed (Network Flap)"
+      }
+    ],
+    "edges": [
+      {
+        "from": "reg",
+        "to": "lb",
+        "label": "Push lease status"
+      },
+      {
+        "from": "lb",
+        "to": "p1",
+        "label": "Route traffic"
+      },
+      {
+        "from": "lb",
+        "to": "p2",
+        "label": "Panic-mode fallback route"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Single Pod Crash (75% Healthy)",
+        "actionLabel": "Evict 1 expired pod; route across remaining 3",
+        "status": "healthy",
+        "activeNodeIds": [
+          "reg",
+          "lb",
+          "p1"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "healthy_pct": 75,
+          "panic_mode": false,
+          "dropped_rpcs": 0
+        },
+        "explanation": "75% >= 50% threshold, so the router cleanly excludes the single crashed pod."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Control-Plane Flap (25% Healthy -> Panic Mode)",
+        "actionLabel": "Healthy < 50% -> engage panic mode across all 4 pods",
+        "status": "warning",
+        "activeNodeIds": [
+          "lb",
+          "p1",
+          "p2"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "healthy_pct": 25,
+          "panic_mode": true,
+          "pod1_cpu_pct": 58
+        },
+        "explanation": "Panic mode prevents 100% of cluster traffic from slamming onto Pod 1 during a heartbeat partition."
+      }
+    ]
+  },
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-sd-1",
+        "question": "Why does standard OS DNS caching often fail during rapid container autoscaling or rolling deployments?",
+        "options": [
+          {
+            "id": "a",
+            "text": "DNS packets cannot carry IPv4 addresses inside containers.",
+            "correct": false,
+            "feedback": "DNS resolves A/AAAA records normally; caching TTLs and persistent sockets are the issue."
+          },
+          {
+            "id": "b",
+            "text": "Clients/runtimes cache resolved IPs beyond pod termination, and existing persistent HTTP/2 or gRPC connections remain pinned to older pods until recycled.",
+            "correct": true,
+            "feedback": "Correct: stale DNS caches route new connections to dead IPs while long-lived multiplexed sockets ignore newly added pods."
+          },
+          {
+            "id": "c",
+            "text": "DNS servers refuse to resolve internal `.svc.cluster.local` domains.",
+            "correct": false,
+            "feedback": "CoreDNS resolves cluster domains, though `ndots:5` can amplify query volume."
+          },
+          {
+            "id": "d",
+            "text": "DNS requires a manual restart after every pod deployment.",
+            "correct": false,
+            "feedback": "Cluster DNS updates dynamically, but client-side caches lag behind."
+          }
+        ],
+        "explanation": "Streaming L7 discovery (like xDS) and connection-level load balancing solve both stale IP caching and HTTP/2 socket pinning."
+      },
+      {
+        "id": "kc-sd-2",
+        "question": "What is the purpose of a 50% 'panic mode' threshold in service discovery and load balancing?",
+        "options": [
+          {
+            "id": "a",
+            "text": "To shut down the entire service whenever half the pods are busy.",
+            "correct": false,
+            "feedback": "Shutting down traffic causes a total outage."
+          },
+          {
+            "id": "b",
+            "text": "When the fraction of healthy endpoints drops below 50%, the router assumes a control-plane/heartbeat partition and routes across all known endpoints instead of overloading the tiny surviving subset.",
+            "correct": true,
+            "feedback": "Correct: panic mode prevents a monitoring glitch from concentrating 100% of traffic onto a small fraction of pods."
+          },
+          {
+            "id": "c",
+            "text": "To double the heartbeat frequency whenever CPU exceeds 50%.",
+            "correct": false,
+            "feedback": "Doubling heartbeats increases load during stress."
+          },
+          {
+            "id": "d",
+            "text": "To switch traffic from HTTPS to unencrypted HTTP.",
+            "correct": false,
+            "feedback": "Transport encryption is unrelated to panic mode."
+          }
+        ],
+        "explanation": "Panic mode protects data-plane capacity against false-positive mass lease expirations."
+      },
+      {
+        "id": "kc-sd-3",
+        "question": "What is the key architectural difference between Client-Side Discovery and Server-Side Discovery?",
+        "options": [
+          {
+            "id": "a",
+            "text": "In client-side discovery, callers watch the registry directly and load-balance locally without an extra proxy hop; in server-side discovery, callers hit a dedicated load balancer that resolves backends.",
+            "correct": true,
+            "feedback": "Correct: client-side discovery saves one network hop at the cost of smarter client SDKs/sidecars, while server-side discovery keeps clients thin."
+          },
+          {
+            "id": "b",
+            "text": "Client-side discovery never uses health checks.",
+            "correct": false,
+            "feedback": "Client-side discovery relies heavily on registry leases and local outlier detection."
+          },
+          {
+            "id": "c",
+            "text": "Server-side discovery only works for static bare-metal servers.",
+            "correct": false,
+            "feedback": "Cloud ALBs and Kubernetes Services dynamically watch container endpoints."
+          },
+          {
+            "id": "d",
+            "text": "Client-side discovery stores all routing tables in browser cookies.",
+            "correct": false,
+            "feedback": "Routing tables live in client/sidecar memory."
+          }
+        ],
+        "explanation": "Choose server-side LBs for simplicity and polyglot clients; choose client-side xDS when avoiding extra proxy hops at extreme scale."
+      },
+      {
+        "id": "kc-sd-4",
+        "question": "Why should Kubernetes pods pair SIGTERM handling with a short `preStop` sleep (e.g., 5 seconds) during rolling deployments?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Because Linux kernels ignore SIGTERM for 5 seconds.",
+            "correct": false,
+            "feedback": "Processes receive SIGTERM immediately."
+          },
+          {
+            "id": "b",
+            "text": "Endpoint removal from kube-proxy/xDS propagates asynchronously in parallel with SIGTERM; waiting briefly lets callers stop routing new traffic before the pod closes its listening socket.",
+            "correct": true,
+            "feedback": "Correct: delaying socket closure until endpoint removal propagates prevents 'Connection refused / reset' errors on in-flight requests."
+          },
+          {
+            "id": "c",
+            "text": "To force all active database transactions to roll back.",
+            "correct": false,
+            "feedback": "Graceful draining allows active requests to finish cleanly."
+          },
+          {
+            "id": "d",
+            "text": "To clear the container's image layer cache.",
+            "correct": false,
+            "feedback": "Container images are unaffected by pod termination hooks."
+          }
+        ],
+        "explanation": "Coordinating deregistration propagation with graceful connection draining eliminates deployment-induced 502 spikes."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "In cloud apps, servers constantly start up, scale down, and move IP addresses. Service discovery acts like a live phonebook where healthy servers register themselves with periodic heartbeats so callers always find active instances instead of dead IPs.",
+      "keyTakeaway": "When running services across autoscaling containers, use dynamic service discovery with health-checked heartbeats and graceful connection draining instead of hardcoded IPs or long DNS caches.",
+      "byteSummary": "Hardcoding server IP addresses breaks the first time a server crashes or autoscales. A service registry keeps a live list of healthy servers using periodic heartbeats, removing crashed servers automatically and helping clients spread traffic evenly."
+    },
+    "intermediate": {
+      "summary": "Replace polling and long DNS TTLs with push-based streaming watches (gRPC xDS / EndpointSlices), L7 connection-aware load balancing, `preStop` connection draining, and Envoy-style 50% panic-mode eviction floors.",
+      "keyTakeaway": "When routing traffic across dynamic, autoscaling fleets, pair push-based endpoint watch streams with local last-known-good endpoint caching and a panic-mode eviction floor so dead instances drain within seconds while control-plane outages never wipe out healthy routing tables.",
+      "byteSummary": "Push-based watch streams eliminate both stale DNS caches and O(N) registry polling storms, while passive outlier detection ejects failing instances within milliseconds. Including a 50% panic threshold ensures transient heartbeat network flaps never concentrate 100% of traffic onto a tiny subset of pods."
+    },
+    "advanced": {
+      "summary": "Bound O(Pods * Services) watch fan-out via explicit upstream dependency scoping and debounce windows, persist static last-known-good endpoint snapshots on disk for control-plane independence, and balance CP (etcd/Raft) vs. AP (Eureka) registry semantics.",
+      "keyTakeaway": "When scaling service discovery to thousands of nodes, scope watch subscriptions to declared upstream dependencies, debounce rapid endpoint churn, and persist static endpoint caches so control-plane partitions never disrupt data-plane routing.",
+      "byteSummary": "At multi-thousand-node scale, unscoped sidecar watches amplify single-pod restarts into millions of control-plane events. Scoping watches to explicit dependencies, debouncing endpoint diffs, and maintaining statically stable local routing caches keep both control and data planes resilient."
+    }
+  }
+}

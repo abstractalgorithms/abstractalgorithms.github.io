@@ -1,0 +1,820 @@
+{
+  "id": "design-serializable-oncall-scheduling-ssi",
+  "slug": "design-serializable-oncall-scheduling-ssi",
+  "title": "Design a Conflict-Free On-Call Shift & Resource Reservation Engine (SSI vs. Advisory Locks)",
+  "domain": "Software Engineering",
+  "tagline": "Eliminate Write-Skew coverage gaps and double-booked time slots at 15K ops/sec using PostgreSQL SSI, GiST exclusion constraints, and parent lock rows.",
+  "purpose": "Architect a conflict-free scheduling and reservation service that upholds multi-row invariants under high concurrency without distributed lock fragility.",
+  "spark": {
+    "summary": "Pair PostgreSQL SERIALIZABLE (SSI) + bounded 40001 retries with GiST exclusion constraints and parent-row locking for hot shifts to guarantee zero coverage gaps or double-bookings.",
+    "keyTakeaway": "If latency budgets leave no room for synchronous retries, use SSI for low-contention multi-row invariants, EXCLUDE USING gist for time-range overlaps, and SELECT FOR UPDATE on a parent row when hot-shift contention exceeds 5%.",
+    "byteSummary": "Building a high-concurrency on-call scheduling and room/resource reservation platform (handling 15K shift swaps, PTO approvals, and slot bookings/sec) exposes a classic database trap: **Write Skew**. Under standard `READ COMMITTED` or `REPEATABLE READ`, two engineers on the same rotation can simultaneously pass the `active_oncall >= 2` check and update their own disjoint rows—leaving a critical production service with zero on-call coverage. Similarly, two users booking `[10:00, 11:00)` and `[10:30, 11:30)` touch non-identical rows and double-book the same resource.\n\nA production-grade reservation engine eliminates both anomalies with a three-layer defense: (1) PostgreSQL `ISOLATION LEVEL SERIALIZABLE` (SSI) paired with a bounded, jittered `40001 serialization_failure` retry loop for multi-row rotation invariants; (2) `EXCLUDE USING gist (resource_id WITH =, slot_range WITH &&)` index constraints for ironclad zero-overlap interval guarantees; and (3) a materialized parent `rotation_shifts` lock row (`SELECT ... FOR UPDATE`) for ultra-hot shifts where optimistic SSI retries would exceed 5%.\n\nTo guarantee end-to-end safety under client retries and hot partitions, the API gateway enforces `Idempotency-Key` deduplication inside the same ACID transaction, shards rotations deterministically across PostgreSQL partitions, and caps `idle_in_transaction_session_timeout` to protect MVCC heap health."
+  },
+  "learningJourney": [
+    {
+      "id": "01-p-scale",
+      "eyebrow": "STAGE 01 · SCALE & INVARIANT BUDGET",
+      "title": "Sizing 15K Scheduling Ops/Sec with Zero Coverage Gaps or Double-Books",
+      "level": "foundation",
+      "purpose": "Define throughput, <40 ms p99 commit targets, and multi-row safety invariants for shifts and time-slot bookings.",
+      "explanation": {
+        "foundation": "Support 15,000 shift-change and slot-booking mutations/sec across 500K active teams/resources with <40 ms p99 write latency.",
+        "core": "Two strict invariants must never break under concurrency: (1) every active rotation maintains `oncall_count >= min_required` (preventing Write Skew), and (2) no resource ever holds two overlapping `[start, end)` reservations.",
+        "deepDive": "Client mobile/web retries on transient timeouts must be deduplicated via `Idempotency-Key` so a retried swap never executes twice."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 01 · SCALE & INVARIANT BUDGET",
+        "title": "Sizing 15K Scheduling Ops/Sec with Zero Coverage Gaps or Double-Books",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "15K Ops / Sec",
+            "sub": "500K Teams & Resources",
+            "role": "Write Load"
+          },
+          {
+            "id": "n2",
+            "label": "Coverage Invariant",
+            "sub": "oncall_count >= min_req",
+            "role": "No Write Skew"
+          },
+          {
+            "id": "n3",
+            "label": "Overlap Invariant",
+            "sub": "Disjoint [start, end)",
+            "role": "No Double-Book"
+          },
+          {
+            "id": "n4",
+            "label": "<40 ms p99 Commit",
+            "sub": "Idempotent API Retries",
+            "role": "Latency SLA"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "enforces"
+          },
+          {
+            "from": "n1",
+            "to": "n3",
+            "label": "enforces"
+          },
+          {
+            "from": "n2",
+            "to": "n4",
+            "label": "meets"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "meets"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Dual Invariants",
+            "detail": "Coverage rules span multiple rows (Write Skew); time-slot rules span continuous ranges (Phantom Overlap)."
+          },
+          {
+            "label": "Retry Safety",
+            "detail": "Every mutation carries a client-generated Idempotency-Key stored in the same DB transaction."
+          },
+          {
+            "label": "Latency Target",
+            "detail": "p99 commit under 40 ms including up to 2 SSI serialization retries."
+          }
+        ],
+        "summary": "15K scheduling ops/sec must uphold both multi-row coverage invariants and zero-overlap intervals below 40 ms p99.",
+        "caption": "15K scheduling ops/sec must uphold both multi-row coverage invariants and zero-overlap intervals below 40 ms p99."
+      }
+    },
+    {
+      "id": "02-p-arch",
+      "eyebrow": "STAGE 02 · CORE ARCHITECTURE",
+      "title": "SSI + GiST Exclusion Constraints + Transactional Idempotency",
+      "level": "foundation",
+      "purpose": "Combine PostgreSQL SSI, GiST range exclusion indexes, and in-tx Idempotency-Key claims in one ACID boundary.",
+      "explanation": {
+        "foundation": "Requests hit an API Gateway that validates auth and forwards `(team_id, shift_id, idempotency_key)` to sharded PostgreSQL.",
+        "core": "Inside `BEGIN ISOLATION LEVEL SERIALIZABLE`, the service claims the `Idempotency-Key`, verifies `oncall_count - 1 >= min_required`, updates the engineer's shift row, and writes an audit outbox row.",
+        "deepDive": "For time-range bookings, `EXCLUDE USING gist (resource_id WITH =, tstzrange(start_at, end_at) WITH &&)` rejects overlapping intervals with SQLSTATE `23P01` (`exclusion_violation`) at the index level."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 02 · CORE ARCHITECTURE",
+        "title": "SSI + GiST Exclusion Constraints + Transactional Idempotency",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "API Gateway",
+            "sub": "Auth + Idempotency-Key",
+            "role": "Ingress"
+          },
+          {
+            "id": "n2",
+            "label": "Sharded PostgreSQL",
+            "sub": "SERIALIZABLE (SSI)",
+            "role": "ACID Engine"
+          },
+          {
+            "id": "n3",
+            "label": "SIREAD / GiST Index",
+            "sub": "Catch Skew & Overlaps",
+            "role": "Conflict Guard"
+          },
+          {
+            "id": "n4",
+            "label": "Audit Outbox + Commit",
+            "sub": "Zero-Overlap Roster",
+            "role": "Durable Output"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "routes by team_id"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "enforces"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "commits"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Single ACID Boundary",
+            "detail": "Idempotency claim, invariant check, shift update, and audit log commit atomically."
+          },
+          {
+            "label": "23P01 vs. 40001",
+            "detail": "23P01 (exclusion_violation) is a hard 409 Conflict to the user; 40001 (serialization_failure) is retried."
+          },
+          {
+            "label": "Zero Out-of-Band Locks",
+            "detail": "No fragile Redis distributed locks that can expire mid-GC pause."
+          }
+        ],
+        "summary": "Combining SSI, GiST exclusion indexes, and transactional idempotency enforces invariants inside PostgreSQL without Redis locks.",
+        "caption": "Combining SSI, GiST exclusion indexes, and transactional idempotency enforces invariants inside PostgreSQL without Redis locks."
+      },
+      "decisionFramework": {
+        "problem": "How to implement Design a Conflict-Free On-Call Shift & Resource Reservation Engine (SSI vs. Advisory Locks) without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "If latency budgets leave no room for synchronous retries, use SSI for low-contention multi-row invariants, EXCLUDE USING gist for time-range overlaps, and SELECT FOR UPDATE on a parent row when hot-shift contention exceeds 5%.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Design a Conflict-Free On-Call Shift & Resource Reservation Engine (SSI vs. Advisory Locks) experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-p-impl",
+      "eyebrow": "STAGE 03 · SAFE IMPLEMENTATION",
+      "title": "Idempotent SSI Shift-Leave Handler with 40001 Backoff Retry",
+      "level": "intermediate",
+      "purpose": "Implement leave_oncall_shift using SERIALIZABLE isolation, explicit rollback on 40001, and domain error fast-fail.",
+      "explanation": {
+        "foundation": "Distinguish transient `40001` serialization conflicts (retryable) from genuine `InsufficientCoverageError` (non-retryable 409).",
+        "core": "```python\nimport random, time\n\ndef leave_oncall_shift(conn, rotation_id: str, user_id: str, min_req: int = 1, max_retries: int = 5) -> dict:\n    if min_req < 1:\n        raise ValueError('min_req must be >= 1')\n    for attempt in range(max_retries):\n        try:\n            with conn.cursor() as cur:\n                cur.execute('BEGIN ISOLATION LEVEL SERIALIZABLE')\n                cur.execute('SELECT COUNT(*) FROM shifts WHERE rotation_id = %s AND active = true', (rotation_id,))\n                active_cnt = cur.fetchone()[0]\n                if active_cnt - 1 < min_req:\n                    conn.rollback()\n                    raise RuntimeError('409_INSUFFICIENT_COVERAGE')\n                cur.execute('UPDATE shifts SET active = false WHERE rotation_id = %s AND user_id = %s', (rotation_id, user_id))\n                cur.execute('COMMIT')\n                return {'status': 'left', 'remaining': active_cnt - 1}\n        except Exception as exc:\n            conn.rollback()\n            if getattr(exc, 'sqlstate', None) == '40001' and attempt + 1 < max_retries:\n                time.sleep((0.01 * (2 ** attempt)) * random.uniform(0.5, 1.5))\n                continue\n            raise\n```",
+        "deepDive": "When `Alice` and `Bob` call `leave_oncall_shift` concurrently with `active_cnt=2` and `min_req=1`, SSI guarantees one commits (`remaining=1`) and the other hits `40001`, retries, sees `active_cnt=1`, and raises `409_INSUFFICIENT_COVERAGE`."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 03 · SAFE IMPLEMENTATION",
+        "title": "Idempotent SSI Shift-Leave Handler with 40001 Backoff Retry",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "BEGIN SERIALIZABLE",
+            "sub": "Read active_cnt",
+            "role": "Snapshot Check"
+          },
+          {
+            "id": "n2",
+            "label": "active_cnt - 1 < min?",
+            "sub": "Fast 409 Rollback",
+            "role": "Domain Guard"
+          },
+          {
+            "id": "n3",
+            "label": "UPDATE shifts -> false",
+            "sub": "Commit or 40001",
+            "role": "SSI Gate"
+          },
+          {
+            "id": "n4",
+            "label": "Jittered 40001 Retry",
+            "sub": "Re-Reads remaining=1",
+            "role": "Zero Coverage Gap"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "checks"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "if >= min"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "if 40001"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Clean Domain Abort",
+            "detail": "Insufficient coverage rolls back immediately and returns 409 without wasting retries."
+          },
+          {
+            "label": "Serialization Retry",
+            "detail": "Loser of a concurrent race catches 40001, sleeps with jitter, and re-evaluates fresh state."
+          },
+          {
+            "label": "Zero Double-Leave",
+            "detail": "Updating WHERE active = true ensures idempotency even across retries."
+          }
+        ],
+        "summary": "Re-evaluating active_cnt after a 40001 retry guarantees the second concurrent caller sees remaining=1 and stops cleanly.",
+        "caption": "Re-evaluating active_cnt after a 40001 retry guarantees the second concurrent caller sees remaining=1 and stops cleanly."
+      }
+    },
+    {
+      "id": "04-p-scaling",
+      "eyebrow": "STAGE 04 · SHARDING & HOT-ROTATION CONTROL",
+      "title": "Tenant Sharding & Parent-Row Lock Materialization for Hot Shifts",
+      "level": "intermediate",
+      "purpose": "Shard 500K rotations by org_id and eliminate 40001 retry storms on viral shifts using materialized parent lock rows.",
+      "explanation": {
+        "foundation": "Shard PostgreSQL horizontally by `org_id` (16 shards via Citus/Vitess) so every rotation's shifts live on a single shard.",
+        "core": "For high-contention holiday shifts or popular flash-booking drops (where >30% of SSI attempts would hit `40001`), materialize a parent `rotations(rotation_id, active_count)` row and lock it with `SELECT active_count FROM rotations WHERE id = $1 FOR UPDATE`.",
+        "deepDive": "Pessimistic row locking queues concurrent callers in FIFO order in the kernel/DB lock manager—achieving 100% commit efficiency with zero rollback churn."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 04 · SHARDING & HOT-ROTATION CONTROL",
+        "title": "Tenant Sharding & Parent-Row Lock Materialization for Hot Shifts",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "Hash Shard (org_id)",
+            "sub": "16 Postgres Shards",
+            "role": "Localize Tx"
+          },
+          {
+            "id": "n2",
+            "label": "Normal Rotations",
+            "sub": "Optimistic SSI (40001)",
+            "role": "Zero Lock Wait"
+          },
+          {
+            "id": "n3",
+            "label": "Hot Flash Drops (>30%)",
+            "sub": "SELECT ... FOR UPDATE",
+            "role": "Parent Lock Row"
+          },
+          {
+            "id": "n4",
+            "label": "15K Ops / Sec",
+            "sub": "Zero Retry Thrashing",
+            "role": "Sustained Scale"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "low conflict"
+          },
+          {
+            "from": "n1",
+            "to": "n3",
+            "label": "high conflict"
+          },
+          {
+            "from": "n2",
+            "to": "n4",
+            "label": "scales"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "serializes"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Co-Located Sharding",
+            "detail": "Sharding by org_id keeps multi-row shift checks single-shard, avoiding slow distributed 2PC."
+          },
+          {
+            "label": "Parent-Row Materialization",
+            "detail": "Locking one parent row converts O(N^2) 40001 rollback storms into orderly O(N) FIFO execution."
+          },
+          {
+            "label": "Dynamic Routing",
+            "detail": "Flag hot rotations via metadata so they automatically use pessimistic parent locking."
+          }
+        ],
+        "summary": "Org-ID sharding keeps transactions single-shard while parent-row locking eliminates 40001 thrashing on hot shifts.",
+        "caption": "Org-ID sharding keeps transactions single-shard while parent-row locking eliminates 40001 thrashing on hot shifts."
+      }
+    },
+    {
+      "id": "05-p-isolation",
+      "eyebrow": "STAGE 05 · FAULT ISOLATION",
+      "title": "Bounding Retry Storms, Lock Timeouts & SIREAD Memory",
+      "level": "advanced",
+      "purpose": "Prevent thread-pool exhaustion during contention spikes using lock_timeout, retry caps, and PgBouncer pools.",
+      "explanation": {
+        "foundation": "Unbounded retries or long lock queues exhaust PostgreSQL `max_connections` and stall unrelated teams.",
+        "core": "Set `lock_timeout = '100ms'`, `statement_timeout = '2s'`, and `idle_in_transaction_session_timeout = '10s'` per session; cap SSI retries at 5 attempts before returning `429 Retry-After`.",
+        "deepDive": "Tune `max_pred_locks_per_transaction = 256` and keep PgBouncer in transaction-pooling mode so idle clients never hold DB backends."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 05 · FAULT ISOLATION",
+        "title": "Bounding Retry Storms, Lock Timeouts & SIREAD Memory",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "lock_timeout = 100ms",
+            "sub": "Fast Shed on Contention",
+            "role": "Queue Cap"
+          },
+          {
+            "id": "n2",
+            "label": "Max 5 SSI Retries",
+            "sub": "429 Retry-After on Cap",
+            "role": "CPU Shield"
+          },
+          {
+            "id": "n3",
+            "label": "10s Idle-Tx Timeout",
+            "sub": "Protect MVCC Horizon",
+            "role": "Bloat Shield"
+          },
+          {
+            "id": "n4",
+            "label": "PgBouncer Tx Pool",
+            "sub": "Isolate Slow Clients",
+            "role": "Pool Safety"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "bounded by"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "paired with"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "protected by"
+          }
+        ],
+        "cards": [
+          {
+            "label": "100 ms Lock Cap",
+            "detail": "Hot-row queues fail fast at 100 ms instead of piling up 1,000 blocked connections."
+          },
+          {
+            "label": "Transaction Pooling",
+            "detail": "PgBouncer transaction pooling multiplexes 10,000 API workers onto 200 PostgreSQL connections cleanly."
+          },
+          {
+            "label": "SIREAD Headroom",
+            "detail": "Raising max_pred_locks_per_transaction avoids false-positive table-level lock escalations."
+          }
+        ],
+        "summary": "100 ms lock timeouts, 5-retry caps, 10s idle-tx limits, and PgBouncer transaction pooling contain contention spikes.",
+        "caption": "100 ms lock timeouts, 5-retry caps, 10s idle-tx limits, and PgBouncer transaction pooling contain contention spikes."
+      }
+    },
+    {
+      "id": "06-p-recovery",
+      "eyebrow": "STAGE 06 · RECOVERY & AUDITABILITY",
+      "title": "Sync WAL Failover, Transactional Outbox & Immutable Shift Audits",
+      "level": "advanced",
+      "purpose": "Preserve confirmed schedules across primary failovers and deliver PagerDuty/Slack notifications exactly once.",
+      "explanation": {
+        "foundation": "If a primary shard fails right after confirming a shift swap, losing that commit could leave an incident unstaffed.",
+        "core": "Run synchronous WAL replication (`synchronous_commit = remote_write`) to an AZ standby, and write PagerDuty/Slack webhook events to an `outbox_events` table inside the same ACID transaction.",
+        "deepDive": "Retain 72-hour partitioned `idempotency_keys` and append-only `shift_audit_log` rows so operators can reconstruct every swap."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 06 · RECOVERY & AUDITABILITY",
+        "title": "Sync WAL Failover, Transactional Outbox & Immutable Shift Audits",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "ACID Shift Commit",
+            "sub": "Roster + Outbox + Idem",
+            "role": "Single Tx"
+          },
+          {
+            "id": "n2",
+            "label": "Sync AZ Standby",
+            "sub": "Zero-RPO WAL Replicate",
+            "role": "Failover Safe"
+          },
+          {
+            "id": "n3",
+            "label": "Outbox CDC Relay",
+            "sub": "Notify PagerDuty / Slack",
+            "role": "Reliable Side-Effect"
+          },
+          {
+            "id": "n4",
+            "label": "72h Idem + Audit Log",
+            "sub": "Replay-Safe History",
+            "role": "Compliance"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "replicates"
+          },
+          {
+            "from": "n1",
+            "to": "n3",
+            "label": "relays"
+          },
+          {
+            "from": "n2",
+            "to": "n4",
+            "label": "preserved in"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Zero Notification Drift",
+            "detail": "Slack/PagerDuty alerts only fire after the shift commit is durable—never on rolled-back 40001 attempts."
+          },
+          {
+            "label": "Zero-RPO Failover",
+            "detail": "Synchronous AZ standby ensures confirmed reservations survive primary node loss."
+          },
+          {
+            "label": "Partitioned Key Cleanup",
+            "detail": "Drop expired idempotency partitions daily without table-bloat vacuum pauses."
+          }
+        ],
+        "summary": "Synchronous AZ standbys and transactional outbox relays keep confirmed schedules and external alerts consistent across crashes.",
+        "caption": "Synchronous AZ standbys and transactional outbox relays keep confirmed schedules and external alerts consistent across crashes."
+      }
+    },
+    {
+      "id": "07-p-observability",
+      "eyebrow": "STAGE 07 · OBSERVABILITY & GUARDRAILS",
+      "title": "Monitoring 40001 Retry Ratios, GiST 23P01 Rejections & Coverage Canaries",
+      "level": "advanced",
+      "purpose": "Detect hot-rotation contention, exhausted retry budgets, and invariant drift before incidents hit.",
+      "explanation": {
+        "foundation": "Rising `40001` retry counts signal contention long before p99 latency breaches 40 ms.",
+        "core": "Track `ssi_40001_retry_ratio`, `ssi_retries_exhausted_total`, `gist_overlap_23p01_total`, and `oldest_xmin_age_seconds` per shard.",
+        "deepDive": "Run a continuous 60-second coverage-audit query asserting zero active rotations have `oncall_count < min_required`—paging Sev-1 immediately on any breach."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 07 · OBSERVABILITY & GUARDRAILS",
+        "title": "Monitoring 40001 Retry Ratios, GiST 23P01 Rejections & Coverage Canaries",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "40001 Retry Ratio",
+            "sub": "Alert > 5% on Rotation",
+            "role": "Contention Signal"
+          },
+          {
+            "id": "n2",
+            "label": "23P01 Overlap Count",
+            "sub": "Track Slot Contention",
+            "role": "Booking Signal"
+          },
+          {
+            "id": "n3",
+            "label": "Coverage Audit Cron",
+            "sub": "Assert active >= min_req",
+            "role": "Invariant Proof"
+          },
+          {
+            "id": "n4",
+            "label": "Auto-Promote Lock Row",
+            "sub": "Switch Hot Rotation",
+            "role": "Self-Healing"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "correlates"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "verified by"
+          },
+          {
+            "from": "n1",
+            "to": "n4",
+            "label": "triggers"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Hot-Rotation Detection",
+            "detail": "Automatically flag any rotation exceeding 5% 40001 retries for parent-row lock mode."
+          },
+          {
+            "label": "Invariant Canary",
+            "detail": "A background audit verifies zero coverage gaps across all 500K rotations every minute."
+          },
+          {
+            "label": "Exhausted-Retry Pager",
+            "detail": "Alert if ssi_retries_exhausted_total rises, indicating lock_timeout or max_retries tuning is needed."
+          }
+        ],
+        "summary": "40001 retry-ratio alerts, GiST overlap counters, and 60s coverage audits keep scheduling invariants airtight.",
+        "caption": "40001 retry-ratio alerts, GiST overlap counters, and 60s coverage audits keep scheduling invariants airtight."
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-ssi-1",
+        "question": "Two users concurrently book `[10:00, 11:00)` and `[10:30, 11:30)` for the same conference room under `READ COMMITTED`. Why does a standard `UNIQUE (room_id, start_at, end_at)` constraint fail to stop the double-booking?",
+        "options": [
+          {
+            "id": "a",
+            "text": "The tuples have different start/end timestamps, so UNIQUE sees no exact duplicate; you need `EXCLUDE USING gist (room_id WITH =, slot_range WITH &&)`.",
+            "correct": true,
+            "feedback": "Correct! UNIQUE checks equality, whereas GiST exclusion constraints enforce range non-overlap (&&) at the index level."
+          },
+          {
+            "id": "b",
+            "text": "PostgreSQL ignores UNIQUE constraints on timestamp columns.",
+            "correct": false,
+            "feedback": "UNIQUE works on timestamps, but only for exact equality—not overlapping intervals."
+          },
+          {
+            "id": "c",
+            "text": "READ COMMITTED disables all index checks during INSERT.",
+            "correct": false,
+            "feedback": "Index constraints are always enforced, even under READ COMMITTED."
+          },
+          {
+            "id": "d",
+            "text": "UNIQUE constraints only apply to UPDATE statements.",
+            "correct": false,
+            "feedback": "UNIQUE applies to both INSERT and UPDATE."
+          }
+        ],
+        "explanation": "Standard UNIQUE indexes check equality, not interval overlap; PostgreSQL EXCLUDE USING gist with && enforces non-overlapping ranges."
+      },
+      {
+        "id": "kc-ssi-2",
+        "question": "A flash-sale reservation drop sees 500 concurrent requests/sec all targeting the exact same rotation/resource. Under `SERIALIZABLE` (SSI), 85% of transactions abort with `40001`. What is the cleanest fix?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Downgrade to READ UNCOMMITTED so transactions never abort.",
+            "correct": false,
+            "feedback": "Downgrading isolation reintroduces Write Skew and corrupts invariants."
+          },
+          {
+            "id": "b",
+            "text": "Materialize a parent row for that rotation/resource and acquire `SELECT ... FOR UPDATE` on it so concurrent writers queue cleanly in FIFO order without 40001 thrashing.",
+            "correct": true,
+            "feedback": "Correct! Pessimistic locking on a parent row eliminates optimistic rollback storms on ultra-hot keys."
+          },
+          {
+            "id": "c",
+            "text": "Increase max_retries from 5 to 500.",
+            "correct": false,
+            "feedback": "Retrying 500 times amplifies database CPU and spikes p99 latency."
+          },
+          {
+            "id": "d",
+            "text": "Remove the Idempotency-Key table.",
+            "correct": false,
+            "feedback": "Idempotency keys are unrelated to SSI contention and are needed for safe retries."
+          }
+        ],
+        "explanation": "High-contention hot spots perform better under pessimistic parent-row locking than optimistic SSI retries."
+      },
+      {
+        "id": "kc-ssi-3",
+        "question": "Why must PagerDuty/Slack webhook notifications NEVER be sent directly inside the `leave_oncall_shift` transaction closure before `COMMIT`?",
+        "options": [
+          {
+            "id": "a",
+            "text": "If the transaction hits SQLSTATE 40001 and rolls back, the external webhook cannot be rolled back—causing phantom alerts and duplicate notifications on retry.",
+            "correct": true,
+            "feedback": "Correct! Write events to an outbox_events table in the same ACID transaction and dispatch asynchronously after commit."
+          },
+          {
+            "id": "b",
+            "text": "PostgreSQL blocks outbound TCP connections from Python.",
+            "correct": false,
+            "feedback": "Python can open HTTP connections, which is precisely why side effects inside retryable DB closures are dangerous."
+          },
+          {
+            "id": "c",
+            "text": "Webhook payloads cannot be serialized in JSON.",
+            "correct": false,
+            "feedback": "Serialization is not the issue; non-transactional side effects across rollbacks are."
+          },
+          {
+            "id": "d",
+            "text": "HTTP 200 responses automatically trigger SQLSTATE 40001.",
+            "correct": false,
+            "feedback": "40001 is raised by PostgreSQL rw-antidependency detection, not HTTP calls."
+          }
+        ],
+        "explanation": "External HTTP calls cannot participate in database rollbacks; use a transactional outbox so alerts fire only on committed state."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "A conflict-free scheduling engine uses database Serializable mode and range-overlap indexes so two people can never double-book a room or leave an on-call shift empty.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, use SSI for low-contention multi-row invariants, EXCLUDE USING gist for time-range overlaps, and SELECT FOR UPDATE on a parent row when hot-shift contention exceeds 5%.",
+      "byteSummary": "Checking 'is someone still on call?' in app code before saving fails when two people click at the same millisecond. Using PostgreSQL Serializable mode (with automatic retries) and overlap-blocking indexes guarantees shifts and bookings never break."
+    },
+    "intermediate": {
+      "summary": "Combine PostgreSQL SERIALIZABLE (SSI) with 40001 jittered retries, EXCLUDE USING gist range indexes, and transactional outbox alerts across org-sharded DBs.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, use SSI for low-contention multi-row invariants, EXCLUDE USING gist for time-range overlaps, and SELECT FOR UPDATE on a parent row when hot-shift contention exceeds 5%.",
+      "byteSummary": "Building a high-concurrency on-call scheduling and room/resource reservation platform (handling 15K shift swaps, PTO approvals, and slot bookings/sec) exposes a classic database trap: **Write Skew**. Under standard `READ COMMITTED` or `REPEATABLE READ`, two engineers on the same rotation can simultaneously pass the `active_oncall >= 2` check and update their own disjoint rows—leaving a critical production service with zero on-call coverage. Similarly, two users booking `[10:00, 11:00)` and `[10:30, 11:30)` touch non-identical rows and double-book the same resource.\n\nA production-grade reservation engine eliminates both anomalies with a three-layer defense: (1) PostgreSQL `ISOLATION LEVEL SERIALIZABLE` (SSI) paired with a bounded, jittered `40001 serialization_failure` retry loop for multi-row rotation invariants; (2) `EXCLUDE USING gist (resource_id WITH =, slot_range WITH &&)` index constraints for ironclad zero-overlap interval guarantees; and (3) a materialized parent `rotation_shifts` lock row (`SELECT ... FOR UPDATE`) for ultra-hot shifts where optimistic SSI retries would exceed 5%.\n\nTo guarantee end-to-end safety under client retries and hot partitions, the API gateway enforces `Idempotency-Key` deduplication inside the same ACID transaction, shards rotations deterministically across PostgreSQL partitions, and caps `idle_in_transaction_session_timeout` to protect MVCC heap health."
+    },
+    "advanced": {
+      "summary": "At 15K ops/sec, pair org_id sharding, adaptive SSI-vs-parent-lock routing, PgBouncer transaction pooling, 100 ms lock_timeout caps, and 60s coverage-invariant canaries.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, use SSI for low-contention multi-row invariants, EXCLUDE USING gist for time-range overlaps, and SELECT FOR UPDATE on a parent row when hot-shift contention exceeds 5%.",
+      "byteSummary": "Building a high-concurrency on-call scheduling and room/resource reservation platform (handling 15K shift swaps, PTO approvals, and slot bookings/sec) exposes a classic database trap: **Write Skew**. Under standard `READ COMMITTED` or `REPEATABLE READ`, two engineers on the same rotation can simultaneously pass the `active_oncall >= 2` check and update their own disjoint rows—leaving a critical production service with zero on-call coverage. Similarly, two users booking `[10:00, 11:00)` and `[10:30, 11:30)` touch non-identical rows and double-book the same resource.\n\nA production-grade reservation engine eliminates both anomalies with a three-layer defense: (1) PostgreSQL `ISOLATION LEVEL SERIALIZABLE` (SSI) paired with a bounded, jittered `40001 serialization_failure` retry loop for multi-row rotation invariants; (2) `EXCLUDE USING gist (resource_id WITH =, slot_range WITH &&)` index constraints for ironclad zero-overlap interval guarantees; and (3) a materialized parent `rotation_shifts` lock row (`SELECT ... FOR UPDATE`) for ultra-hot shifts where optimistic SSI retries would exceed 5%.\n\nTo guarantee end-to-end safety under client retries and hot partitions, the API gateway enforces `Idempotency-Key` deduplication inside the same ACID transaction, shards rotations deterministically across PostgreSQL partitions, and caps `idle_in_transaction_session_timeout` to protect MVCC heap health."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "prerequisites": [
+    {
+      "title": "MVCC Snapshot Isolation, Tuple Versioning & Write-Skew Prevention",
+      "summary": "MVCC lets readers and writers run lock-free via (xmin, xmax) tuple versions, but Snapshot Isolation allows Write Skew on disjoint rows unless guarded by SSI (40001 retries) or parent locks."
+    },
+    {
+      "title": "TOCTOU Race Conditions & Atomic Compare-And-Swap (CAS)",
+      "summary": "Time-of-Check to Time-of-Use (TOCTOU) race conditions occur when state validated in step 1 changes before step 2 mutates it; Atomic Compare-And-Swap (CAS) closes the gap in a single indivisible operation."
+    }
+  ],
+  "simulation": {
+    "title": "Design a Conflict-Free On-Call Shift & Resource Reservation Engine (SSI vs. Advisory Locks) — Interactive Execution Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Workload & Budget"
+      },
+      {
+        "id": "router",
+        "label": "Gateway / Router",
+        "role": "Admission & Dispatch"
+      },
+      {
+        "id": "engine",
+        "label": "Core Engine",
+        "role": "Primary Execution"
+      },
+      {
+        "id": "replica",
+        "label": "Replica / Fallback",
+        "role": "Durability & Recovery"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "router",
+        "label": "request"
+      },
+      {
+        "from": "router",
+        "to": "engine",
+        "label": "route"
+      },
+      {
+        "from": "engine",
+        "to": "replica",
+        "label": "sync / fallback"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Sizing 15K Scheduling Ops/Sec with Zero Coverage Gaps or Dou",
+        "actionLabel": "Dispatch nominal request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "router"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "Ingress",
+          "p99_ms": 8,
+          "error_rate": "0.0%"
+        },
+        "explanation": "Caller sends work into the gateway with explicit timeout and concurrency bounds (Sizing 15K Scheduling Ops/Sec with Zero Coverage Gaps or Double-Books)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "SSI + GiST Exclusion Constraints + Transactional Idempotency",
+        "actionLabel": "Execute core invariant",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "Core Path",
+          "p99_ms": 18,
+          "in_flight": 124
+        },
+        "explanation": "The core engine processes the hot path while keeping state transitions deterministic (SSI + GiST Exclusion Constraints + Transactional Idempotency)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Idempotent SSI Shift-Leave Handler with 40001 Backoff Retry",
+        "actionLabel": "Detect skew or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Degraded",
+          "p99_ms": 64,
+          "retries_capped": "true"
+        },
+        "explanation": "Under load or replica lag, bounded backoff and isolation prevent cascading saturation (Idempotent SSI Shift-Leave Handler with 40001 Backoff Retry)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Monitoring 40001 Retry Ratios, GiST 23P01 Rejections & Cover",
+        "actionLabel": "Converge & restore SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 11,
+          "drift": 0
+        },
+        "explanation": "State converges cleanly and telemetry confirms the system returned within its SLO envelope (Monitoring 40001 Retry Ratios, GiST 23P01 Rejections & Coverage Canaries)."
+      }
+    ]
+  }
+}

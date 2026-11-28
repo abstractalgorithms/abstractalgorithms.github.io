@@ -1,0 +1,872 @@
+{
+  "id": "problem-fixing-kubernetes-cfs-cpu-throttling",
+  "slug": "fixing-kubernetes-cfs-cpu-throttling",
+  "title": "Fixing Kubernetes CFS CPU Throttling Freezes",
+  "problemType": "production-debugging",
+  "difficulty": "hard",
+  "prompt": "A latency-sensitive Java/Netty payment gateway running in Kubernetes (`requests.cpu: '500m'`, `limits.cpu: '2'`) on 64-vCPU nodes has a median latency of 4ms, but p99 latency spikes to 95-120ms every few seconds. Node CPU utilization is only 35%, yet `container_cpu_cfs_throttled_periods_total` is 45% and `nr_throttled` climbs rapidly. The JVM sees all 64 host cores via `/proc/cpuinfo` (or defaults) and spawns 64 Netty/ForkJoin/G1GC threads. Diagnose the Linux CFS bandwidth mechanism causing the 95ms freezes and fix the Kubernetes and runtime configuration.",
+  "spark": {
+    "summary": "With limits.cpu: 2 (200 ms quota per 100 ms period) on a 64-vCPU host, a JVM spawning 64 Netty/G1GC threads burns its 200 ms quota in 3.1 ms and freezes for 96.9 ms; capping ActiveProcessorCount=2 and removing limits.cpu (or using Static CPU Manager) drops p99 below 15 ms.",
+    "keyTakeaway": "When traffic spikes expose hidden coupling, never let a container spawn 64 threads inside a 2-vCPU cgroup quota, and avoid arbitrary limits.cpu on latency-sensitive pods (or use Guaranteed QoS with integer CPU + Static CPU Manager).",
+    "byteSummary": "**Core Mechanics:** A payment gateway pod has `limits.cpu: 2` (`200 ms` of CPU time per `100 ms` `cpu.cfs_period_us` window) on a `64-vCPU` node.\n\n**Visual & Structural Flow:** Depicts 64 Threads Burn 200ms Quota in 3.1ms -> Frozen 96.9ms (64 JVM Threads -> Linux CFS (200ms) -> Payment Req); ActiveProcessorCount=2 + Burstable (No CPU Limit) or Static Cores (JVM Flags -> Netty / G1GC -> Kubelet QoS -> Payment p99).\n\n**Trade-Offs & Production:** Raising `requests.cpu` from `500m` to `2` while keeping `limits.cpu: 2` changes scheduling priority, **not** `cfs_quota_us`—the pod still throttles at `200 ms` per `100 ms`. Production Kubernetes clusters eliminate CFS throttling using two proven strategies:\n\n**Failure Modes & Application:** CFS bandwidth awareness is critical for any low-latency containerized workload: **Netty / Spring / Go Gateways**: Eliminating periodic 100 ms tail-latency spikes on multi-core nodes."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why Linux CFS bandwidth throttling causes 95 ms p99 freezes",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "Think of **Why Linux CFS bandwidth throttling causes 95 ms p99 freezes** as the intuition layer for Fixing Kubernetes CFS CPU Throttling Freezes: The mechanism: understand how Why Linux CFS bandwidth throttling causes 95 ms p99 freezes works from first principles.",
+        "core": "A payment gateway pod has `limits.cpu: 2` (`200 ms` of CPU time per `100 ms` `cpu.cfs_period_us` window) on a `64-vCPU` node. Because the JVM misreads host cores (or spawns 64 Netty/ForkJoin/G1GC threads), **all 64 threads wake up simultaneously**, burn the entire `200 ms` quota in `~3.1 ms` of wall time (`200 / 64`), and the Linux CFS scheduler **freezes the entire pod for the remaining `96.9 ms`**—causing `95–120 ms` p99 spikes even at 35% node CPU.",
+        "deepDive": "Under heavy load or partial failure, why linux cfs bandwidth throttling causes 95 ms p99 freezes becomes a critical lever for predictable latency and correctness. With limits.cpu: 2 (200 ms quota per 100 ms period) on a 64-vCPU host, a JVM spawning 64 Netty/G1GC threads burns its 200 ms quota in 3.1 ms and freezes for 96.9 ms; capping ActiveProcessorCount=2 and removing limits.cpu (or using Static CPU Manager) drops p99 below 15 ms."
+      },
+      "purpose": "The mechanism: understand how Why Linux CFS bandwidth throttling causes 95 ms p99 freezes works from first principles.",
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "Stage 1 Topology",
+        "title": "Why Linux CFS bandwidth throttling causes 95 ms p99 freeze...",
+        "nodes": [
+          {
+            "id": "edge",
+            "label": "Edge Router",
+            "tier": "ingress"
+          },
+          {
+            "id": "worker",
+            "label": "Fixing Kubernetes CF Worker",
+            "tier": "compute"
+          },
+          {
+            "id": "state",
+            "label": "Primary State",
+            "tier": "storage"
+          },
+          {
+            "id": "obs",
+            "label": "Telemetry & Audit",
+            "tier": "control"
+          }
+        ],
+        "edges": [
+          {
+            "from": "edge",
+            "to": "worker",
+            "label": "route"
+          },
+          {
+            "from": "worker",
+            "to": "state",
+            "label": "read / mutate"
+          },
+          {
+            "from": "worker",
+            "to": "obs",
+            "label": "emit metrics"
+          }
+        ]
+      }
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "What happens when multi-threaded runtimes hit 100 ms CFS periods",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "CFS quota throttling creates deceptive 'healthy node, frozen pod' incidents:",
+        "core": "1. **Burst Exhaustion**: 64 GC/Netty threads consume a 2-core quota in a few milliseconds.\n2. **100 ms Tail Spikes**: Every throttled period adds up to `97 ms` of artificial latency (`nr_throttled` climbs).\n3. **Misleading Metrics**: Average CPU looks low (`35%`) because averages hide sub-100ms quota exhaustion.",
+        "deepDive": "In production deployments of Fixing Kubernetes CFS CPU Throttling Freezes, watch how what happens when multi-threaded runtimes hit 100 ms cfs periods interacts with tail latency, retry amplification, and partial failures. With limits.cpu: 2 (200 ms quota per 100 ms period) on a 64-vCPU host, a JVM spawning 64 Netty/G1GC threads burns its 200 ms quota in 3.1 ms and freezes for 96.9 ms; capping ActiveProcessorCount=2 and removing limits.cpu (or using Static CPU Manager) drops p99 below 15 ms."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "100ms CFS Period Anatomy",
+        "title": "64 Threads Burn 200ms Quota in 3.1ms -> Frozen 96.9ms",
+        "actors": [
+          {
+            "id": "jvm",
+            "label": "64 JVM Threads"
+          },
+          {
+            "id": "cfs",
+            "label": "Linux CFS (200ms)"
+          },
+          {
+            "id": "req",
+            "label": "Payment Req"
+          }
+        ],
+        "events": [
+          {
+            "from": "jvm",
+            "to": "cfs",
+            "label": "t=0ms: 64 threads run concurrently",
+            "status": "warn"
+          },
+          {
+            "from": "cfs",
+            "to": "jvm",
+            "label": "t=3.1ms: 200ms quota spent -> THROTTLE!",
+            "status": "fail"
+          },
+          {
+            "from": "req",
+            "to": "jvm",
+            "label": "t=4ms..99ms: Request frozen 96ms!",
+            "status": "fail"
+          },
+          {
+            "from": "cfs",
+            "to": "jvm",
+            "label": "t=100ms: Quota replenishes (or no limit)",
+            "status": "ok"
+          }
+        ],
+        "summary": "Capping JVM threads (-XX:ActiveProcessorCount=2) and removing burst-blocking limits.cpu eliminates 95ms CFS freezes."
+      },
+      "purpose": "The problem: see what breaks without What happens when multi-threaded runtimes hit 100 ms CFS periods under real concurrency or scale.",
+      "decisionFramework": {
+        "problem": "How to implement Fixing Kubernetes CFS CPU Throttling Freezes without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "When traffic spikes expose hidden coupling, never let a container spawn 64 threads inside a 2-vCPU cgroup quota, and avoid arbitrary limits.cpu on latency-sensitive pods (or use Guaranteed QoS with integer CPU + Static CPU Manager).",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Fixing Kubernetes CFS CPU Throttling Freezes experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Naive solution (and why raising requests.cpu alone fails)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Think of **Naive solution (and why raising requests.cpu alone fails)** as the intuition layer for Fixing Kubernetes CFS CPU Throttling Freezes: The problem: see what breaks without Naive solution under real concurrency or scale.",
+        "core": "Raising `requests.cpu` from `500m` to `2` while keeping `limits.cpu: 2` changes scheduling priority, **not** `cfs_quota_us`—the pod still throttles at `200 ms` per `100 ms`. Conversely, setting `limits.cpu: 16` over-provisions nodes by `8×`.",
+        "deepDive": "Under heavy load or partial failure, naive solution (and why raising requests.cpu alone fails) becomes a critical lever for predictable latency and correctness. With limits.cpu: 2 (200 ms quota per 100 ms period) on a 64-vCPU host, a JVM spawning 64 Netty/G1GC threads burns its 200 ms quota in 3.1 ms and freezes for 96.9 ms; capping ActiveProcessorCount=2 and removing limits.cpu (or using Static CPU Manager) drops p99 below 15 ms."
+      },
+      "purpose": "The problem: see what breaks without Naive solution under real concurrency or scale.",
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Stage 3 Interaction",
+        "title": "Naive solution (and why raising requests.cpu alone fails)",
+        "actors": [
+          {
+            "id": "caller",
+            "label": "Client / Caller"
+          },
+          {
+            "id": "coord",
+            "label": "Coordinator"
+          },
+          {
+            "id": "store",
+            "label": "State / Engine"
+          }
+        ],
+        "steps": [
+          {
+            "from": "caller",
+            "to": "coord",
+            "label": "1. Dispatch request + bounds"
+          },
+          {
+            "from": "coord",
+            "to": "store",
+            "label": "2. Execute deterministic step"
+          },
+          {
+            "from": "store",
+            "to": "coord",
+            "label": "3. Return state & proof"
+          },
+          {
+            "from": "coord",
+            "to": "caller",
+            "label": "4. Ack with bounded latency"
+          }
+        ]
+      }
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise solution: Cap JVM Concurrency + Remove CPU Limits / Static CPU Manager",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": {
+        "foundation": "Production Kubernetes clusters eliminate CFS throttling using two proven strategies:",
+        "core": "- **1. Match Runtime Threads to Allocated CPUs**: Pass `-XX:ActiveProcessorCount=2` (and configure Netty `EventLoopGroup(2)`) so the JVM does not spawn 64 threads inside a 2-vCPU container.\n- **2. Remove `limits.cpu` (Burstable QoS) OR Use Static CPU Manager**:\n  - **Standard Approach**: Set `requests.cpu: 2` and **omit `limits.cpu`** (preserving `limits.memory == requests.memory` for OOM safety) so CFS shares idle node CPU instead of hard-freezing pods at 100 ms boundaries.\n  - **Strict Isolation Approach**: Use `Guaranteed` QoS (`requests.cpu == limits.cpu: 2`, integer) with Kubelet `cpuManagerPolicy: static` to pin 2 exclusive physical cores, bypassing CFS quota entirely.",
+        "deepDive": "In production deployments of Fixing Kubernetes CFS CPU Throttling Freezes, watch how enterprise solution: cap jvm concurrency + remove cpu limits / static cpu manager interacts with tail latency, retry amplification, and partial failures. With limits.cpu: 2 (200 ms quota per 100 ms period) on a 64-vCPU host, a JVM spawning 64 Netty/G1GC threads burns its 200 ms quota in 3.1 ms and freezes for 96.9 ms; capping ActiveProcessorCount=2 and removing limits.cpu (or using Static CPU Manager) drops p99 below 15 ms."
+      },
+      "sectionDiagram": {
+        "kind": "cache-tier",
+        "eyebrow": "Thread & Scheduler Alignment",
+        "title": "ActiveProcessorCount=2 + Burstable (No CPU Limit) or Static Cores",
+        "nodes": [
+          {
+            "label": "JVM Flags",
+            "role": "ActiveProcessorCount=2"
+          },
+          {
+            "label": "Netty / G1GC",
+            "role": "2-4 threads (no burst)"
+          },
+          {
+            "label": "Kubelet QoS",
+            "role": "No cpu limit / Static"
+          },
+          {
+            "label": "Payment p99",
+            "role": "<15ms steady latency"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Thread Alignment",
+            "detail": "Prevents 64 threads from burning a 2-core quota in 3 ms."
+          },
+          {
+            "label": "Omit limits.cpu",
+            "detail": "Uses CFS cpu.weight shares so pods use idle CPU without 97ms freezes."
+          },
+          {
+            "label": "Static CPU Mgr",
+            "detail": "Pins 2 dedicated physical cores for Guaranteed integer-CPU pods."
+          },
+          {
+            "label": "Memory Limits Kept",
+            "detail": "Keeps requests.memory == limits.memory to prevent noisy-neighbor OOMs."
+          }
+        ],
+        "summary": "Aligning JVM thread count and removing artificial CFS quotas (or pinning static cores) brings p99 from 120 ms down below 15 ms."
+      },
+      "markdownContent": "```yaml\n# Payment Gateway PodSpec: Align JVM threads & eliminate CFS quota freezes\ncontainers:\n  - name: payment-gateway\n    env:\n      - name: JAVA_TOOL_OPTIONS\n        value: \"-XX:ActiveProcessorCount=2 -XX:+UseG1GC -XX:MaxGCPauseMillis=10\"\n    resources:\n      requests:\n        cpu: \"2\"\n        memory: \"4Gi\"\n      limits:\n        # Omit limits.cpu (or use Guaranteed + cpuManagerPolicy: static)\n        memory: \"4Gi\"\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where CFS Quota Tuning applies in Kubernetes",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "CFS bandwidth awareness is critical for any low-latency containerized workload:",
+        "core": "- **Netty / Spring / Go Gateways**: Eliminating periodic 100 ms tail-latency spikes on multi-core nodes.\n- **JVM / G1GC Services**: Preventing parallel GC phases from tripping CFS quotas during allocation bursts.\n- **HFT & Inference Servers**: Pinning exclusive cores via Kubelet Static CPU Manager.",
+        "deepDive": "In production deployments of Fixing Kubernetes CFS CPU Throttling Freezes, watch how where cfs quota tuning applies in kubernetes interacts with tail latency, retry amplification, and partial failures. With limits.cpu: 2 (200 ms quota per 100 ms period) on a 64-vCPU host, a JVM spawning 64 Netty/G1GC threads burns its 200 ms quota in 3.1 ms and freezes for 96.9 ms; capping ActiveProcessorCount=2 and removing limits.cpu (or using Static CPU Manager) drops p99 below 15 ms."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "kubernetes-workloads",
+          "title": "Concept: Kubernetes Workloads",
+          "kind": "concept"
+        },
+        {
+          "slug": "jvm-internals-and-garbage-collection",
+          "title": "Concept: JVM Internals & GC",
+          "kind": "concept"
+        },
+        {
+          "slug": "thread-pool-design",
+          "title": "Concept: Thread Pool Design",
+          "kind": "concept"
+        },
+        {
+          "slug": "designing-safe-liveness-readiness-probes",
+          "title": "Problem: Safe Liveness & Readiness Probes",
+          "kind": "problem"
+        },
+        {
+          "slug": "fixing-coordinated-omission-load-tests",
+          "title": "Problem: Coordinated Omission in Load Tests",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Stage 5 Interaction",
+        "title": "Where CFS Quota Tuning applies in Kubernetes",
+        "actors": [
+          {
+            "id": "caller",
+            "label": "Client / Caller"
+          },
+          {
+            "id": "coord",
+            "label": "Coordinator"
+          },
+          {
+            "id": "store",
+            "label": "State / Engine"
+          }
+        ],
+        "steps": [
+          {
+            "from": "caller",
+            "to": "coord",
+            "label": "1. Dispatch request + bounds"
+          },
+          {
+            "from": "coord",
+            "to": "store",
+            "label": "2. Execute deterministic step"
+          },
+          {
+            "from": "store",
+            "to": "coord",
+            "label": "3. Return state & proof"
+          },
+          {
+            "from": "coord",
+            "to": "caller",
+            "label": "4. Ack with bounded latency"
+          }
+        ]
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why does a pod with limits.cpu: 2 on a 64-vCPU node experience ~95 ms freezes even when node CPU is only 35%?",
+      "options": [
+        {
+          "id": "a",
+          "text": "If 64 threads wake up simultaneously, they consume the 200 ms CFS quota in ~3 ms and the kernel freezes the pod for the rest of the 100 ms period",
+          "correct": true,
+          "feedback": "Correct: Linux CFS bandwidth control enforces quota per 100 ms period across all runnable threads in the cgroup."
+        },
+        {
+          "id": "b",
+          "text": "Because Kubernetes disables G1GC when limits.cpu is set",
+          "correct": false,
+          "feedback": "G1GC still runs, and its parallel threads actually accelerate quota exhaustion."
+        },
+        {
+          "id": "c",
+          "text": "Because memory limits throttle CPU every 100 ms",
+          "correct": false,
+          "feedback": "Memory limits trigger OOMKills, not 100 ms periodic CPU throttling."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why does a pod with limits.cpu: 2 on a 64-vCPU node experience ~95 ms freezes even when node CPU is only 35%?",
+        "options": [
+          {
+            "id": "a",
+            "text": "If 64 threads wake up simultaneously, they consume the 200 ms CFS quota in ~3 ms and the kernel freezes the pod for the rest of the 100 ms period",
+            "correct": true,
+            "feedback": "Correct: Linux CFS bandwidth control enforces quota per 100 ms period across all runnable threads in the cgroup."
+          },
+          {
+            "id": "b",
+            "text": "Because Kubernetes disables G1GC when limits.cpu is set",
+            "correct": false,
+            "feedback": "G1GC still runs, and its parallel threads actually accelerate quota exhaustion."
+          },
+          {
+            "id": "c",
+            "text": "Because memory limits throttle CPU every 100 ms",
+            "correct": false,
+            "feedback": "Memory limits trigger OOMKills, not 100 ms periodic CPU throttling."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why Linux CFS bandwidth throttling causes 95 ms p99 freezes', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "b",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "c",
+            "text": "A payment gateway pod has limits.cpu: 2 (200 ms of CPU time per 100 ms cpu.cfs_period_us window) on a 64-vCPU node.",
+            "correct": true,
+            "feedback": "Correct: A payment gateway pod has limits.cpu: 2 (200 ms of CPU time per 100 ms cpu.cfs_period_us window) on a 64-vCPU node."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'What happens when multi-threaded runtimes hit 100 ms CFS periods', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "b",
+            "text": "CFS quota throttling creates deceptive 'healthy node, frozen pod' incidents: 1.",
+            "correct": true,
+            "feedback": "Correct: CFS quota throttling creates deceptive 'healthy node, frozen pod' incidents: 1."
+          },
+          {
+            "id": "c",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** A payment gateway pod has `limits.cpu: 2` (`200 ms` of CPU time per `100 ms` `cpu.cfs_period_us` window) on a `64-vCPU` node.\n\n**How It Flows:** Think of Fixing Kubernetes CFS CPU Throttling Freezes as a clear step-by-step chain: 64 JVM Threads -> Linux CFS (200ms) -> Payment Req -> JVM Flags -> Netty / G1GC.\n\n**Why Beginners Should Care:** Never let a container spawn 64 threads inside a 2-vCPU cgroup quota, and avoid arbitrary limits.cpu on latency-sensitive pods (or use Guaranteed QoS with integer CPU + Static CPU Manager).",
+      "spark": {
+        "summary": "A payment gateway pod has `limits.cpu: 2` (`200 ms` of CPU time per `100 ms` `cpu.cfs_period_us` window) on a `64-vCPU` node.",
+        "keyTakeaway": "Never let a container spawn 64 threads inside a 2-vCPU cgroup quota, and avoid arbitrary limits.cpu on latency-sensitive pods (or use Guaranteed QoS with integer CPU + Static CPU Manager)."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why Linux CFS bandwidth throttling causes 95 ms p99 freezes",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why Linux CFS bandwidth throttling causes 95 ms p99 freezes works from first principles.",
+          "explanation": "A payment gateway pod has `limits.cpu: 2` (`200 ms` of CPU time per `100 ms` `cpu.cfs_period_us` window) on a `64-vCPU` node.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "What happens when multi-threaded runtimes hit 100 ms CFS periods",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without What happens when multi-threaded runtimes hit 100 ms CFS periods under real concurrency or scale.",
+          "explanation": "CFS quota throttling creates deceptive 'healthy node, frozen pod' incidents: 1. **Burst Exhaustion**: 64 GC/Netty threads consume a 2-core quota in a few milliseconds. 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "100ms CFS Period Anatomy",
+            "title": "64 Threads Burn 200ms Quota in 3.1ms -> Frozen 96.9ms",
+            "actors": [
+              {
+                "id": "jvm",
+                "label": "64 JVM Threads"
+              },
+              {
+                "id": "cfs",
+                "label": "Linux CFS (200ms)"
+              },
+              {
+                "id": "req",
+                "label": "Payment Req"
+              }
+            ],
+            "events": [
+              {
+                "from": "jvm",
+                "to": "cfs",
+                "label": "t=0ms: 64 threads run concurrently",
+                "status": "warn"
+              },
+              {
+                "from": "cfs",
+                "to": "jvm",
+                "label": "t=3.1ms: 200ms quota spent -> THROTTLE!",
+                "status": "fail"
+              },
+              {
+                "from": "req",
+                "to": "jvm",
+                "label": "t=4ms..99ms: Request frozen 96ms!",
+                "status": "fail"
+              },
+              {
+                "from": "cfs",
+                "to": "jvm",
+                "label": "t=100ms: Quota replenishes (or no limit)",
+                "status": "ok"
+              }
+            ],
+            "summary": "Capping JVM threads (-XX:ActiveProcessorCount=2) and removing burst-blocking limits.cpu eliminates 95ms CFS freezes."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive solution (and why raising requests.cpu alone fails)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "The problem: see what breaks without Naive solution under real concurrency or scale.",
+          "explanation": "Raising `requests.cpu` from `500m` to `2` while keeping `limits.cpu: 2` changes scheduling priority, **not** `cfs_quota_us`—the pod still throttles at `200 ms` per `100 ms`. Conversely, setting `limits.cpu: 16` over-provisions nodes by `8×`.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Cap JVM Concurrency + Remove CPU Limits / Static CPU Manager",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Production Kubernetes clusters eliminate CFS throttling using two proven strategies: **1. Match Runtime Threads to Allocated CPUs**: Pass `-XX:ActiveProcessorCount=2` (and configure Netty `EventLoopGroup(2)`) so the JVM does not spawn 64 threads inside a 2-vCPU container. **2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Thread & Scheduler Alignment",
+            "title": "ActiveProcessorCount=2 + Burstable (No CPU Limit) or Static Cores",
+            "nodes": [
+              {
+                "label": "JVM Flags",
+                "role": "ActiveProcessorCount=2"
+              },
+              {
+                "label": "Netty / G1GC",
+                "role": "2-4 threads (no burst)"
+              },
+              {
+                "label": "Kubelet QoS",
+                "role": "No cpu limit / Static"
+              },
+              {
+                "label": "Payment p99",
+                "role": "<15ms steady latency"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Thread Alignment",
+                "detail": "Prevents 64 threads from burning a 2-core quota in 3 ms."
+              },
+              {
+                "label": "Omit limits.cpu",
+                "detail": "Uses CFS cpu.weight shares so pods use idle CPU without 97ms freezes."
+              },
+              {
+                "label": "Static CPU Mgr",
+                "detail": "Pins 2 dedicated physical cores for Guaranteed integer-CPU pods."
+              },
+              {
+                "label": "Memory Limits Kept",
+                "detail": "Keeps requests.memory == limits.memory to prevent noisy-neighbor OOMs."
+              }
+            ],
+            "summary": "Aligning JVM thread count and removing artificial CFS quotas (or pinning static cores) brings p99 from 120 ms down below 15 ms."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Never let a container spawn 64 threads inside a 2-vCPU cgroup quota, and avoid arbitrary limits.cpu on latency-sensitive pods (or use Guaranteed QoS with integer CPU + Static CPU Manager).",
+      "summary": "With limits.cpu: 2 (200 ms quota per 100 ms period) on a 64-vCPU host, a JVM spawning 64 Netty/G1GC threads burns its 200 ms quota in 3.1 ms and freezes for 96.9 ms; capping ActiveProcessorCount=2 and removing limits.cpu (or using Static CPU Manager) drops p99 below 15 ms.",
+      "keyTakeaway": "When traffic spikes expose hidden coupling, never let a container spawn 64 threads inside a 2-vCPU cgroup quota, and avoid arbitrary limits.cpu on latency-sensitive pods (or use Guaranteed QoS with integer CPU + Static CPU Manager)."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** A payment gateway pod has `limits.cpu: 2` (`200 ms` of CPU time per `100 ms` `cpu.cfs_period_us` window) on a `64-vCPU` node.\n\n**Visual & Structural Flow:** Depicts 64 Threads Burn 200ms Quota in 3.1ms -> Frozen 96.9ms (64 JVM Threads -> Linux CFS (200ms) -> Payment Req); ActiveProcessorCount=2 + Burstable (No CPU Limit) or Static Cores (JVM Flags -> Netty / G1GC -> Kubelet QoS -> Payment p99).\n\n**Trade-Offs & Production:** Raising `requests.cpu` from `500m` to `2` while keeping `limits.cpu: 2` changes scheduling priority, **not** `cfs_quota_us`—the pod still throttles at `200 ms` per `100 ms`. Production Kubernetes clusters eliminate CFS throttling using two proven strategies:\n\n**Failure Modes & Application:** CFS bandwidth awareness is critical for any low-latency containerized workload: **Netty / Spring / Go Gateways**: Eliminating periodic 100 ms tail-latency spikes on multi-core nodes.",
+      "spark": {
+        "summary": "With limits.cpu: 2 (200 ms quota per 100 ms period) on a 64-vCPU host, a JVM spawning 64 Netty/G1GC threads burns its 200 ms quota in 3.1 ms and freezes for 96.9 ms; capping ActiveProcessorCount=2 and removing limits.cpu (or using Static CPU Manager) drops p99 below 15 ms.",
+        "keyTakeaway": "Never let a container spawn 64 threads inside a 2-vCPU cgroup quota, and avoid arbitrary limits.cpu on latency-sensitive pods (or use Guaranteed QoS with integer CPU + Static CPU Manager)."
+      },
+      "summary": "With limits.cpu: 2 (200 ms quota per 100 ms period) on a 64-vCPU host, a JVM spawning 64 Netty/G1GC threads burns its 200 ms quota in 3.1 ms and freezes for 96.9 ms; capping ActiveProcessorCount=2 and removing limits.cpu (or using Static CPU Manager) drops p99 below 15 ms.",
+      "keyTakeaway": "When traffic spikes expose hidden coupling, never let a container spawn 64 threads inside a 2-vCPU cgroup quota, and avoid arbitrary limits.cpu on latency-sensitive pods (or use Guaranteed QoS with integer CPU + Static CPU Manager)."
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** With limits.cpu: 2 (200 ms quota per 100 ms period) on a 64-vCPU host, a JVM spawning 64 Netty/G1GC threads burns its 200 ms quota in 3.1 ms and freezes for 96.9 ms; capping ActiveProcessorCount=2 and removing limits.cpu (or using Static CPU Manager) drops p99 below 15 ms.\n\n**Production Trade-Offs:** Raising `requests.cpu` from `500m` to `2` while keeping `limits.cpu: 2` changes scheduling priority, **not** `cfs_quota_us`—the pod still throttles at `200 ms` per `100 ms`.\n\n**Failure Modes & Edge Cases:** CFS bandwidth awareness is critical for any low-latency containerized workload: **Netty / Spring / Go Gateways**: Eliminating periodic 100 ms tail-latency spikes on multi-core nodes.\n\n**Principal Takeaway:** Never let a container spawn 64 threads inside a 2-vCPU cgroup quota, and avoid arbitrary limits.cpu on latency-sensitive pods (or use Guaranteed QoS with integer CPU + Static CPU Manager).",
+      "spark": {
+        "summary": "With limits.cpu: 2 (200 ms quota per 100 ms period) on a 64-vCPU host, a JVM spawning 64 Netty/G1GC threads burns its 200 ms quota in 3.1 ms and freezes for 96.9 ms; capping ActiveProcessorCount=2 and removing limits.cpu (or using Static CPU Manager) drops p99 below 15 ms.",
+        "keyTakeaway": "Never let a container spawn 64 threads inside a 2-vCPU cgroup quota, and avoid arbitrary limits.cpu on latency-sensitive pods (or use Guaranteed QoS with integer CPU + Static CPU Manager)."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why Linux CFS bandwidth throttling causes 95 ms p99 freezes",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why Linux CFS bandwidth throttling causes 95 ms p99 freezes works from first principles.",
+          "explanation": "A payment gateway pod has `limits.cpu: 2` (`200 ms` of CPU time per `100 ms` `cpu.cfs_period_us` window) on a `64-vCPU` node. Because the JVM misreads host cores (or spawns 64 Netty/ForkJoin/G1GC threads), **all 64 threads wake up simultaneously**, burn the entire `200 ms` quota in `~3.1 ms` of wall time (`200 / 64`), and the Linux CFS scheduler **freezes the entire pod for the remaining `96.9 ms`**—causing `95–120 ms` p99 spikes even at 35% node CPU.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "What happens when multi-threaded runtimes hit 100 ms CFS periods",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without What happens when multi-threaded runtimes hit 100 ms CFS periods under real concurrency or scale.",
+          "explanation": "CFS quota throttling creates deceptive 'healthy node, frozen pod' incidents:\n\n1. **Burst Exhaustion**: 64 GC/Netty threads consume a 2-core quota in a few milliseconds.\n2. **100 ms Tail Spikes**: Every throttled period adds up to `97 ms` of artificial latency (`nr_throttled` climbs).\n3. **Misleading Metrics**: Average CPU looks low (`35%`) because averages hide sub-100ms quota exhaustion.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "100ms CFS Period Anatomy",
+            "title": "64 Threads Burn 200ms Quota in 3.1ms -> Frozen 96.9ms",
+            "actors": [
+              {
+                "id": "jvm",
+                "label": "64 JVM Threads"
+              },
+              {
+                "id": "cfs",
+                "label": "Linux CFS (200ms)"
+              },
+              {
+                "id": "req",
+                "label": "Payment Req"
+              }
+            ],
+            "events": [
+              {
+                "from": "jvm",
+                "to": "cfs",
+                "label": "t=0ms: 64 threads run concurrently",
+                "status": "warn"
+              },
+              {
+                "from": "cfs",
+                "to": "jvm",
+                "label": "t=3.1ms: 200ms quota spent -> THROTTLE!",
+                "status": "fail"
+              },
+              {
+                "from": "req",
+                "to": "jvm",
+                "label": "t=4ms..99ms: Request frozen 96ms!",
+                "status": "fail"
+              },
+              {
+                "from": "cfs",
+                "to": "jvm",
+                "label": "t=100ms: Quota replenishes (or no limit)",
+                "status": "ok"
+              }
+            ],
+            "summary": "Capping JVM threads (-XX:ActiveProcessorCount=2) and removing burst-blocking limits.cpu eliminates 95ms CFS freezes."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive solution (and why raising requests.cpu alone fails)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "The problem: see what breaks without Naive solution under real concurrency or scale.",
+          "explanation": "Raising `requests.cpu` from `500m` to `2` while keeping `limits.cpu: 2` changes scheduling priority, **not** `cfs_quota_us`—the pod still throttles at `200 ms` per `100 ms`. Conversely, setting `limits.cpu: 16` over-provisions nodes by `8×`.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Cap JVM Concurrency + Remove CPU Limits / Static CPU Manager",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Production Kubernetes clusters eliminate CFS throttling using two proven strategies:\n\n- **1. Match Runtime Threads to Allocated CPUs**: Pass `-XX:ActiveProcessorCount=2` (and configure Netty `EventLoopGroup(2)`) so the JVM does not spawn 64 threads inside a 2-vCPU container.\n- **2. Remove `limits.cpu` (Burstable QoS) OR Use Static CPU Manager**:\n  - **Standard Approach**: Set `requests.cpu: 2` and **omit `limits.cpu`** (preserving `limits.memory == requests.memory` for OOM safety) so CFS shares idle node CPU instead of hard-freezing pods at 100 ms boundaries.\n  - **Strict Isolation Approach**: Use `Guaranteed` QoS (`requests.cpu == limits.cpu: 2`, integer) with Kubelet `cpuManagerPolicy: static` to pin 2 exclusive physical cores, bypassing CFS quota entirely.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Thread & Scheduler Alignment",
+            "title": "ActiveProcessorCount=2 + Burstable (No CPU Limit) or Static Cores",
+            "nodes": [
+              {
+                "label": "JVM Flags",
+                "role": "ActiveProcessorCount=2"
+              },
+              {
+                "label": "Netty / G1GC",
+                "role": "2-4 threads (no burst)"
+              },
+              {
+                "label": "Kubelet QoS",
+                "role": "No cpu limit / Static"
+              },
+              {
+                "label": "Payment p99",
+                "role": "<15ms steady latency"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Thread Alignment",
+                "detail": "Prevents 64 threads from burning a 2-core quota in 3 ms."
+              },
+              {
+                "label": "Omit limits.cpu",
+                "detail": "Uses CFS cpu.weight shares so pods use idle CPU without 97ms freezes."
+              },
+              {
+                "label": "Static CPU Mgr",
+                "detail": "Pins 2 dedicated physical cores for Guaranteed integer-CPU pods."
+              },
+              {
+                "label": "Memory Limits Kept",
+                "detail": "Keeps requests.memory == limits.memory to prevent noisy-neighbor OOMs."
+              }
+            ],
+            "summary": "Aligning JVM thread count and removing artificial CFS quotas (or pinning static cores) brings p99 from 120 ms down below 15 ms."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where CFS Quota Tuning applies in Kubernetes",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "CFS bandwidth awareness is critical for any low-latency containerized workload:\n\n- **Netty / Spring / Go Gateways**: Eliminating periodic 100 ms tail-latency spikes on multi-core nodes.\n- **JVM / G1GC Services**: Preventing parallel GC phases from tripping CFS quotas during allocation bursts.\n- **HFT & Inference Servers**: Pinning exclusive cores via Kubelet Static CPU Manager.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Never let a container spawn 64 threads inside a 2-vCPU cgroup quota, and avoid arbitrary limits.cpu on latency-sensitive pods (or use Guaranteed QoS with integer CPU + Static CPU Manager).",
+      "summary": "With limits.cpu: 2 (200 ms quota per 100 ms period) on a 64-vCPU host, a JVM spawning 64 Netty/G1GC threads burns its 200 ms quota in 3.1 ms and freezes for 96.9 ms; capping ActiveProcessorCount=2 and removing limits.cpu (or using Static CPU Manager) drops p99 below 15 ms.",
+      "keyTakeaway": "When traffic spikes expose hidden coupling, never let a container spawn 64 threads inside a 2-vCPU cgroup quota, and avoid arbitrary limits.cpu on latency-sensitive pods (or use Guaranteed QoS with integer CPU + Static CPU Manager)."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "simulation": {
+    "title": "Fixing Kubernetes CFS CPU Throttling Freezes — Interactive Execution Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Workload & Budget"
+      },
+      {
+        "id": "router",
+        "label": "Gateway / Router",
+        "role": "Admission & Dispatch"
+      },
+      {
+        "id": "engine",
+        "label": "Core Engine",
+        "role": "Primary Execution"
+      },
+      {
+        "id": "replica",
+        "label": "Replica / Fallback",
+        "role": "Durability & Recovery"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "router",
+        "label": "request"
+      },
+      {
+        "from": "router",
+        "to": "engine",
+        "label": "route"
+      },
+      {
+        "from": "engine",
+        "to": "replica",
+        "label": "sync / fallback"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why Linux CFS bandwidth throttling causes 95 ms p99 freezes",
+        "actionLabel": "Dispatch nominal request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "router"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "Ingress",
+          "p99_ms": 8,
+          "error_rate": "0.0%"
+        },
+        "explanation": "Caller sends work into the gateway with explicit timeout and concurrency bounds (Why Linux CFS bandwidth throttling causes 95 ms p99 freezes)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "What happens when multi-threaded runtimes hit 100 ms CFS per",
+        "actionLabel": "Execute core invariant",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "Core Path",
+          "p99_ms": 18,
+          "in_flight": 124
+        },
+        "explanation": "The core engine processes the hot path while keeping state transitions deterministic (What happens when multi-threaded runtimes hit 100 ms CFS periods)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Naive solution (and why raising requests.cpu alone fails)",
+        "actionLabel": "Detect skew or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Degraded",
+          "p99_ms": 64,
+          "retries_capped": "true"
+        },
+        "explanation": "Under load or replica lag, bounded backoff and isolation prevent cascading saturation (Naive solution (and why raising requests.cpu alone fails))."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Where CFS Quota Tuning applies in Kubernetes",
+        "actionLabel": "Converge & restore SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 11,
+          "drift": 0
+        },
+        "explanation": "State converges cleanly and telemetry confirms the system returned within its SLO envelope (Where CFS Quota Tuning applies in Kubernetes)."
+      }
+    ]
+  }
+}

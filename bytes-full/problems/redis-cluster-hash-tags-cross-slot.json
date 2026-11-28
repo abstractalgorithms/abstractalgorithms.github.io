@@ -1,0 +1,800 @@
+{
+  "id": "problem-redis-cluster-hash-tags-cross-slot",
+  "slug": "redis-cluster-hash-tags-cross-slot",
+  "title": "Solving Redis Cluster Cross-Slot Errors with Hash Tags",
+  "problemType": "architecture",
+  "difficulty": "medium",
+  "prompt": "Your payments service is migrating from standalone Redis to a 6-node Redis Cluster (3 primaries, 3 replicas, 16,384 hash slots). Two core workflows immediately fail with `CROSSSLOT Keys in request don't hash to the same slot`: (1) an atomic Lua transfer/ledger script touching `user:1042:balance`, `user:1042:ledger`, and `user:1042:nonce`, and (2) a batch dashboard read calling `MGET` across 50 different users (`user:101:profile ... user:150:profile`). Redesign key naming, Lua execution, and client batching so both workflows succeed with < 2ms p99 latency and zero hot-shard skew.",
+  "spark": {
+    "summary": "Migrating multi-key MGET, MULTI/EXEC, or Lua scripts to a 16,384-slot Redis Cluster fails with CROSSSLOT errors whenever keys hash to different shard primaries.",
+    "keyTakeaway": "When a single bottleneck threatens end-to-end availability, colocate strictly atomic entity keys on one slot using `{hash_tags}` (e.g., `{user:1042}:balance`), and replace cross-entity MGET/MSET with slot-grouped parallel scatter-gather pipelines.",
+    "byteSummary": "**Core Mechanics:** Redis Cluster partitions the keyspace into `16,384` hash slots (`CRC16(key) & 16383`) across 3 primaries (`0–5460`, `5461–10922`, `10923–16383`) with no distributed two-phase commit.\n\n**Visual & Structural Flow:** Depicts Untagged Keys Scatter Across Shards and Fail Lua/MGET (Payments Svc -> Primary 1 (0..5460) -> Primary 2 (5461..10922)); Fine-Grained {user:1042} Colocation Across 3 Primaries (P1 -> P2 -> P3 -> R1..3 -> 0..5460).\n\n**Trade-Offs & Production:** Wrapping a static prefix in braces—such as `{payments}:user:1042:balance`—forces Redis Cluster to hash only `\"payments\"` for **every key in the system**. Solve both atomic per-entity scripts and cross-entity batches cleanly: **Entity-Scoped `{hash_tags}`**: Name keys `{user:1042}:balance`, `{user:1042}:ledger`, and `{user:1042}:nonce`.\n\n**Failure Modes & Application:** Slot-aware key design is foundational when scaling Redis Cluster: **Rate Limiters & Sliding Windows**: Colocate `{tenant:42}:tokens` and `{tenant:42}:ts` for atomic Lua token-bucket updates."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why standalone multi-key Redis commands fail in Redis Cluster",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "Think of **Why standalone multi-key Redis commands fail in Redis Cluster** as the intuition layer for Solving Redis Cluster Cross-Slot Errors with Hash Tags: The mechanism: understand how Why standalone multi-key Redis commands fail in Redis Cluster works from first principles.",
+        "core": "Redis Cluster partitions the keyspace into `16,384` hash slots (`CRC16(key) & 16383`) across 3 primaries (`0–5460`, `5461–10922`, `10923–16383`) with no distributed two-phase commit. Migrating a standalone Lua transfer script (`user:1042:balance`, `user:1042:ledger`, `user:1042:nonce`) or a 50-key `MGET` immediately throws `CROSSSLOT Keys in request don't hash to the same slot`.",
+        "deepDive": "Under heavy load or partial failure, why standalone multi-key redis commands fail in redis cluster becomes a critical lever for predictable latency and correctness. Migrating multi-key MGET, MULTI/EXEC, or Lua scripts to a 16,384-slot Redis Cluster fails with CROSSSLOT errors whenever keys hash to different shard primaries."
+      },
+      "purpose": "The mechanism: understand how Why standalone multi-key Redis commands fail in Redis Cluster works from first principles.",
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "Stage 1 Lifecycle",
+        "title": "Why standalone multi-key Redis commands fail in Redis Clus...",
+        "states": [
+          {
+            "id": "init",
+            "label": "Ready / Idle",
+            "tone": "neutral"
+          },
+          {
+            "id": "active",
+            "label": "In-Flight",
+            "tone": "info"
+          },
+          {
+            "id": "verified",
+            "label": "Committed",
+            "tone": "good"
+          },
+          {
+            "id": "degraded",
+            "label": "Fallback / Retry",
+            "tone": "warn"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "init",
+            "to": "active",
+            "label": "acquire"
+          },
+          {
+            "from": "active",
+            "to": "verified",
+            "label": "quorum ok"
+          },
+          {
+            "from": "active",
+            "to": "degraded",
+            "label": "timeout / skew"
+          },
+          {
+            "from": "degraded",
+            "to": "init",
+            "label": "backoff reset"
+          }
+        ]
+      }
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "Broken atomic ledger scripts and 25 ms sequential MGET fallbacks",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Two critical payment workflows break on cluster cutover:",
+        "core": "1. **Atomic Lua / `MULTI/EXEC` Failure**: `EVAL` cannot touch `balance` on Shard 1 and `nonce` on Shard 2, failing all transfers.\n2. **50-Key `MGET` Latency Cliff**: Falling back to 50 sequential `GET` calls at `0.5 ms` RTT turns a `< 1 ms` batch read into `25 ms`.",
+        "deepDive": "In production deployments of Solving Redis Cluster Cross-Slot Errors with Hash Tags, watch how broken atomic ledger scripts and 25 ms sequential mget fallbacks interacts with tail latency, retry amplification, and partial failures. Migrating multi-key MGET, MULTI/EXEC, or Lua scripts to a 16,384-slot Redis Cluster fails with CROSSSLOT errors whenever keys hash to different shard primaries."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "CROSSSLOT Error vs. Slot Grouping",
+        "title": "Untagged Keys Scatter Across Shards and Fail Lua/MGET",
+        "actors": [
+          {
+            "id": "pay",
+            "label": "Payments Svc"
+          },
+          {
+            "id": "s1",
+            "label": "Primary 1 (0..5460)"
+          },
+          {
+            "id": "s2",
+            "label": "Primary 2 (5461..10922)"
+          }
+        ],
+        "events": [
+          {
+            "from": "pay",
+            "to": "s1",
+            "label": "EVAL balance (1204) + nonce (9811)",
+            "status": "warn"
+          },
+          {
+            "from": "s1",
+            "to": "pay",
+            "label": "ERR CROSSSLOT (different shards)",
+            "status": "fail"
+          },
+          {
+            "from": "pay",
+            "to": "s1",
+            "label": "Sequential 50x GET = 25ms",
+            "status": "fail"
+          },
+          {
+            "from": "pay",
+            "to": "s1",
+            "label": "{user:1042}:* -> same slot (1 RTT)",
+            "status": "ok"
+          }
+        ],
+        "summary": "Entity hash tags colocate atomic per-user keys onto one slot, while slot-grouped pipelines execute cross-user MGET in 1 parallel RTT."
+      },
+      "purpose": "The problem: see what breaks without Broken atomic ledger scripts and 25 ms sequential MGET fallbacks under real concurrency or scale.",
+      "decisionFramework": {
+        "problem": "How to implement Solving Redis Cluster Cross-Slot Errors with Hash Tags without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "When a single bottleneck threatens end-to-end availability, colocate strictly atomic entity keys on one slot using `{hash_tags}` (e.g., `{user:1042}:balance`), and replace cross-entity MGET/MSET with slot-grouped parallel scatter-gather pipelines.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Solving Redis Cluster Cross-Slot Errors with Hash Tags experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Why coarse hash tags like {global} destroy cluster sharding",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Think of **Why coarse hash tags like {global} destroy cluster sharding** as the intuition layer for Solving Redis Cluster Cross-Slot Errors with Hash Tags: The problem: see what breaks without Why coarse hash tags like {global} destroy cluster sharding under real concurrency or scale.",
+        "core": "Wrapping a static prefix in braces—such as `{payments}:user:1042:balance`—forces Redis Cluster to hash only `\"payments\"` for **every key in the system**. All keys land on a single hash slot on Primary 1, turning a 3-shard cluster into a single-node bottleneck.",
+        "deepDive": "Under heavy load or partial failure, why coarse hash tags like {global} destroy cluster sharding becomes a critical lever for predictable latency and correctness. Migrating multi-key MGET, MULTI/EXEC, or Lua scripts to a 16,384-slot Redis Cluster fails with CROSSSLOT errors whenever keys hash to different shard primaries."
+      },
+      "purpose": "The problem: see what breaks without Why coarse hash tags like {global} destroy cluster sharding under real concurrency or scale.",
+      "sectionDiagram": {
+        "kind": "behavior-transition",
+        "eyebrow": "Stage 3 Trade-Off",
+        "title": "Why coarse hash tags like {global} destroy cluster shardin...",
+        "before": {
+          "label": "Naive Unbounded Path",
+          "metrics": [
+            "Unbounded retries",
+            "Tail latency spikes",
+            "Silent state drift"
+          ]
+        },
+        "after": {
+          "label": "Bounded Engineering Path",
+          "metrics": [
+            "Explicit budgets",
+            "Predictable p99",
+            "Verifiable invariants"
+          ]
+        }
+      }
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise solution: Fine-Grained {entity} Hash Tags + Scatter-Gather Pipelines",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": {
+        "foundation": "Solve both atomic per-entity scripts and cross-entity batches cleanly:",
+        "core": "- **Entity-Scoped `{hash_tags}`**: Name keys `{user:1042}:balance`, `{user:1042}:ledger`, and `{user:1042}:nonce`. Redis hashes only `user:1042`, colocating all three keys on one slot for single-RTT `EVAL` atomicity while spreading millions of users uniformly across all 16,384 slots.\n- **Client-Side Slot Scatter-Gather for `MGET`/`MSET`**: For 50 unrelated users, compute `CRC16(key) & 16383` in the client, group keys by owning primary node (3 groups), and dispatch 3 parallel pipelines in `~0.9 ms` (`< 2 ms` p99).",
+        "deepDive": "In production deployments of Solving Redis Cluster Cross-Slot Errors with Hash Tags, watch how enterprise solution: fine-grained {entity} hash tags + scatter-gather pipelines interacts with tail latency, retry amplification, and partial failures. Migrating multi-key MGET, MULTI/EXEC, or Lua scripts to a 16,384-slot Redis Cluster fails with CROSSSLOT errors whenever keys hash to different shard primaries."
+      },
+      "sectionDiagram": {
+        "kind": "ring",
+        "eyebrow": "16,384-Slot Hash Partitioning",
+        "title": "Fine-Grained {user:1042} Colocation Across 3 Primaries",
+        "ringLabel": "[0 .. 16,383]",
+        "ringSub": "CRC16({tag}) & 16383",
+        "sampleKey": "{user:1042}",
+        "nodes": [
+          "P1",
+          "P2",
+          "P3",
+          "R1..3"
+        ],
+        "vnodes": [
+          "0..5460",
+          "5461..",
+          "10923..",
+          "bal",
+          "ledg",
+          "nonce",
+          "pipe1",
+          "pipe2"
+        ],
+        "summary": "Caption: Fine-Grained {user:1042} Colocation Across 3 Primaries (P1 -> P2 -> P3 -> R1..3)."
+      },
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where hash tags and scatter-gather apply in distributed caches",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Slot-aware key design is foundational when scaling Redis Cluster:",
+        "core": "- **Rate Limiters & Sliding Windows**: Colocate `{tenant:42}:tokens` and `{tenant:42}:ts` for atomic Lua token-bucket updates.\n- **Payment Ledgers & Nonce Guards**: Keep balance, ledger, and idempotency nonce on one slot.\n- **Batch Profile Hydration**: Use slot-grouped parallel pipelines instead of naive `MGET`.",
+        "deepDive": "In production deployments of Solving Redis Cluster Cross-Slot Errors with Hash Tags, watch how where hash tags and scatter-gather apply in distributed caches interacts with tail latency, retry amplification, and partial failures. Migrating multi-key MGET, MULTI/EXEC, or Lua scripts to a 16,384-slot Redis Cluster fails with CROSSSLOT errors whenever keys hash to different shard primaries."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "consistent-hashing",
+          "title": "Concept: Consistent Hashing",
+          "kind": "concept"
+        },
+        {
+          "slug": "database-sharding",
+          "title": "Concept: Database Sharding",
+          "kind": "concept"
+        },
+        {
+          "slug": "key-value-store-patterns",
+          "title": "Concept: Key-Value Store Patterns",
+          "kind": "concept"
+        },
+        {
+          "slug": "design-distributed-key-value-store",
+          "title": "System Design: Distributed Key-Value Store",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Stage 5 Interaction",
+        "title": "Where hash tags and scatter-gather apply in distributed ca...",
+        "actors": [
+          {
+            "id": "caller",
+            "label": "Client / Caller"
+          },
+          {
+            "id": "coord",
+            "label": "Coordinator"
+          },
+          {
+            "id": "store",
+            "label": "State / Engine"
+          }
+        ],
+        "steps": [
+          {
+            "from": "caller",
+            "to": "coord",
+            "label": "1. Dispatch request + bounds"
+          },
+          {
+            "from": "coord",
+            "to": "store",
+            "label": "2. Execute deterministic step"
+          },
+          {
+            "from": "store",
+            "to": "coord",
+            "label": "3. Return state & proof"
+          },
+          {
+            "from": "coord",
+            "to": "caller",
+            "label": "4. Ack with bounded latency"
+          }
+        ]
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "What happens if you name keys `{global}:user:1042:balance` and `{global}:user:9999:balance` in Redis Cluster?",
+      "options": [
+        {
+          "id": "a",
+          "text": "Every key hashes only `global` and maps to the exact same slot on a single shard, creating a hot-shard bottleneck",
+          "correct": true,
+          "feedback": "Correct: Redis hashes only the first `{...}` substring, so `{global}` defeats cluster sharding."
+        },
+        {
+          "id": "b",
+          "text": "Redis Cluster throws a CROSSSLOT error on single-key GETs",
+          "correct": false,
+          "feedback": "Single-key GETs work, but all keys pile onto one primary."
+        },
+        {
+          "id": "c",
+          "text": "Redis automatically strips `{global}` and hashes the full key",
+          "correct": false,
+          "feedback": "Redis always hashes the non-empty substring inside the first `{...}`."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "What happens if you name keys `{global}:user:1042:balance` and `{global}:user:9999:balance` in Redis Cluster?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Every key hashes only `global` and maps to the exact same slot on a single shard, creating a hot-shard bottleneck",
+            "correct": true,
+            "feedback": "Correct: Redis hashes only the first `{...}` substring, so `{global}` defeats cluster sharding."
+          },
+          {
+            "id": "b",
+            "text": "Redis Cluster throws a CROSSSLOT error on single-key GETs",
+            "correct": false,
+            "feedback": "Single-key GETs work, but all keys pile onto one primary."
+          },
+          {
+            "id": "c",
+            "text": "Redis automatically strips `{global}` and hashes the full key",
+            "correct": false,
+            "feedback": "Redis always hashes the non-empty substring inside the first `{...}`."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why standalone multi-key Redis commands fail in Redis Cluster', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "b",
+            "text": "Redis Cluster partitions the keyspace into 16,384 hash slots (CRC16(key) & 16383) across 3 primaries (0–5460, 5461–10922, 10923–16383) with no distributed two-phase commit.",
+            "correct": true,
+            "feedback": "Correct: Redis Cluster partitions the keyspace into 16,384 hash slots (CRC16(key) & 16383) across 3 primaries (0–5460, 5461–10922, 10923–16383) with no distributed two-phase commit."
+          },
+          {
+            "id": "c",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Broken atomic ledger scripts and 25 ms sequential MGET fallbacks', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Two critical payment workflows break on cluster cutover: 1.",
+            "correct": true,
+            "feedback": "Correct: Two critical payment workflows break on cluster cutover: 1."
+          },
+          {
+            "id": "b",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "c",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** Redis Cluster partitions the keyspace into `16,384` hash slots (`CRC16(key) & 16383`) across 3 primaries (`0–5460`, `5461–10922`, `10923–16383`) with no distributed two-phase commit.\n\n**How It Flows:** Think of Solving Redis Cluster Cross-Slot Errors with Hash Tags as a clear step-by-step chain: Payments Svc -> Primary 1 (0..5460) -> Primary 2 (5461..10922) -> P1 -> P2.\n\n**Why Beginners Should Care:** Colocate strictly atomic entity keys on one slot using `{hash_tags}` (e.g., `{user:1042}:balance`), and replace cross-entity MGET/MSET with slot-grouped parallel scatter-gather pipelines.",
+      "spark": {
+        "summary": "Redis Cluster partitions the keyspace into `16,384` hash slots (`CRC16(key) & 16383`) across 3 primaries (`0–5460`, `5461–10922`, `10923–16383`) with no distributed two-phase commit.",
+        "keyTakeaway": "Colocate strictly atomic entity keys on one slot using `{hash_tags}` (e.g., `{user:1042}:balance`), and replace cross-entity MGET/MSET with slot-grouped parallel scatter-gather pipelines."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why standalone multi-key Redis commands fail in Redis Cluster",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why standalone multi-key Redis commands fail in Redis Cluster works from first principles.",
+          "explanation": "Redis Cluster partitions the keyspace into `16,384` hash slots (`CRC16(key) & 16383`) across 3 primaries (`0–5460`, `5461–10922`, `10923–16383`) with no distributed two-phase commit. Migrating a standalone Lua transfer script (`user:1042:balance`, `user:1042:ledger`, `user:1042:nonce`) or a 50-key `MGET` immediately throws `CROSSSLOT Keys in request don't hash to the same slot`.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Broken atomic ledger scripts and 25 ms sequential MGET fallbacks",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without Broken atomic ledger scripts and 25 ms sequential MGET fallbacks under real concurrency or scale.",
+          "explanation": "Two critical payment workflows break on cluster cutover: 1. **Atomic Lua / `MULTI/EXEC` Failure**: `EVAL` cannot touch `balance` on Shard 1 and `nonce` on Shard 2, failing all transfers. 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "CROSSSLOT Error vs. Slot Grouping",
+            "title": "Untagged Keys Scatter Across Shards and Fail Lua/MGET",
+            "actors": [
+              {
+                "id": "pay",
+                "label": "Payments Svc"
+              },
+              {
+                "id": "s1",
+                "label": "Primary 1 (0..5460)"
+              },
+              {
+                "id": "s2",
+                "label": "Primary 2 (5461..10922)"
+              }
+            ],
+            "events": [
+              {
+                "from": "pay",
+                "to": "s1",
+                "label": "EVAL balance (1204) + nonce (9811)",
+                "status": "warn"
+              },
+              {
+                "from": "s1",
+                "to": "pay",
+                "label": "ERR CROSSSLOT (different shards)",
+                "status": "fail"
+              },
+              {
+                "from": "pay",
+                "to": "s1",
+                "label": "Sequential 50x GET = 25ms",
+                "status": "fail"
+              },
+              {
+                "from": "pay",
+                "to": "s1",
+                "label": "{user:1042}:* -> same slot (1 RTT)",
+                "status": "ok"
+              }
+            ],
+            "summary": "Entity hash tags colocate atomic per-user keys onto one slot, while slot-grouped pipelines execute cross-user MGET in 1 parallel RTT."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Why coarse hash tags like {global} destroy cluster sharding",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "The problem: see what breaks without Why coarse hash tags like {global} destroy cluster sharding under real concurrency or scale.",
+          "explanation": "Wrapping a static prefix in braces—such as `{payments}:user:1042:balance`—forces Redis Cluster to hash only `\"payments\"` for **every key in the system**. All keys land on a single hash slot on Primary 1, turning a 3-shard cluster into a single-node bottleneck.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Fine-Grained {entity} Hash Tags + Scatter-Gather Pipelines",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Solve both atomic per-entity scripts and cross-entity batches cleanly: **Entity-Scoped `{hash_tags}`**: Name keys `{user:1042}:balance`, `{user:1042}:ledger`, and `{user:1042}:nonce`. Redis hashes only `user:1042`, colocating all three keys on one slot for single-RTT `EVAL` atomicity while spreading millions of users uniformly across all 16,384 slots.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "ring",
+            "eyebrow": "16,384-Slot Hash Partitioning",
+            "title": "Fine-Grained {user:1042} Colocation Across 3 Primaries",
+            "ringLabel": "[0 .. 16,383]",
+            "ringSub": "CRC16({tag}) & 16383",
+            "sampleKey": "{user:1042}",
+            "nodes": [
+              "P1",
+              "P2",
+              "P3",
+              "R1..3"
+            ],
+            "vnodes": [
+              "0..5460",
+              "5461..",
+              "10923..",
+              "bal",
+              "ledg",
+              "nonce",
+              "pipe1",
+              "pipe2"
+            ],
+            "summary": "Caption: Fine-Grained {user:1042} Colocation Across 3 Primaries (P1 -> P2 -> P3 -> R1..3)."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Colocate strictly atomic entity keys on one slot using `{hash_tags}` (e.g., `{user:1042}:balance`), and replace cross-entity MGET/MSET with slot-grouped parallel scatter-gather pipelines.",
+      "summary": "Migrating multi-key MGET, MULTI/EXEC, or Lua scripts to a 16,384-slot Redis Cluster fails with CROSSSLOT errors whenever keys hash to different shard primaries.",
+      "keyTakeaway": "When a single bottleneck threatens end-to-end availability, colocate strictly atomic entity keys on one slot using `{hash_tags}` (e.g., `{user:1042}:balance`), and replace cross-entity MGET/MSET with slot-grouped parallel scatter-gather pipelines."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** Redis Cluster partitions the keyspace into `16,384` hash slots (`CRC16(key) & 16383`) across 3 primaries (`0–5460`, `5461–10922`, `10923–16383`) with no distributed two-phase commit.\n\n**Visual & Structural Flow:** Depicts Untagged Keys Scatter Across Shards and Fail Lua/MGET (Payments Svc -> Primary 1 (0..5460) -> Primary 2 (5461..10922)); Fine-Grained {user:1042} Colocation Across 3 Primaries (P1 -> P2 -> P3 -> R1..3 -> 0..5460).\n\n**Trade-Offs & Production:** Wrapping a static prefix in braces—such as `{payments}:user:1042:balance`—forces Redis Cluster to hash only `\"payments\"` for **every key in the system**. Solve both atomic per-entity scripts and cross-entity batches cleanly: **Entity-Scoped `{hash_tags}`**: Name keys `{user:1042}:balance`, `{user:1042}:ledger`, and `{user:1042}:nonce`.\n\n**Failure Modes & Application:** Slot-aware key design is foundational when scaling Redis Cluster: **Rate Limiters & Sliding Windows**: Colocate `{tenant:42}:tokens` and `{tenant:42}:ts` for atomic Lua token-bucket updates.",
+      "spark": {
+        "summary": "Migrating multi-key MGET, MULTI/EXEC, or Lua scripts to a 16,384-slot Redis Cluster fails with CROSSSLOT errors whenever keys hash to different shard primaries.",
+        "keyTakeaway": "Colocate strictly atomic entity keys on one slot using `{hash_tags}` (e.g., `{user:1042}:balance`), and replace cross-entity MGET/MSET with slot-grouped parallel scatter-gather pipelines."
+      },
+      "summary": "Migrating multi-key MGET, MULTI/EXEC, or Lua scripts to a 16,384-slot Redis Cluster fails with CROSSSLOT errors whenever keys hash to different shard primaries.",
+      "keyTakeaway": "When a single bottleneck threatens end-to-end availability, colocate strictly atomic entity keys on one slot using `{hash_tags}` (e.g., `{user:1042}:balance`), and replace cross-entity MGET/MSET with slot-grouped parallel scatter-gather pipelines."
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** Migrating multi-key MGET, MULTI/EXEC, or Lua scripts to a 16,384-slot Redis Cluster fails with CROSSSLOT errors whenever keys hash to different shard primaries.\n\n**Production Trade-Offs:** Wrapping a static prefix in braces—such as `{payments}:user:1042:balance`—forces Redis Cluster to hash only `\"payments\"` for **every key in the system**.\n\n**Failure Modes & Edge Cases:** Slot-aware key design is foundational when scaling Redis Cluster: **Rate Limiters & Sliding Windows**: Colocate `{tenant:42}:tokens` and `{tenant:42}:ts` for atomic Lua token-bucket updates.\n\n**Principal Takeaway:** Colocate strictly atomic entity keys on one slot using `{hash_tags}` (e.g., `{user:1042}:balance`), and replace cross-entity MGET/MSET with slot-grouped parallel scatter-gather pipelines.",
+      "spark": {
+        "summary": "Migrating multi-key MGET, MULTI/EXEC, or Lua scripts to a 16,384-slot Redis Cluster fails with CROSSSLOT errors whenever keys hash to different shard primaries.",
+        "keyTakeaway": "Colocate strictly atomic entity keys on one slot using `{hash_tags}` (e.g., `{user:1042}:balance`), and replace cross-entity MGET/MSET with slot-grouped parallel scatter-gather pipelines."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why standalone multi-key Redis commands fail in Redis Cluster",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why standalone multi-key Redis commands fail in Redis Cluster works from first principles.",
+          "explanation": "Redis Cluster partitions the keyspace into `16,384` hash slots (`CRC16(key) & 16383`) across 3 primaries (`0–5460`, `5461–10922`, `10923–16383`) with no distributed two-phase commit. Migrating a standalone Lua transfer script (`user:1042:balance`, `user:1042:ledger`, `user:1042:nonce`) or a 50-key `MGET` immediately throws `CROSSSLOT Keys in request don't hash to the same slot`.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Broken atomic ledger scripts and 25 ms sequential MGET fallbacks",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without Broken atomic ledger scripts and 25 ms sequential MGET fallbacks under real concurrency or scale.",
+          "explanation": "Two critical payment workflows break on cluster cutover:\n\n1. **Atomic Lua / `MULTI/EXEC` Failure**: `EVAL` cannot touch `balance` on Shard 1 and `nonce` on Shard 2, failing all transfers.\n2. **50-Key `MGET` Latency Cliff**: Falling back to 50 sequential `GET` calls at `0.5 ms` RTT turns a `< 1 ms` batch read into `25 ms`.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "CROSSSLOT Error vs. Slot Grouping",
+            "title": "Untagged Keys Scatter Across Shards and Fail Lua/MGET",
+            "actors": [
+              {
+                "id": "pay",
+                "label": "Payments Svc"
+              },
+              {
+                "id": "s1",
+                "label": "Primary 1 (0..5460)"
+              },
+              {
+                "id": "s2",
+                "label": "Primary 2 (5461..10922)"
+              }
+            ],
+            "events": [
+              {
+                "from": "pay",
+                "to": "s1",
+                "label": "EVAL balance (1204) + nonce (9811)",
+                "status": "warn"
+              },
+              {
+                "from": "s1",
+                "to": "pay",
+                "label": "ERR CROSSSLOT (different shards)",
+                "status": "fail"
+              },
+              {
+                "from": "pay",
+                "to": "s1",
+                "label": "Sequential 50x GET = 25ms",
+                "status": "fail"
+              },
+              {
+                "from": "pay",
+                "to": "s1",
+                "label": "{user:1042}:* -> same slot (1 RTT)",
+                "status": "ok"
+              }
+            ],
+            "summary": "Entity hash tags colocate atomic per-user keys onto one slot, while slot-grouped pipelines execute cross-user MGET in 1 parallel RTT."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Why coarse hash tags like {global} destroy cluster sharding",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "The problem: see what breaks without Why coarse hash tags like {global} destroy cluster sharding under real concurrency or scale.",
+          "explanation": "Wrapping a static prefix in braces—such as `{payments}:user:1042:balance`—forces Redis Cluster to hash only `\"payments\"` for **every key in the system**. All keys land on a single hash slot on Primary 1, turning a 3-shard cluster into a single-node bottleneck.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Fine-Grained {entity} Hash Tags + Scatter-Gather Pipelines",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Solve both atomic per-entity scripts and cross-entity batches cleanly:\n\n- **Entity-Scoped `{hash_tags}`**: Name keys `{user:1042}:balance`, `{user:1042}:ledger`, and `{user:1042}:nonce`. Redis hashes only `user:1042`, colocating all three keys on one slot for single-RTT `EVAL` atomicity while spreading millions of users uniformly across all 16,384 slots.\n- **Client-Side Slot Scatter-Gather for `MGET`/`MSET`**: For 50 unrelated users, compute `CRC16(key) & 16383` in the client, group keys by owning primary node (3 groups), and dispatch 3 parallel pipelines in `~0.9 ms` (`< 2 ms` p99).",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "ring",
+            "eyebrow": "16,384-Slot Hash Partitioning",
+            "title": "Fine-Grained {user:1042} Colocation Across 3 Primaries",
+            "ringLabel": "[0 .. 16,383]",
+            "ringSub": "CRC16({tag}) & 16383",
+            "sampleKey": "{user:1042}",
+            "nodes": [
+              "P1",
+              "P2",
+              "P3",
+              "R1..3"
+            ],
+            "vnodes": [
+              "0..5460",
+              "5461..",
+              "10923..",
+              "bal",
+              "ledg",
+              "nonce",
+              "pipe1",
+              "pipe2"
+            ],
+            "summary": "Caption: Fine-Grained {user:1042} Colocation Across 3 Primaries (P1 -> P2 -> P3 -> R1..3)."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where hash tags and scatter-gather apply in distributed caches",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Slot-aware key design is foundational when scaling Redis Cluster:\n\n- **Rate Limiters & Sliding Windows**: Colocate `{tenant:42}:tokens` and `{tenant:42}:ts` for atomic Lua token-bucket updates.\n- **Payment Ledgers & Nonce Guards**: Keep balance, ledger, and idempotency nonce on one slot.\n- **Batch Profile Hydration**: Use slot-grouped parallel pipelines instead of naive `MGET`.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Colocate strictly atomic entity keys on one slot using `{hash_tags}` (e.g., `{user:1042}:balance`), and replace cross-entity MGET/MSET with slot-grouped parallel scatter-gather pipelines.",
+      "summary": "Migrating multi-key MGET, MULTI/EXEC, or Lua scripts to a 16,384-slot Redis Cluster fails with CROSSSLOT errors whenever keys hash to different shard primaries.",
+      "keyTakeaway": "When a single bottleneck threatens end-to-end availability, colocate strictly atomic entity keys on one slot using `{hash_tags}` (e.g., `{user:1042}:balance`), and replace cross-entity MGET/MSET with slot-grouped parallel scatter-gather pipelines."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "simulation": {
+    "title": "Solving Redis Cluster Cross-Slot Errors with Hash Tags — Interactive Execution Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Workload & Budget"
+      },
+      {
+        "id": "router",
+        "label": "Gateway / Router",
+        "role": "Admission & Dispatch"
+      },
+      {
+        "id": "engine",
+        "label": "Core Engine",
+        "role": "Primary Execution"
+      },
+      {
+        "id": "replica",
+        "label": "Replica / Fallback",
+        "role": "Durability & Recovery"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "router",
+        "label": "request"
+      },
+      {
+        "from": "router",
+        "to": "engine",
+        "label": "route"
+      },
+      {
+        "from": "engine",
+        "to": "replica",
+        "label": "sync / fallback"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why standalone multi-key Redis commands fail in Redis Cluste",
+        "actionLabel": "Dispatch nominal request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "router"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "Ingress",
+          "p99_ms": 8,
+          "error_rate": "0.0%"
+        },
+        "explanation": "Caller sends work into the gateway with explicit timeout and concurrency bounds (Why standalone multi-key Redis commands fail in Redis Cluster)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Broken atomic ledger scripts and 25 ms sequential MGET fallb",
+        "actionLabel": "Execute core invariant",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "Core Path",
+          "p99_ms": 18,
+          "in_flight": 124
+        },
+        "explanation": "The core engine processes the hot path while keeping state transitions deterministic (Broken atomic ledger scripts and 25 ms sequential MGET fallbacks)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Why coarse hash tags like {global} destroy cluster sharding",
+        "actionLabel": "Detect skew or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Degraded",
+          "p99_ms": 64,
+          "retries_capped": "true"
+        },
+        "explanation": "Under load or replica lag, bounded backoff and isolation prevent cascading saturation (Why coarse hash tags like {global} destroy cluster sharding)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Where hash tags and scatter-gather apply in distributed cach",
+        "actionLabel": "Converge & restore SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 11,
+          "drift": 0
+        },
+        "explanation": "State converges cleanly and telemetry confirms the system returned within its SLO envelope (Where hash tags and scatter-gather apply in distributed caches)."
+      }
+    ]
+  }
+}

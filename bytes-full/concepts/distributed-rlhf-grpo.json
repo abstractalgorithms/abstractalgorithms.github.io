@@ -1,0 +1,808 @@
+{
+  "slug": "distributed-rlhf-grpo",
+  "title": "Distributed RLHF, DPO & GRPO Post-Training",
+  "domain": "ai-machine-learning-systems",
+  "spark": {
+    "summary": "Distributed post-training aligns base LLMs via multi-model RL loops (PPO/GRPO) or offline preference optimization (DPO), coordinating high-throughput vLLM rollout actors, reward/verifier pools, frozen reference KL penalties, and FSDP policy trainers.",
+    "keyTakeaway": "When inference latency or GPU memory limits bind throughput, DPO & GRPO Post-Training, GRPO eliminates the memory-heavy PPO Critic model by computing group-relative advantages across G sampled completions per prompt, while disaggregated vLLM rollout engines + NCCL weight sync eliminate training-inference GPU bubbles.",
+    "byteSummary": "Unlike pre-training—where every GPU runs uniform forward/backward passes over static token chunks—online RLHF alternates between autoregressive rollout generation (memory-bandwidth bound) and dense gradient updates (compute bound) across four distinct models: Policy Actor, Frozen Reference Policy, Reward/Verifier, and (in PPO) a learned Value Critic.\n\nGroup Relative Policy Optimization (GRPO) simplifies this 4-model bottleneck by dropping the Value Critic entirely. Instead, a vLLM rollout cluster generates G=8–16 completions per prompt, a hybrid pool of deterministic verifiers (math/unit-test sandboxes) and neural reward models scores each trajectory, and advantages are normalized within each prompt's group: A_i = (r_i - mean(R)) / std(R).\n\nAt cluster scale, naive synchronous RLHF stalls whenever a single long chain-of-thought rollout (straggler) blocks all other GPUs. Modern pipelines disaggregate vLLM rollout GPUs from FSDP2/Megatron trainer GPUs, stream completed trajectories into a replay buffer, and broadcast updated policy weights back to inference engines via non-blocking NCCL or LoRA delta syncs."
+  },
+  "learningJourney": [
+    {
+      "stage": 1,
+      "level": "foundation",
+      "title": "The Post-Training Spectrum: SFT, DPO, PPO & GRPO",
+      "purpose": "Compare offline preference tuning (DPO) against online RL (PPO and GRPO) in memory, stability, and ceiling.",
+      "explanation": {
+        "foundation": "Supervised Fine-Tuning (SFT) teaches format, but struggles to surpass human demonstrations.",
+        "core": "Direct Preference Optimization (DPO) skips online rollouts by optimizing a closed-form contrastive loss over static `(prompt, chosen, rejected)` pairs—needing only Policy + Frozen Reference weights, though it suffers from off-policy distribution shift. Online RLHF (PPO) explores new trajectories and fixes distribution shift, but requires 4 models in GPU memory (Actor, Critic, Reference, Reward).",
+        "deepDive": "GRPO drops the Critic model by sampling G=8 completions per prompt and normalizing rewards within the group, cutting ~35–40% of training HBM while excelling at verifiable reasoning tasks."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 1 · ALGORITHMS",
+        "title": "DPO vs. PPO vs. GRPO Memory & Compute Trade-offs",
+        "nodes": [
+          {
+            "id": "sft",
+            "label": "SFT (1 Model)",
+            "sub": "Cross-entropy on demos",
+            "role": "baseline-stage"
+          },
+          {
+            "id": "dpo",
+            "label": "DPO (2 Models)",
+            "sub": "Offline chosen/rejected",
+            "role": "offline-pref"
+          },
+          {
+            "id": "ppo",
+            "label": "PPO (4 Models)",
+            "sub": "Actor+Critic+Ref+RM",
+            "role": "online-critic"
+          },
+          {
+            "id": "grpo",
+            "label": "GRPO (3 Models)",
+            "sub": "G=8 group-relative adv",
+            "role": "online-criticless"
+          }
+        ],
+        "edges": [
+          {
+            "from": "sft",
+            "to": "dpo",
+            "label": "Adds preference pairs"
+          },
+          {
+            "from": "dpo",
+            "to": "ppo",
+            "label": "Moves on-policy w/ Critic"
+          },
+          {
+            "from": "ppo",
+            "to": "grpo",
+            "label": "Replaces Critic w/ G-group"
+          }
+        ],
+        "cards": [
+          {
+            "label": "When to Use DPO",
+            "detail": "Fastest path for style/tone alignment when you already have clean human preference pairs."
+          },
+          {
+            "label": "When GRPO Dominates",
+            "detail": "Math, code, and agentic tool-use where deterministic verifiers provide exact group rewards."
+          }
+        ],
+        "summary": "GRPO achieves online RL exploration without a separate Value Critic by normalizing rewards across G sampled completions per prompt.",
+        "caption": "Dropping the Critic model saves ~35-40% HBM and simplifies distributed multi-node orchestration."
+      },
+      "id": "stage-1-the-post-training-spectrum-sft-dpo-ppo-grpo"
+    },
+    {
+      "stage": 2,
+      "level": "foundation",
+      "title": "The 4-Model / 3-Model Memory & Compute Split",
+      "purpose": "Understand why co-locating rollout inference, reference logprobs, reward scoring, and FSDP training saturates HBM.",
+      "explanation": {
+        "foundation": "Think of **The 4-Model / 3-Model Memory & Compute Split** as the intuition layer for Distributed RLHF, DPO & GRPO Post-Training: Understand why co-locating rollout inference, reference logprobs, reward scoring, and FSDP training saturates HBM.",
+        "core": "For a 70B parameter policy in BF16 (140 GB weights alone), storing Policy weights + AdamW optimizer states (FP32 master weights + momentum + variance = ~12x bytes/param = 840 GB) + activations + Frozen Reference weights (140 GB) + KV-caches for G=8 rollouts exceeds single-node HBM. Distributed trainers partition these roles using FSDP2/ZeRO-3 sharding for the Policy Trainer, tensor-parallel TP=4/8 vLLM engines for rollouts, and lightweight quantized/offloaded or shared-weight Reference evaluation (computing `log pi_ref` in a single forward pass before updating).",
+        "deepDive": "Under heavy load or partial failure, the 4-model / 3-model memory & compute split becomes a critical lever for predictable latency and correctness. Large-scale post-training architecture combining criticless GRPO (k3 KL, zero-std masking), seccomp verifier sandboxes, disaggregated vLLM rollouts, bounded-staleness replay, and layer-pipelined NCCL weight sync."
+      },
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "STAGE 2 · RESOURCE SPLIT",
+        "title": "Distributed Memory Partitioning Across RLHF Roles",
+        "cards": [
+          {
+            "label": "Shared Reference Trick",
+            "detail": "With LoRA policy training, toggling adapters off yields exact pi_ref logprobs with zero extra HBM."
+          },
+          {
+            "label": "KV-Cache Pressure",
+            "detail": "Long 8K-token reasoning rollouts make rollout inference memory-bandwidth bound, not FLOP bound."
+          }
+        ],
+        "summary": "Disaggregating vLLM rollout engines from ZeRO-3 FSDP2 trainers prevents KV-caches and AdamW optimizer states from fighting over the same HBM.",
+        "caption": "LoRA adapter toggling or separate TP/FSDP sharding keeps 70B+ post-training within node HBM limits.",
+        "graphNodes": [
+          {
+            "id": "rollout",
+            "label": "vLLM Rollout Cluster",
+            "role": "actor-inference",
+            "col": 0,
+            "row": 0,
+            "tone": "primary"
+          },
+          {
+            "id": "reward",
+            "label": "Reward / Verifier Pool",
+            "role": "reward-scorer",
+            "col": 1,
+            "row": 0,
+            "tone": "tint"
+          },
+          {
+            "id": "ref",
+            "label": "Frozen Reference Policy",
+            "role": "kl-anchor",
+            "col": 2,
+            "row": 0,
+            "tone": "tint"
+          },
+          {
+            "id": "train",
+            "label": "FSDP2 Policy Trainer",
+            "role": "gradient-updater",
+            "col": 0,
+            "row": 1,
+            "tone": "tint"
+          }
+        ],
+        "graphEdges": [
+          {
+            "from": "rollout",
+            "to": "reward",
+            "label": "Sends G=8 trajectories",
+            "style": "solid",
+            "tone": "green"
+          },
+          {
+            "from": "rollout",
+            "to": "ref",
+            "label": "Queries ref log-probs",
+            "style": "solid",
+            "tone": "green"
+          },
+          {
+            "from": "reward",
+            "to": "train",
+            "label": "Feeds advantages + D_KL",
+            "style": "solid",
+            "tone": "green"
+          }
+        ]
+      },
+      "decisionFramework": {
+        "problem": "How to implement Distributed RLHF, DPO & GRPO Post-Training without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "When inference latency or GPU memory limits bind throughput, DPO & GRPO Post-Training, GRPO eliminates the memory-heavy PPO Critic model by computing group-relative advantages across G sampled completions per prompt, while disaggregated vLLM rollout engines + NCCL weight sync eliminate training-inference GPU bubbles.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Distributed RLHF, DPO & GRPO Post-Training experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      },
+      "id": "stage-2-the-4-model-3-model-memory-compute-split"
+    },
+    {
+      "stage": 3,
+      "level": "intermediate",
+      "title": "Group-Relative Advantage & Clipped Surrogate Objective",
+      "purpose": "Compute GRPO advantages safely, handle zero-variance groups, and prevent policy collapse via KL penalties.",
+      "explanation": {
+        "foundation": "Given a prompt q and G=8 sampled completions {o_1, ..., o_G} with scalar rewards {r_1, ..., r_G}, GRPO computes the normalized advantage `A_i = (r_i - mean(R)) / (std(R) + eps)`.",
+        "core": "If all 8 completions score identically (e.g., all 0 or all 1), `std(R) == 0`; naive division causes NaNs, so zero-variance groups are masked out (`advantage = 0.0`) or skipped.",
+        "deepDive": "Below is a numerically safe PyTorch implementation with KL-penalty clipping:\n```python\ndef compute_grpo_loss(logp_new, logp_old, logp_ref, rewards, mask, eps=0.2, beta=0.04):\n    mean_r = rewards.mean(dim=-1, keepdim=True)\n    std_r = rewards.std(dim=-1, keepdim=True)\n    adv = torch.where(std_r > 1e-6, (rewards - mean_r) / (std_r + 1e-6), torch.zeros_like(rewards))\n    ratio = torch.exp(torch.clamp(logp_new - logp_old, -10.0, 10.0))\n    surr = torch.min(ratio * adv.unsqueeze(-1), torch.clamp(ratio, 1 - eps, 1 + eps) * adv.unsqueeze(-1))\n    kl = torch.exp(logp_ref - logp_new) - (logp_ref - logp_new) - 1.0  # Schulman k3 estimator\n    loss = -((surr - beta * kl) * mask).sum() / mask.sum().clamp_min(1)\n    return loss\n```"
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 3 · OBJECTIVE MATH",
+        "title": "Numerically Safe GRPO Advantage & Schulman KL Loss",
+        "nodes": [
+          {
+            "id": "grp",
+            "label": "G=8 Reward Vector",
+            "sub": "[r_1 ... r_8] per prompt",
+            "role": "reward-group"
+          },
+          {
+            "id": "norm",
+            "label": "Safe Group Normalizer",
+            "sub": "Masks std(R) <= 1e-6",
+            "role": "advantage-calc"
+          },
+          {
+            "id": "clip",
+            "label": "PPO-Clip Surrogate",
+            "sub": "eps=0.2 trust region",
+            "role": "policy-loss"
+          },
+          {
+            "id": "kl",
+            "label": "Schulman k3 KL Estimator",
+            "sub": "Non-negative beta*D_KL",
+            "role": "kl-regularizer"
+          }
+        ],
+        "edges": [
+          {
+            "from": "grp",
+            "to": "norm",
+            "label": "Normalizes within group"
+          },
+          {
+            "from": "norm",
+            "to": "clip",
+            "label": "Applies clipped ratio"
+          },
+          {
+            "from": "clip",
+            "to": "kl",
+            "label": "Subtracts beta * D_KL"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Schulman k3 KL",
+            "detail": "Using exp(r)-r-1 guarantees non-negative unbiased KL estimates, avoiding negative KL spikes."
+          },
+          {
+            "label": "Zero-Std Masking",
+            "detail": "Skipping prompts where all G=8 answers are right or wrong avoids wasting backward-pass compute."
+          }
+        ],
+        "summary": "Safe group normalization, ratio clamping, and the non-negative k3 KL estimator stabilize GRPO training against NaNs and policy collapse.",
+        "caption": "Masking zero-variance prompt groups prevents NaN gradients and saves backward-pass FLOPs."
+      },
+      "id": "stage-3-group-relative-advantage-clipped-surrogate-objec"
+    },
+    {
+      "stage": 4,
+      "level": "intermediate",
+      "title": "Hybrid Reward & Verifier Pools (Mitigating Reward Hacking)",
+      "purpose": "Combine deterministic sandboxes with calibrated neural reward models to stop length and format hacking.",
+      "explanation": {
+        "foundation": "Policies trained solely against a neural Reward Model (RM) rapidly discover reward hacks—inflating response length, inserting markdown boilerplate, or echoing confident-sounding nonsense that fools the RM.",
+        "core": "Production pipelines combine: (1) Deterministic Verifiers (Firecracker/gVisor sandboxes running unit tests, Lean/SymPy math equivalence, JSON schema checks) with exact binary rewards; and (2) Process/Outcome Neural RMs with length-penalty normalization and format gates.",
+        "deepDive": "Timeout-bounded execution ensures infinite `while True` code generated by the policy never hangs the verifier pool."
+      },
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "STAGE 4 · REWARD POOL",
+        "title": "Sandboxed Verifiers + Length-Normalized Neural RM",
+        "cards": [
+          {
+            "label": "Format-First Gate",
+            "detail": "Multiply or gate total reward by format validity so the model never trades syntax for RM score."
+          },
+          {
+            "label": "Sandbox Isolation",
+            "detail": "Policy-generated code is untrusted; run with seccomp, cgroup RAM caps, and zero network."
+          }
+        ],
+        "summary": "Sandboxed deterministic verifiers and length-normalized neural RMs block reward hacking while safely executing untrusted policy code.",
+        "caption": "Seccomp-isolated verifier sandboxes with strict 2s timeouts prevent policy-generated infinite loops.",
+        "graphNodes": [
+          {
+            "id": "traj",
+            "label": "Sampled Trajectories",
+            "role": "trajectory-in",
+            "col": 0,
+            "row": 0,
+            "tone": "primary"
+          },
+          {
+            "id": "sbx",
+            "label": "gVisor / Firecracker Pool",
+            "role": "code-verifier",
+            "col": 1,
+            "row": 0,
+            "tone": "tint"
+          },
+          {
+            "id": "rm",
+            "label": "Neural Outcome RM",
+            "role": "neural-rm",
+            "col": 2,
+            "row": 0,
+            "tone": "tint"
+          },
+          {
+            "id": "agg",
+            "label": "Composite Reward Gate",
+            "role": "reward-combiner",
+            "col": 0,
+            "row": 1,
+            "tone": "tint"
+          }
+        ],
+        "graphEdges": [
+          {
+            "from": "traj",
+            "to": "sbx",
+            "label": "Executes code/math checks",
+            "style": "solid",
+            "tone": "green"
+          },
+          {
+            "from": "traj",
+            "to": "rm",
+            "label": "Scores helpfulness/safety",
+            "style": "solid",
+            "tone": "green"
+          },
+          {
+            "from": "sbx",
+            "to": "agg",
+            "label": "Combines with format gate",
+            "style": "solid",
+            "tone": "green"
+          }
+        ]
+      },
+      "id": "stage-4-hybrid-reward-verifier-pools-mitigating-reward-h"
+    },
+    {
+      "stage": 5,
+      "level": "intermediate",
+      "title": "Eliminating Rollout Stragglers & GPU Bubbles",
+      "purpose": "Solve the 40% idle-GPU bubble caused by heavy-tailed Chain-of-Thought completion lengths.",
+      "explanation": {
+        "foundation": "Think of **Eliminating Rollout Stragglers & GPU Bubbles** as the intuition layer for Distributed RLHF, DPO & GRPO Post-Training: Solve the 40% idle-GPU bubble caused by heavy-tailed Chain-of-Thought completion lengths.",
+        "core": "In synchronous RLHF, a batch of 512 prompts waits for the single longest completion (e.g., a 12,000-token reasoning trace) while 511 other sequences finished at 800 tokens—leaving GPUs 40–60% idle! Disaggregated continuous batching solves this in three ways: (1) vLLM's continuous batching immediately slots new prompts into freed KV-cache space as shorter rollouts finish; (2) Dynamic Length-Bucketing groups prompts by predicted response length; and (3) Bounded Off-Policy Staleness lets the trainer pull completed batches from a replay buffer while stragglers finish asynchronously (capped at K<=2–4 policy steps old).",
+        "deepDive": "Under heavy load or partial failure, eliminating rollout stragglers & gpu bubbles becomes a critical lever for predictable latency and correctness. Large-scale post-training architecture combining criticless GRPO (k3 KL, zero-std masking), seccomp verifier sandboxes, disaggregated vLLM rollouts, bounded-staleness replay, and layer-pipelined NCCL weight sync."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 5 · THROUGHPUT",
+        "title": "Continuous Rollout Batching & Bounded-Staleness Buffer",
+        "nodes": [
+          {
+            "id": "q",
+            "label": "Length-Bucketed Queue",
+            "sub": "Groups short vs CoT",
+            "role": "prompt-scheduler"
+          },
+          {
+            "id": "vllm",
+            "label": "vLLM Continuous Batching",
+            "sub": "Backfills freed KV slots",
+            "role": "rollout-engine"
+          },
+          {
+            "id": "buf",
+            "label": "Replay Buffer (Ray Store)",
+            "sub": "Max staleness K<=3 steps",
+            "role": "trajectory-buffer"
+          },
+          {
+            "id": "fsdp",
+            "label": "FSDP2 Trainer GPUs",
+            "sub": "Never stalls on stragglers",
+            "role": "trainer-consumer"
+          }
+        ],
+        "edges": [
+          {
+            "from": "q",
+            "to": "vllm",
+            "label": "Feeds bucketed prompts"
+          },
+          {
+            "from": "vllm",
+            "to": "buf",
+            "label": "Streams finished rollouts"
+          },
+          {
+            "from": "buf",
+            "to": "fsdp",
+            "label": "Supplies full mini-batches"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Staleness Guard",
+            "detail": "Drop or importance-weight trajectories older than K=3 policy updates to keep RL on-policy."
+          },
+          {
+            "label": "2.4x GPU Utilization",
+            "detail": "Disaggregated streaming raises cluster MFU from ~28% (sync) to >65%."
+          }
+        ],
+        "summary": "Continuous batching, length bucketing, and a bounded-staleness replay buffer eliminate straggler stalls across rollout and trainer GPUs.",
+        "caption": "Decoupling rollout completion from trainer step boundaries boosts cluster GPU utilization above 65%."
+      },
+      "id": "stage-5-eliminating-rollout-stragglers-gpu-bubbles"
+    },
+    {
+      "stage": 6,
+      "level": "advanced",
+      "title": "Non-Blocking NCCL Weight Sync (Trainer -> Rollout Actors)",
+      "purpose": "Broadcast updated 70B policy weights from FSDP2 trainers to vLLM actors in seconds without halting the cluster.",
+      "explanation": {
+        "foundation": "After each FSDP2 optimizer step, the vLLM rollout engines need the new policy weights.",
+        "core": "Saving a 140 GB BF16 checkpoint to S3/Lustre and reloading it into vLLM takes 45–90 seconds—wasting more time than the gradient step itself! Instead, trainers gather sharded parameters via `all_gather` into contiguous CUDA IPC / RDMA InfiniBand buffers and stream them directly into vLLM worker memory over a dedicated NCCL Weight-Sync process group (`ncclBroadcast`).",
+        "deepDive": "For LoRA post-training, syncing only the rank-64 adapter deltas (~200 MB) completes in <80ms."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 6 · WEIGHT SYNC",
+        "title": "Direct RDMA / NCCL Weight-Sync Ring (Zero Disk I/O)",
+        "nodes": [
+          {
+            "id": "fsdp",
+            "label": "FSDP2 Sharded Weights",
+            "sub": "ZeRO-3 across 256 GPUs",
+            "role": "weight-source"
+          },
+          {
+            "id": "gather",
+            "label": "Bucketed All-Gather",
+            "sub": "Layer-by-layer BF16 buf",
+            "role": "shard-reassembler"
+          },
+          {
+            "id": "nccl",
+            "label": "NCCL RDMA Broadcast",
+            "sub": "400 Gbps InfiniBand ring",
+            "role": "sync-transport"
+          },
+          {
+            "id": "vllm",
+            "label": "vLLM Weight Swap",
+            "sub": "Atomic pointer update",
+            "role": "inference-target"
+          }
+        ],
+        "edges": [
+          {
+            "from": "fsdp",
+            "to": "gather",
+            "label": "Gathers layer chunks"
+          },
+          {
+            "from": "gather",
+            "to": "nccl",
+            "label": "Streams over IB RDMA"
+          },
+          {
+            "from": "nccl",
+            "to": "vllm",
+            "label": "Updates active weights"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Layer-Wise Pipelining",
+            "detail": "Gather and broadcast one transformer layer at a time to avoid a 140 GB HBM spike."
+          },
+          {
+            "label": "LoRA Delta Fast-Path",
+            "detail": "Syncing 200 MB LoRA weights takes <80ms vs. ~3s for full 70B BF16 weights."
+          }
+        ],
+        "summary": "Layer-pipelined NCCL RDMA broadcasts replace slow disk checkpointing, syncing 70B weights directly into vLLM HBM in seconds.",
+        "caption": "Zero-disk NCCL weight sync removes the #1 I/O bottleneck in distributed online RLHF."
+      },
+      "id": "stage-6-non-blocking-nccl-weight-sync-trainer-rollout-ac"
+    },
+    {
+      "stage": 7,
+      "level": "advanced",
+      "title": "Training Stability Telemetry & Automated Collapse Recovery",
+      "purpose": "Detect KL explosion, entropy collapse, and length drift early with automatic checkpoint rollback.",
+      "explanation": {
+        "foundation": "Online RL can silently collapse: entropy drops to zero (deterministic repetitive outputs), KL divergence spikes past 0.15 (forgetting pre-trained capabilities), or response length explodes to hit max_tokens.",
+        "core": "Continuous telemetry logs `kl_div`, `policy_entropy`, `clip_fraction`, `grad_norm`, and `zero_std_group_ratio` at every step.",
+        "deepDive": "If `kl_div > 0.15` or `grad_norm` spikes >10x for 3 consecutive steps, an automated watchdog freezes training, rolls back to the last healthy checkpoint, halves the learning rate, and increases the KL penalty `beta`."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 7 · STABILITY",
+        "title": "KL/Entropy Watchdog & Automated Checkpoint Rollback",
+        "nodes": [
+          {
+            "id": "metrics",
+            "label": "Step Telemetry Stream",
+            "sub": "KL, entropy, clip_frac",
+            "role": "stability-probe"
+          },
+          {
+            "id": "detect",
+            "label": "Collapse Detector",
+            "sub": "KL>0.15 or entropy<0.05",
+            "role": "anomaly-detector"
+          },
+          {
+            "id": "ckpt",
+            "label": "Async NVMe/Lustre Ckpt",
+            "sub": "Non-blocking snapshot",
+            "role": "recovery-store"
+          },
+          {
+            "id": "recover",
+            "label": "Auto-Rollback & Tune",
+            "sub": "0.5x LR, 1.5x beta_KL",
+            "role": "recovery-controller"
+          }
+        ],
+        "edges": [
+          {
+            "from": "metrics",
+            "to": "detect",
+            "label": "Checks stability bounds"
+          },
+          {
+            "from": "detect",
+            "to": "ckpt",
+            "label": "Fetches last clean step"
+          },
+          {
+            "from": "ckpt",
+            "to": "recover",
+            "label": "Resumes w/ safer LR/KL"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Clip Fraction Signal",
+            "detail": "Healthy PPO/GRPO clip fraction sits at 5-15%; >35% signals overly aggressive LR."
+          },
+          {
+            "label": "Non-Blocking Snapshots",
+            "detail": "Copy weights to pinned CPU RAM first so Lustre writes never stall training GPUs."
+          }
+        ],
+        "summary": "Tracking KL divergence, entropy, and clip fraction enables automated rollback and hyperparameter dampening before RL collapse ruins a run.",
+        "caption": "Pinned-RAM async checkpointing protects GPU utilization while enabling instant recovery from KL spikes."
+      },
+      "id": "stage-7-training-stability-telemetry-automated-collapse-"
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-1",
+        "question": "How does GRPO (Group Relative Policy Optimization) reduce GPU memory usage compared to standard PPO?",
+        "options": [
+          {
+            "id": "a",
+            "text": "It eliminates the learned Value Critic model by normalizing rewards across G sampled completions per prompt.",
+            "correct": true,
+            "feedback": "Correct! Dropping the Value Critic model saves ~35-40% of training HBM and removes critic warmup instability."
+          },
+          {
+            "id": "b",
+            "text": "It trains on static DPO pairs without running any rollout inference.",
+            "correct": false,
+            "feedback": "GRPO is an online RL algorithm that actively samples G rollouts per prompt."
+          },
+          {
+            "id": "c",
+            "text": "It removes the KL divergence penalty against the reference policy.",
+            "correct": false,
+            "feedback": "GRPO still computes KL divergence against the frozen reference policy to prevent collapse."
+          },
+          {
+            "id": "d",
+            "text": "It replaces AdamW with SGD without momentum.",
+            "correct": false,
+            "feedback": "GRPO typically still uses AdamW on the Policy Trainer."
+          }
+        ],
+        "explanation": "GRPO replaces the Value Critic network with group-relative reward normalization over G completions per prompt."
+      },
+      {
+        "id": "kc-2",
+        "question": "In a GRPO batch, all G=8 sampled completions for a math prompt receive reward = 1.0 (std = 0). What should the trainer do for that group?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Divide by 0.0 anyway so the gradient scales up.",
+            "correct": false,
+            "feedback": "Dividing by zero produces NaN gradients and corrupts the entire model."
+          },
+          {
+            "id": "b",
+            "text": "Mask the group's advantage to 0.0 (or skip it) because there is no within-group preference signal.",
+            "correct": true,
+            "feedback": "Correct! Zero-variance groups carry zero relative preference signal; masking them prevents NaNs and wasted backward compute."
+          },
+          {
+            "id": "c",
+            "text": "Set the KL penalty beta to 0 for the rest of training.",
+            "correct": false,
+            "feedback": "Zeroing beta removes KL regularization and risks policy collapse."
+          },
+          {
+            "id": "d",
+            "text": "Broadcast an emergency NCCL reset to the vLLM actors.",
+            "correct": false,
+            "feedback": "All-1.0 rewards are normal on easy prompts and do not indicate a hardware or sync failure."
+          }
+        ],
+        "explanation": "Checking `std(R) > 1e-6` before dividing prevents NaN explosions on unanimous prompt groups."
+      },
+      {
+        "id": "kc-3",
+        "question": "Why do large-scale RLHF clusters replace disk-based checkpointing (FSDP -> S3/Lustre -> vLLM reload) with direct NCCL RDMA weight sync?",
+        "options": [
+          {
+            "id": "a",
+            "text": "S3 cannot store BF16 floating-point numbers.",
+            "correct": false,
+            "feedback": "Object stores can store any binary tensor file."
+          },
+          {
+            "id": "b",
+            "text": "Writing and reloading 140 GB+ weights via disk takes 45-90s per step, whereas layer-pipelined NCCL RDMA broadcasts complete in ~1-3s.",
+            "correct": true,
+            "feedback": "Correct! Direct GPU-to-GPU NCCL weight sync eliminates disk I/O bottlenecks between trainer and rollout actors."
+          },
+          {
+            "id": "c",
+            "text": "NCCL automatically runs unit tests inside Firecracker sandboxes.",
+            "correct": false,
+            "feedback": "NCCL is a GPU collective communications library, not a code execution sandbox."
+          },
+          {
+            "id": "d",
+            "text": "Direct NCCL sync eliminates the need for a replay buffer.",
+            "correct": false,
+            "feedback": "Replay buffers are still used to decouple rollout stragglers from trainer steps."
+          }
+        ],
+        "explanation": "Streaming updated weights directly over InfiniBand/NCCL avoids minute-long disk serialization stalls every RL step."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Distributed RLHF improves an AI model after pre-training by letting it generate multiple answers, grading them with verifiers and reward models, and updating the model's weights across hundreds of GPUs.",
+      "keyTakeaway": "When inference latency or GPU memory limits bind throughput, DPO & GRPO Post-Training, GRPO eliminates the memory-heavy PPO Critic model by computing group-relative advantages across G sampled completions per prompt, while disaggregated vLLM rollout engines + NCCL weight sync eliminate training-inference GPU bubbles.",
+      "byteSummary": "After an AI learns language from pre-training, post-training teaches it to reason accurately and follow rules. In GRPO, the AI generates 8 candidate answers to each prompt, a verifier or reward model grades which answers are best, and the trainer nudges the AI toward the winning style.\n\nTo run this across hundreds of GPUs without waiting on slow answers, one group of GPUs focuses purely on generating answers while another group focuses on learning from finished batches, syncing updated brain weights directly over high-speed cables."
+    },
+    "intermediate": {
+      "summary": "Distributed GRPO/RLHF disaggregates vLLM rollout workers from FSDP2 trainers, using sandboxed verifiers, a bounded-staleness replay buffer, and non-blocking NCCL weight syncs.",
+      "keyTakeaway": "When inference latency or GPU memory limits bind throughput, DPO & GRPO Post-Training, GRPO eliminates the memory-heavy PPO Critic model by computing group-relative advantages across G sampled completions per prompt, while disaggregated vLLM rollout engines + NCCL weight sync eliminate training-inference GPU bubbles.",
+      "byteSummary": "GRPO drops the PPO Value Critic by computing group-relative advantages over G=8 rollouts per prompt, masking zero-variance groups and regularizing with the Schulman k3 KL estimator. Sandboxed code/math verifiers prevent neural reward hacking.\n\nAt scale, disaggregated vLLM rollout engines backfill freed KV slots via continuous batching and stream finished trajectories into a Ray Object Store replay buffer (staleness <=3 steps). FSDP2 trainers update weights and broadcast layer-pipelined deltas directly over NCCL RDMA."
+    },
+    "advanced": {
+      "summary": "Large-scale post-training architecture combining criticless GRPO (k3 KL, zero-std masking), seccomp verifier sandboxes, disaggregated vLLM rollouts, bounded-staleness replay, and layer-pipelined NCCL weight sync.",
+      "keyTakeaway": "When inference latency or GPU memory limits bind throughput, DPO & GRPO Post-Training, GRPO eliminates the memory-heavy PPO Critic model by computing group-relative advantages across G sampled completions per prompt, while disaggregated vLLM rollout engines + NCCL weight sync eliminate training-inference GPU bubbles.",
+      "byteSummary": "Co-locating 70B+ rollouts with ZeRO-3 AdamW states creates severe HBM contention and 50% straggler bubbles. Disaggregating TP-sharded vLLM actors from FSDP2 trainers—bridged by a length-bucketed Ray replay buffer capped at K<=3 policy steps staleness—sustains >65% utilization.\n\nLayer-by-layer `all_gather` + InfiniBand `ncclBroadcast` (or <80ms LoRA delta sync) replaces 60s disk checkpoints, while automated KL/entropy watchdogs trigger pinned-RAM rollback and LR/beta dampening on collapse."
+    }
+  },
+  "pedagogicalFramework": "PRIME",
+  "prerequisites": [
+    {
+      "title": "Verifier-Guided Self-Play & Synthetic Data Pipelines",
+      "summary": "Verifier-guided self-play pairs an entropy-bounded curriculum mutator with deterministic execution sandboxes (Lean4, Pytest, Z3), 13-gram/MinHash decontamination, and step-level Process Reward Models (PRM)."
+    },
+    {
+      "title": "LLM Guardrails, Red Teaming & Evaluation",
+      "summary": "Production LLM safety and quality combine sub-25ms inline guardrail meshes (PII, prompt-injection, topic routing) with streaming output verifiers and asynchronous LLM-as-a-Judge + automated red-teaming loops."
+    }
+  ],
+  "simulation": {
+    "title": "Distributed RLHF, DPO & GRPO Post-Training — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "user",
+        "label": "Caller / Agent",
+        "role": "Prompt & Tool Loop"
+      },
+      {
+        "id": "gw",
+        "label": "LLM Gateway",
+        "role": "Routing & Guardrails"
+      },
+      {
+        "id": "ret",
+        "label": "Radix / Vector",
+        "role": "Prefix & RAG Lookup"
+      },
+      {
+        "id": "gpu",
+        "label": "GPU Pool",
+        "role": "Paged KV & Decode"
+      }
+    ],
+    "edges": [
+      {
+        "from": "user",
+        "to": "gw",
+        "label": "prompt"
+      },
+      {
+        "from": "gw",
+        "to": "ret",
+        "label": "prefix / RAG"
+      },
+      {
+        "from": "ret",
+        "to": "gpu",
+        "label": "batched decode"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "The Post-Training Spectrum: SFT, DPO, PPO & GRPO",
+        "actionLabel": "prompt",
+        "status": "healthy",
+        "activeNodeIds": [
+          "user",
+          "gw"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "prompt",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Caller / Agent sends work to LLM Gateway (The Post-Training Spectrum: SFT, DPO, PPO & GRPO)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "The 4-Model / 3-Model Memory & Compute Split",
+        "actionLabel": "prefix / RAG",
+        "status": "healthy",
+        "activeNodeIds": [
+          "gw",
+          "ret"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "prefix / RAG",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "LLM Gateway coordinates with Radix / Vector while preserving the core invariant (The 4-Model / 3-Model Memory & Compute Split)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Group-Relative Advantage & Clipped Surrogate Objective",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "ret",
+          "gpu"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, GPU Pool absorbs pressure without cascading (Group-Relative Advantage & Clipped Surrogate Objective)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Training Stability Telemetry & Automated Collapse Recovery",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "user",
+          "gw",
+          "ret",
+          "gpu"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Training Stability Telemetry & Automated Collapse Recovery)."
+      }
+    ]
+  }
+}

@@ -1,0 +1,778 @@
+{
+  "id": "design-async-python",
+  "slug": "design-async-python",
+  "title": "Design a Bounded-Concurrency Asyncio Pipeline in Python",
+  "problemType": "concurrency",
+  "difficulty": "medium",
+  "prompt": "Design a single-container Python asyncio pipeline that ingests 50,000 external API pages without exhausting file descriptors (cap in-flight HTTP sockets to 50), tripping 429 rate limits (global 200 req/sec), or blocking the event loop during CPU-heavy HTML/PDF parsing, with graceful shutdown.",
+  "spark": {
+    "summary": "Firing 50,000 `asyncio.gather()` coroutines at once exhausts OS file descriptors, triggers 429 bans, and lets synchronous parsing freeze the event loop.",
+    "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, pair an `asyncio.Semaphore(50)` + async Token Bucket (`200 req/s`) + bounded `asyncio.Queue` worker pool, and offload CPU-heavy parsing via `asyncio.to_thread` or `ProcessPoolExecutor`.",
+    "byteSummary": "**Core Mechanics:** Coroutines are cheap (~2 KB each), so engineers often launch `50,000` tasks via `asyncio.gather()`.\n\n**Visual & Structural Flow:** Depicts Queue -> Token Bucket (200/s) + Semaphore(50) -> Offloaded Parser (asyncio.Queue (500) -> Bucket(200/s) + Sem(50) -> External API -> to_thread / ProcessPool); Three-Layer Bounds: Socket Cap, Rate Bucket, and CPU Pool (asyncio.Queue(500) -> Token Bucket (200/s) -> TCPConnector(50) -> ProcessPool / Thread).\n\n**Trade-Offs & Production:** A `Semaphore(50)` alone still sends `50 / 0.05 s = 1,000 req/sec` if the API responds in `50 ms` (5x over the `200 req/s` limit!). Compose four clean primitives in Python 3.11+: **Bounded Queue & 50 Workers**: A `asyncio.Queue(maxsize=500)` + `50` worker tasks (`asyncio.TaskGroup`) caps memory and in-flight.\n\n**Failure Modes & Application:** Bounded async worker pools power high-throughput Python ingestion and orchestration services: **Webhook & Partner API Ingestion**: Enforces per-tenant rate limits while saturating I/O without FD leaks."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why unbounded `asyncio` concurrency still crashes single containers",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "Think of **Why unbounded `asyncio` concurrency still crashes single containers** as the intuition layer for Design a Bounded-Concurrency Asyncio Pipeline in Python: The mechanism: understand how Why unbounded `asyncio` concurrency still crashes single containers works from first principles.",
+        "core": "Coroutines are cheap (~2 KB each), so engineers often launch `50,000` tasks via `asyncio.gather()`. While Python happily creates 50,000 coroutines, the OS immediately hits `ulimit -n` (`Too many open files`), upstream APIs return `429 Too Many Requests`, and synchronous BeautifulSoup/PDF parsing blocks the single-threaded event loop.",
+        "deepDive": "Under heavy load or partial failure, why unbounded `asyncio` concurrency still crashes single containers becomes a critical lever for predictable latency and correctness. Firing 50,000 `asyncio.gather()` coroutines at once exhausts OS file descriptors, triggers 429 bans, and lets synchronous parsing freeze the event loop."
+      },
+      "purpose": "The mechanism: understand how Why unbounded `asyncio` concurrency still crashes single containers works from first principles."
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "FD exhaustion, 429 storms, and frozen event-loop heartbeats",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "An unthrottled asyncio scraper fails on three fronts:",
+        "core": "1. **File Descriptor Exhaustion**: 50,000 concurrent sockets exceed the container's `1024-4096` FD limit.\n2. **429 Banning**: Bursting thousands of requests in 100 ms trips upstream rate limiters.\n3. **Event-Loop Starvation**: A `150 ms` synchronous HTML/PDF parse blocks all 50 sockets and Kubernetes health probes.",
+        "deepDive": "In production deployments of Design a Bounded-Concurrency Asyncio Pipeline in Python, watch how fd exhaustion, 429 storms, and frozen event-loop heartbeats interacts with tail latency, retry amplification, and partial failures. Firing 50,000 `asyncio.gather()` coroutines at once exhausts OS file descriptors, triggers 429 bans, and lets synchronous parsing freeze the event loop."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Bounded Asyncio Pipeline",
+        "title": "Queue -> Token Bucket (200/s) + Semaphore(50) -> Offloaded Parser",
+        "actors": [
+          {
+            "id": "q",
+            "label": "asyncio.Queue (500)"
+          },
+          {
+            "id": "lim",
+            "label": "Bucket(200/s) + Sem(50)"
+          },
+          {
+            "id": "api",
+            "label": "External API"
+          },
+          {
+            "id": "cpu",
+            "label": "to_thread / ProcessPool"
+          }
+        ],
+        "events": [
+          {
+            "from": "q",
+            "to": "lim",
+            "label": "50 workers pull URLs (backpressure)",
+            "status": "ok"
+          },
+          {
+            "from": "lim",
+            "to": "api",
+            "label": "Acquire token + sem -> <=50 sockets, 200/s",
+            "status": "ok"
+          },
+          {
+            "from": "api",
+            "to": "cpu",
+            "label": "Offload HTML/PDF parse (event loop free)",
+            "status": "ok"
+          },
+          {
+            "from": "lim",
+            "to": "q",
+            "label": "429 Retry-After -> jittered backoff",
+            "status": "warn"
+          }
+        ],
+        "summary": "Bounding both socket concurrency (50) and request rate (200/s) while offloading CPU parsing keeps the event loop responsive."
+      },
+      "purpose": "The problem: see what breaks without FD exhaustion, 429 storms, and frozen event-loop heartbeats under real concurrency or scale.",
+      "decisionFramework": {
+        "problem": "How to implement Design a Bounded-Concurrency Asyncio Pipeline in Python without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "To keep the architecture evolvable without sacrificing reliability, pair an `asyncio.Semaphore(50)` + async Token Bucket (`200 req/s`) + bounded `asyncio.Queue` worker pool, and offload CPU-heavy parsing via `asyncio.to_thread` or `ProcessPoolExecutor`.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Design a Bounded-Concurrency Asyncio Pipeline in Python experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Naive `Semaphore(50)` without rate limiting or CPU offloading",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Think of **Naive `Semaphore(50)` without rate limiting or CPU offloading** as the intuition layer for Design a Bounded-Concurrency Asyncio Pipeline in Python: Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+        "core": "A `Semaphore(50)` alone still sends `50 / 0.05 s = 1,000 req/sec` if the API responds in `50 ms` (5x over the `200 req/s` limit!). Meanwhile, parsing HTML directly inside `async def worker()` still freezes the event loop.",
+        "deepDive": "Under heavy load or partial failure, naive `semaphore(50)` without rate limiting or cpu offloading becomes a critical lever for predictable latency and correctness. Firing 50,000 `asyncio.gather()` coroutines at once exhausts OS file descriptors, triggers 429 bans, and lets synchronous parsing freeze the event loop."
+      },
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "Lifecycle & Failure Recovery",
+        "title": "Naive `Semaphore(50)` without rate limiting or CPU offloading",
+        "states": [
+          {
+            "id": "idle",
+            "label": "Worker Idle",
+            "tone": "neutral"
+          },
+          {
+            "id": "running",
+            "label": "Executing Task",
+            "tone": "good"
+          },
+          {
+            "id": "blocked",
+            "label": "Backpressure / Full",
+            "tone": "warn"
+          },
+          {
+            "id": "done",
+            "label": "Permit Released",
+            "tone": "good"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "idle",
+            "to": "running",
+            "label": "acquire permit"
+          },
+          {
+            "from": "running",
+            "to": "blocked",
+            "label": "queue saturated"
+          },
+          {
+            "from": "running",
+            "to": "done",
+            "label": "finally release"
+          }
+        ]
+      }
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise solution: Worker Pool + Async Token Bucket + CPU Offload",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": {
+        "foundation": "Compose four clean primitives in Python 3.11+:",
+        "core": "- **Bounded Queue & 50 Workers**: A `asyncio.Queue(maxsize=500)` + `50` worker tasks (`asyncio.TaskGroup`) caps memory and in-flight sockets to `<= 50` (matching `aiohttp.TCPConnector(limit=50)`).\n- **Async Token Bucket (`200 req/s`)**: Serializes token refill via `asyncio.Lock` using `time.monotonic()` so average rate never exceeds `200 req/s`.\n- **CPU Offloading**: Run `await asyncio.to_thread(parse_html, body)` (or `loop.run_in_executor(process_pool, ...)` for pure-Python CPU work) so heartbeats never stall.\n- **Graceful Shutdown**: On `SIGTERM`, cancel producer, drain queue or cancel `TaskGroup` cleanly, and close the `ClientSession`.",
+        "deepDive": "In production deployments of Design a Bounded-Concurrency Asyncio Pipeline in Python, watch how enterprise solution: worker pool + async token bucket + cpu offload interacts with tail latency, retry amplification, and partial failures. Firing 50,000 `asyncio.gather()` coroutines at once exhausts OS file descriptors, triggers 429 bans, and lets synchronous parsing freeze the event loop."
+      },
+      "sectionDiagram": {
+        "kind": "cache-tier",
+        "eyebrow": "Concurrency & Rate Controls",
+        "title": "Three-Layer Bounds: Socket Cap, Rate Bucket, and CPU Pool",
+        "nodes": [
+          {
+            "label": "asyncio.Queue(500)",
+            "role": "Bounded memory backpressure"
+          },
+          {
+            "label": "Token Bucket (200/s)",
+            "role": "time.monotonic() + Lock"
+          },
+          {
+            "label": "TCPConnector(50)",
+            "role": "Max 50 open FDs"
+          },
+          {
+            "label": "ProcessPool / Thread",
+            "role": "Non-blocking parse"
+          }
+        ],
+        "edges": [
+          {
+            "label": "rate + socket gate"
+          },
+          {
+            "label": "offload CPU parse"
+          }
+        ],
+        "summary": "Each layer enforces an independent bound: memory (500), rate (200/s), sockets (50), and event-loop latency (<5 ms)."
+      },
+      "markdownContent": "```python\nimport asyncio, time\n\nclass AsyncTokenBucket:\n    def __init__(self, rate: float, capacity: float):\n        self.rate, self.cap, self.tokens = rate, capacity, capacity\n        self.updated = time.monotonic()\n        self.lock = asyncio.Lock()\n\n    async def acquire(self):\n        while True:\n            async with self.lock:\n                now = time.monotonic()\n                self.tokens = min(self.cap, self.tokens + (now - self.updated) * self.rate)\n                self.updated = now\n                if self.tokens >= 1.0:\n                    self.tokens -= 1.0\n                    return\n                wait = (1.0 - self.tokens) / self.rate\n            await asyncio.sleep(wait)\n\nasync def worker(queue: asyncio.Queue, sem: asyncio.Semaphore, bucket: AsyncTokenBucket, session):\n    while True:\n        url = await queue.get()\n        try:\n            await bucket.acquire()\n            async with sem:\n                async with session.get(url) as resp:\n                    body = await resp.read()\n            await asyncio.to_thread(parse_payload, body)\n        finally:\n            queue.task_done()\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where bounded asyncio pipelines are used",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Bounded async worker pools power high-throughput Python ingestion and orchestration services:",
+        "core": "- **Webhook & Partner API Ingestion**: Enforces per-tenant rate limits while saturating I/O without FD leaks.\n- **RAG Document Crawlers**: Fetches S3/web documents with bounded sockets and offloads PDF/HTML chunking to `ProcessPoolExecutor`.",
+        "deepDive": "In production deployments of Design a Bounded-Concurrency Asyncio Pipeline in Python, watch how where bounded asyncio pipelines are used interacts with tail latency, retry amplification, and partial failures. Firing 50,000 `asyncio.gather()` coroutines at once exhausts OS file descriptors, triggers 429 bans, and lets synchronous parsing freeze the event loop."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "python-asyncio-internals",
+          "title": "Concept: Python Asyncio Event Loops",
+          "kind": "concept"
+        },
+        {
+          "slug": "rate-limiting",
+          "title": "Concept: Rate Limiting",
+          "kind": "concept"
+        },
+        {
+          "slug": "backpressure-flow-control",
+          "title": "Concept: Backpressure & Flow Control",
+          "kind": "concept"
+        },
+        {
+          "slug": "python-gil-workarounds",
+          "title": "System Design: Bypassing Python GIL Contention",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why does `asyncio.Semaphore(50)` alone fail to enforce a 200 req/sec global rate limit?",
+      "options": [
+        {
+          "id": "a",
+          "text": "Semaphore only bounds simultaneous in-flight sockets; if responses take 50 ms, 50 workers will still fire 1,000 req/sec unless paired with a Token Bucket",
+          "correct": true,
+          "feedback": "Correct: concurrency (Semaphore) and throughput rate (Token Bucket) are orthogonal bounds."
+        },
+        {
+          "id": "b",
+          "text": "`asyncio.Semaphore(50)` releases the Python GIL for CPU-bound HTML parsing",
+          "correct": false,
+          "feedback": "Semaphores do not offload CPU work or release the GIL; use `to_thread` or `ProcessPoolExecutor` for CPU parsing."
+        },
+        {
+          "id": "c",
+          "text": "`asyncio.Semaphore` blocks the entire event loop thread while waiting",
+          "correct": false,
+          "feedback": "`await sem.acquire()` yields control back to the event loop without blocking other coroutines."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why does `asyncio.Semaphore(50)` alone fail to enforce a 200 req/sec global rate limit?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Semaphore only bounds simultaneous in-flight sockets; if responses take 50 ms, 50 workers will still fire 1,000 req/sec unless paired with a Token Bucket",
+            "correct": true,
+            "feedback": "Correct: concurrency (Semaphore) and throughput rate (Token Bucket) are orthogonal bounds."
+          },
+          {
+            "id": "b",
+            "text": "`asyncio.Semaphore(50)` releases the Python GIL for CPU-bound HTML parsing",
+            "correct": false,
+            "feedback": "Semaphores do not offload CPU work or release the GIL; use `to_thread` or `ProcessPoolExecutor` for CPU parsing."
+          },
+          {
+            "id": "c",
+            "text": "`asyncio.Semaphore` blocks the entire event loop thread while waiting",
+            "correct": false,
+            "feedback": "`await sem.acquire()` yields control back to the event loop without blocking other coroutines."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why unbounded asyncio concurrency still crashes single containers', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Coroutines are cheap (~2 KB each), so engineers often launch 50,000 tasks via asyncio.gather().",
+            "correct": true,
+            "feedback": "Correct: Coroutines are cheap (~2 KB each), so engineers often launch 50,000 tasks via asyncio.gather()."
+          },
+          {
+            "id": "b",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "c",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'FD exhaustion, 429 storms, and frozen event-loop heartbeats', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "b",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "c",
+            "text": "An unthrottled asyncio scraper fails on three fronts: 1.",
+            "correct": true,
+            "feedback": "Correct: An unthrottled asyncio scraper fails on three fronts: 1."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** Coroutines are cheap (~2 KB each), so engineers often launch `50,000` tasks via `asyncio.gather()`.\n\n**How It Flows:** Think of Design a Bounded-Concurrency Asyncio Pipeline in Python as a clear step-by-step chain: asyncio.Queue (500) -> Bucket(200/s) + Sem(50) -> External API -> to_thread / ProcessPool -> asyncio.Queue(500).\n\n**Why Beginners Should Care:** Pair an `asyncio.Semaphore(50)` + async Token Bucket (`200 req/s`) + bounded `asyncio.Queue` worker pool, and offload CPU-heavy parsing via `asyncio.to_thread` or `ProcessPoolExecutor`.",
+      "spark": {
+        "summary": "Coroutines are cheap (~2 KB each), so engineers often launch `50,000` tasks via `asyncio.gather()`.",
+        "keyTakeaway": "Pair an `asyncio.Semaphore(50)` + async Token Bucket (`200 req/s`) + bounded `asyncio.Queue` worker pool, and offload CPU-heavy parsing via `asyncio.to_thread` or `ProcessPoolExecutor`."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why unbounded `asyncio` concurrency still crashes single containers",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why unbounded `asyncio` concurrency still crashes single containers works from first principles.",
+          "explanation": "Coroutines are cheap (~2 KB each), so engineers often launch `50,000` tasks via `asyncio.gather()`. While Python happily creates 50,000 coroutines, the OS immediately hits `ulimit -n` (`Too many open files`), upstream APIs return `429 Too Many Requests`, and synchronous BeautifulSoup/PDF parsing blocks the single-threaded event loop.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "FD exhaustion, 429 storms, and frozen event-loop heartbeats",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without FD exhaustion, 429 storms, and frozen event-loop heartbeats under real concurrency or scale.",
+          "explanation": "An unthrottled asyncio scraper fails on three fronts: 1. **File Descriptor Exhaustion**: 50,000 concurrent sockets exceed the container's `1024-4096` FD limit. 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Bounded Asyncio Pipeline",
+            "title": "Queue -> Token Bucket (200/s) + Semaphore(50) -> Offloaded Parser",
+            "actors": [
+              {
+                "id": "q",
+                "label": "asyncio.Queue (500)"
+              },
+              {
+                "id": "lim",
+                "label": "Bucket(200/s) + Sem(50)"
+              },
+              {
+                "id": "api",
+                "label": "External API"
+              },
+              {
+                "id": "cpu",
+                "label": "to_thread / ProcessPool"
+              }
+            ],
+            "events": [
+              {
+                "from": "q",
+                "to": "lim",
+                "label": "50 workers pull URLs (backpressure)",
+                "status": "ok"
+              },
+              {
+                "from": "lim",
+                "to": "api",
+                "label": "Acquire token + sem -> <=50 sockets, 200/s",
+                "status": "ok"
+              },
+              {
+                "from": "api",
+                "to": "cpu",
+                "label": "Offload HTML/PDF parse (event loop free)",
+                "status": "ok"
+              },
+              {
+                "from": "lim",
+                "to": "q",
+                "label": "429 Retry-After -> jittered backoff",
+                "status": "warn"
+              }
+            ],
+            "summary": "Bounding both socket concurrency (50) and request rate (200/s) while offloading CPU parsing keeps the event loop responsive."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive `Semaphore(50)` without rate limiting or CPU offloading",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "A `Semaphore(50)` alone still sends `50 / 0.05 s = 1,000 req/sec` if the API responds in `50 ms` (5x over the `200 req/s` limit!). Meanwhile, parsing HTML directly inside `async def worker()` still freezes the event loop.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Worker Pool + Async Token Bucket + CPU Offload",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Compose four clean primitives in Python 3.11+: **Bounded Queue & 50 Workers**: A `asyncio.Queue(maxsize=500)` + `50` worker tasks (`asyncio.TaskGroup`) caps memory and in-flight sockets to `<= 50` (matching `aiohttp.TCPConnector(limit=50)`). **Async Token Bucket (`200 req/s`)**: Serializes token refill via `asyncio.Lock` using `time.monotonic()` so average rate never exceeds `200 req/s`.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Concurrency & Rate Controls",
+            "title": "Three-Layer Bounds: Socket Cap, Rate Bucket, and CPU Pool",
+            "nodes": [
+              {
+                "label": "asyncio.Queue(500)",
+                "role": "Bounded memory backpressure"
+              },
+              {
+                "label": "Token Bucket (200/s)",
+                "role": "time.monotonic() + Lock"
+              },
+              {
+                "label": "TCPConnector(50)",
+                "role": "Max 50 open FDs"
+              },
+              {
+                "label": "ProcessPool / Thread",
+                "role": "Non-blocking parse"
+              }
+            ],
+            "edges": [
+              {
+                "label": "rate + socket gate"
+              },
+              {
+                "label": "offload CPU parse"
+              }
+            ],
+            "summary": "Each layer enforces an independent bound: memory (500), rate (200/s), sockets (50), and event-loop latency (<5 ms)."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Pair an `asyncio.Semaphore(50)` + async Token Bucket (`200 req/s`) + bounded `asyncio.Queue` worker pool, and offload CPU-heavy parsing via `asyncio.to_thread` or `ProcessPoolExecutor`.",
+      "summary": "Firing 50,000 `asyncio.gather()` coroutines at once exhausts OS file descriptors, triggers 429 bans, and lets synchronous parsing freeze the event loop.",
+      "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, pair an `asyncio.Semaphore(50)` + async Token Bucket (`200 req/s`) + bounded `asyncio.Queue` worker pool, and offload CPU-heavy parsing via `asyncio.to_thread` or `ProcessPoolExecutor`."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** Coroutines are cheap (~2 KB each), so engineers often launch `50,000` tasks via `asyncio.gather()`.\n\n**Visual & Structural Flow:** Depicts Queue -> Token Bucket (200/s) + Semaphore(50) -> Offloaded Parser (asyncio.Queue (500) -> Bucket(200/s) + Sem(50) -> External API -> to_thread / ProcessPool); Three-Layer Bounds: Socket Cap, Rate Bucket, and CPU Pool (asyncio.Queue(500) -> Token Bucket (200/s) -> TCPConnector(50) -> ProcessPool / Thread).\n\n**Trade-Offs & Production:** A `Semaphore(50)` alone still sends `50 / 0.05 s = 1,000 req/sec` if the API responds in `50 ms` (5x over the `200 req/s` limit!). Compose four clean primitives in Python 3.11+: **Bounded Queue & 50 Workers**: A `asyncio.Queue(maxsize=500)` + `50` worker tasks (`asyncio.TaskGroup`) caps memory and in-flight.\n\n**Failure Modes & Application:** Bounded async worker pools power high-throughput Python ingestion and orchestration services: **Webhook & Partner API Ingestion**: Enforces per-tenant rate limits while saturating I/O without FD leaks.",
+      "spark": {
+        "summary": "Firing 50,000 `asyncio.gather()` coroutines at once exhausts OS file descriptors, triggers 429 bans, and lets synchronous parsing freeze the event loop.",
+        "keyTakeaway": "Pair an `asyncio.Semaphore(50)` + async Token Bucket (`200 req/s`) + bounded `asyncio.Queue` worker pool, and offload CPU-heavy parsing via `asyncio.to_thread` or `ProcessPoolExecutor`."
+      },
+      "summary": "Firing 50,000 `asyncio.gather()` coroutines at once exhausts OS file descriptors, triggers 429 bans, and lets synchronous parsing freeze the event loop.",
+      "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, pair an `asyncio.Semaphore(50)` + async Token Bucket (`200 req/s`) + bounded `asyncio.Queue` worker pool, and offload CPU-heavy parsing via `asyncio.to_thread` or `ProcessPoolExecutor`."
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** Firing 50,000 `asyncio.gather()` coroutines at once exhausts OS file descriptors, triggers 429 bans, and lets synchronous parsing freeze the event loop.\n\n**Production Trade-Offs:** A `Semaphore(50)` alone still sends `50 / 0.05 s = 1,000 req/sec` if the API responds in `50 ms` (5x over the `200 req/s` limit!).\n\n**Failure Modes & Edge Cases:** Bounded async worker pools power high-throughput Python ingestion and orchestration services: **Webhook & Partner API Ingestion**: Enforces per-tenant rate limits while saturating I/O without FD leaks.\n\n**Principal Takeaway:** Pair an `asyncio.Semaphore(50)` + async Token Bucket (`200 req/s`) + bounded `asyncio.Queue` worker pool, and offload CPU-heavy parsing via `asyncio.to_thread` or `ProcessPoolExecutor`.",
+      "spark": {
+        "summary": "Firing 50,000 `asyncio.gather()` coroutines at once exhausts OS file descriptors, triggers 429 bans, and lets synchronous parsing freeze the event loop.",
+        "keyTakeaway": "Pair an `asyncio.Semaphore(50)` + async Token Bucket (`200 req/s`) + bounded `asyncio.Queue` worker pool, and offload CPU-heavy parsing via `asyncio.to_thread` or `ProcessPoolExecutor`."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why unbounded `asyncio` concurrency still crashes single containers",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why unbounded `asyncio` concurrency still crashes single containers works from first principles.",
+          "explanation": "Coroutines are cheap (~2 KB each), so engineers often launch `50,000` tasks via `asyncio.gather()`. While Python happily creates 50,000 coroutines, the OS immediately hits `ulimit -n` (`Too many open files`), upstream APIs return `429 Too Many Requests`, and synchronous BeautifulSoup/PDF parsing blocks the single-threaded event loop.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "FD exhaustion, 429 storms, and frozen event-loop heartbeats",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without FD exhaustion, 429 storms, and frozen event-loop heartbeats under real concurrency or scale.",
+          "explanation": "An unthrottled asyncio scraper fails on three fronts:\n\n1. **File Descriptor Exhaustion**: 50,000 concurrent sockets exceed the container's `1024-4096` FD limit.\n2. **429 Banning**: Bursting thousands of requests in 100 ms trips upstream rate limiters.\n3. **Event-Loop Starvation**: A `150 ms` synchronous HTML/PDF parse blocks all 50 sockets and Kubernetes health probes.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Bounded Asyncio Pipeline",
+            "title": "Queue -> Token Bucket (200/s) + Semaphore(50) -> Offloaded Parser",
+            "actors": [
+              {
+                "id": "q",
+                "label": "asyncio.Queue (500)"
+              },
+              {
+                "id": "lim",
+                "label": "Bucket(200/s) + Sem(50)"
+              },
+              {
+                "id": "api",
+                "label": "External API"
+              },
+              {
+                "id": "cpu",
+                "label": "to_thread / ProcessPool"
+              }
+            ],
+            "events": [
+              {
+                "from": "q",
+                "to": "lim",
+                "label": "50 workers pull URLs (backpressure)",
+                "status": "ok"
+              },
+              {
+                "from": "lim",
+                "to": "api",
+                "label": "Acquire token + sem -> <=50 sockets, 200/s",
+                "status": "ok"
+              },
+              {
+                "from": "api",
+                "to": "cpu",
+                "label": "Offload HTML/PDF parse (event loop free)",
+                "status": "ok"
+              },
+              {
+                "from": "lim",
+                "to": "q",
+                "label": "429 Retry-After -> jittered backoff",
+                "status": "warn"
+              }
+            ],
+            "summary": "Bounding both socket concurrency (50) and request rate (200/s) while offloading CPU parsing keeps the event loop responsive."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive `Semaphore(50)` without rate limiting or CPU offloading",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "A `Semaphore(50)` alone still sends `50 / 0.05 s = 1,000 req/sec` if the API responds in `50 ms` (5x over the `200 req/s` limit!). Meanwhile, parsing HTML directly inside `async def worker()` still freezes the event loop.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Worker Pool + Async Token Bucket + CPU Offload",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Compose four clean primitives in Python 3.11+:\n\n- **Bounded Queue & 50 Workers**: A `asyncio.Queue(maxsize=500)` + `50` worker tasks (`asyncio.TaskGroup`) caps memory and in-flight sockets to `<= 50` (matching `aiohttp.TCPConnector(limit=50)`).\n- **Async Token Bucket (`200 req/s`)**: Serializes token refill via `asyncio.Lock` using `time.monotonic()` so average rate never exceeds `200 req/s`.\n- **CPU Offloading**: Run `await asyncio.to_thread(parse_html, body)` (or `loop.run_in_executor(process_pool, ...)` for pure-Python CPU work) so heartbeats never stall.\n- **Graceful Shutdown**: On `SIGTERM`, cancel producer, drain queue or cancel `TaskGroup` cleanly, and close the `ClientSession`.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Concurrency & Rate Controls",
+            "title": "Three-Layer Bounds: Socket Cap, Rate Bucket, and CPU Pool",
+            "nodes": [
+              {
+                "label": "asyncio.Queue(500)",
+                "role": "Bounded memory backpressure"
+              },
+              {
+                "label": "Token Bucket (200/s)",
+                "role": "time.monotonic() + Lock"
+              },
+              {
+                "label": "TCPConnector(50)",
+                "role": "Max 50 open FDs"
+              },
+              {
+                "label": "ProcessPool / Thread",
+                "role": "Non-blocking parse"
+              }
+            ],
+            "edges": [
+              {
+                "label": "rate + socket gate"
+              },
+              {
+                "label": "offload CPU parse"
+              }
+            ],
+            "summary": "Each layer enforces an independent bound: memory (500), rate (200/s), sockets (50), and event-loop latency (<5 ms)."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where bounded asyncio pipelines are used",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Bounded async worker pools power high-throughput Python ingestion and orchestration services:\n\n- **Webhook & Partner API Ingestion**: Enforces per-tenant rate limits while saturating I/O without FD leaks.\n- **RAG Document Crawlers**: Fetches S3/web documents with bounded sockets and offloads PDF/HTML chunking to `ProcessPoolExecutor`.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Pair an `asyncio.Semaphore(50)` + async Token Bucket (`200 req/s`) + bounded `asyncio.Queue` worker pool, and offload CPU-heavy parsing via `asyncio.to_thread` or `ProcessPoolExecutor`.",
+      "summary": "Firing 50,000 `asyncio.gather()` coroutines at once exhausts OS file descriptors, triggers 429 bans, and lets synchronous parsing freeze the event loop.",
+      "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, pair an `asyncio.Semaphore(50)` + async Token Bucket (`200 req/s`) + bounded `asyncio.Queue` worker pool, and offload CPU-heavy parsing via `asyncio.to_thread` or `ProcessPoolExecutor`."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "prerequisites": [
+    {
+      "title": "Python Asyncio: Event Loops, Coroutines, Tasks & Backpressure",
+      "summary": "Python's asyncio achieves high-throughput single-threaded I/O concurrency via a cooperative event loop, non-blocking coroutines (`async def` / `await`), `asyncio.TaskGroup`, and bounded `asyncio.Semaphore` / `asyncio.Queue` backpressure."
+    },
+    {
+      "title": "Python GIL-Free Concurrency, Asyncio & Coroutines",
+      "summary": "Free-threaded Python (PEP 703, CPython 3.13t+) removes the Global Interpreter Lock so multiple threads execute Python bytecode simultaneously across CPU cores within a single shared memory space."
+    }
+  ],
+  "simulation": {
+    "title": "Design a Bounded-Concurrency Asyncio Pipeline in Python — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "prod",
+        "label": "Producers",
+        "role": "Concurrent Tasks"
+      },
+      {
+        "id": "queue",
+        "label": "Bounded Queue",
+        "role": "Backpressure Gate"
+      },
+      {
+        "id": "pool",
+        "label": "Worker Pool",
+        "role": "Isolated Threads"
+      },
+      {
+        "id": "sink",
+        "label": "Shared Memory",
+        "role": "CAS / Padded State"
+      }
+    ],
+    "edges": [
+      {
+        "from": "prod",
+        "to": "queue",
+        "label": "offer(task)"
+      },
+      {
+        "from": "queue",
+        "to": "pool",
+        "label": "dispatch"
+      },
+      {
+        "from": "pool",
+        "to": "sink",
+        "label": "CAS update"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why unbounded `asyncio` concurrency still crashes single containers",
+        "actionLabel": "offer(task)",
+        "status": "healthy",
+        "activeNodeIds": [
+          "prod",
+          "queue"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "offer(task)",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Producers sends work to Bounded Queue (Why unbounded `asyncio` concurrency still crashes single containers)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "FD exhaustion, 429 storms, and frozen event-loop heartbeats",
+        "actionLabel": "dispatch",
+        "status": "healthy",
+        "activeNodeIds": [
+          "queue",
+          "pool"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "dispatch",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Bounded Queue coordinates with Worker Pool while preserving the core invariant (FD exhaustion, 429 storms, and frozen event-loop heartbeats)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Naive `Semaphore(50)` without rate limiting or CPU offloading",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "pool",
+          "sink"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, Shared Memory absorbs pressure without cascading (Naive `Semaphore(50)` without rate limiting or CPU offloading)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Where bounded asyncio pipelines are used",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "prod",
+          "queue",
+          "pool",
+          "sink"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Where bounded asyncio pipelines are used)."
+      }
+    ]
+  }
+}

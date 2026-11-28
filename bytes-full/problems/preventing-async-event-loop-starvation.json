@@ -1,0 +1,868 @@
+{
+  "id": "problem-preventing-async-event-loop-starvation",
+  "slug": "preventing-async-event-loop-starvation",
+  "title": "Preventing Async Event-Loop Starvation",
+  "problemType": "system-design",
+  "difficulty": "hard",
+  "prompt": "An async API gateway (Netty on Linux `epoll` / Python `asyncio`) multiplexes 40,000 concurrent TLS connections across 8 event-loop threads (1 per vCPU). Whenever a backend triggers a 250 ms synchronous DNS resolution or a 40 MB JSON payload parse on an event-loop thread, p99 latency across *all* 5,000 sockets on that core spikes to 300 ms and TCP keepalives drop. Design a starvation-proof event-loop runtime.",
+  "spark": {
+    "summary": "A single blocking DNS lookup, synchronous DB query, or heavy JSON parse inside a Netty/asyncio event loop stalls epoll_wait(), starving thousands of unrelated sockets sharing that thread.",
+    "keyTakeaway": "When traffic spikes expose hidden coupling, keep event-loop threads strictly non-blocking (< 1 ms per tick), offload CPU/blocking I/O to dedicated bounded pools, and cap per-tick socket reads so one noisy peer cannot starve the loop.",
+    "byteSummary": "**Core Mechanics:** An async API gateway (Netty `epoll` / Python `asyncio`) multiplexes **40,000 concurrent TLS connections** across **8 event-loop threads** (1 per vCPU) at **50,000 RPS** (`< 1.5 ms` p99).\n\n**Visual & Structural Flow:** Depicts 250ms Blocking Freeze vs. Offloaded Worker Pool + Watermarks (5,000 Healthy Clients -> Event Loop (1/vCPU) -> Offload Pool -> Slow-Loris Peer); 8-Core epoll Loops + Bounded Offload Pool + Backpressure (8 Event Loops -> Write Watermarks -> Bounded Offload Pool -> Watchdog Alert).\n\n**Trade-Offs & Production:** Increasing event-loop threads from 8 to 200 on an 8-vCPU host destroys `epoll` cache locality with heavy OS context switching. Keep the 8 event-loop threads strictly non-blocking (`< 1 ms` per tick): **Async DNS & Offloaded CPU/Blocking**: Use Netty's `DnsAddressResolverGroup` (async UDP DNS) and offload.\n\n**Failure Modes & Application:** Non-blocking event-loop discipline is essential in high-concurrency proxies and servers: **Netty / Envoy / Nginx Gateways**: Multiplexing tens of thousands of TLS connections per node."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why Async Event-Loop Starvation Matters",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "Think of **Why Async Event-Loop Starvation Matters** as the intuition layer for Preventing Async Event-Loop Starvation: The mechanism: understand how Why Async Event-Loop Starvation Matters works from first principles.",
+        "core": "An async API gateway (Netty `epoll` / Python `asyncio`) multiplexes **40,000 concurrent TLS connections** across **8 event-loop threads** (1 per vCPU) at **50,000 RPS** (`< 1.5 ms` p99). Whenever one request triggers a **250 ms synchronous DNS lookup** or **40 MB JSON parse** on an event-loop thread, p99 latency spikes across *all* 5,000 sockets pinned to that core—and slow-loris readers threaten outbound write-buffer OOM.",
+        "deepDive": "Under heavy load or partial failure, why async event-loop starvation matters becomes a critical lever for predictable latency and correctness. A single blocking DNS lookup, synchronous DB query, or heavy JSON parse inside a Netty/asyncio event loop stalls epoll_wait(), starving thousands of unrelated sockets sharing that thread."
+      },
+      "purpose": "The mechanism: understand how Why Async Event-Loop Starvation Matters works from first principles.",
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "Stage 1 Lifecycle",
+        "title": "Why Async Event-Loop Starvation Matters",
+        "states": [
+          {
+            "id": "init",
+            "label": "Ready / Idle",
+            "tone": "neutral"
+          },
+          {
+            "id": "active",
+            "label": "In-Flight",
+            "tone": "info"
+          },
+          {
+            "id": "verified",
+            "label": "Committed",
+            "tone": "good"
+          },
+          {
+            "id": "degraded",
+            "label": "Fallback / Retry",
+            "tone": "warn"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "init",
+            "to": "active",
+            "label": "acquire"
+          },
+          {
+            "from": "active",
+            "to": "verified",
+            "label": "quorum ok"
+          },
+          {
+            "from": "active",
+            "to": "degraded",
+            "label": "timeout / skew"
+          },
+          {
+            "from": "degraded",
+            "to": "init",
+            "label": "backoff reset"
+          }
+        ]
+      }
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "Real-World Impact of Blocking an Event Loop",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Because each event-loop thread runs a single non-blocking `epoll` loop for 5,000 sockets:",
+        "core": "1. **5,000-Socket Head-of-Line Freeze**: A 250 ms blocking call stalls heartbeats, TLS reads, and healthy responses for 5,000 unrelated clients.\n2. **Health-Check Timeouts**: Kubernetes kills healthy pods because `/health` sits in the blocked event-loop queue.\n3. **Slow-Loris Write-Buffer OOM**: Without `WRITE_BUFFER_WATER_MARK` backpressure, stalled readers cause Netty/asyncio to buffer gigabytes of outbound responses.",
+        "deepDive": "In production deployments of Preventing Async Event-Loop Starvation, watch how real-world impact of blocking an event loop interacts with tail latency, retry amplification, and partial failures. A single blocking DNS lookup, synchronous DB query, or heavy JSON parse inside a Netty/asyncio event loop stalls epoll_wait(), starving thousands of unrelated sockets sharing that thread."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Event-Loop Cooperative Scheduling",
+        "title": "250ms Blocking Freeze vs. Offloaded Worker Pool + Watermarks",
+        "actors": [
+          {
+            "id": "c1",
+            "label": "5,000 Healthy Clients"
+          },
+          {
+            "id": "el",
+            "label": "Event Loop (1/vCPU)"
+          },
+          {
+            "id": "wrk",
+            "label": "Offload Pool"
+          },
+          {
+            "id": "slow",
+            "label": "Slow-Loris Peer"
+          }
+        ],
+        "events": [
+          {
+            "from": "el",
+            "to": "el",
+            "label": "Naive: 250ms sync DNS / 40MB JSON on loop",
+            "status": "fail"
+          },
+          {
+            "from": "c1",
+            "to": "el",
+            "label": "All 5,000 sockets stalled 250ms!",
+            "status": "fail"
+          },
+          {
+            "from": "el",
+            "to": "wrk",
+            "label": "Fixed: offload CPU/blocking to bounded pool",
+            "status": "ok"
+          },
+          {
+            "from": "slow",
+            "to": "el",
+            "label": "High watermark hit -> pause upstream read",
+            "status": "warn"
+          }
+        ],
+        "summary": "Keeping event-loop ticks <1 ms and enforcing write-buffer watermarks protects all 40,000 multiplexed connections."
+      },
+      "purpose": "The problem: see what breaks without Real-World Impact of Blocking an Event Loop under real concurrency or scale.",
+      "decisionFramework": {
+        "problem": "How to implement Preventing Async Event-Loop Starvation without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "When traffic spikes expose hidden coupling, keep event-loop threads strictly non-blocking (< 1 ms per tick), offload CPU/blocking I/O to dedicated bounded pools, and cap per-tick socket reads so one noisy peer cannot starve the loop.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Preventing Async Event-Loop Starvation experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Naive Solution (and Why It Breaks)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Think of **Naive Solution (and Why It Breaks)** as the intuition layer for Preventing Async Event-Loop Starvation: The problem: see what breaks without Naive Solution under real concurrency or scale.",
+        "core": "Increasing event-loop threads from 8 to 200 on an 8-vCPU host destroys `epoll` cache locality with heavy OS context switching. Using `asyncio.to_thread()` or Netty `EventExecutorGroup` *without* a bounded queue still lets 40 MB JSON parses OOM the process.",
+        "deepDive": "Under heavy load or partial failure, naive solution (and why it breaks) becomes a critical lever for predictable latency and correctness. A single blocking DNS lookup, synchronous DB query, or heavy JSON parse inside a Netty/asyncio event loop stalls epoll_wait(), starving thousands of unrelated sockets sharing that thread."
+      },
+      "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+      "sectionDiagram": {
+        "kind": "behavior-transition",
+        "eyebrow": "Stage 3 Trade-Off",
+        "title": "Naive Solution (and Why It Breaks)",
+        "before": {
+          "label": "Naive Unbounded Path",
+          "metrics": [
+            "Unbounded retries",
+            "Tail latency spikes",
+            "Silent state drift"
+          ]
+        },
+        "after": {
+          "label": "Bounded Engineering Path",
+          "metrics": [
+            "Explicit budgets",
+            "Predictable p99",
+            "Verifiable invariants"
+          ]
+        }
+      }
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise Solution: Sub-ms Event Loops, Offload Pools & Write Watermarks",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": {
+        "foundation": "Keep the 8 event-loop threads strictly non-blocking (`< 1 ms` per tick):",
+        "core": "- **Async DNS & Offloaded CPU/Blocking**: Use Netty's `DnsAddressResolverGroup` (async UDP DNS) and offload heavy JSON/compression/blocking calls to a bounded `ExecutorService` (or `loop.run_in_executor` in Python), shedding load with `429`/`413` if the offload queue fills.\n- **Fair Per-Tick Read Caps**: Limit `maxMessagesPerRead` (e.g., 16) so one noisy peer cannot monopolize an `epoll` tick.\n- **Write-Buffer Backpressure & Watchdogs**: Configure `WriteBufferWaterMark(32KB, 64KB)` to pause `AUTO_READ` on slow-loris consumers, and enable Netty `BlockedThreadChecker` / `asyncio` slow-callback warnings (`> 50 ms`).",
+        "deepDive": "In production deployments of Preventing Async Event-Loop Starvation, watch how enterprise solution: sub-ms event loops, offload pools & write watermarks interacts with tail latency, retry amplification, and partial failures. A single blocking DNS lookup, synchronous DB query, or heavy JSON parse inside a Netty/asyncio event loop stalls epoll_wait(), starving thousands of unrelated sockets sharing that thread."
+      },
+      "sectionDiagram": {
+        "kind": "cache-tier",
+        "eyebrow": "Non-Blocking Gateway Pipeline",
+        "title": "8-Core epoll Loops + Bounded Offload Pool + Backpressure",
+        "nodes": [
+          {
+            "label": "8 Event Loops",
+            "role": "<1ms tick | async DNS"
+          },
+          {
+            "label": "Write Watermarks",
+            "role": "32KB-64KB backpressure"
+          },
+          {
+            "label": "Bounded Offload Pool",
+            "role": "Heavy JSON / CPU work"
+          },
+          {
+            "label": "Watchdog Alert",
+            "role": "Flag ticks > 50ms"
+          }
+        ],
+        "edges": [
+          {
+            "label": "Zero blocking I/O"
+          },
+          {
+            "label": "429 / 413 load shed"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Async DNS",
+            "detail": "Replaces blocking getaddrinfo() with non-blocking UDP resolver."
+          },
+          {
+            "label": "Watermarks",
+            "detail": "Drops AUTO_READ when outbound socket buffer exceeds 64 KB."
+          },
+          {
+            "label": "Payload Caps",
+            "detail": "Reject >10 MB payloads at streaming parser before buffering."
+          },
+          {
+            "label": "Loop Watchdog",
+            "detail": "PYTHONASYNCIODEBUG / Netty BlockedThreadChecker catches regressions."
+          }
+        ],
+        "summary": "Strict <1 ms event-loop discipline sustains 50k RPS at <1.5 ms p99 across 40,000 TLS sockets."
+      },
+      "markdownContent": "```java\nimport io.netty.bootstrap.ServerBootstrap;\nimport io.netty.channel.*;\nimport io.netty.channel.epoll.*;\nimport io.netty.handler.timeout.IdleStateHandler;\nimport io.netty.util.concurrent.*;\nimport java.util.concurrent.*;\n\npublic class StarvationSafeGateway {\n    public static void start() throws InterruptedException {\n        EventLoopGroup boss = new EpollEventLoopGroup(1);\n        EventLoopGroup workers = new EpollEventLoopGroup(8);\n        EventExecutorGroup heavyPool = new DefaultEventExecutorGroup(32);\n\n        startLoopWatchdog(workers, 10_000_000L); // 10 ms threshold\n\n        new ServerBootstrap()\n            .group(boss, workers)\n            .channel(EpollServerSocketChannel.class)\n            .childOption(ChannelOption.MAX_MESSAGES_PER_READ, 16)\n            .childOption(ChannelOption.WRITE_BUFFER_WATER_MARK,\n                         new WriteBufferWaterMark(32 * 1024, 64 * 1024))\n            .childHandler(new ChannelInitializer<Channel>() {\n                @Override\n                protected void initChannel(Channel ch) {\n                    ch.pipeline()\n                      .addLast(new IdleStateHandler(60, 0, 0))\n                      .addLast(heavyPool, new HeavyJsonHandler());\n                }\n            })\n            .bind(8443).sync();\n    }\n\n    private static void startLoopWatchdog(EventLoopGroup group, long maxLagNs) {\n        ScheduledExecutorService watchdog = Executors.newSingleThreadScheduledExecutor();\n        watchdog.scheduleAtFixedRate(() -> {\n            for (EventExecutor loop : group) {\n                long scheduledNs = System.nanoTime();\n                loop.execute(() -> {\n                    long lag = System.nanoTime() - scheduledNs;\n                    if (lag > maxLagNs) {\n                        System.err.printf(\"EventLoop %s stalled %.2f ms%n\",\n                            Thread.currentThread().getName(), lag / 1e6);\n                    }\n                });\n            }\n        }, 5, 5, TimeUnit.MILLISECONDS);\n    }\n}\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where Event-Loop Hygiene Applies in System Design",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Non-blocking event-loop discipline is essential in high-concurrency proxies and servers:",
+        "core": "- **Netty / Envoy / Nginx Gateways**: Multiplexing tens of thousands of TLS connections per node.\n- **Node.js & Python `asyncio` APIs**: Offloading bcrypt, image resizing, or large JSON parsing to worker pools.\n- **WebSocket & Real-Time Servers**: Enforcing write-buffer watermarks so slow mobile clients don't OOM the server.",
+        "deepDive": "In production deployments of Preventing Async Event-Loop Starvation, watch how where event-loop hygiene applies in system design interacts with tail latency, retry amplification, and partial failures. A single blocking DNS lookup, synchronous DB query, or heavy JSON parse inside a Netty/asyncio event loop stalls epoll_wait(), starving thousands of unrelated sockets sharing that thread."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "reactive-streams-backpressure",
+          "title": "Concept: Reactive Streams & Backpressure",
+          "kind": "concept"
+        },
+        {
+          "slug": "python-asyncio-event-loops-coroutines",
+          "title": "Concept: Python asyncio Event Loops",
+          "kind": "concept"
+        },
+        {
+          "slug": "websocket-realtime-scaling",
+          "title": "Concept: WebSocket Real-Time Scaling",
+          "kind": "concept"
+        },
+        {
+          "slug": "design-distributed-rate-limiter",
+          "title": "System Design: Distributed Rate Limiter",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+      "sectionDiagram": {
+        "kind": "behavior-transition",
+        "eyebrow": "Stage 5 Trade-Off",
+        "title": "Where Event-Loop Hygiene Applies in System Design",
+        "before": {
+          "label": "Naive Unbounded Path",
+          "metrics": [
+            "Unbounded retries",
+            "Tail latency spikes",
+            "Silent state drift"
+          ]
+        },
+        "after": {
+          "label": "Bounded Engineering Path",
+          "metrics": [
+            "Explicit budgets",
+            "Predictable p99",
+            "Verifiable invariants"
+          ]
+        }
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "How does Netty's `WriteBufferWaterMark(32KB, 64KB)` prevent a slow-loris client from OOMing the gateway?",
+      "options": [
+        {
+          "id": "a",
+          "text": "When queued outbound bytes exceed 64 KB, `channel.isWritable()` becomes `false` so the server stops reading from upstream until the client drains",
+          "correct": true,
+          "feedback": "Correct: backpressure propagates upstream instead of buffering unbounded gigabytes in heap."
+        },
+        {
+          "id": "b",
+          "text": "It compresses all outbound HTTP responses with Zstandard automatically",
+          "correct": false,
+          "feedback": "Watermarks control flow backpressure, not compression."
+        },
+        {
+          "id": "c",
+          "text": "It moves slow sockets onto a separate Linux kernel",
+          "correct": false,
+          "feedback": "It toggles `AUTO_READ` / `isWritable()` within the same Netty event loop."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "How does Netty's `WriteBufferWaterMark(32KB, 64KB)` prevent a slow-loris client from OOMing the gateway?",
+        "options": [
+          {
+            "id": "a",
+            "text": "When queued outbound bytes exceed 64 KB, `channel.isWritable()` becomes `false` so the server stops reading from upstream until the client drains",
+            "correct": true,
+            "feedback": "Correct: backpressure propagates upstream instead of buffering unbounded gigabytes in heap."
+          },
+          {
+            "id": "b",
+            "text": "It compresses all outbound HTTP responses with Zstandard automatically",
+            "correct": false,
+            "feedback": "Watermarks control flow backpressure, not compression."
+          },
+          {
+            "id": "c",
+            "text": "It moves slow sockets onto a separate Linux kernel",
+            "correct": false,
+            "feedback": "It toggles `AUTO_READ` / `isWritable()` within the same Netty event loop."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why Async Event-Loop Starvation Matters', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "An async API gateway (Netty epoll / Python asyncio) multiplexes **40,000 concurrent TLS connections** across **8 event-loop threads** (1 per vCPU) at **50,000 RPS** (< 1.5…",
+            "correct": true,
+            "feedback": "Correct: An async API gateway (Netty epoll / Python asyncio) multiplexes **40,000 concurrent TLS connections** across **8 event-loop threads** (1 per vCPU) at **50,000 RPS** (< 1.5…"
+          },
+          {
+            "id": "b",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "c",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Real-World Impact of Blocking an Event Loop', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Because each event-loop thread runs a single non-blocking epoll loop for 5,000 sockets: 1.",
+            "correct": true,
+            "feedback": "Correct: Because each event-loop thread runs a single non-blocking epoll loop for 5,000 sockets: 1."
+          },
+          {
+            "id": "b",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "c",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** An async API gateway (Netty `epoll` / Python `asyncio`) multiplexes **40,000 concurrent TLS connections** across **8 event-loop threads** (1 per vCPU) at **50,000 RPS** (`< 1.5 ms` p99).\n\n**How It Flows:** Think of Preventing Async Event-Loop Starvation as a clear step-by-step chain: 5,000 Healthy Clients -> Event Loop (1/vCPU) -> Offload Pool -> Slow-Loris Peer -> 8 Event Loops.\n\n**Why Beginners Should Care:** Keep event-loop threads strictly non-blocking (< 1 ms per tick), offload CPU/blocking I/O to dedicated bounded pools, and cap per-tick socket reads so one noisy peer cannot starve the loop.",
+      "spark": {
+        "summary": "An async API gateway (Netty `epoll` / Python `asyncio`) multiplexes **40,000 concurrent TLS connections** across **8 event-loop threads** (1 per vCPU) at **50,000 RPS** (`< 1.5 ms` p99).",
+        "keyTakeaway": "Keep event-loop threads strictly non-blocking (< 1 ms per tick), offload CPU/blocking I/O to dedicated bounded pools, and cap per-tick socket reads so one noisy peer cannot starve the loop."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why Async Event-Loop Starvation Matters",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why Async Event-Loop Starvation Matters works from first principles.",
+          "explanation": "An async API gateway (Netty `epoll` / Python `asyncio`) multiplexes **40,000 concurrent TLS connections** across **8 event-loop threads** (1 per vCPU) at **50,000 RPS** (`< 1.5 ms` p99).",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Real-World Impact of Blocking an Event Loop",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without Real-World Impact of Blocking an Event Loop under real concurrency or scale.",
+          "explanation": "Because each event-loop thread runs a single non-blocking `epoll` loop for 5,000 sockets: 1. **5,000-Socket Head-of-Line Freeze**: A 250 ms blocking call stalls heartbeats, TLS reads, and healthy responses for 5,000 unrelated clients. 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Event-Loop Cooperative Scheduling",
+            "title": "250ms Blocking Freeze vs. Offloaded Worker Pool + Watermarks",
+            "actors": [
+              {
+                "id": "c1",
+                "label": "5,000 Healthy Clients"
+              },
+              {
+                "id": "el",
+                "label": "Event Loop (1/vCPU)"
+              },
+              {
+                "id": "wrk",
+                "label": "Offload Pool"
+              },
+              {
+                "id": "slow",
+                "label": "Slow-Loris Peer"
+              }
+            ],
+            "events": [
+              {
+                "from": "el",
+                "to": "el",
+                "label": "Naive: 250ms sync DNS / 40MB JSON on loop",
+                "status": "fail"
+              },
+              {
+                "from": "c1",
+                "to": "el",
+                "label": "All 5,000 sockets stalled 250ms!",
+                "status": "fail"
+              },
+              {
+                "from": "el",
+                "to": "wrk",
+                "label": "Fixed: offload CPU/blocking to bounded pool",
+                "status": "ok"
+              },
+              {
+                "from": "slow",
+                "to": "el",
+                "label": "High watermark hit -> pause upstream read",
+                "status": "warn"
+              }
+            ],
+            "summary": "Keeping event-loop ticks <1 ms and enforcing write-buffer watermarks protects all 40,000 multiplexed connections."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive Solution (and Why It Breaks)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+          "explanation": "Increasing event-loop threads from 8 to 200 on an 8-vCPU host destroys `epoll` cache locality with heavy OS context switching. Using `asyncio.to_thread()` or Netty `EventExecutorGroup` *without* a bounded queue still lets 40 MB JSON parses OOM the process.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise Solution: Sub-ms Event Loops, Offload Pools & Write Watermarks",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Keep the 8 event-loop threads strictly non-blocking (`< 1 ms` per tick): **Async DNS & Offloaded CPU/Blocking**: Use Netty's `DnsAddressResolverGroup` (async UDP DNS) and offload heavy JSON/compression/blocking calls to a bounded `ExecutorService` (or `loop.run_in_executor` in Python), shedding load with `429`/`413` if the offload queue fills.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Non-Blocking Gateway Pipeline",
+            "title": "8-Core epoll Loops + Bounded Offload Pool + Backpressure",
+            "nodes": [
+              {
+                "label": "8 Event Loops",
+                "role": "<1ms tick | async DNS"
+              },
+              {
+                "label": "Write Watermarks",
+                "role": "32KB-64KB backpressure"
+              },
+              {
+                "label": "Bounded Offload Pool",
+                "role": "Heavy JSON / CPU work"
+              },
+              {
+                "label": "Watchdog Alert",
+                "role": "Flag ticks > 50ms"
+              }
+            ],
+            "edges": [
+              {
+                "label": "Zero blocking I/O"
+              },
+              {
+                "label": "429 / 413 load shed"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Async DNS",
+                "detail": "Replaces blocking getaddrinfo() with non-blocking UDP resolver."
+              },
+              {
+                "label": "Watermarks",
+                "detail": "Drops AUTO_READ when outbound socket buffer exceeds 64 KB."
+              },
+              {
+                "label": "Payload Caps",
+                "detail": "Reject >10 MB payloads at streaming parser before buffering."
+              },
+              {
+                "label": "Loop Watchdog",
+                "detail": "PYTHONASYNCIODEBUG / Netty BlockedThreadChecker catches regressions."
+              }
+            ],
+            "summary": "Strict <1 ms event-loop discipline sustains 50k RPS at <1.5 ms p99 across 40,000 TLS sockets."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Keep event-loop threads strictly non-blocking (< 1 ms per tick), offload CPU/blocking I/O to dedicated bounded pools, and cap per-tick socket reads so one noisy peer cannot starve the loop.",
+      "summary": "A single blocking DNS lookup, synchronous DB query, or heavy JSON parse inside a Netty/asyncio event loop stalls epoll_wait(), starving thousands of unrelated sockets sharing that thread.",
+      "keyTakeaway": "When traffic spikes expose hidden coupling, keep event-loop threads strictly non-blocking (< 1 ms per tick), offload CPU/blocking I/O to dedicated bounded pools, and cap per-tick socket reads so one noisy peer cannot starve the loop."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** An async API gateway (Netty `epoll` / Python `asyncio`) multiplexes **40,000 concurrent TLS connections** across **8 event-loop threads** (1 per vCPU) at **50,000 RPS** (`< 1.5 ms` p99).\n\n**Visual & Structural Flow:** Depicts 250ms Blocking Freeze vs. Offloaded Worker Pool + Watermarks (5,000 Healthy Clients -> Event Loop (1/vCPU) -> Offload Pool -> Slow-Loris Peer); 8-Core epoll Loops + Bounded Offload Pool + Backpressure (8 Event Loops -> Write Watermarks -> Bounded Offload Pool -> Watchdog Alert).\n\n**Trade-Offs & Production:** Increasing event-loop threads from 8 to 200 on an 8-vCPU host destroys `epoll` cache locality with heavy OS context switching. Keep the 8 event-loop threads strictly non-blocking (`< 1 ms` per tick): **Async DNS & Offloaded CPU/Blocking**: Use Netty's `DnsAddressResolverGroup` (async UDP DNS) and offload.\n\n**Failure Modes & Application:** Non-blocking event-loop discipline is essential in high-concurrency proxies and servers: **Netty / Envoy / Nginx Gateways**: Multiplexing tens of thousands of TLS connections per node.",
+      "spark": {
+        "summary": "A single blocking DNS lookup, synchronous DB query, or heavy JSON parse inside a Netty/asyncio event loop stalls epoll_wait(), starving thousands of unrelated sockets sharing that thread.",
+        "keyTakeaway": "Keep event-loop threads strictly non-blocking (< 1 ms per tick), offload CPU/blocking I/O to dedicated bounded pools, and cap per-tick socket reads so one noisy peer cannot starve the loop."
+      },
+      "summary": "A single blocking DNS lookup, synchronous DB query, or heavy JSON parse inside a Netty/asyncio event loop stalls epoll_wait(), starving thousands of unrelated sockets sharing that thread.",
+      "keyTakeaway": "When traffic spikes expose hidden coupling, keep event-loop threads strictly non-blocking (< 1 ms per tick), offload CPU/blocking I/O to dedicated bounded pools, and cap per-tick socket reads so one noisy peer cannot starve the loop."
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** A single blocking DNS lookup, synchronous DB query, or heavy JSON parse inside a Netty/asyncio event loop stalls epoll_wait(), starving thousands of unrelated sockets sharing that thread.\n\n**Production Trade-Offs:** Increasing event-loop threads from 8 to 200 on an 8-vCPU host destroys `epoll` cache locality with heavy OS context switching.\n\n**Failure Modes & Edge Cases:** Non-blocking event-loop discipline is essential in high-concurrency proxies and servers: **Netty / Envoy / Nginx Gateways**: Multiplexing tens of thousands of TLS connections per node.\n\n**Principal Takeaway:** Keep event-loop threads strictly non-blocking (< 1 ms per tick), offload CPU/blocking I/O to dedicated bounded pools, and cap per-tick socket reads so one noisy peer cannot starve the loop.",
+      "spark": {
+        "summary": "A single blocking DNS lookup, synchronous DB query, or heavy JSON parse inside a Netty/asyncio event loop stalls epoll_wait(), starving thousands of unrelated sockets sharing that thread.",
+        "keyTakeaway": "Keep event-loop threads strictly non-blocking (< 1 ms per tick), offload CPU/blocking I/O to dedicated bounded pools, and cap per-tick socket reads so one noisy peer cannot starve the loop."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why Async Event-Loop Starvation Matters",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why Async Event-Loop Starvation Matters works from first principles.",
+          "explanation": "An async API gateway (Netty `epoll` / Python `asyncio`) multiplexes **40,000 concurrent TLS connections** across **8 event-loop threads** (1 per vCPU) at **50,000 RPS** (`< 1.5 ms` p99). Whenever one request triggers a **250 ms synchronous DNS lookup** or **40 MB JSON parse** on an event-loop thread, p99 latency spikes across *all* 5,000 sockets pinned to that core—and slow-loris readers threaten outbound write-buffer OOM.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Real-World Impact of Blocking an Event Loop",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without Real-World Impact of Blocking an Event Loop under real concurrency or scale.",
+          "explanation": "Because each event-loop thread runs a single non-blocking `epoll` loop for 5,000 sockets:\n\n1. **5,000-Socket Head-of-Line Freeze**: A 250 ms blocking call stalls heartbeats, TLS reads, and healthy responses for 5,000 unrelated clients.\n2. **Health-Check Timeouts**: Kubernetes kills healthy pods because `/health` sits in the blocked event-loop queue.\n3. **Slow-Loris Write-Buffer OOM**: Without `WRITE_BUFFER_WATER_MARK` backpressure, stalled readers cause Netty/asyncio to buffer gigabytes of outbound responses.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Event-Loop Cooperative Scheduling",
+            "title": "250ms Blocking Freeze vs. Offloaded Worker Pool + Watermarks",
+            "actors": [
+              {
+                "id": "c1",
+                "label": "5,000 Healthy Clients"
+              },
+              {
+                "id": "el",
+                "label": "Event Loop (1/vCPU)"
+              },
+              {
+                "id": "wrk",
+                "label": "Offload Pool"
+              },
+              {
+                "id": "slow",
+                "label": "Slow-Loris Peer"
+              }
+            ],
+            "events": [
+              {
+                "from": "el",
+                "to": "el",
+                "label": "Naive: 250ms sync DNS / 40MB JSON on loop",
+                "status": "fail"
+              },
+              {
+                "from": "c1",
+                "to": "el",
+                "label": "All 5,000 sockets stalled 250ms!",
+                "status": "fail"
+              },
+              {
+                "from": "el",
+                "to": "wrk",
+                "label": "Fixed: offload CPU/blocking to bounded pool",
+                "status": "ok"
+              },
+              {
+                "from": "slow",
+                "to": "el",
+                "label": "High watermark hit -> pause upstream read",
+                "status": "warn"
+              }
+            ],
+            "summary": "Keeping event-loop ticks <1 ms and enforcing write-buffer watermarks protects all 40,000 multiplexed connections."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive Solution (and Why It Breaks)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+          "explanation": "Increasing event-loop threads from 8 to 200 on an 8-vCPU host destroys `epoll` cache locality with heavy OS context switching. Using `asyncio.to_thread()` or Netty `EventExecutorGroup` *without* a bounded queue still lets 40 MB JSON parses OOM the process.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise Solution: Sub-ms Event Loops, Offload Pools & Write Watermarks",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Keep the 8 event-loop threads strictly non-blocking (`< 1 ms` per tick):\n\n- **Async DNS & Offloaded CPU/Blocking**: Use Netty's `DnsAddressResolverGroup` (async UDP DNS) and offload heavy JSON/compression/blocking calls to a bounded `ExecutorService` (or `loop.run_in_executor` in Python), shedding load with `429`/`413` if the offload queue fills.\n- **Fair Per-Tick Read Caps**: Limit `maxMessagesPerRead` (e.g., 16) so one noisy peer cannot monopolize an `epoll` tick.\n- **Write-Buffer Backpressure & Watchdogs**: Configure `WriteBufferWaterMark(32KB, 64KB)` to pause `AUTO_READ` on slow-loris consumers, and enable Netty `BlockedThreadChecker` / `asyncio` slow-callback warnings (`> 50 ms`).",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Non-Blocking Gateway Pipeline",
+            "title": "8-Core epoll Loops + Bounded Offload Pool + Backpressure",
+            "nodes": [
+              {
+                "label": "8 Event Loops",
+                "role": "<1ms tick | async DNS"
+              },
+              {
+                "label": "Write Watermarks",
+                "role": "32KB-64KB backpressure"
+              },
+              {
+                "label": "Bounded Offload Pool",
+                "role": "Heavy JSON / CPU work"
+              },
+              {
+                "label": "Watchdog Alert",
+                "role": "Flag ticks > 50ms"
+              }
+            ],
+            "edges": [
+              {
+                "label": "Zero blocking I/O"
+              },
+              {
+                "label": "429 / 413 load shed"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Async DNS",
+                "detail": "Replaces blocking getaddrinfo() with non-blocking UDP resolver."
+              },
+              {
+                "label": "Watermarks",
+                "detail": "Drops AUTO_READ when outbound socket buffer exceeds 64 KB."
+              },
+              {
+                "label": "Payload Caps",
+                "detail": "Reject >10 MB payloads at streaming parser before buffering."
+              },
+              {
+                "label": "Loop Watchdog",
+                "detail": "PYTHONASYNCIODEBUG / Netty BlockedThreadChecker catches regressions."
+              }
+            ],
+            "summary": "Strict <1 ms event-loop discipline sustains 50k RPS at <1.5 ms p99 across 40,000 TLS sockets."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where Event-Loop Hygiene Applies in System Design",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Non-blocking event-loop discipline is essential in high-concurrency proxies and servers:\n\n- **Netty / Envoy / Nginx Gateways**: Multiplexing tens of thousands of TLS connections per node.\n- **Node.js & Python `asyncio` APIs**: Offloading bcrypt, image resizing, or large JSON parsing to worker pools.\n- **WebSocket & Real-Time Servers**: Enforcing write-buffer watermarks so slow mobile clients don't OOM the server.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Keep event-loop threads strictly non-blocking (< 1 ms per tick), offload CPU/blocking I/O to dedicated bounded pools, and cap per-tick socket reads so one noisy peer cannot starve the loop.",
+      "summary": "A single blocking DNS lookup, synchronous DB query, or heavy JSON parse inside a Netty/asyncio event loop stalls epoll_wait(), starving thousands of unrelated sockets sharing that thread.",
+      "keyTakeaway": "When traffic spikes expose hidden coupling, keep event-loop threads strictly non-blocking (< 1 ms per tick), offload CPU/blocking I/O to dedicated bounded pools, and cap per-tick socket reads so one noisy peer cannot starve the loop."
+    }
+  },
+  "pedagogicalFramework": "CLASSE",
+  "simulation": {
+    "title": "Preventing Async Event-Loop Starvation — Interactive Execution Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Workload & Budget"
+      },
+      {
+        "id": "router",
+        "label": "Gateway / Router",
+        "role": "Admission & Dispatch"
+      },
+      {
+        "id": "engine",
+        "label": "Core Engine",
+        "role": "Primary Execution"
+      },
+      {
+        "id": "replica",
+        "label": "Replica / Fallback",
+        "role": "Durability & Recovery"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "router",
+        "label": "request"
+      },
+      {
+        "from": "router",
+        "to": "engine",
+        "label": "route"
+      },
+      {
+        "from": "engine",
+        "to": "replica",
+        "label": "sync / fallback"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why Async Event-Loop Starvation Matters",
+        "actionLabel": "Dispatch nominal request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "router"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "Ingress",
+          "p99_ms": 8,
+          "error_rate": "0.0%"
+        },
+        "explanation": "Caller sends work into the gateway with explicit timeout and concurrency bounds (Why Async Event-Loop Starvation Matters)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Real-World Impact of Blocking an Event Loop",
+        "actionLabel": "Execute core invariant",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "Core Path",
+          "p99_ms": 18,
+          "in_flight": 124
+        },
+        "explanation": "The core engine processes the hot path while keeping state transitions deterministic (Real-World Impact of Blocking an Event Loop)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Naive Solution (and Why It Breaks)",
+        "actionLabel": "Detect skew or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Degraded",
+          "p99_ms": 64,
+          "retries_capped": "true"
+        },
+        "explanation": "Under load or replica lag, bounded backoff and isolation prevent cascading saturation (Naive Solution (and Why It Breaks))."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Where Event-Loop Hygiene Applies in System Design",
+        "actionLabel": "Converge & restore SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 11,
+          "drift": 0
+        },
+        "explanation": "State converges cleanly and telemetry confirms the system returned within its SLO envelope (Where Event-Loop Hygiene Applies in System Design)."
+      }
+    ]
+  }
+}

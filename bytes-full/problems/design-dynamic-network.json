@@ -1,0 +1,815 @@
+{
+  "id": "design-dynamic-network",
+  "slug": "design-dynamic-network",
+  "title": "Design a Dynamic Network Connectivity & Fraud Ring Detector with Union-Find",
+  "problemType": "system-design",
+  "difficulty": "hard",
+  "prompt": "Design a real-time fraud-ring detection and dynamic network connectivity service ingesting 100K account-link events/sec (shared device_id, IP, payment_card) across 200M accounts, supporting < 5 ms p99 `sameRing(accountA, accountB)` queries, component size alerts when a ring exceeds 50 accounts, and crash recovery without losing merged state.",
+  "spark": {
+    "summary": "Partition link events into an idempotent WAL feeding stateful DSU engine shards with periodic RocksDB snapshots and bounded-window edge expiry.",
+    "keyTakeaway": "If latency budgets leave no room for synchronous retries, because DSU merges are associative and commutative, you can recover exact cluster state from an append-only WAL + periodic checkpoints and trigger fraud alerts on the exact union() that crosses the ring-size threshold.",
+    "byteSummary": "A real-time fraud-ring detector links accounts whenever they share a device fingerprint, payment instrument, or residential proxy. Running BFS/DFS on a 200M-node graph on every checkout request would blow the 5 ms latency SLA; instead, an in-memory Disjoint Set Union (Union-Find) engine answers `sameRing(A, B)` and `ringSize(A)` in O(alpha(N)) time.\n\nAt 200M accounts, a compact single-array negative-size DSU (`int32 parent[]`) consumes only 800 MB of RAM, easily fitting on a single high-memory shard with hot standby replicas—or partitioned by region/tenant with cross-shard federation. Incoming link events flow through Kafka into an idempotent consumer that checks an edge deduplication filter before calling `union(a, b)`.\n\nTo handle account unlinking or stale device reuse (e.g., carrier-grade NAT IPs after 30 days), standard DSU cannot delete individual edges. Production deployments solve this using sliding-window epoch rebuilds (rolling 30-day DSU snapshots) combined with high-degree hub filtering so shared public Wi-Fi IPs never collapse millions of innocent users into one giant false-positive ring."
+  },
+  "learningJourney": [
+    {
+      "id": "01-scale-and-memory-math",
+      "eyebrow": "STAGE 01 · SCALE & MEMORY MATH",
+      "title": "Sizing 200M-Node DSU State & Latency Budgets",
+      "level": "foundation",
+      "purpose": "Size a 200M-account fraud-ring DSU in 800 MB RAM plus a RocksDB ID-interning map with <1 ms connectivity queries.",
+      "explanation": {
+        "foundation": "Assume 200M active accounts mapped to dense `int32` internal IDs via an ID-interning RocksDB/hash table.",
+        "core": "- **DSU Array**: `200M * 4 bytes` (negative-size `parent[]`) = **800 MB RAM**.\n- **ID Interning Map**: `200M * ~24 bytes` = **~4.8 GB RAM**.\n- **Throughput**: 100K `union()`/sec and 250K `find()`/sec easily run on 1–4 CPU cores in C++/Rust/Go at ~100 ns per operation.",
+        "deepDive": "In production deployments of Design a Dynamic Network Connectivity & Fraud Ring Detector with Union-Find, watch how sizing 200m-node dsu state & latency budgets interacts with tail latency, retry amplification, and partial failures. Production DSU fraud-ring systems pair idempotent WAL snapshots with super-node circuit breakers, rolling epoch swaps, and bounded-lag read replicas."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 01 · SCALE & MEMORY MATH",
+        "title": "Sizing 200M-Node DSU State & Latency Budgets",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "200M Active Accounts",
+            "sub": "String -> int32 Intern",
+            "role": "Dense ID Space"
+          },
+          {
+            "id": "n2",
+            "label": "800 MB DSU Array",
+            "sub": "200M x 4B int32[]",
+            "role": "Compact Forest"
+          },
+          {
+            "id": "n3",
+            "label": "4.8 GB RocksDB Interner",
+            "sub": "Account/Device -> ID",
+            "role": "ID Lookup"
+          },
+          {
+            "id": "n4",
+            "label": "<1 ms sameRing(A, B)",
+            "sub": "O(alpha(N)) Query",
+            "role": "Latency SLA"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "indexes"
+          },
+          {
+            "from": "n1",
+            "to": "n3",
+            "label": "persisted in"
+          },
+          {
+            "from": "n2",
+            "to": "n4",
+            "label": "serves"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Memory Footprint",
+            "detail": "200M * 4 bytes = 800 MB for negative-size parent[]—fits easily in L3/RAM on one server."
+          },
+          {
+            "label": "Dense int32 Encoding",
+            "detail": "Negative parent[root] stores -component_size, eliminating a separate rank/size array."
+          },
+          {
+            "label": "Query Budget",
+            "detail": "Fraud-check API calls sameRing(A, B) inline during checkout in <1 ms."
+          }
+        ],
+        "summary": "Dense int32[] parent encoding fits 200M accounts in 800 MB RAM and serves sameRing(A, B) in <1 ms.",
+        "caption": "Dense int32[] parent encoding fits 200M accounts in 800 MB RAM and serves sameRing(A, B) in <1 ms."
+      }
+    },
+    {
+      "id": "02-hub-filtering-and-ingest",
+      "eyebrow": "STAGE 02 · INGESTION & SUPER-NODE GUARD",
+      "title": "Preventing False-Positive Collapses on Shared IPs & Hubs",
+      "level": "foundation",
+      "purpose": "Prevent false-positive mega-component collapses on shared Wi-Fi/CGNAT IPs using attribute degree caps.",
+      "explanation": {
+        "foundation": "A naive `union(account, ip)` merges every user on an airport Wi-Fi or CGNAT IP into one mega-component. Before emitting a union edge for an attribute (IP, device, card), enforce a degree cap (e.g., max 20 accounts per IP per 24h) using a Redis/HyperLogLog or Count-Min Sketch gate.",
+        "core": "Attributes exceeding the threshold are quarantined as `super_node` signals rather than hard DSU edges.",
+        "deepDive": "In production deployments of Design a Dynamic Network Connectivity & Fraud Ring Detector with Union-Find, watch how preventing false-positive collapses on shared ips & hubs interacts with tail latency, retry amplification, and partial failures. Production DSU fraud-ring systems pair idempotent WAL snapshots with super-node circuit breakers, rolling epoch swaps, and bounded-lag read replicas."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 02 · INGESTION & SUPER-NODE GUARD",
+        "title": "Preventing False-Positive Collapses on Shared IPs & Hubs",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "Edge Event (Acct, IP)",
+            "sub": "Kafka Risk Stream",
+            "role": "Raw Signal"
+          },
+          {
+            "id": "n2",
+            "label": "HyperLogLog / Count",
+            "sub": "Distinct Accts / IP",
+            "role": "Degree Check"
+          },
+          {
+            "id": "n3",
+            "label": "Degree > 20 Quarantine",
+            "sub": "Drop Public Wi-Fi/CGNAT",
+            "role": "Super-Node Guard"
+          },
+          {
+            "id": "n4",
+            "label": "Safe DSU union(a, b)",
+            "sub": "Only Clean Edges",
+            "role": "Accurate Rings"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "counts degree"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "if > 20"
+          },
+          {
+            "from": "n2",
+            "to": "n4",
+            "label": "if <= 20"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Airport Wi-Fi Trap",
+            "detail": "One shared IP with 5,000 travelers would merge 5,000 innocent users into one giant fraud ring."
+          },
+          {
+            "label": "Attribute-Specific Caps",
+            "detail": "Cap shared IPs at 20 accounts, shared devices at 5, and shared cards at 3."
+          },
+          {
+            "label": "Quarantine Log",
+            "detail": "Send excluded super-node attributes to a separate anomaly stream instead of the DSU."
+          }
+        ],
+        "summary": "Attribute degree caps quarantine shared Wi-Fi/CGNAT IPs before union(), preventing giant-component false positives.",
+        "caption": "Attribute degree caps quarantine shared Wi-Fi/CGNAT IPs before union(), preventing giant-component false positives."
+      },
+      "decisionFramework": {
+        "problem": "How to implement Design a Dynamic Network Connectivity & Fraud Ring Detector with Union-Find without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "If latency budgets leave no room for synchronous retries, because DSU merges are associative and commutative, you can recover exact cluster state from an append-only WAL + periodic checkpoints and trigger fraud alerts on the exact union() that crosses the ring-size threshold.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Design a Dynamic Network Connectivity & Fraud Ring Detector with Union-Find experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-core-engine-implementation",
+      "eyebrow": "STAGE 03 · CORE DSU ENGINE",
+      "title": "Thread-Safe Sharded Engine with Threshold Alerting",
+      "level": "intermediate",
+      "purpose": "Implement FraudRingDSU with iterative path halving, union-by-size, and >50-member ring threshold alerts.",
+      "explanation": {
+        "foundation": "On every `union(a, b)` that merges two distinct components whose combined size crosses `ALERT_THRESHOLD = 50`, emit an asynchronous alert event to the Risk Sink.",
+        "core": "```python\nclass FraudRingDSU:\n    def __init__(self, capacity: int, alert_threshold: int = 50) -> None:\n        self.parent = [-1] * capacity\n        self.alert_threshold = alert_threshold\n\ndef find(self, x: int) -> int:\n        if not (0 <= x < len(self.parent)):\n            raise ValueError('Invalid account ID')\n        root = x\n        while self.parent[root] >= 0:\n            root = self.parent[root]\n        while x != root:\n            nxt = self.parent[x]\n            self.parent[x] = root\n            x = nxt\n        return root",
+        "deepDive": "def union_and_check(self, a: int, b: int) -> tuple[bool, int]:\n        ra, rb = self.find(a), self.find(b)\n        if ra == rb:\n            return False, -self.parent[ra]\n        if self.parent[ra] > self.parent[rb]:\n            ra, rb = rb, ra\n        prev_a, prev_b = -self.parent[ra], -self.parent[rb]\n        self.parent[ra] += self.parent[rb]\n        self.parent[rb] = ra\n        new_size = -self.parent[ra]\n        crossed = (prev_a < self.alert_threshold and prev_b < self.alert_threshold and new_size >= self.alert_threshold)\n        return crossed, new_size\n```"
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 03 · CORE DSU ENGINE",
+        "title": "Thread-Safe Sharded Engine with Threshold Alerting",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "Iterative Path Halving",
+            "sub": "O(1) Stack Space",
+            "role": "Safe Find"
+          },
+          {
+            "id": "n2",
+            "label": "Union by Size",
+            "sub": "Merge Smaller -> Larger",
+            "role": "Balanced Merge"
+          },
+          {
+            "id": "n3",
+            "label": "Crosses Size >= 50?",
+            "sub": "Threshold Trigger",
+            "role": "Ring Detection"
+          },
+          {
+            "id": "n4",
+            "label": "Emit Risk Sink Alert",
+            "sub": "Root + Component Size",
+            "role": "Fraud Action"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "resolves roots"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "checks size"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "on crossing"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Iterative Only",
+            "detail": "Path halving (parent[x] = parent[parent[x]]) runs in a simple while loop with zero recursion."
+          },
+          {
+            "label": "One-Time Crossing Alert",
+            "detail": "Alert when a merge pushes combined size from <50 to >=50 so downstream isn't spammed."
+          },
+          {
+            "label": "Thread Safety",
+            "detail": "Shard or synchronize writes on the single writer thread while serving lock-free/RCU reads."
+          }
+        ],
+        "summary": "Iterative path halving and union-by-size emit risk alerts the moment any merged component crosses 50 accounts.",
+        "caption": "Iterative path halving and union-by-size emit risk alerts the moment any merged component crosses 50 accounts."
+      }
+    },
+    {
+      "id": "04-durability-and-checkpoints",
+      "eyebrow": "STAGE 04 · CRASH RECOVERY",
+      "title": "Idempotent WAL Replay & Non-Blocking Snapshots",
+      "level": "intermediate",
+      "purpose": "Recover crashed DSU instances via copy-on-write 60s parent[] snapshots and idempotent Kafka WAL replay.",
+      "explanation": {
+        "foundation": "Because `union(a, b)` is commutative and associative, replaying duplicate WAL records after a crash is naturally idempotent! Every 60 seconds, fork/copy-on-write snapshot the `parent[]` array + Kafka offset to object storage (S3/GCS).",
+        "core": "On restart, mmap the latest 800 MB snapshot in < 1 second and replay only the tail WAL from the recorded offset.",
+        "deepDive": "In production deployments of Design a Dynamic Network Connectivity & Fraud Ring Detector with Union-Find, watch how idempotent wal replay & non-blocking snapshots interacts with tail latency, retry amplification, and partial failures. Production DSU fraud-ring systems pair idempotent WAL snapshots with super-node circuit breakers, rolling epoch swaps, and bounded-lag read replicas."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 04 · CRASH RECOVERY",
+        "title": "Idempotent WAL Replay & Non-Blocking Snapshots",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "Kafka Edge Topic",
+            "sub": "Commutative Unions",
+            "role": "Idempotent Log"
+          },
+          {
+            "id": "n2",
+            "label": "60s Fork / CoW Snapshot",
+            "sub": "Dump 800MB + Offset",
+            "role": "Fast Checkpoint"
+          },
+          {
+            "id": "n3",
+            "label": "Crash Restore",
+            "sub": "Load Snapshot + Seek",
+            "role": "Sub-10s Recovery"
+          },
+          {
+            "id": "n4",
+            "label": "Exact State Rebuilt",
+            "sub": "Duplicate Edges Safe",
+            "role": "Zero Drift"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "checkpoints"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "restores"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "replays tail"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Natural Idempotency",
+            "detail": "Because union(a, b) is commutative and associative, replaying duplicate Kafka messages changes nothing."
+          },
+          {
+            "label": "Copy-on-Write Fork",
+            "detail": "Using Linux fork() snapshots the 800 MB array to disk without pausing live queries."
+          },
+          {
+            "label": "Fast Boot",
+            "detail": "Loading an 800 MB binary snapshot plus 60s of Kafka tail takes <10 seconds."
+          }
+        ],
+        "summary": "60s copy-on-write snapshots and naturally idempotent Kafka union replay recover 200M-node state in <10 seconds.",
+        "caption": "60s copy-on-write snapshots and naturally idempotent Kafka union replay recover 200M-node state in <10 seconds."
+      }
+    },
+    {
+      "id": "05-time-window-expiry",
+      "eyebrow": "STAGE 05 · HANDLING EDGE EXPIRY",
+      "title": "Rolling Epoch DSU for 30-Day Sliding Windows",
+      "level": "advanced",
+      "purpose": "Expire edges older than 30 days using rolling shadow-rebuilt epoch snapshots swapped atomically at midnight.",
+      "explanation": {
+        "foundation": "Instead of deleting edges online, maintain daily or weekly DSU epochs (or a background shadow-rebuild job over the trailing 30-day edge log). At midnight UTC, promote the freshly built 30-day DSU snapshot atomically via pointer swap.",
+        "core": "Queries read the active immutable-horizon snapshot + live delta ring buffer.",
+        "deepDive": "In production deployments of Design a Dynamic Network Connectivity & Fraud Ring Detector with Union-Find, watch how rolling epoch dsu for 30-day sliding windows interacts with tail latency, retry amplification, and partial failures. Production DSU fraud-ring systems pair idempotent WAL snapshots with super-node circuit breakers, rolling epoch swaps, and bounded-lag read replicas."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 05 · HANDLING EDGE EXPIRY",
+        "title": "Rolling Epoch DSU for 30-Day Sliding Windows",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "30-Day Edge Log",
+            "sub": "Sliding Window",
+            "role": "Source of Truth"
+          },
+          {
+            "id": "n2",
+            "label": "Nightly Shadow Build",
+            "sub": "Fresh 800MB DSU",
+            "role": "Offline Rebuild"
+          },
+          {
+            "id": "n3",
+            "label": "Atomic Pointer Swap",
+            "sub": "Midnight UTC Cutover",
+            "role": "Zero Downtime"
+          },
+          {
+            "id": "n4",
+            "label": "Stale Edges Pruned",
+            "sub": "Bounded Ring History",
+            "role": "Clean Window"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "replays 30d"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "promotes"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "achieves"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Why Not Online Delete?",
+            "detail": "Standard DSU with path compression cannot delete individual edges efficiently."
+          },
+          {
+            "label": "Shadow Rebuild Cost",
+            "detail": "Replaying 30 days of edges into a fresh int32[] array takes ~2 minutes on one background core."
+          },
+          {
+            "label": "Atomic Cutover",
+            "detail": "Swap the read-replica pointer cleanly once the shadow snapshot catches up to Kafka head."
+          }
+        ],
+        "summary": "Background 30-day shadow rebuilds and atomic pointer swaps expire old edges without sacrificing O(alpha(N)) finds.",
+        "caption": "Background 30-day shadow rebuilds and atomic pointer swaps expire old edges without sacrificing O(alpha(N)) finds."
+      }
+    },
+    {
+      "id": "06-read-scaling-and-sharding",
+      "eyebrow": "STAGE 06 · READ SCALING",
+      "title": "Read Replicas & Cross-Shard Federation",
+      "level": "advanced",
+      "purpose": "Scale read throughput linearly by replicating the Kafka edge stream to N local-RAM read replicas.",
+      "explanation": {
+        "foundation": "Replicate the Kafka edge stream to N stateless-recovery read replicas. Each replica maintains an identical in-memory DSU and serves `sameRing(A, B)` locally in < 1 ms.",
+        "core": "If graph size outgrows single-node RAM, shard by region/tenant or run a two-tier architecture: local shard DSU + global cross-shard boundary-edge DSU.",
+        "deepDive": "In production deployments of Design a Dynamic Network Connectivity & Fraud Ring Detector with Union-Find, watch how read replicas & cross-shard federation interacts with tail latency, retry amplification, and partial failures. Production DSU fraud-ring systems pair idempotent WAL snapshots with super-node circuit breakers, rolling epoch swaps, and bounded-lag read replicas."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 06 · READ SCALING",
+        "title": "Read Replicas & Cross-Shard Federation",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "Kafka Edge Stream",
+            "sub": "Partitioned Events",
+            "role": "Single Source"
+          },
+          {
+            "id": "n2",
+            "label": "Read Replica 1",
+            "sub": "800 MB Local DSU",
+            "role": "<1ms sameRing"
+          },
+          {
+            "id": "n3",
+            "label": "Read Replica N",
+            "sub": "800 MB Local DSU",
+            "role": "<1ms sameRing"
+          },
+          {
+            "id": "n4",
+            "label": "Region Federation",
+            "sub": "Shard if > 1B Nodes",
+            "role": "Future Scale"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "streams to"
+          },
+          {
+            "from": "n1",
+            "to": "n3",
+            "label": "streams to"
+          },
+          {
+            "from": "n2",
+            "to": "n4",
+            "label": "scales via"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Zero Network Read Hop",
+            "detail": "Every API replica or sidecar holds the 800 MB DSU locally—queries never cross the network."
+          },
+          {
+            "label": "Deterministic Convergence",
+            "detail": "All replicas applying the same ordered Kafka log converge to identical connected components."
+          },
+          {
+            "label": "Regional Sharding",
+            "detail": "If accounts exceed 1B, shard by region and federate rare cross-region edges."
+          }
+        ],
+        "summary": "Streaming the Kafka edge log to local-RAM read replicas scales sameRing() reads horizontally at <1 ms.",
+        "caption": "Streaming the Kafka edge log to local-RAM read replicas scales sameRing() reads horizontally at <1 ms."
+      }
+    },
+    {
+      "id": "07-observability-and-slos",
+      "eyebrow": "STAGE 07 · OBSERVABILITY & FAILURE MODES",
+      "title": "Monitoring Giant-Component Drift & Replication Lag",
+      "level": "advanced",
+      "purpose": "Monitor max_component_size, p99 find hops, super-node quarantine rate, and WAL consumer lag.",
+      "explanation": {
+        "foundation": "Think of **Monitoring Giant-Component Drift & Replication Lag** as the intuition layer for Design a Dynamic Network Connectivity & Fraud Ring Detector with Union-Find: Monitor max_component_size, p99 find hops, super-node quarantine rate, and WAL consumer lag.",
+        "core": "Track `max_component_size`, `p99_find_hops`, `super_node_quarantine_rate`, and `wal_consumer_lag_ms`. If `max_component_size` spikes suddenly (e.g., > 100K accounts), trigger an automatic circuit breaker that pauses ingestion from the offending attribute source and rolls back to the previous 60-second snapshot.",
+        "deepDive": "Under heavy load or partial failure, monitoring giant-component drift & replication lag becomes a critical lever for predictable latency and correctness. Production DSU fraud-ring systems pair idempotent WAL snapshots with super-node circuit breakers, rolling epoch swaps, and bounded-lag read replicas."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 07 · OBSERVABILITY & FAILURE MODES",
+        "title": "Monitoring Giant-Component Drift & Replication Lag",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "max_component_size",
+            "sub": "Breaker if > 100K",
+            "role": "Collapse Guard"
+          },
+          {
+            "id": "n2",
+            "label": "p99_find_hops",
+            "sub": "Target <= 3 Hops",
+            "role": "Tree Health"
+          },
+          {
+            "id": "n3",
+            "label": "super_node_quarantine",
+            "sub": "Degree Filter Rate",
+            "role": "Signal Hygiene"
+          },
+          {
+            "id": "n4",
+            "label": "wal_consumer_lag_ms",
+            "sub": "Replica Freshness",
+            "role": "Sync KPI"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "paired with"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "tuned by"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "monitored by"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Giant-Component Breaker",
+            "detail": "If max_component_size jumps past 100K, pause ingestion automatically before flagging innocent users."
+          },
+          {
+            "label": "Hop Count Check",
+            "detail": "Rising p99_find_hops signals path compression was accidentally disabled."
+          },
+          {
+            "label": "Lag Alert",
+            "detail": "Alert if replica WAL lag exceeds 5 seconds so checkout fraud checks stay fresh."
+          }
+        ],
+        "summary": "Giant-component circuit breakers (>100K), p99 hop counts, and WAL lag alerts keep fraud-ring detection accurate.",
+        "caption": "Giant-component circuit breakers (>100K), p99 hop counts, and WAL lag alerts keep fraud-ring detection accurate."
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-1",
+        "question": "Why is replaying an edge stream from a Kafka offset after a crash safe for DSU state recovery?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Path compression reverses previous unions automatically.",
+            "correct": false,
+            "feedback": "Incorrect: Once a and b share a root, calling union(a, b) again returns early without mutating component membership."
+          },
+          {
+            "id": "b",
+            "text": "Union(a, b) is associative, commutative, and idempotent—re-merging already connected components is a no-op.",
+            "correct": true,
+            "feedback": "Correct: Once a and b share a root, calling union(a, b) again returns early without mutating component membership."
+          },
+          {
+            "id": "c",
+            "text": "Kafka automatically deduplicates all graph edges across partitions.",
+            "correct": false,
+            "feedback": "Incorrect: Once a and b share a root, calling union(a, b) again returns early without mutating component membership."
+          },
+          {
+            "id": "d",
+            "text": "DSU snapshots never require WAL replay.",
+            "correct": false,
+            "feedback": "Incorrect: Once a and b share a root, calling union(a, b) again returns early without mutating component membership."
+          }
+        ],
+        "explanation": "Once a and b share a root, calling union(a, b) again returns early without mutating component membership."
+      },
+      {
+        "id": "kc-2",
+        "question": "What happens if you feed unthrottled shared public Wi-Fi IPs directly into `union(account, ip)`?",
+        "options": [
+          {
+            "id": "a",
+            "text": "The parent[] array overflows 32-bit integers.",
+            "correct": false,
+            "feedback": "Incorrect: High-degree shared hubs bridge unrelated components; degree-cap quarantine gates prevent this collapse."
+          },
+          {
+            "id": "b",
+            "text": "find() degrades to O(N^2) time.",
+            "correct": false,
+            "feedback": "Incorrect: High-degree shared hubs bridge unrelated components; degree-cap quarantine gates prevent this collapse."
+          },
+          {
+            "id": "c",
+            "text": "A super-node collapse merges millions of unrelated users into one giant false-positive fraud ring.",
+            "correct": true,
+            "feedback": "Correct: High-degree shared hubs bridge unrelated components; degree-cap quarantine gates prevent this collapse."
+          },
+          {
+            "id": "d",
+            "text": "Path compression stops working.",
+            "correct": false,
+            "feedback": "Incorrect: High-degree shared hubs bridge unrelated components; degree-cap quarantine gates prevent this collapse."
+          }
+        ],
+        "explanation": "High-degree shared hubs bridge unrelated components; degree-cap quarantine gates prevent this collapse."
+      },
+      {
+        "id": "kc-3",
+        "question": "How does the system expire 30-day-old device links when standard DSU has no `deleteEdge()` operation?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Run BFS on every query instead of using DSU.",
+            "correct": false,
+            "feedback": "Incorrect: Rolling epoch rebuilds over the active 30-day window cleanly drop expired edges without complex dynamic-tree overhead."
+          },
+          {
+            "id": "b",
+            "text": "Reset `parent[x] = x` for individual nodes without checking neighbors.",
+            "correct": false,
+            "feedback": "Incorrect: Rolling epoch rebuilds over the active 30-day window cleanly drop expired edges without complex dynamic-tree overhead."
+          },
+          {
+            "id": "c",
+            "text": "Disable Union by Rank.",
+            "correct": false,
+            "feedback": "Incorrect: Rolling epoch rebuilds over the active 30-day window cleanly drop expired edges without complex dynamic-tree overhead."
+          },
+          {
+            "id": "d",
+            "text": "Rebuild a fresh DSU snapshot in the background over the trailing 30-day edge log and atomically swap it in.",
+            "correct": true,
+            "feedback": "Correct: Rolling epoch rebuilds over the active 30-day window cleanly drop expired edges without complex dynamic-tree overhead."
+          }
+        ],
+        "explanation": "Rolling epoch rebuilds over the active 30-day window cleanly drop expired edges without complex dynamic-tree overhead."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Use Union-Find in memory to link accounts sharing devices or cards, and trigger alerts when a group grows past 50 accounts.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, because DSU merges are associative and commutative, you can recover exact cluster state from an append-only WAL + periodic checkpoints and trigger fraud alerts on the exact union() that crosses the ring-size threshold.",
+      "byteSummary": "Instead of scanning a huge database graph every time someone checks out, keep a compact Union-Find array in RAM. Every time two accounts share a device or card, merge their groups in microseconds.\n\nSave periodic snapshots to disk so the service can restart quickly, and ignore ultra-common IPs like airport Wi-Fi."
+    },
+    "intermediate": {
+      "summary": "An 800 MB negative-size DSU array handles 200M accounts in RAM, backed by Kafka WAL replay, degree-capped hub filtering, and read replicas.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, because DSU merges are associative and commutative, you can recover exact cluster state from an append-only WAL + periodic checkpoints and trigger fraud alerts on the exact union() that crosses the ring-size threshold.",
+      "byteSummary": "Encoding `-size` in `parent[root]` lets a single `int32` array hold 200M nodes in 800 MB. Ingesting via Kafka with a Count-Min Sketch hub gate prevents super-node collapses.\n\nReplicas tail the same stream for sub-5ms `sameRing()` queries, and scheduled epoch rebuilds expire old links."
+    },
+    "advanced": {
+      "summary": "Production DSU fraud-ring systems pair idempotent WAL snapshots with super-node circuit breakers, rolling epoch swaps, and bounded-lag read replicas.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, because DSU merges are associative and commutative, you can recover exact cluster state from an append-only WAL + periodic checkpoints and trigger fraud alerts on the exact union() that crosses the ring-size threshold.",
+      "byteSummary": "Beyond O(alpha(N)) lookups, operational resilience hinges on data hygiene and recovery speed. Mmap-backed 60s snapshots bound recovery time to seconds.\n\nTracking `max_component_size` and `super_node_quarantine_rate` catches poison-pill shared attributes early, allowing automated rollback before false-positive alerts block legitimate checkout traffic."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "prerequisites": [
+    {
+      "title": "Disjoint Set Union (Union-Find): Path Compression & Union by Rank",
+      "summary": "Disjoint Set Union (DSU) maintains a partition of N elements into non-overlapping sets, supporting find(x) and union(x, y) in O(alpha(N)) amortized time."
+    },
+    {
+      "title": "Consistent Hashing & Virtual Nodes",
+      "summary": "Consistent hashing assigns data keys to servers in a way that limits how many keys move when servers are added or removed. This helps avoid widespread cache misses and sudden load on databases."
+    },
+    {
+      "title": "Change Data Capture (CDC)",
+      "summary": "Change Data Capture (CDC) streams row-level inserts, updates, and deletes directly from a database's transaction log (WAL/binlog/oplog) into event buses like Kafka—eliminating dual-write race conditions and heavy polling queries."
+    }
+  ],
+  "simulation": {
+    "title": "Design a Dynamic Network Connectivity & Fraud Ring Detector with Union-Find — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Input Workload"
+      },
+      {
+        "id": "entry",
+        "label": "Router / API",
+        "role": "Admission Control"
+      },
+      {
+        "id": "worker",
+        "label": "Processor",
+        "role": "Domain Logic"
+      },
+      {
+        "id": "store",
+        "label": "State Layer",
+        "role": "Durable Store"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "entry",
+        "label": "request"
+      },
+      {
+        "from": "entry",
+        "to": "worker",
+        "label": "dispatch"
+      },
+      {
+        "from": "worker",
+        "to": "store",
+        "label": "read/write"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Sizing 200M-Node DSU State & Latency Budgets",
+        "actionLabel": "request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "entry"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "request",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Caller sends work to Router / API (Sizing 200M-Node DSU State & Latency Budgets)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Preventing False-Positive Collapses on Shared IPs & Hubs",
+        "actionLabel": "dispatch",
+        "status": "healthy",
+        "activeNodeIds": [
+          "entry",
+          "worker"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "dispatch",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Router / API coordinates with Processor while preserving the core invariant (Preventing False-Positive Collapses on Shared IPs & Hubs)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Thread-Safe Sharded Engine with Threshold Alerting",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "worker",
+          "store"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, State Layer absorbs pressure without cascading (Thread-Safe Sharded Engine with Threshold Alerting)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Monitoring Giant-Component Drift & Replication Lag",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "entry",
+          "worker",
+          "store"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Monitoring Giant-Component Drift & Replication Lag)."
+      }
+    ]
+  }
+}

@@ -1,0 +1,799 @@
+{
+  "id": "hot-key-cache",
+  "slug": "hot-key-cache",
+  "title": "Preventing Hot-Key Cache Stampedes",
+  "problemType": "system-design",
+  "difficulty": "medium",
+  "prompt": "Your e-commerce homepage serves a global flash-deal configuration key (`deal:global:active`) cached in Redis with a fixed 60-second TTL at 50,000 req/s across 200 API pods. Every 60 seconds, the key expires instantaneously; thousands of API workers miss Redis in the same 50 ms window and fire identical heavy SQL joins (180 ms each) against PostgreSQL. The DB connection pool (200 connections) saturates, causing 504 Gateway Timeouts for 8 seconds every minute. Design a stampede-proof caching architecture that caps DB recomputation at 1 query per refresh cycle.",
+  "spark": {
+    "summary": "When a celebrity hot key's 60-second Redis TTL expires, 50,000 concurrent requests miss simultaneously and stampede the primary PostgreSQL database.",
+    "keyTakeaway": "When a celebrity hot key's 60-second Redis TTL expires, 50,000 concurrent requests miss simultaneously and stampede, combine in-process singleflight request coalescing, distributed Redis lease locks, and XFetch probabilistic early expiration to keep DB load at 1 query per refresh.",
+    "byteSummary": "**Core Mechanics:** A global flash-deal key (`deal:global:active`) is cached in Redis with a 60s TTL and read at **50,000 req/s** across **200 stateless API pods**.\n\n**Visual & Structural Flow:** Depicts L1 Local Cache + Singleflight + Redis Lease + XFetch (200 Pods (50k/s) -> L1 Local (2s) -> Redis + Lease -> Postgres (<=5 max)); Bounding DB Refresh to 1 Query Across 200 Stateless Pods (L1 Pod Cache (2s) -> Pod Singleflight -> Redis Lease + XFetch -> Postgres).\n\n**Trade-Offs & Production:** Using only Redis without L1 local caching still sends 50,000 req/s to a single Redis shard for one key. Combine three lightweight layers using existing infrastructure: **Layer 1 — Short L1 In-Process Cache (1–2s TTL)**: Absorbs >98% of the 50,000 req/s in pod RAM so Redis isn't saturated on one shard.\n\n**Failure Modes & Application:** Hot-key coalescing is critical in high-fan-out consumer applications: **Flash Sales & Homepage Banners**: Protects databases during viral traffic spikes."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why Preventing Hot-Key Cache Stampedes Matters",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "Think of **Why Preventing Hot-Key Cache Stampedes Matters** as the intuition layer for Preventing Hot-Key Cache Stampedes: The mechanism: understand how Why Preventing Hot-Key Cache Stampedes Matters works from first principles.",
+        "core": "A global flash-deal key (`deal:global:active`) is cached in Redis with a 60s TTL and read at **50,000 req/s** across **200 stateless API pods**. Every 60 seconds, the key expires instantaneously—causing thousands of workers to miss Redis in the same **50 ms** window and fire identical **180 ms** SQL joins simultaneously (violating the **<= 5 concurrent DB queries** limit).",
+        "deepDive": "Under heavy load or partial failure, why preventing hot-key cache stampedes matters becomes a critical lever for predictable latency and correctness. When a celebrity hot key's 60-second Redis TTL expires, 50,000 concurrent requests miss simultaneously and stampede the primary PostgreSQL database."
+      },
+      "purpose": "The mechanism: understand how Why Preventing Hot-Key Cache Stampedes Matters works from first principles."
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "Real-World Impact of Hot-Key Stampedes",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "A single hot-key expiration creates periodic 60-second outages:",
+        "core": "1. **5,000× DB Spike**: Thousands of workers across 200 pods miss Redis in the 50 ms window and hammer Postgres with identical 180 ms joins.\n2. **Single-Shard Redis Hot-Spotting**: 50,000 req/s for one key hits a single Redis shard's single-threaded CPU.\n3. **Self-Reinforcing Delay**: As DB latency degrades from 180 ms to 5s, even more pods miss and pile onto the same query.",
+        "deepDive": "In production deployments of Preventing Hot-Key Cache Stampedes, watch how real-world impact of hot-key stampedes interacts with tail latency, retry amplification, and partial failures. When a celebrity hot key's 60-second Redis TTL expires, 50,000 concurrent requests miss simultaneously and stampede the primary PostgreSQL database."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "3-Layer Stampede Defense",
+        "title": "L1 Local Cache + Singleflight + Redis Lease + XFetch",
+        "actors": [
+          {
+            "id": "pods",
+            "label": "200 Pods (50k/s)"
+          },
+          {
+            "id": "l1",
+            "label": "L1 Local (2s)"
+          },
+          {
+            "id": "red",
+            "label": "Redis + Lease"
+          },
+          {
+            "id": "pg",
+            "label": "Postgres (<=5 max)"
+          }
+        ],
+        "events": [
+          {
+            "from": "pods",
+            "to": "l1",
+            "label": "99% served from 2s L1 RAM (0 Redis RTT)",
+            "status": "ok"
+          },
+          {
+            "from": "l1",
+            "to": "red",
+            "label": "Singleflight collapses pod misses to 1",
+            "status": "ok"
+          },
+          {
+            "from": "red",
+            "to": "pg",
+            "label": "XFetch / SET NX lease: 1 winner queries DB",
+            "status": "ok"
+          },
+          {
+            "from": "red",
+            "to": "pods",
+            "label": "Other pods wait 25ms or read stale copy",
+            "status": "ok"
+          }
+        ],
+        "summary": "L1 local cache + per-pod singleflight + Redis distributed lease / XFetch reduces 50k/s misses to 1 DB query."
+      },
+      "purpose": "The problem: see what breaks without Real-World Impact of Hot-Key Stampedes under real concurrency or scale.",
+      "decisionFramework": {
+        "problem": "How to implement Preventing Hot-Key Cache Stampedes without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "When a celebrity hot key's 60-second Redis TTL expires, 50,000 concurrent requests miss simultaneously and stampede, combine in-process singleflight request coalescing, distributed Redis lease locks, and XFetch probabilistic early expiration to keep DB load at 1 query per refresh.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Preventing Hot-Key Cache Stampedes experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Naive Solution (and Why It Breaks)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Think of **Naive Solution (and Why It Breaks)** as the intuition layer for Preventing Hot-Key Cache Stampedes: The problem: see what breaks without Naive Solution under real concurrency or scale.",
+        "core": "Using only Redis without L1 local caching still sends 50,000 req/s to a single Redis shard for one key. Using only per-pod `singleflight` still allows **200 concurrent DB queries** (1 per pod) to hit Postgres simultaneously—40× over the `<= 5` query limit.",
+        "deepDive": "Under heavy load or partial failure, naive solution (and why it breaks) becomes a critical lever for predictable latency and correctness. When a celebrity hot key's 60-second Redis TTL expires, 50,000 concurrent requests miss simultaneously and stampede the primary PostgreSQL database."
+      },
+      "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+      "sectionDiagram": {
+        "kind": "behavior-transition",
+        "eyebrow": "Design Trade-Off",
+        "title": "Naive Solution (and Why It Breaks)",
+        "before": {
+          "label": "Fixed TTL + Direct DB",
+          "metrics": [
+            "Synchronized cache avalanche",
+            "1,000 duplicate DB queries",
+            "Big-key event-loop freeze"
+          ]
+        },
+        "after": {
+          "label": "Jittered TTL + Singleflight",
+          "metrics": [
+            "1 origin fetch per expired key",
+            "Randomized TTL spreads expiry",
+            "O(1) HashMap + DLL eviction"
+          ]
+        }
+      }
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise Solution: L1 Micro-Cache + Singleflight + Redis Lease / XFetch",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": {
+        "foundation": "Combine three lightweight layers using existing infrastructure:",
+        "core": "- **Layer 1 — Short L1 In-Process Cache (1–2s TTL)**: Absorbs >98% of the 50,000 req/s in pod RAM so Redis isn't saturated on one shard.\n- **Layer 2 — In-Pod `singleflight`**: Coalesces concurrent worker misses inside each pod into 1 outbound call.\n- **Layer 3 — Redis `SET NX` Lease + XFetch Probabilistic Early Refresh**: Store `{value, delta, expiry}` and recompute early when `time() - delta * beta * log(rand()) >= expiry`—or acquire a short `SET lock:deal 1 NX PX 1000` lease so **at most 1 pod** queries Postgres while others wait briefly or serve stale.",
+        "deepDive": "In production deployments of Preventing Hot-Key Cache Stampedes, watch how enterprise solution: l1 micro-cache + singleflight + redis lease / xfetch interacts with tail latency, retry amplification, and partial failures. When a celebrity hot key's 60-second Redis TTL expires, 50,000 concurrent requests miss simultaneously and stampede the primary PostgreSQL database."
+      },
+      "sectionDiagram": {
+        "kind": "cache-tier",
+        "eyebrow": "Hot-Key Caching Hierarchy",
+        "title": "Bounding DB Refresh to 1 Query Across 200 Stateless Pods",
+        "nodes": [
+          {
+            "label": "L1 Pod Cache (2s)",
+            "role": "Absorbs 50k/s hot key"
+          },
+          {
+            "label": "Pod Singleflight",
+            "role": "N workers -> 1 call/pod"
+          },
+          {
+            "label": "Redis Lease + XFetch",
+            "role": "200 pods -> 1 DB winner"
+          },
+          {
+            "label": "Postgres",
+            "role": "1 query / 60s (<=5 limit)"
+          }
+        ],
+        "edges": [
+          {
+            "label": "Coalesce in-pod"
+          },
+          {
+            "label": "Coalesce cross-pod"
+          }
+        ],
+        "cards": [
+          {
+            "label": "L1 Micro-Cache",
+            "detail": "2s in-memory TTL shields single Redis shard from 50k RPS."
+          },
+          {
+            "label": "XFetch Algorithm",
+            "detail": "Probabilistically refreshes hot keys *before* TTL hits 0."
+          },
+          {
+            "label": "Redis SET NX PX",
+            "detail": "Cross-pod distributed lease ensures <= 1-2 concurrent DB queries."
+          },
+          {
+            "label": "Zero New Infra",
+            "detail": "Uses existing Redis cluster and in-process Python/Java maps."
+          }
+        ],
+        "summary": "L1 + singleflight + XFetch/Redis lease guarantees <= 5 concurrent DB queries without sticky sessions or new infrastructure."
+      },
+      "markdownContent": "```python\nimport math, random, time, json\n\ndef get_with_xfetch(redis_client, key: str, fetch_fn, soft_ttl=60, hard_ttl=300, beta=1.0):\n    raw = redis_client.get(key)\n    now = time.time()\n    if raw:\n        entry = json.loads(raw)\n        should_refresh = (now - entry['delta'] * beta * math.log(random.random())) >= entry['soft_exp']\n        if should_refresh and redis_client.set(f'lock:{key}', '1', nx=True, px=2000):\n            t0 = time.time()\n            val = fetch_fn()\n            delta = time.time() - t0\n            redis_client.set(key, json.dumps({'val': val, 'delta': delta, 'soft_exp': time.time() + soft_ttl}), ex=hard_ttl)\n        return entry['val']\n    # Cold cache fallback: acquire lease or wait\n    for _ in range(10):\n        if redis_client.set(f'lock:{key}', '1', nx=True, px=2000):\n            t0 = time.time()\n            val = fetch_fn()\n            redis_client.set(key, json.dumps({'val': val, 'delta': time.time()-t0, 'soft_exp': time.time() + soft_ttl}), ex=hard_ttl)\n            return val\n        time.sleep(0.05 + random.uniform(0, 0.02))\n        raw = redis_client.get(key)\n        if raw:\n            return json.loads(raw)['val']\n    return fetch_fn()\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where Hot-Key Stampede Defense Applies in System Design",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Hot-key coalescing is critical in high-fan-out consumer applications:",
+        "core": "- **Flash Sales & Homepage Banners**: Protects databases during viral traffic spikes.\n- **Celebrity Profiles & Trending Feeds**: L1 + singleflight shields Redis shards from 100k+ RPS on one user ID.\n- **Auth Public Key (JWKS) & Config Caches**: XFetch refreshes rotating keys seamlessly before expiration.",
+        "deepDive": "In production deployments of Preventing Hot-Key Cache Stampedes, watch how where hot-key stampede defense applies in system design interacts with tail latency, retry amplification, and partial failures. When a celebrity hot key's 60-second Redis TTL expires, 50,000 concurrent requests miss simultaneously and stampede the primary PostgreSQL database."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "caching",
+          "title": "Concept: Caching Strategies",
+          "kind": "concept"
+        },
+        {
+          "slug": "distributed-locking",
+          "title": "Concept: Distributed Locking",
+          "kind": "concept"
+        },
+        {
+          "slug": "consistent-hashing",
+          "title": "Concept: Consistent Hashing",
+          "kind": "concept"
+        },
+        {
+          "slug": "design-cache",
+          "title": "System Design: High-Concurrency Cache",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why is in-process `singleflight` alone insufficient to protect Postgres across 200 stateless API pods during a hot-key expiration?",
+      "options": [
+        {
+          "id": "a",
+          "text": "Each of the 200 pods still sends 1 coalesced miss, resulting in 200 concurrent DB queries unless coordinated by a Redis lease or XFetch",
+          "correct": true,
+          "feedback": "Correct: `singleflight` is per-process, so cross-pod coordination (Redis `SET NX` lease or XFetch) is needed to stay under 5 concurrent DB queries."
+        },
+        {
+          "id": "b",
+          "text": "`singleflight` only works for POST requests, not GET requests",
+          "correct": false,
+          "feedback": "`singleflight` is ideal for idempotent read/refresh operations."
+        },
+        {
+          "id": "c",
+          "text": "Redis deletes `singleflight` keys every 50 ms",
+          "correct": false,
+          "feedback": "`singleflight` runs in application memory, not Redis."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why is in-process `singleflight` alone insufficient to protect Postgres across 200 stateless API pods during a hot-key expiration?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Each of the 200 pods still sends 1 coalesced miss, resulting in 200 concurrent DB queries unless coordinated by a Redis lease or XFetch",
+            "correct": true,
+            "feedback": "Correct: `singleflight` is per-process, so cross-pod coordination (Redis `SET NX` lease or XFetch) is needed to stay under 5 concurrent DB queries."
+          },
+          {
+            "id": "b",
+            "text": "`singleflight` only works for POST requests, not GET requests",
+            "correct": false,
+            "feedback": "`singleflight` is ideal for idempotent read/refresh operations."
+          },
+          {
+            "id": "c",
+            "text": "Redis deletes `singleflight` keys every 50 ms",
+            "correct": false,
+            "feedback": "`singleflight` runs in application memory, not Redis."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why Preventing Hot-Key Cache Stampedes Matters', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "A global flash-deal key (deal:global:active) is cached in Redis with a 60s TTL and read at **50,000 req/s** across **200 stateless API pods**.",
+            "correct": true,
+            "feedback": "Correct: A global flash-deal key (deal:global:active) is cached in Redis with a 60s TTL and read at **50,000 req/s** across **200 stateless API pods**."
+          },
+          {
+            "id": "b",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "c",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Real-World Impact of Hot-Key Stampedes', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "A single hot-key expiration creates periodic 60-second outages: 1.",
+            "correct": true,
+            "feedback": "Correct: A single hot-key expiration creates periodic 60-second outages: 1."
+          },
+          {
+            "id": "b",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "c",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** A global flash-deal key (`deal:global:active`) is cached in Redis with a 60s TTL and read at **50,000 req/s** across **200 stateless API pods**.\n\n**How It Flows:** Think of Preventing Hot-Key Cache Stampedes as a clear step-by-step chain: 200 Pods (50k/s) -> L1 Local (2s) -> Redis + Lease -> Postgres (<=5 max) -> L1 Pod Cache (2s).\n\n**Why Beginners Should Care:** Combine in-process singleflight request coalescing, distributed Redis lease locks, and XFetch probabilistic early expiration to keep DB load at 1 query per refresh.",
+      "spark": {
+        "summary": "A global flash-deal key (`deal:global:active`) is cached in Redis with a 60s TTL and read at **50,000 req/s** across **200 stateless API pods**.",
+        "keyTakeaway": "Combine in-process singleflight request coalescing, distributed Redis lease locks, and XFetch probabilistic early expiration to keep DB load at 1 query per refresh."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why Preventing Hot-Key Cache Stampedes Matters",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why Preventing Hot-Key Cache Stampedes Matters works from first principles.",
+          "explanation": "A global flash-deal key (`deal:global:active`) is cached in Redis with a 60s TTL and read at **50,000 req/s** across **200 stateless API pods**. Every 60 seconds, the key expires instantaneously—causing thousands of workers to miss Redis in the same **50 ms** window and fire identical **180 ms** SQL joins simultaneously (violating the **<= 5 concurrent DB queries** limit).",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Real-World Impact of Hot-Key Stampedes",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without Real-World Impact of Hot-Key Stampedes under real concurrency or scale.",
+          "explanation": "A single hot-key expiration creates periodic 60-second outages: 1. **5,000× DB Spike**: Thousands of workers across 200 pods miss Redis in the 50 ms window and hammer Postgres with identical 180 ms joins. 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "3-Layer Stampede Defense",
+            "title": "L1 Local Cache + Singleflight + Redis Lease + XFetch",
+            "actors": [
+              {
+                "id": "pods",
+                "label": "200 Pods (50k/s)"
+              },
+              {
+                "id": "l1",
+                "label": "L1 Local (2s)"
+              },
+              {
+                "id": "red",
+                "label": "Redis + Lease"
+              },
+              {
+                "id": "pg",
+                "label": "Postgres (<=5 max)"
+              }
+            ],
+            "events": [
+              {
+                "from": "pods",
+                "to": "l1",
+                "label": "99% served from 2s L1 RAM (0 Redis RTT)",
+                "status": "ok"
+              },
+              {
+                "from": "l1",
+                "to": "red",
+                "label": "Singleflight collapses pod misses to 1",
+                "status": "ok"
+              },
+              {
+                "from": "red",
+                "to": "pg",
+                "label": "XFetch / SET NX lease: 1 winner queries DB",
+                "status": "ok"
+              },
+              {
+                "from": "red",
+                "to": "pods",
+                "label": "Other pods wait 25ms or read stale copy",
+                "status": "ok"
+              }
+            ],
+            "summary": "L1 local cache + per-pod singleflight + Redis distributed lease / XFetch reduces 50k/s misses to 1 DB query."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive Solution (and Why It Breaks)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+          "explanation": "Using only Redis without L1 local caching still sends 50,000 req/s to a single Redis shard for one key. Using only per-pod `singleflight` still allows **200 concurrent DB queries** (1 per pod) to hit Postgres simultaneously—40× over the `<= 5` query limit.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise Solution: L1 Micro-Cache + Singleflight + Redis Lease / XFetch",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Combine three lightweight layers using existing infrastructure: **Layer 1 — Short L1 In-Process Cache (1–2s TTL)**: Absorbs >98% of the 50,000 req/s in pod RAM so Redis isn't saturated on one shard. **Layer 2 — In-Pod `singleflight`**: Coalesces concurrent worker misses inside each pod into 1 outbound call.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Hot-Key Caching Hierarchy",
+            "title": "Bounding DB Refresh to 1 Query Across 200 Stateless Pods",
+            "nodes": [
+              {
+                "label": "L1 Pod Cache (2s)",
+                "role": "Absorbs 50k/s hot key"
+              },
+              {
+                "label": "Pod Singleflight",
+                "role": "N workers -> 1 call/pod"
+              },
+              {
+                "label": "Redis Lease + XFetch",
+                "role": "200 pods -> 1 DB winner"
+              },
+              {
+                "label": "Postgres",
+                "role": "1 query / 60s (<=5 limit)"
+              }
+            ],
+            "edges": [
+              {
+                "label": "Coalesce in-pod"
+              },
+              {
+                "label": "Coalesce cross-pod"
+              }
+            ],
+            "cards": [
+              {
+                "label": "L1 Micro-Cache",
+                "detail": "2s in-memory TTL shields single Redis shard from 50k RPS."
+              },
+              {
+                "label": "XFetch Algorithm",
+                "detail": "Probabilistically refreshes hot keys *before* TTL hits 0."
+              },
+              {
+                "label": "Redis SET NX PX",
+                "detail": "Cross-pod distributed lease ensures <= 1-2 concurrent DB queries."
+              },
+              {
+                "label": "Zero New Infra",
+                "detail": "Uses existing Redis cluster and in-process Python/Java maps."
+              }
+            ],
+            "summary": "L1 + singleflight + XFetch/Redis lease guarantees <= 5 concurrent DB queries without sticky sessions or new infrastructure."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Combine in-process singleflight request coalescing, distributed Redis lease locks, and XFetch probabilistic early expiration to keep DB load at 1 query per refresh.",
+      "summary": "When a celebrity hot key's 60-second Redis TTL expires, 50,000 concurrent requests miss simultaneously and stampede the primary PostgreSQL database.",
+      "keyTakeaway": "When a celebrity hot key's 60-second Redis TTL expires, 50,000 concurrent requests miss simultaneously and stampede, combine in-process singleflight request coalescing, distributed Redis lease locks, and XFetch probabilistic early expiration to keep DB load at 1 query per refresh."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** A global flash-deal key (`deal:global:active`) is cached in Redis with a 60s TTL and read at **50,000 req/s** across **200 stateless API pods**.\n\n**Visual & Structural Flow:** Depicts L1 Local Cache + Singleflight + Redis Lease + XFetch (200 Pods (50k/s) -> L1 Local (2s) -> Redis + Lease -> Postgres (<=5 max)); Bounding DB Refresh to 1 Query Across 200 Stateless Pods (L1 Pod Cache (2s) -> Pod Singleflight -> Redis Lease + XFetch -> Postgres).\n\n**Trade-Offs & Production:** Using only Redis without L1 local caching still sends 50,000 req/s to a single Redis shard for one key. Combine three lightweight layers using existing infrastructure: **Layer 1 — Short L1 In-Process Cache (1–2s TTL)**: Absorbs >98% of the 50,000 req/s in pod RAM so Redis isn't saturated on one shard.\n\n**Failure Modes & Application:** Hot-key coalescing is critical in high-fan-out consumer applications: **Flash Sales & Homepage Banners**: Protects databases during viral traffic spikes.",
+      "spark": {
+        "summary": "When a celebrity hot key's 60-second Redis TTL expires, 50,000 concurrent requests miss simultaneously and stampede the primary PostgreSQL database.",
+        "keyTakeaway": "Combine in-process singleflight request coalescing, distributed Redis lease locks, and XFetch probabilistic early expiration to keep DB load at 1 query per refresh."
+      },
+      "summary": "When a celebrity hot key's 60-second Redis TTL expires, 50,000 concurrent requests miss simultaneously and stampede the primary PostgreSQL database.",
+      "keyTakeaway": "When a celebrity hot key's 60-second Redis TTL expires, 50,000 concurrent requests miss simultaneously and stampede, combine in-process singleflight request coalescing, distributed Redis lease locks, and XFetch probabilistic early expiration to keep DB load at 1 query per refresh."
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** When a celebrity hot key's 60-second Redis TTL expires, 50,000 concurrent requests miss simultaneously and stampede the primary PostgreSQL database.\n\n**Production Trade-Offs:** Using only Redis without L1 local caching still sends 50,000 req/s to a single Redis shard for one key.\n\n**Failure Modes & Edge Cases:** Hot-key coalescing is critical in high-fan-out consumer applications: **Flash Sales & Homepage Banners**: Protects databases during viral traffic spikes.\n\n**Principal Takeaway:** Combine in-process singleflight request coalescing, distributed Redis lease locks, and XFetch probabilistic early expiration to keep DB load at 1 query per refresh.",
+      "spark": {
+        "summary": "When a celebrity hot key's 60-second Redis TTL expires, 50,000 concurrent requests miss simultaneously and stampede the primary PostgreSQL database.",
+        "keyTakeaway": "Combine in-process singleflight request coalescing, distributed Redis lease locks, and XFetch probabilistic early expiration to keep DB load at 1 query per refresh."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why Preventing Hot-Key Cache Stampedes Matters",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why Preventing Hot-Key Cache Stampedes Matters works from first principles.",
+          "explanation": "A global flash-deal key (`deal:global:active`) is cached in Redis with a 60s TTL and read at **50,000 req/s** across **200 stateless API pods**. Every 60 seconds, the key expires instantaneously—causing thousands of workers to miss Redis in the same **50 ms** window and fire identical **180 ms** SQL joins simultaneously (violating the **<= 5 concurrent DB queries** limit).",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Real-World Impact of Hot-Key Stampedes",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without Real-World Impact of Hot-Key Stampedes under real concurrency or scale.",
+          "explanation": "A single hot-key expiration creates periodic 60-second outages:\n\n1. **5,000× DB Spike**: Thousands of workers across 200 pods miss Redis in the 50 ms window and hammer Postgres with identical 180 ms joins.\n2. **Single-Shard Redis Hot-Spotting**: 50,000 req/s for one key hits a single Redis shard's single-threaded CPU.\n3. **Self-Reinforcing Delay**: As DB latency degrades from 180 ms to 5s, even more pods miss and pile onto the same query.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "3-Layer Stampede Defense",
+            "title": "L1 Local Cache + Singleflight + Redis Lease + XFetch",
+            "actors": [
+              {
+                "id": "pods",
+                "label": "200 Pods (50k/s)"
+              },
+              {
+                "id": "l1",
+                "label": "L1 Local (2s)"
+              },
+              {
+                "id": "red",
+                "label": "Redis + Lease"
+              },
+              {
+                "id": "pg",
+                "label": "Postgres (<=5 max)"
+              }
+            ],
+            "events": [
+              {
+                "from": "pods",
+                "to": "l1",
+                "label": "99% served from 2s L1 RAM (0 Redis RTT)",
+                "status": "ok"
+              },
+              {
+                "from": "l1",
+                "to": "red",
+                "label": "Singleflight collapses pod misses to 1",
+                "status": "ok"
+              },
+              {
+                "from": "red",
+                "to": "pg",
+                "label": "XFetch / SET NX lease: 1 winner queries DB",
+                "status": "ok"
+              },
+              {
+                "from": "red",
+                "to": "pods",
+                "label": "Other pods wait 25ms or read stale copy",
+                "status": "ok"
+              }
+            ],
+            "summary": "L1 local cache + per-pod singleflight + Redis distributed lease / XFetch reduces 50k/s misses to 1 DB query."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive Solution (and Why It Breaks)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+          "explanation": "Using only Redis without L1 local caching still sends 50,000 req/s to a single Redis shard for one key. Using only per-pod `singleflight` still allows **200 concurrent DB queries** (1 per pod) to hit Postgres simultaneously—40× over the `<= 5` query limit.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise Solution: L1 Micro-Cache + Singleflight + Redis Lease / XFetch",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Combine three lightweight layers using existing infrastructure:\n\n- **Layer 1 — Short L1 In-Process Cache (1–2s TTL)**: Absorbs >98% of the 50,000 req/s in pod RAM so Redis isn't saturated on one shard.\n- **Layer 2 — In-Pod `singleflight`**: Coalesces concurrent worker misses inside each pod into 1 outbound call.\n- **Layer 3 — Redis `SET NX` Lease + XFetch Probabilistic Early Refresh**: Store `{value, delta, expiry}` and recompute early when `time() - delta * beta * log(rand()) >= expiry`—or acquire a short `SET lock:deal 1 NX PX 1000` lease so **at most 1 pod** queries Postgres while others wait briefly or serve stale.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Hot-Key Caching Hierarchy",
+            "title": "Bounding DB Refresh to 1 Query Across 200 Stateless Pods",
+            "nodes": [
+              {
+                "label": "L1 Pod Cache (2s)",
+                "role": "Absorbs 50k/s hot key"
+              },
+              {
+                "label": "Pod Singleflight",
+                "role": "N workers -> 1 call/pod"
+              },
+              {
+                "label": "Redis Lease + XFetch",
+                "role": "200 pods -> 1 DB winner"
+              },
+              {
+                "label": "Postgres",
+                "role": "1 query / 60s (<=5 limit)"
+              }
+            ],
+            "edges": [
+              {
+                "label": "Coalesce in-pod"
+              },
+              {
+                "label": "Coalesce cross-pod"
+              }
+            ],
+            "cards": [
+              {
+                "label": "L1 Micro-Cache",
+                "detail": "2s in-memory TTL shields single Redis shard from 50k RPS."
+              },
+              {
+                "label": "XFetch Algorithm",
+                "detail": "Probabilistically refreshes hot keys *before* TTL hits 0."
+              },
+              {
+                "label": "Redis SET NX PX",
+                "detail": "Cross-pod distributed lease ensures <= 1-2 concurrent DB queries."
+              },
+              {
+                "label": "Zero New Infra",
+                "detail": "Uses existing Redis cluster and in-process Python/Java maps."
+              }
+            ],
+            "summary": "L1 + singleflight + XFetch/Redis lease guarantees <= 5 concurrent DB queries without sticky sessions or new infrastructure."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where Hot-Key Stampede Defense Applies in System Design",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Hot-key coalescing is critical in high-fan-out consumer applications:\n\n- **Flash Sales & Homepage Banners**: Protects databases during viral traffic spikes.\n- **Celebrity Profiles & Trending Feeds**: L1 + singleflight shields Redis shards from 100k+ RPS on one user ID.\n- **Auth Public Key (JWKS) & Config Caches**: XFetch refreshes rotating keys seamlessly before expiration.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Combine in-process singleflight request coalescing, distributed Redis lease locks, and XFetch probabilistic early expiration to keep DB load at 1 query per refresh.",
+      "summary": "When a celebrity hot key's 60-second Redis TTL expires, 50,000 concurrent requests miss simultaneously and stampede the primary PostgreSQL database.",
+      "keyTakeaway": "When a celebrity hot key's 60-second Redis TTL expires, 50,000 concurrent requests miss simultaneously and stampede, combine in-process singleflight request coalescing, distributed Redis lease locks, and XFetch probabilistic early expiration to keep DB load at 1 query per refresh."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "simulation": {
+    "title": "Preventing Hot-Key Cache Stampedes — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "app",
+        "label": "App Servers",
+        "role": "Concurrent Reads"
+      },
+      {
+        "id": "sf",
+        "label": "Singleflight",
+        "role": "In-Flight Coalescer"
+      },
+      {
+        "id": "redis",
+        "label": "Redis L2",
+        "role": "Hot Key Store"
+      },
+      {
+        "id": "db",
+        "label": "Primary DB",
+        "role": "Origin Source"
+      }
+    ],
+    "edges": [
+      {
+        "from": "app",
+        "to": "sf",
+        "label": "GET hot_key"
+      },
+      {
+        "from": "sf",
+        "to": "redis",
+        "label": "L2 lookup"
+      },
+      {
+        "from": "redis",
+        "to": "db",
+        "label": "1x origin fetch"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why Preventing Hot-Key Cache Stampedes Matters",
+        "actionLabel": "GET hot_key",
+        "status": "healthy",
+        "activeNodeIds": [
+          "app",
+          "sf"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "GET hot_key",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "App Servers sends work to Singleflight (Why Preventing Hot-Key Cache Stampedes Matters)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Real-World Impact of Hot-Key Stampedes",
+        "actionLabel": "L2 lookup",
+        "status": "healthy",
+        "activeNodeIds": [
+          "sf",
+          "redis"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "L2 lookup",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Singleflight coordinates with Redis L2 while preserving the core invariant (Real-World Impact of Hot-Key Stampedes)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Naive Solution (and Why It Breaks)",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "redis",
+          "db"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, Primary DB absorbs pressure without cascading (Naive Solution (and Why It Breaks))."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Where Hot-Key Stampede Defense Applies in System Design",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "app",
+          "sf",
+          "redis",
+          "db"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Where Hot-Key Stampede Defense Applies in System Design)."
+      }
+    ]
+  }
+}

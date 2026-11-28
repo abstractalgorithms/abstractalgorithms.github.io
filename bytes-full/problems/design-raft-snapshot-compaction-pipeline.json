@@ -1,0 +1,603 @@
+{
+  "id": "design-raft-snapshot-compaction-pipeline",
+  "slug": "design-raft-snapshot-compaction-pipeline",
+  "title": "Design a Zero-Stall Raft Log Compaction & Snapshot Streaming Engine",
+  "domain": "distributed-systems",
+  "spark": {
+    "summary": "Design a Raft log compaction and snapshot streaming subsystem for a 50K writes/sec consensus cluster that bounds WAL size under 1 GB, sustains sub-10ms write P99, and recovers restarted followers in < 45 seconds.",
+    "keyTakeaway": "Combine RocksDB hard-link checkpoints, jittered dual compaction triggers, priority heartbeat lanes, and token-bucket InstallSnapshot streaming.",
+    "byteSummary": "In a 50,000 writes/sec consensus cluster (such as etcd or Kafka KRaft), naive log compaction introduces two failure modes: stop-the-world state-machine freezes during snapshot serialization, and NIC saturation during unthrottled `InstallSnapshot` transfers that starve heartbeats and trigger split-brain election storms.\n\nThe target engine triggers compaction via jittered dual thresholds (`100K entries OR 256 MB WAL`), forks an O(1) RocksDB hard-link checkpoint (or CoW clone) in < 1 ms without pausing the Raft apply loop, fsyncs CRC32C-verified snapshot chunks, and retains a 10K-entry WAL suffix.\n\nWhen a follower restarts behind `firstLogIndex`, the leader streams `InstallSnapshot` chunks through a token-bucket rate limiter (capping snapshot traffic at 50% NIC bandwidth) while routing `AppendEntries` heartbeats on a separate priority lane with PreVote enabled—delivering sub-10ms write P99 and < 45s follower recovery."
+  },
+  "learningJourney": [
+    {
+      "level": "foundation",
+      "title": "Stage 1: SLO Framing — Bounded WAL, Sub-10ms P99 & < 45s Recovery",
+      "purpose": "Define disk bounds, write-latency targets, and recovery-time objectives for a 50K writes/sec Raft group.",
+      "explanation": "At 50K writes/sec (~40 MB/s WAL append rate), the compaction engine must keep uncompacted WAL under 256-512 MB per node, avoid any write-path P99 spike > 10 ms during snapshotting, and recover a wiped/restarted follower (e.g., 4 GB compressed snapshot) in < 45 seconds without disturbing leader stability.",
+      "codeExample": "def check_recovery_slo(snapshot_gb: float, stream_mbps: float, suffix_entries: int = 10000) -> dict:\n    if snapshot_gb <= 0 or stream_mbps <= 0:\n        raise ValueError('Snapshot size and stream rate must be positive')\n    transfer_sec = (snapshot_gb * 8000.0) / stream_mbps\n    return {'transfer_sec': round(transfer_sec, 2), 'within_45s_slo': transfer_sec < 40.0}\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "FOUNDATION · SYSTEM SLOS",
+        "title": "Balancing Disk Bounds, Write P99 & Follower Recovery Speed",
+        "nodes": [
+          {
+            "id": "wl",
+            "label": "50K Writes/sec (40 MB/s)",
+            "sub": "Continuous Raft quorum",
+            "role": "Ingress Load"
+          },
+          {
+            "id": "dsk",
+            "label": "WAL Cap <= 256 MB",
+            "sub": "Prevent 500 GB growth",
+            "role": "Disk SLO"
+          },
+          {
+            "id": "lat",
+            "label": "Write P99 < 10 ms",
+            "sub": "Zero snapshot apply stalls",
+            "role": "Latency SLO"
+          },
+          {
+            "id": "rec",
+            "label": "Follower Recovery < 45s",
+            "sub": "4 GB snap @ 1 Gbps (~32s)",
+            "role": "Recovery SLO"
+          }
+        ],
+        "edges": [
+          {
+            "from": "wl",
+            "to": "dsk",
+            "label": "Compact every ~6-10s"
+          },
+          {
+            "from": "dsk",
+            "to": "lat",
+            "label": "Zero-lock CoW/Checkpoint"
+          },
+          {
+            "from": "lat",
+            "to": "rec",
+            "label": "Stream rate-limited chunks"
+          }
+        ],
+        "cards": [
+          {
+            "label": "32-Second Transfer",
+            "detail": "A 4 GB compressed snapshot streams at 1 Gbps (125 MB/s) in ~32 seconds, leaving 13 seconds for suffix replay."
+          },
+          {
+            "label": "Zero Quorum Disruption",
+            "detail": "Maintaining < 10 ms P99 ensures Raft client leases and ReadIndex queries never time out."
+          }
+        ],
+        "summary": "The engine targets <= 256 MB uncompacted WAL, < 10 ms write P99 during compaction, and < 45s follower recovery.",
+        "caption": "50K writes/sec consensus engine targets <= 256 MB WAL, < 10 ms write P99, and < 45s follower recovery."
+      },
+      "id": "stage-1-stage-1-slo-framing-bounded-wal-sub-10ms-p99-45s"
+    },
+    {
+      "level": "foundation",
+      "title": "Stage 2: Compaction State Machine & Jittered Dual Triggers",
+      "purpose": "Design non-overlapping compaction triggers so replicas never compact simultaneously.",
+      "explanation": "Each Raft node evaluates `uncompacted_entries >= entry_thresh OR wal_bytes >= byte_thresh` after committing an apply batch. Adding +/-15% node-specific jitter (seeded by `node_id`) prevents all 3-5 replicas from entering compaction at the exact same index and spiking cluster-wide tail latency.",
+      "codeExample": "def jittered_threshold(base_bytes: int, node_id: int) -> int:\n    if base_bytes <= 0:\n        raise ValueError('base_bytes must be positive')\n    offsets = [-0.15, -0.05, 0.0, 0.05, 0.15]\n    factor = 1.0 + offsets[node_id % len(offsets)]\n    return int(base_bytes * factor)\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "FOUNDATION · COMPACTION TRIGGERS",
+        "title": "Jittered Dual-Threshold Compaction Controller",
+        "nodes": [
+          {
+            "id": "mon",
+            "label": "Apply Batch Monitor",
+            "sub": "Track entries & WAL bytes",
+            "role": "Trigger Watcher"
+          },
+          {
+            "id": "jit",
+            "label": "Node-ID Jitter (+/-15%)",
+            "sub": "217 MB..294 MB per node",
+            "role": "Stagger Policy"
+          },
+          {
+            "id": "guard",
+            "label": "Single-Flight Lock",
+            "sub": "1 active snapshot per node",
+            "role": "Overlap Guard"
+          },
+          {
+            "id": "kick",
+            "label": "Spawn Async Compaction",
+            "sub": "Return apply loop in <1ms",
+            "role": "Dispatcher"
+          }
+        ],
+        "edges": [
+          {
+            "from": "mon",
+            "to": "jit",
+            "label": "Evaluate dual threshold"
+          },
+          {
+            "from": "jit",
+            "to": "guard",
+            "label": "Check compaction_in_flight"
+          },
+          {
+            "from": "guard",
+            "to": "kick",
+            "label": "Launch background job"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Single-Flight Guard",
+            "detail": "If a previous snapshot is still streaming to disk, skip triggering a second concurrent compaction."
+          },
+          {
+            "label": "Staggered Replicas",
+            "detail": "Jitter ensures at least a majority of replicas remain unburdened by compaction I/O at any instant."
+          }
+        ],
+        "summary": "Jittered dual thresholds and a single-flight compaction guard stagger replica snapshots and prevent overlapping builds.",
+        "caption": "Apply batch monitor applies +/-15% node jitter and single-flight gating before launching background compaction."
+      },
+      "id": "stage-2-stage-2-compaction-state-machine-jittered-dual-t"
+    },
+    {
+      "level": "intermediate",
+      "title": "Stage 3: Zero-Stall Checkpoint Fork & Streaming Checksums",
+      "purpose": "Implement O(1) RocksDB hard-link checkpoints with Zstd compression and per-chunk CRC32C.",
+      "explanation": "On trigger, the apply thread invokes `rocksdb::Checkpoint::CreateCheckpoint()` (creating hard-links to immutable SSTables and copying the small active memtable) in < 1 ms, tagging `(lastIncludedIndex, lastIncludedTerm)`. A background thread tars/Zstd-compresses the checkpoint into 4 MB chunks with CRC32C trailers and atomically commits `snapshot.meta`.",
+      "codeExample": "import zlib\n\ndef frame_snapshot_chunk(offset: int, payload: bytes) -> dict:\n    if offset < 0:\n        raise ValueError('offset must be non-negative')\n    crc = zlib.crc32(payload) & 0xFFFFFFFF\n    return {'offset': offset, 'size': len(payload), 'crc32c': crc}\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "INTERMEDIATE · ZERO-STALL CHECKPOINT",
+        "title": "O(1) RocksDB Checkpoint -> Zstd + CRC32C Background Pipeline",
+        "nodes": [
+          {
+            "id": "cp",
+            "label": "RocksDB CreateCheckpoint()",
+            "sub": "< 1 ms SSTable hard-links",
+            "role": "Instant Fork"
+          },
+          {
+            "id": "zstd",
+            "label": "Background Zstd Streamer",
+            "sub": "Level-3 fast compression",
+            "role": "Compactor"
+          },
+          {
+            "id": "crc",
+            "label": "4 MB Chunk + CRC32C",
+            "sub": "Integrity per chunk",
+            "role": "Verifier"
+          },
+          {
+            "id": "meta",
+            "label": "fsync() + Atomic Rename",
+            "sub": "Publish snapshot.idx",
+            "role": "Commit"
+          }
+        ],
+        "edges": [
+          {
+            "from": "cp",
+            "to": "zstd",
+            "label": "Hand off immutable dir"
+          },
+          {
+            "from": "zstd",
+            "to": "crc",
+            "label": "Emit 4 MB framed chunks"
+          },
+          {
+            "from": "crc",
+            "to": "meta",
+            "label": "Durably commit snapshot"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Zstd Level 3 Sweet Spot",
+            "detail": "Zstd level 3 compresses KV snapshots ~2.5x at 400+ MB/s per core, cutting network transfer time in half."
+          },
+          {
+            "label": "Bounded I/O Nice",
+            "detail": "Run background compression with cgroup/ionice throttling so foreground WAL fsyncs keep < 2 ms latency."
+          }
+        ],
+        "summary": "RocksDB hard-link checkpoints plus background Zstd-3 compression and CRC32C framing build durable snapshots without blocking writes.",
+        "caption": "RocksDB CreateCheckpoint() hands immutable SSTables to a background Zstd + CRC32C pipeline."
+      },
+      "id": "stage-3-stage-3-zero-stall-checkpoint-fork-streaming-che"
+    },
+    {
+      "level": "intermediate",
+      "title": "Stage 4: WAL Segment Rotation & Suffix-Preserving GC",
+      "purpose": "Reclaim disk space safely via fixed-size WAL segments while keeping a 10K-entry suffix.",
+      "explanation": "Store the Raft WAL as 64 MB sealed segments (`wal-000001.log`, `wal-000002.log`). After a snapshot is durably committed at `S`, the WAL garbage collector unlinks any sealed segment whose `max_index <= S - 10,000`, reclaiming disk in O(1) `unlink()` calls without rewriting active log files.",
+      "codeExample": "def select_reclaimable_segments(segments: list[tuple[str, int]], snap_idx: int, suffix: int = 10000) -> list[str]:\n    cutoff = max(0, snap_idx - suffix)\n    return [name for name, max_idx in segments if max_idx <= cutoff]\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "INTERMEDIATE · SEGMENTED WAL GC",
+        "title": "O(1) Unlink of Sealed 64 MB WAL Segments Behind Suffix Cutoff",
+        "nodes": [
+          {
+            "id": "seg",
+            "label": "Sealed 64 MB WAL Segments",
+            "sub": "Indexed by max_log_index",
+            "role": "Log Store"
+          },
+          {
+            "id": "cut",
+            "label": "Cutoff = snapIdx - 10,000",
+            "sub": "Preserve recent suffix",
+            "role": "Safety Margin"
+          },
+          {
+            "id": "ref",
+            "label": "Active Stream Refcheck",
+            "sub": "Don't unlink active reader",
+            "role": "Reader Guard"
+          },
+          {
+            "id": "unl",
+            "label": "O(1) unlink() Reclaim",
+            "sub": "Keep disk <= 256 MB",
+            "role": "Garbage Collect"
+          }
+        ],
+        "edges": [
+          {
+            "from": "seg",
+            "to": "cut",
+            "label": "Compare segment max_idx"
+          },
+          {
+            "from": "cut",
+            "to": "ref",
+            "label": "Verify no open cursor"
+          },
+          {
+            "from": "ref",
+            "to": "unl",
+            "label": "Delete obsolete segments"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Zero In-Place Rewrite",
+            "detail": "Segmented WALs avoid copying remaining suffix entries during truncation—just unlink old segment files."
+          },
+          {
+            "label": "Active-Cursor Pinning",
+            "detail": "Ref-counting sealed segments prevents deleting a file while an AppendEntries batch is still reading it."
+          }
+        ],
+        "summary": "64 MB segmented WALs let the GC unlink obsolete prefixes in O(1) while preserving a 10K-entry suffix for minor follower lag.",
+        "caption": "Segmented 64 MB WAL files are unlinked in O(1) once their max_index falls behind snapIdx - 10,000."
+      },
+      "id": "stage-4-stage-4-wal-segment-rotation-suffix-preserving-g"
+    },
+    {
+      "level": "intermediate",
+      "title": "Stage 5: Token-Bucket InstallSnapshot & Priority Heartbeat Lane",
+      "purpose": "Stream snapshots to lagging followers without starving AppendEntries heartbeats or saturating NICs.",
+      "explanation": "Leaders maintain two gRPC/TCP channels per peer: a high-priority control channel for `AppendEntries` heartbeats and `RequestVote`, and a bulk data channel for `InstallSnapshot` chunks. A token-bucket limiter caps snapshot egress at 50% NIC capacity (and max 2 concurrent peers) so heartbeats always arrive in < 10 ms.",
+      "codeExample": "def allocate_peer_chunk_rate(total_budget_mbps: float, active_snapshot_peers: int) -> float:\n    if active_snapshot_peers <= 0:\n        return 0.0\n    return round(total_budget_mbps / min(active_snapshot_peers, 2), 2)\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "INTERMEDIATE · NETWORK ISOLATION",
+        "title": "Dual-Channel Raft Transport: Priority Heartbeats vs. Paced Snapshots",
+        "nodes": [
+          {
+            "id": "ctrl",
+            "label": "Control Channel (Priority)",
+            "sub": "Heartbeats & Vote (<10 ms)",
+            "role": "Quorum Lane"
+          },
+          {
+            "id": "bulk",
+            "label": "Bulk Data Channel",
+            "sub": "InstallSnapshot 4 MB chunks",
+            "role": "Transfer Lane"
+          },
+          {
+            "id": "tb",
+            "label": "Token-Bucket Pacer",
+            "sub": "50% NIC cap, max 2 peers",
+            "role": "Bandwidth Guard"
+          },
+          {
+            "id": "fol",
+            "label": "Follower Staging + Swap",
+            "sub": "Verify CRC -> atomic reload",
+            "role": "Catch-Up Sink"
+          }
+        ],
+        "edges": [
+          {
+            "from": "ctrl",
+            "to": "fol",
+            "label": "Maintain leader lease"
+          },
+          {
+            "from": "bulk",
+            "to": "tb",
+            "label": "Pace chunk egress"
+          },
+          {
+            "from": "tb",
+            "to": "fol",
+            "label": "Stream to snapshot.tmp"
+          }
+        ],
+        "cards": [
+          {
+            "label": "No Head-of-Line Blocking",
+            "detail": "Separate TCP connections prevent a 4 MB snapshot chunk from delaying a 64-byte heartbeat packet."
+          },
+          {
+            "label": "Staggered Multi-Node Rebuild",
+            "detail": "Capping concurrent snapshot streams at 2 prevents 3 simultaneous node restarts from saturating leader egress."
+          }
+        ],
+        "summary": "Separating heartbeats onto a priority lane and pacing InstallSnapshot chunks via token buckets keeps quorum stable during rebuilds.",
+        "caption": "Priority heartbeat connections and token-bucket-paced bulk channels isolate quorum liveness from snapshot transfers."
+      },
+      "id": "stage-5-stage-5-token-bucket-installsnapshot-priority-he"
+    },
+    {
+      "level": "advanced",
+      "title": "Stage 6: Resumable Snapshot Transfers & PreVote Election Safety",
+      "purpose": "Handle mid-transfer network drops and prevent partitioned followers from disrupting the leader.",
+      "explanation": "If a follower loses connectivity at byte offset 2.5 GB of a 4 GB snapshot, resumable chunking (keyed by `snapshot_id` + `offset`) lets the follower continue from 2.5 GB instead of restarting from 0. Meanwhile, `PreVote` ensures any lagging or briefly congested follower checks whether a majority would vote for it before incrementing `currentTerm`.",
+      "codeExample": "def next_resume_offset(expected_offset: int, incoming_offset: int, chunk_len: int) -> int:\n    if incoming_offset != expected_offset:\n        raise ValueError(f'Out-of-order chunk: expected {expected_offset}, got {incoming_offset}')\n    return expected_offset + chunk_len\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "ADVANCED · RESUMABILITY & PREVOTE",
+        "title": "Offset-Resumable Transfers & PreVote Term Protection",
+        "nodes": [
+          {
+            "id": "drop",
+            "label": "Transient Link Drop @ 2.5 GB",
+            "sub": "snapshot_id still valid",
+            "role": "Network Fault"
+          },
+          {
+            "id": "res",
+            "label": "Resume from Offset 2.5 GB",
+            "sub": "Avoid 0-byte restart",
+            "role": "Offset Recovery"
+          },
+          {
+            "id": "pv",
+            "label": "PreVote Handshake",
+            "sub": "Do not bump term blindly",
+            "role": "Leader Shield"
+          },
+          {
+            "id": "sync",
+            "label": "Atomic Swap + AppendEntries",
+            "sub": "Join quorum in < 45s",
+            "role": "Synced Follower"
+          }
+        ],
+        "edges": [
+          {
+            "from": "drop",
+            "to": "res",
+            "label": "Reconnect with snapshot_id"
+          },
+          {
+            "from": "drop",
+            "to": "pv",
+            "label": "If election timer fires"
+          },
+          {
+            "from": "res",
+            "to": "sync",
+            "label": "Finish remaining chunks"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Snapshot Pinning",
+            "detail": "The leader pins the active snapshot_id in memory/disk until transfer completes or times out so GC won't delete it mid-stream."
+          },
+          {
+            "label": "Zero Spurious Term Bumps",
+            "detail": "PreVote stops isolated followers from forcing healthy leaders to step down upon reconnection."
+          }
+        ],
+        "summary": "Keying chunks by snapshot_id enables offset resumption after drops, while PreVote shields the leader from spurious term bumps.",
+        "caption": "Resumable snapshot_id offsets avoid full restarts on network drops, and PreVote blocks spurious leader elections."
+      },
+      "id": "stage-6-stage-6-resumable-snapshot-transfers-prevote-ele"
+    },
+    {
+      "level": "advanced",
+      "title": "Stage 7: Operational Telemetry, Corruption Drills & ReadIndex",
+      "purpose": "Monitor compaction lag, verify snapshot checksums in CI/chaos drills, and uphold ReadIndex linearizability.",
+      "explanation": "Track `raft_wal_bytes`, `raft_snapshot_duration_ms`, and `raft_install_snapshot_active_peers` with alerts if WAL exceeds 2x threshold. Run automated chaos drills that corrupt a chunk's CRC32C (verifying clean rejection) and validate that `ReadIndex` queries remain linearizable across follower snapshot swaps.",
+      "codeExample": "def check_compaction_health(wal_bytes: int, byte_thresh: int, failed_snapshots: int) -> str:\n    if failed_snapshots > 0:\n        return 'PAGE_SNAPSHOT_FAILURE'\n    if wal_bytes > byte_thresh * 2:\n        return 'WARN_COMPACTION_LAGGING'\n    return 'HEALTHY'\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "ADVANCED · OBSERVABILITY & CHAOS",
+        "title": "WAL Lag Telemetry, CRC Chaos Drills & ReadIndex Verification",
+        "nodes": [
+          {
+            "id": "met",
+            "label": "Prometheus Raft Metrics",
+            "sub": "wal_bytes, snap_dur_ms",
+            "role": "Telemetry"
+          },
+          {
+            "id": "crc",
+            "label": "CRC32C Chaos Drill",
+            "sub": "Inject bit-flip -> clean reject",
+            "role": "Integrity Test"
+          },
+          {
+            "id": "ri",
+            "label": "ReadIndex Linearizability",
+            "sub": "Verify commitIndex monotonic",
+            "role": "Safety Check"
+          },
+          {
+            "id": "alt",
+            "label": "2x WAL Threshold Alert",
+            "sub": "Catch stuck compaction early",
+            "role": "SRE Gate"
+          }
+        ],
+        "edges": [
+          {
+            "from": "met",
+            "to": "alt",
+            "label": "Alert if wal > 512 MB"
+          },
+          {
+            "from": "crc",
+            "to": "ri",
+            "label": "Verify safe state swap"
+          },
+          {
+            "from": "ri",
+            "to": "alt",
+            "label": "Confirm zero stale reads"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Snapshot-Before-GC Alert",
+            "detail": "If disk usage rises while snapshots fail, alert immediately before the node hits ENOSPC."
+          },
+          {
+            "label": "Linearizability Invariant",
+            "detail": "A follower that just installed a snapshot at index S never serves ReadIndex < S."
+          }
+        ],
+        "summary": "WAL-size alerts, CRC32C fault-injection drills, and ReadIndex checks keep the compaction engine production-safe.",
+        "caption": "Prometheus WAL alerts, CRC32C fault drills, and ReadIndex monotonicity checks verify production safety."
+      },
+      "id": "stage-7-stage-7-operational-telemetry-corruption-drills-"
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "prob-raft-1",
+        "question": "Why does a Raft leader separate `AppendEntries` heartbeats onto a priority connection distinct from `InstallSnapshot`?",
+        "options": [
+          {
+            "id": "a",
+            "text": "To prevent 4 MB snapshot chunks from causing head-of-line blocking and delaying heartbeats past `electionTimeout`.",
+            "correct": true,
+            "feedback": "Correct. Separate priority connections ensure heartbeats stay under 10 ms even during multi-gigabyte transfers."
+          },
+          {
+            "id": "b",
+            "text": "Because TCP does not support files larger than 1 MB.",
+            "correct": false,
+            "feedback": "Incorrect. TCP streams arbitrary bytes, but large chunks cause head-of-line queueing delays."
+          },
+          {
+            "id": "c",
+            "text": "Because `AppendEntries` uses UDP while `InstallSnapshot` uses HTTP/1.1.",
+            "correct": false,
+            "feedback": "Incorrect. Both typically run over TCP/gRPC."
+          },
+          {
+            "id": "d",
+            "text": "To bypass CRC32C checksum verification on heartbeats.",
+            "correct": false,
+            "feedback": "Incorrect. Separate lanes are for QoS and head-of-line isolation."
+          }
+        ],
+        "explanation": "Isolating heartbeats on a dedicated priority lane prevents large snapshot chunks from delaying heartbeats and triggering election storms."
+      },
+      {
+        "id": "prob-raft-2",
+        "question": "What is the purpose of adding +/-15% node-ID jitter to Raft compaction thresholds?",
+        "options": [
+          {
+            "id": "a",
+            "text": "To stagger snapshots across replicas so the entire quorum never incurs compaction I/O simultaneously.",
+            "correct": true,
+            "feedback": "Correct. Jittering thresholds keeps a majority of replicas fast and unburdened at any point in time."
+          },
+          {
+            "id": "b",
+            "text": "To randomize `lastIncludedTerm` so leaders change faster.",
+            "correct": false,
+            "feedback": "Incorrect. lastIncludedTerm is a deterministic log term, never randomized."
+          },
+          {
+            "id": "c",
+            "text": "To disable `fsync()` on follower nodes.",
+            "correct": false,
+            "feedback": "Incorrect. Every node must still fsync snapshots before truncating WALs."
+          },
+          {
+            "id": "d",
+            "text": "To skip `InstallSnapshot` when `nextIndex < firstLogIndex`.",
+            "correct": false,
+            "feedback": "Incorrect. InstallSnapshot is always required when the needed prefix has been compacted."
+          }
+        ],
+        "explanation": "Per-node threshold jitter prevents synchronized compaction pauses across all replicas in a Raft group."
+      },
+      {
+        "id": "prob-raft-3",
+        "question": "If a follower crashes while receiving chunk 50 of 100 in `InstallSnapshot`, why is its existing state machine still intact on restart?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Because chunks are staged in `snapshot.tmp` and the state machine is only swapped atomically after `done == true` and CRC32C verification.",
+            "correct": true,
+            "feedback": "Correct. Staging in a temp file and atomically renaming on completion ensures partial transfers never corrupt live state."
+          },
+          {
+            "id": "b",
+            "text": "Because Raft followers never write snapshots to disk.",
+            "correct": false,
+            "feedback": "Incorrect. Followers must durably persist snapshots before acknowledging and truncating."
+          },
+          {
+            "id": "c",
+            "text": "Because `PreVote` rolls back the leader's snapshot.",
+            "correct": false,
+            "feedback": "Incorrect. PreVote only governs leader elections."
+          },
+          {
+            "id": "d",
+            "text": "Because the leader deletes its own snapshot after chunk 50.",
+            "correct": false,
+            "feedback": "Incorrect. Leaders pin the snapshot until transfer completes."
+          }
+        ],
+        "explanation": "Staging incoming chunks in a temporary file and atomically swapping only after done=true and checksum validation makes snapshot installation crash-safe."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Build a Raft snapshot system that takes fast background checkpoints, deletes old log files safely, and streams snapshots to restarting nodes in under 45 seconds.",
+      "keyTakeaway": "Background checkpoints and rate-limited snapshot streaming keep the cluster fast while recovering failed nodes.",
+      "byteSummary": "To keep a Raft database fast at 50,000 writes/sec, nodes take quick background snapshots, delete older log files once the snapshot is safe on disk, and stream snapshots in paced chunks to restarting followers."
+    },
+    "intermediate": {
+      "summary": "Use O(1) RocksDB checkpoints, 64 MB segmented WAL GC with a 10K-entry suffix, and dual-lane `InstallSnapshot` + priority heartbeats.",
+      "keyTakeaway": "Jittered dual triggers (100K entries or 256 MB WAL) and token-bucket snapshot pacing maintain < 10 ms write P99 and < 45s recovery.",
+      "byteSummary": "The engine uses `RocksDB CreateCheckpoint()` (< 1 ms) and Zstd-3 + CRC32C background framing, unlinks sealed 64 MB WAL segments behind `snapIdx - 10,000`, and paces `InstallSnapshot` at 50% NIC capacity on a separate bulk lane."
+    },
+    "advanced": {
+      "summary": "Add `snapshot_id` offset-resumable transfers, `PreVote` term protection, cgroup/ionice background throttling, and CRC32C chaos drills.",
+      "keyTakeaway": "Resumable offset transfers avoid restarting multi-GB rebuilds on transient drops, while `PreVote` and priority heartbeats eliminate election storms.",
+      "byteSummary": "Production hardening pairs `snapshot_id`-pinned offset resumption (avoiding 0-byte restarts on link drops) with `PreVote` election guards, `ionice` background compression, 2x WAL-threshold alerting, and automated CRC32C fault-injection drills."
+    }
+  }
+}

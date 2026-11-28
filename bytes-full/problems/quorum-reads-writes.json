@@ -1,0 +1,795 @@
+{
+  "id": "quorum-reads-writes",
+  "slug": "quorum-reads-writes",
+  "title": "Quorum Consistency & Stale Reads in Replicated Stores",
+  "problemType": "architecture",
+  "difficulty": "hard",
+  "prompt": "A distributed feature-flag and session-metadata store uses a Dynamo-style quorum configuration with `N=3` replicas (`R1, R2, R3`), write quorum `W=2`, and read quorum `R=2` (`R + W = 4 > 3`). During a partial rack degradation, `R3` experiences 45% packet loss and `R2` suffers an abrupt reboot, wiping its volatile memtable/unflushed WAL or recovering from a 10-minute-old EBS snapshot. Meanwhile, the coordinator has `sloppy_quorum = true` (hinted handoff) enabled so writes succeed on `{R1, HintedR4}` when `R2` and `R3` are slow. Immediately afterward, `R2` rejoins the ring and a client executes an `R=2` read that contacts `{R2, R3}`, receiving `v1` instead of the newly committed `v2`. Design the consistency protocol, recovery gating, and read-repair mechanisms to eliminate stale reads under partial replica degradation.",
+  "spark": {
+    "summary": "Even with `R + W > N` (`N=3, W=2, R=2`), partial replica degradation, sloppy quorums, or un-synchronized node restarts allow a read quorum to intersect only stale replicas and return outdated values.",
+    "keyTakeaway": "If latency budgets leave no room for synchronous retries, strict `R + W > N` only guarantees overlap when replica membership is static and durable; production quorum stores require disabling sloppy quorum for strong reads, monotonic/read-your-writes tokens, and epoch-gated replica recovery.",
+    "byteSummary": "**Core Mechanics:** In a Dynamo-style replicated store with `N=3`, `W=2`, and `R=2` (`R + W = 4 > 3`), textbook math says every read quorum overlaps the write quorum by at least one replica.\n\n**Visual & Structural Flow:** Depicts Sloppy Quorum Write Leaves Canonical Read Quorum Stale (Client -> Coordinator -> R1 (Canon) -> R4 (Hinted) -> R2 & R3 (v1)); Canonical Quorum Intersection & Synchronous Digest Repair (Coordinator (N=3, W=2, R=2) -> R1 (Epoch 5, v2) -> R2 (Stale v1 -> Repaired)).\n\n**Trade-Offs & Production:** Relying on asynchronous background read repair leaves a window where consecutive reads see `v2` then `v1` (non-monotonic reads). To preserve `R + W > N` invariants under node failures and restarts while keeping p99 reads `< 12 ms`: **Disable Sloppy Quorums for Strong Paths**: Enforce strict canonical `W=2`.\n\n**Failure Modes & Application:** Production Dynamo-inspired databases expose tunable consistency per operation: **Apache Cassandra / ScyllaDB**: `LOCAL_QUORUM` with `hinted_handoff` disabled from quorum counts and blocking read repair."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why R + W > N does not automatically guarantee strong consistency",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "Think of **Why R + W > N does not automatically guarantee strong consistency** as the intuition layer for Quorum Consistency & Stale Reads in Replicated Stores: The mechanism: understand how Why R + W > N does not automatically guarantee strong consistency works from first principles.",
+        "core": "In a Dynamo-style replicated store with `N=3`, `W=2`, and `R=2` (`R + W = 4 > 3`), textbook math says every read quorum overlaps the write quorum by at least one replica. Yet in production (40k reads/s, 5k writes/s across 3 AZs), sloppy quorums, volatile memtables, or snapshot restores can leave only **one** canonical replica holding `v2`—allowing `{R2, R3}` to return stale `v1`.",
+        "deepDive": "Under heavy load or partial failure, why r + w > n does not automatically guarantee strong consistency becomes a critical lever for predictable latency and correctness. Even with `R + W > N` (`N=3, W=2, R=2`), partial replica degradation, sloppy quorums, or un-synchronized node restarts allow a read quorum to intersect only stale replicas and return outdated values."
+      },
+      "purpose": "The mechanism: understand how Why R + W > N does not automatically guarantee strong consistency works from first principles."
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "How sloppy quorums and un-synced restarts cause stale reads",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Two subtle failure modes break quorum overlap in production:",
+        "core": "1. **Sloppy Quorum & Hinted Handoff**: When `R3` has 45% packet loss, a coordinator writes `v2` to `R1` + hinted node `R4`. Only 1 canonical replica (`R1`) has `v2`; a subsequent `R=2` read hitting `{R2, R3}` returns `v1`.\n2. **Snapshot / Volatile-Loss Reboot**: If `R2` reboots with an older EBS snapshot or unflushed memtable and rejoins `R=2` immediately, `{R2, R3}` again misses `v2`.",
+        "deepDive": "In production deployments of Quorum Consistency & Stale Reads in Replicated Stores, watch how how sloppy quorums and un-synced restarts cause stale reads interacts with tail latency, retry amplification, and partial failures. Even with `R + W > N` (`N=3, W=2, R=2`), partial replica degradation, sloppy quorums, or un-synchronized node restarts allow a read quorum to intersect only stale replicas and return outdated values."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Quorum Overlap Violation",
+        "title": "Sloppy Quorum Write Leaves Canonical Read Quorum Stale",
+        "actors": [
+          {
+            "id": "cli",
+            "label": "Client"
+          },
+          {
+            "id": "coord",
+            "label": "Coordinator"
+          },
+          {
+            "id": "r1",
+            "label": "R1 (Canon)"
+          },
+          {
+            "id": "r4",
+            "label": "R4 (Hinted)"
+          },
+          {
+            "id": "r23",
+            "label": "R2 & R3 (v1)"
+          }
+        ],
+        "events": [
+          {
+            "from": "cli",
+            "to": "coord",
+            "label": "Write key=flag val=v2 (W=2)",
+            "status": "ok"
+          },
+          {
+            "from": "coord",
+            "to": "r1",
+            "label": "Write v2 -> ACK (1/2)",
+            "status": "ok"
+          },
+          {
+            "from": "coord",
+            "to": "r4",
+            "label": "R2/R3 slow -> Hinted R4 (2/2)",
+            "status": "warn"
+          },
+          {
+            "from": "cli",
+            "to": "coord",
+            "label": "Read key=flag (R=2)",
+            "status": "ok"
+          },
+          {
+            "from": "coord",
+            "to": "r23",
+            "label": "Reads R2+R3 -> returns stale v1!",
+            "status": "fail"
+          }
+        ],
+        "summary": "Because hinted node R4 is outside the canonical N=3 set, reading {R2, R3} satisfies R=2 without intersecting R1."
+      },
+      "purpose": "The problem: see what breaks without How sloppy quorums and un-synced restarts cause stale reads under real concurrency or scale.",
+      "decisionFramework": {
+        "problem": "How to implement Quorum Consistency & Stale Reads in Replicated Stores without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "If latency budgets leave no room for synchronous retries, strict `R + W > N` only guarantees overlap when replica membership is static and durable; production quorum stores require disabling sloppy quorum for strong reads, monotonic/read-your-writes tokens, and epoch-gated replica recovery.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Quorum Consistency & Stale Reads in Replicated Stores experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Why async read repair and buffered WALs still violate linearizability",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Think of **Why async read repair and buffered WALs still violate linearizability** as the intuition layer for Quorum Consistency & Stale Reads in Replicated Stores: The problem: see what breaks without Why async read repair and buffered WALs still violate linearizability under real concurrency or scale.",
+        "core": "Relying on asynchronous background read repair leaves a window where consecutive reads see `v2` then `v1` (non-monotonic reads). Likewise, acknowledging writes before `fsync()` on the WAL means a node reboot wipes `v2` after the client already received `200 OK`.",
+        "deepDive": "Under heavy load or partial failure, why async read repair and buffered wals still violate linearizability becomes a critical lever for predictable latency and correctness. Even with `R + W > N` (`N=3, W=2, R=2`), partial replica degradation, sloppy quorums, or un-synchronized node restarts allow a read quorum to intersect only stale replicas and return outdated values."
+      },
+      "purpose": "The problem: see what breaks without Why async read repair and buffered WALs still violate linearizability under real concurrency or scale.",
+      "sectionDiagram": {
+        "kind": "behavior-transition",
+        "eyebrow": "Design Trade-Off",
+        "title": "Why async read repair and buffered WALs still violate linearizability",
+        "before": {
+          "label": "Seq Scan + Unbounded Bloat",
+          "metrics": [
+            "Implicit cast breaks B-Tree",
+            "Deadlock or XID wraparound risk",
+            "Long tx blocks VACUUM"
+          ]
+        },
+        "after": {
+          "label": "Indexed Plan + Bounded MVCC",
+          "metrics": [
+            "Index-only scan in <2 ms",
+            "Deterministic lock ordering",
+            "Autovacuum keeps bloat flat"
+          ]
+        }
+      }
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise solution: Strict Quorums, Sync Read Repair, and Epoch Gating",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": {
+        "foundation": "To preserve `R + W > N` invariants under node failures and restarts while keeping p99 reads `< 12 ms`:",
+        "core": "- **Disable Sloppy Quorums for Strong Paths**: Enforce strict canonical `W=2` (`LOCAL_QUORUM` / `QUORUM`) so writes never count hinted nodes toward `W`.\n- **Synchronous Digest Read Repair**: Query 1 full data replica + `R-1` hash digests; if hashes mismatch, fetch the highest `(timestamp, version)` and write it back synchronously to stale responders before returning.\n- **Durable `fsync` + Bootstrapping Gate**: Require WAL `fsync` before ACK, and keep snapshot-restored nodes in `JOINING` state (excluded from `R`/`W` quorums) until anti-entropy Merkle-tree sync completes.",
+        "deepDive": "In production deployments of Quorum Consistency & Stale Reads in Replicated Stores, watch how enterprise solution: strict quorums, sync read repair, and epoch gating interacts with tail latency, retry amplification, and partial failures. Even with `R + W > N` (`N=3, W=2, R=2`), partial replica degradation, sloppy quorums, or un-synchronized node restarts allow a read quorum to intersect only stale replicas and return outdated values."
+      },
+      "sectionDiagram": {
+        "kind": "quorum-cluster",
+        "eyebrow": "Strict Quorum + Read Repair",
+        "title": "Canonical Quorum Intersection & Synchronous Digest Repair",
+        "nodes": [
+          {
+            "label": "Coordinator (N=3, W=2, R=2)",
+            "role": "Strict canonical set; no hints"
+          },
+          {
+            "label": "R1 (Epoch 5, v2)",
+            "role": "fsync WAL + Merkle synced"
+          },
+          {
+            "label": "R2 (Stale v1 -> Repaired)",
+            "role": "Sync write-back before ACK"
+          }
+        ],
+        "edges": [
+          {
+            "label": "R + W = 4 > 3 (Strict)"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Strict Canonical W=2",
+            "detail": "Hinted handoff may buffer asynchronously, but never counts toward strict W=2 acknowledgment."
+          },
+          {
+            "label": "Digest + Sync Repair",
+            "detail": "Compare version digests across R replicas; block and repair stale nodes before returning to caller."
+          },
+          {
+            "label": "Epoch-Gated Recovery",
+            "detail": "Rebooted or snapshot-restored replicas stream missed mutations before rejoining R/W quorums."
+          }
+        ],
+        "summary": "Combining strict canonical quorums, WAL fsync, and synchronous read repair guarantees linearizable / RYOW reads."
+      },
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where quorum tuning is used in real distributed stores",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Production Dynamo-inspired databases expose tunable consistency per operation:",
+        "core": "- **Apache Cassandra / ScyllaDB**: `LOCAL_QUORUM` with `hinted_handoff` disabled from quorum counts and blocking read repair.\n- **Amazon DynamoDB**: `ConsistentRead=true` routes to the Raft/Paxos leader quorum rather than eventually consistent replicas.\n- **Feature-Flag & Session Stores**: Use `W=2, R=2` (`N=3`) for flag mutations and `W=1` only for non-critical telemetry.",
+        "deepDive": "In production deployments of Quorum Consistency & Stale Reads in Replicated Stores, watch how where quorum tuning is used in real distributed stores interacts with tail latency, retry amplification, and partial failures. Even with `R + W > N` (`N=3, W=2, R=2`), partial replica degradation, sloppy quorums, or un-synchronized node restarts allow a read quorum to intersect only stale replicas and return outdated values."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "quorum-tuning",
+          "title": "Concept: Quorum Tuning",
+          "kind": "concept"
+        },
+        {
+          "slug": "hinted-handoff-repair",
+          "title": "Concept: Hinted Handoff & Repair",
+          "kind": "concept"
+        },
+        {
+          "slug": "read-repair-anti",
+          "title": "Concept: Read Repair & Anti-Entropy",
+          "kind": "concept"
+        },
+        {
+          "slug": "design-key-value-store",
+          "title": "System Design: Distributed Key-Value Store",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "In an N=3, W=2, R=2 quorum store, why can a read still return stale data if sloppy quorums are enabled?",
+      "options": [
+        {
+          "id": "a",
+          "text": "A write may be acknowledged by 1 canonical replica plus 1 temporary hinted node, leaving 2 canonical replicas with stale data",
+          "correct": true,
+          "feedback": "Correct: reading those 2 canonical replicas satisfies R=2 without intersecting the node that received the write."
+        },
+        {
+          "id": "b",
+          "text": "Because R + W must be strictly greater than 2 * N",
+          "correct": false,
+          "feedback": "R + W > N suffices when all W and R participants are canonical, durable replicas."
+        },
+        {
+          "id": "c",
+          "text": "Because inter-AZ RTT exceeds 1 ms",
+          "correct": false,
+          "feedback": "Network latency affects p99 speed, not quorum set intersection."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "In an N=3, W=2, R=2 quorum store, why can a read still return stale data if sloppy quorums are enabled?",
+        "options": [
+          {
+            "id": "a",
+            "text": "A write may be acknowledged by 1 canonical replica plus 1 temporary hinted node, leaving 2 canonical replicas with stale data",
+            "correct": true,
+            "feedback": "Correct: reading those 2 canonical replicas satisfies R=2 without intersecting the node that received the write."
+          },
+          {
+            "id": "b",
+            "text": "Because R + W must be strictly greater than 2 * N",
+            "correct": false,
+            "feedback": "R + W > N suffices when all W and R participants are canonical, durable replicas."
+          },
+          {
+            "id": "c",
+            "text": "Because inter-AZ RTT exceeds 1 ms",
+            "correct": false,
+            "feedback": "Network latency affects p99 speed, not quorum set intersection."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why R + W > N does not automatically guarantee strong consistency', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "b",
+            "text": "In a Dynamo-style replicated store with N=3, W=2, and R=2 (R + W = 4 > 3), textbook math says every read quorum overlaps the write quorum by at least one replica.",
+            "correct": true,
+            "feedback": "Correct: In a Dynamo-style replicated store with N=3, W=2, and R=2 (R + W = 4 > 3), textbook math says every read quorum overlaps the write quorum by at least one replica."
+          },
+          {
+            "id": "c",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'How sloppy quorums and un-synced restarts cause stale reads', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "b",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "c",
+            "text": "Two subtle failure modes break quorum overlap in production: 1.",
+            "correct": true,
+            "feedback": "Correct: Two subtle failure modes break quorum overlap in production: 1."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** In a Dynamo-style replicated store with `N=3`, `W=2`, and `R=2` (`R + W = 4 > 3`), textbook math says every read quorum overlaps the write quorum by at least one replica.\n\n**How It Flows:** Think of Quorum Consistency & Stale Reads in Replicated Stores as a clear step-by-step chain: Client -> Coordinator -> R1 (Canon) -> R4 (Hinted) -> R2 & R3 (v1).\n\n**Why Beginners Should Care:** Strict `R + W > N` only guarantees overlap when replica membership is static and durable; production quorum stores require disabling sloppy quorum for strong reads.",
+      "spark": {
+        "summary": "In a Dynamo-style replicated store with `N=3`, `W=2`, and `R=2` (`R + W = 4 > 3`), textbook math says every read quorum overlaps the write quorum by at least one replica.",
+        "keyTakeaway": "Strict `R + W > N` only guarantees overlap when replica membership is static and durable; production quorum stores require disabling sloppy quorum for strong reads."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why R + W > N does not automatically guarantee strong consistency",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why R + W > N does not automatically guarantee strong consistency works from first principles.",
+          "explanation": "In a Dynamo-style replicated store with `N=3`, `W=2`, and `R=2` (`R + W = 4 > 3`), textbook math says every read quorum overlaps the write quorum by at least one replica. Yet in production (40k reads/s, 5k writes/s across 3 AZs), sloppy quorums, volatile memtables, or snapshot restores can leave only **one** canonical replica holding `v2`—allowing `{R2, R3}` to return stale `v1`.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "How sloppy quorums and un-synced restarts cause stale reads",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without How sloppy quorums and un-synced restarts cause stale reads under real concurrency or scale.",
+          "explanation": "Two subtle failure modes break quorum overlap in production: 1. **Sloppy Quorum & Hinted Handoff**: When `R3` has 45% packet loss, a coordinator writes `v2` to `R1` + hinted node `R4`. Only 1 canonical replica (`R1`) has `v2`; a subsequent `R=2` read hitting `{R2, R3}` returns `v1`.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Quorum Overlap Violation",
+            "title": "Sloppy Quorum Write Leaves Canonical Read Quorum Stale",
+            "actors": [
+              {
+                "id": "cli",
+                "label": "Client"
+              },
+              {
+                "id": "coord",
+                "label": "Coordinator"
+              },
+              {
+                "id": "r1",
+                "label": "R1 (Canon)"
+              },
+              {
+                "id": "r4",
+                "label": "R4 (Hinted)"
+              },
+              {
+                "id": "r23",
+                "label": "R2 & R3 (v1)"
+              }
+            ],
+            "events": [
+              {
+                "from": "cli",
+                "to": "coord",
+                "label": "Write key=flag val=v2 (W=2)",
+                "status": "ok"
+              },
+              {
+                "from": "coord",
+                "to": "r1",
+                "label": "Write v2 -> ACK (1/2)",
+                "status": "ok"
+              },
+              {
+                "from": "coord",
+                "to": "r4",
+                "label": "R2/R3 slow -> Hinted R4 (2/2)",
+                "status": "warn"
+              },
+              {
+                "from": "cli",
+                "to": "coord",
+                "label": "Read key=flag (R=2)",
+                "status": "ok"
+              },
+              {
+                "from": "coord",
+                "to": "r23",
+                "label": "Reads R2+R3 -> returns stale v1!",
+                "status": "fail"
+              }
+            ],
+            "summary": "Because hinted node R4 is outside the canonical N=3 set, reading {R2, R3} satisfies R=2 without intersecting R1."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Why async read repair and buffered WALs still violate linearizability",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "The problem: see what breaks without Why async read repair and buffered WALs still violate linearizability under real concurrency or scale.",
+          "explanation": "Relying on asynchronous background read repair leaves a window where consecutive reads see `v2` then `v1` (non-monotonic reads). Likewise, acknowledging writes before `fsync()` on the WAL means a node reboot wipes `v2` after the client already received `200 OK`.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Strict Quorums, Sync Read Repair, and Epoch Gating",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "To preserve `R + W > N` invariants under node failures and restarts while keeping p99 reads `< 12 ms`: **Disable Sloppy Quorums for Strong Paths**: Enforce strict canonical `W=2` (`LOCAL_QUORUM` / `QUORUM`) so writes never count hinted nodes toward `W`.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "quorum-cluster",
+            "eyebrow": "Strict Quorum + Read Repair",
+            "title": "Canonical Quorum Intersection & Synchronous Digest Repair",
+            "nodes": [
+              {
+                "label": "Coordinator (N=3, W=2, R=2)",
+                "role": "Strict canonical set; no hints"
+              },
+              {
+                "label": "R1 (Epoch 5, v2)",
+                "role": "fsync WAL + Merkle synced"
+              },
+              {
+                "label": "R2 (Stale v1 -> Repaired)",
+                "role": "Sync write-back before ACK"
+              }
+            ],
+            "edges": [
+              {
+                "label": "R + W = 4 > 3 (Strict)"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Strict Canonical W=2",
+                "detail": "Hinted handoff may buffer asynchronously, but never counts toward strict W=2 acknowledgment."
+              },
+              {
+                "label": "Digest + Sync Repair",
+                "detail": "Compare version digests across R replicas; block and repair stale nodes before returning to caller."
+              },
+              {
+                "label": "Epoch-Gated Recovery",
+                "detail": "Rebooted or snapshot-restored replicas stream missed mutations before rejoining R/W quorums."
+              }
+            ],
+            "summary": "Combining strict canonical quorums, WAL fsync, and synchronous read repair guarantees linearizable / RYOW reads."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Strict `R + W > N` only guarantees overlap when replica membership is static and durable; production quorum stores require disabling sloppy quorum for strong reads.",
+      "summary": "Even with `R + W > N` (`N=3, W=2, R=2`), partial replica degradation, sloppy quorums, or un-synchronized node restarts allow a read quorum to intersect only stale replicas and return outdated values.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, strict `R + W > N` only guarantees overlap when replica membership is static and durable; production quorum stores require disabling sloppy quorum for strong reads, monotonic/read-your-writes tokens, and epoch-gated replica recovery."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** In a Dynamo-style replicated store with `N=3`, `W=2`, and `R=2` (`R + W = 4 > 3`), textbook math says every read quorum overlaps the write quorum by at least one replica.\n\n**Visual & Structural Flow:** Depicts Sloppy Quorum Write Leaves Canonical Read Quorum Stale (Client -> Coordinator -> R1 (Canon) -> R4 (Hinted) -> R2 & R3 (v1)); Canonical Quorum Intersection & Synchronous Digest Repair (Coordinator (N=3, W=2, R=2) -> R1 (Epoch 5, v2) -> R2 (Stale v1 -> Repaired)).\n\n**Trade-Offs & Production:** Relying on asynchronous background read repair leaves a window where consecutive reads see `v2` then `v1` (non-monotonic reads). To preserve `R + W > N` invariants under node failures and restarts while keeping p99 reads `< 12 ms`: **Disable Sloppy Quorums for Strong Paths**: Enforce strict canonical `W=2`.\n\n**Failure Modes & Application:** Production Dynamo-inspired databases expose tunable consistency per operation: **Apache Cassandra / ScyllaDB**: `LOCAL_QUORUM` with `hinted_handoff` disabled from quorum counts and blocking read repair.",
+      "spark": {
+        "summary": "Even with `R + W > N` (`N=3, W=2, R=2`), partial replica degradation, sloppy quorums, or un-synchronized node restarts allow a read quorum to intersect only stale replicas and return outdated values.",
+        "keyTakeaway": "Strict `R + W > N` only guarantees overlap when replica membership is static and durable; production quorum stores require disabling sloppy quorum for strong reads, monotonic/read-your-writes tokens, and epoch-gated replica recovery."
+      },
+      "summary": "Even with `R + W > N` (`N=3, W=2, R=2`), partial replica degradation, sloppy quorums, or un-synchronized node restarts allow a read quorum to intersect only stale replicas and return outdated values.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, strict `R + W > N` only guarantees overlap when replica membership is static and durable; production quorum stores require disabling sloppy quorum for strong reads, monotonic/read-your-writes tokens, and epoch-gated replica recovery."
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** Even with `R + W > N` (`N=3, W=2, R=2`), partial replica degradation, sloppy quorums, or un-synchronized node restarts allow a read quorum to intersect only stale replicas and return outdated values.\n\n**Production Trade-Offs:** Relying on asynchronous background read repair leaves a window where consecutive reads see `v2` then `v1` (non-monotonic reads).\n\n**Failure Modes & Edge Cases:** Production Dynamo-inspired databases expose tunable consistency per operation: **Apache Cassandra / ScyllaDB**: `LOCAL_QUORUM` with `hinted_handoff` disabled from quorum counts and blocking read repair.\n\n**Principal Takeaway:** Strict `R + W > N` only guarantees overlap when replica membership is static and durable; production quorum stores require disabling sloppy quorum for strong reads, monotonic/read-your-writes tokens, and epoch-gated replica recovery.",
+      "spark": {
+        "summary": "Even with `R + W > N` (`N=3, W=2, R=2`), partial replica degradation, sloppy quorums, or un-synchronized node restarts allow a read quorum to intersect only stale replicas and return outdated values.",
+        "keyTakeaway": "Strict `R + W > N` only guarantees overlap when replica membership is static and durable; production quorum stores require disabling sloppy quorum for strong reads, monotonic/read-your-writes tokens, and epoch-gated replica recovery."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why R + W > N does not automatically guarantee strong consistency",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why R + W > N does not automatically guarantee strong consistency works from first principles.",
+          "explanation": "In a Dynamo-style replicated store with `N=3`, `W=2`, and `R=2` (`R + W = 4 > 3`), textbook math says every read quorum overlaps the write quorum by at least one replica. Yet in production (40k reads/s, 5k writes/s across 3 AZs), sloppy quorums, volatile memtables, or snapshot restores can leave only **one** canonical replica holding `v2`—allowing `{R2, R3}` to return stale `v1`.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "How sloppy quorums and un-synced restarts cause stale reads",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without How sloppy quorums and un-synced restarts cause stale reads under real concurrency or scale.",
+          "explanation": "Two subtle failure modes break quorum overlap in production:\n\n1. **Sloppy Quorum & Hinted Handoff**: When `R3` has 45% packet loss, a coordinator writes `v2` to `R1` + hinted node `R4`. Only 1 canonical replica (`R1`) has `v2`; a subsequent `R=2` read hitting `{R2, R3}` returns `v1`.\n2. **Snapshot / Volatile-Loss Reboot**: If `R2` reboots with an older EBS snapshot or unflushed memtable and rejoins `R=2` immediately, `{R2, R3}` again misses `v2`.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Quorum Overlap Violation",
+            "title": "Sloppy Quorum Write Leaves Canonical Read Quorum Stale",
+            "actors": [
+              {
+                "id": "cli",
+                "label": "Client"
+              },
+              {
+                "id": "coord",
+                "label": "Coordinator"
+              },
+              {
+                "id": "r1",
+                "label": "R1 (Canon)"
+              },
+              {
+                "id": "r4",
+                "label": "R4 (Hinted)"
+              },
+              {
+                "id": "r23",
+                "label": "R2 & R3 (v1)"
+              }
+            ],
+            "events": [
+              {
+                "from": "cli",
+                "to": "coord",
+                "label": "Write key=flag val=v2 (W=2)",
+                "status": "ok"
+              },
+              {
+                "from": "coord",
+                "to": "r1",
+                "label": "Write v2 -> ACK (1/2)",
+                "status": "ok"
+              },
+              {
+                "from": "coord",
+                "to": "r4",
+                "label": "R2/R3 slow -> Hinted R4 (2/2)",
+                "status": "warn"
+              },
+              {
+                "from": "cli",
+                "to": "coord",
+                "label": "Read key=flag (R=2)",
+                "status": "ok"
+              },
+              {
+                "from": "coord",
+                "to": "r23",
+                "label": "Reads R2+R3 -> returns stale v1!",
+                "status": "fail"
+              }
+            ],
+            "summary": "Because hinted node R4 is outside the canonical N=3 set, reading {R2, R3} satisfies R=2 without intersecting R1."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Why async read repair and buffered WALs still violate linearizability",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "The problem: see what breaks without Why async read repair and buffered WALs still violate linearizability under real concurrency or scale.",
+          "explanation": "Relying on asynchronous background read repair leaves a window where consecutive reads see `v2` then `v1` (non-monotonic reads). Likewise, acknowledging writes before `fsync()` on the WAL means a node reboot wipes `v2` after the client already received `200 OK`.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Strict Quorums, Sync Read Repair, and Epoch Gating",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "To preserve `R + W > N` invariants under node failures and restarts while keeping p99 reads `< 12 ms`:\n\n- **Disable Sloppy Quorums for Strong Paths**: Enforce strict canonical `W=2` (`LOCAL_QUORUM` / `QUORUM`) so writes never count hinted nodes toward `W`.\n- **Synchronous Digest Read Repair**: Query 1 full data replica + `R-1` hash digests; if hashes mismatch, fetch the highest `(timestamp, version)` and write it back synchronously to stale responders before returning.\n- **Durable `fsync` + Bootstrapping Gate**: Require WAL `fsync` before ACK, and keep snapshot-restored nodes in `JOINING` state (excluded from `R`/`W` quorums) until anti-entropy Merkle-tree sync completes.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "quorum-cluster",
+            "eyebrow": "Strict Quorum + Read Repair",
+            "title": "Canonical Quorum Intersection & Synchronous Digest Repair",
+            "nodes": [
+              {
+                "label": "Coordinator (N=3, W=2, R=2)",
+                "role": "Strict canonical set; no hints"
+              },
+              {
+                "label": "R1 (Epoch 5, v2)",
+                "role": "fsync WAL + Merkle synced"
+              },
+              {
+                "label": "R2 (Stale v1 -> Repaired)",
+                "role": "Sync write-back before ACK"
+              }
+            ],
+            "edges": [
+              {
+                "label": "R + W = 4 > 3 (Strict)"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Strict Canonical W=2",
+                "detail": "Hinted handoff may buffer asynchronously, but never counts toward strict W=2 acknowledgment."
+              },
+              {
+                "label": "Digest + Sync Repair",
+                "detail": "Compare version digests across R replicas; block and repair stale nodes before returning to caller."
+              },
+              {
+                "label": "Epoch-Gated Recovery",
+                "detail": "Rebooted or snapshot-restored replicas stream missed mutations before rejoining R/W quorums."
+              }
+            ],
+            "summary": "Combining strict canonical quorums, WAL fsync, and synchronous read repair guarantees linearizable / RYOW reads."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where quorum tuning is used in real distributed stores",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Production Dynamo-inspired databases expose tunable consistency per operation:\n\n- **Apache Cassandra / ScyllaDB**: `LOCAL_QUORUM` with `hinted_handoff` disabled from quorum counts and blocking read repair.\n- **Amazon DynamoDB**: `ConsistentRead=true` routes to the Raft/Paxos leader quorum rather than eventually consistent replicas.\n- **Feature-Flag & Session Stores**: Use `W=2, R=2` (`N=3`) for flag mutations and `W=1` only for non-critical telemetry.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Strict `R + W > N` only guarantees overlap when replica membership is static and durable; production quorum stores require disabling sloppy quorum for strong reads, monotonic/read-your-writes tokens, and epoch-gated replica recovery.",
+      "summary": "Even with `R + W > N` (`N=3, W=2, R=2`), partial replica degradation, sloppy quorums, or un-synchronized node restarts allow a read quorum to intersect only stale replicas and return outdated values.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, strict `R + W > N` only guarantees overlap when replica membership is static and durable; production quorum stores require disabling sloppy quorum for strong reads, monotonic/read-your-writes tokens, and epoch-gated replica recovery."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "simulation": {
+    "title": "Quorum Consistency & Stale Reads in Replicated Stores — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "tx",
+        "label": "Client Tx",
+        "role": "Snapshot Read/Write"
+      },
+      {
+        "id": "plan",
+        "label": "Query Planner",
+        "role": "Index & Lock Order"
+      },
+      {
+        "id": "wal",
+        "label": "WAL Buffer",
+        "role": "Group Commit"
+      },
+      {
+        "id": "disk",
+        "label": "Storage Pages",
+        "role": "MVCC / Vacuum"
+      }
+    ],
+    "edges": [
+      {
+        "from": "tx",
+        "to": "plan",
+        "label": "SQL query"
+      },
+      {
+        "from": "plan",
+        "to": "wal",
+        "label": "append redo"
+      },
+      {
+        "from": "wal",
+        "to": "disk",
+        "label": "checkpoint flush"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why R + W > N does not automatically guarantee strong consistency",
+        "actionLabel": "SQL query",
+        "status": "healthy",
+        "activeNodeIds": [
+          "tx",
+          "plan"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "SQL query",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Client Tx sends work to Query Planner (Why R + W > N does not automatically guarantee strong consistency)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "How sloppy quorums and un-synced restarts cause stale reads",
+        "actionLabel": "append redo",
+        "status": "healthy",
+        "activeNodeIds": [
+          "plan",
+          "wal"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "append redo",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Query Planner coordinates with WAL Buffer while preserving the core invariant (How sloppy quorums and un-synced restarts cause stale reads)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Why async read repair and buffered WALs still violate linearizability",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "wal",
+          "disk"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, Storage Pages absorbs pressure without cascading (Why async read repair and buffered WALs still violate linearizability)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Where quorum tuning is used in real distributed stores",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "tx",
+          "plan",
+          "wal",
+          "disk"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Where quorum tuning is used in real distributed stores)."
+      }
+    ]
+  }
+}

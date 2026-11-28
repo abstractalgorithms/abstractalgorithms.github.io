@@ -1,0 +1,589 @@
+{
+  "id": "colpali-late-interaction-multimodal-retrieval",
+  "slug": "colpali-late-interaction-multimodal-retrieval",
+  "title": "ColPali Late-Interaction & Joint-Embedding Multimodal Retrieval",
+  "domain": "ai-machine-learning",
+  "spark": {
+    "summary": "ColPali late-interaction retrieval and SigLIP joint-embedding spaces pair sub-30 ms billion-scale candidate recall with fine-grained 1,024-patch MaxSim scoring for dense OCR, charts, and cross-modal search.",
+    "keyTakeaway": "Use single-vector SigLIP (SQ8/PQ64) for sub-30 ms billion-scale recall, fuse modalities strictly by rank (RRF k=60), and reserve 2-bit ColPali MaxSim exclusively for top-200 reranking.",
+    "byteSummary": "Single-vector bi-encoders like CLIP and SigLIP map images and text onto a shared 768-d unit hypersphere, enabling sub-10 ms HNSW retrieval across hundreds of millions of assets. However, pooling an entire document page or complex video frame into one 768-d vector destroys spatial coordinates, dense table structure, and small OCR text.\n\nColPali solves this bottleneck via late-interaction multi-vector retrieval: a Vision-Language Model encodes each visual asset into a 32x32 grid of 1,024 contextualized 128-d patch vectors, quantized to 2-bit codes on NVMe mmap. At query time, fast single-vector SigLIP + DiskANN/HNSW + BM25 scatter-gather feeds Reciprocal Rank Fusion (RRF k=60) to select a unified top-200 pool, which is then reranked by exact AVX-512 MaxSim scoring in 42 ms p95.\n\nIn production, cross-modal alignment requires Platt z-score calibration to neutralize the modality gap, click-skip hard-negative mining, 18 ms hedged replica reads to survive 48-shard tail-at-scale amplification, and circuit breakers that fall back to RRF top-20 during GPU/CPU spikes."
+  },
+  "learningJourney": [
+    {
+      "stage": 1,
+      "level": "foundation",
+      "id": "contrastive-joint-spaces",
+      "title": "Contrastive Joint-Embedding Spaces (CLIP vs. SigLIP)",
+      "purpose": "Understand why single-vector bi-encoders align modalities on a unit hypersphere and how SigLIP removes global Softmax bottlenecks.",
+      "explanation": "CLIP trains image and text encoders jointly using InfoNCE Softmax across a global batch, forcing expensive cross-GPU All-Gather synchronization. SigLIP replaces Softmax with a pairwise Sigmoid binary cross-entropy loss using learnable temperature t and scalar bias b, decoupling batch size from normalization and improving zero-shot cross-modal alignment.",
+      "assumptions": [
+        "Corpus: 100M images, 50M videos (750M keyframes), 500M texts; 15,000 QPS sustained.",
+        "Latency SLO: p95 < 200 ms end-to-end across 48 vector shards."
+      ],
+      "codeExample": {
+        "language": "python",
+        "title": "Stage 1: Bounded Execution Contract",
+        "code": "async def search_multimodal(query_vec_768, query_patches_32x128, timeout_ms=180):\n    try:\n        # 1. Parallel 48-shard scatter-gather with 18ms replica hedging\n        hnsw_hits, diskann_hits, bm25_hits = await scatter_with_hedge(\n            query_vec_768, hedge_after_ms=18, budget_ms=45\n        )\n        # 2. Rank-only Reciprocal Rank Fusion (k=60) -> top-200\n        candidates = reciprocal_rank_fusion([hnsw_hits, diskann_hits, bm25_hits], k=60, limit=200)\n        # 3. Circuit-broken ColPali MaxSim reranking\n        if maxsim_circuit_breaker.allow():\n            reranked = await avx512_maxsim_rerank(query_patches_32x128, candidates, timeout_ms=65)\n            return temporal_collapse_video(reranked, window_sec=5)[:20]\n        return temporal_collapse_video(candidates, window_sec=5)[:20]\n    except TimeoutError:\n        return fallback_rrf_top_k(candidates, k=20)"
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 1 \u2022 Foundation",
+        "title": "Contrastive Joint-Embedding Spaces (CLIP vs. SigLIP)",
+        "nodes": [
+          {
+            "id": "siglip-img",
+            "label": "SigLIP ViT Tower",
+            "sub": "768-d L2-norm vector",
+            "role": "encoder"
+          },
+          {
+            "id": "siglip-txt",
+            "label": "SigLIP Text Tower",
+            "sub": "768-d L2-norm vector",
+            "role": "encoder"
+          },
+          {
+            "id": "sigmoid-loss",
+            "label": "Pairwise Sigmoid Loss",
+            "sub": "t*(x.y)+b, no All-Gather",
+            "role": "loss"
+          }
+        ],
+        "edges": [
+          {
+            "from": "siglip-img",
+            "to": "sigmoid-loss",
+            "label": "emits unit vector"
+          },
+          {
+            "from": "siglip-txt",
+            "to": "sigmoid-loss",
+            "label": "emits unit vector"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Decoupled Batching",
+            "detail": "Pairwise logistic loss eliminates global Softmax synchronization across GPU nodes."
+          },
+          {
+            "label": "Modality Gap",
+            "detail": "Image-to-image cosine (~0.68) exceeds text-to-image (~0.29), requiring z-score calibration."
+          }
+        ],
+        "summary": "SigLIP aligns image and text embeddings via pairwise sigmoid loss on the unit hypersphere.",
+        "caption": "SigLIP dual-encoder alignment with pairwise sigmoid loss."
+      }
+    },
+    {
+      "stage": 2,
+      "level": "foundation",
+      "id": "single-vector-bottleneck",
+      "title": "The Single-Vector Information Bottleneck",
+      "purpose": "Diagnose why compressing dense documents, charts, and small OCR text into one 768-d vector destroys spatial recall.",
+      "explanation": "A single 768-d float vector holds at most 3 KB of representational capacity. When indexing a financial PDF, product spec sheet, or video frame with small UI labels, global average pooling blurs fine-grained token-to-region correspondences. Queries for exact part numbers or chart axes suffer severe recall collapse.",
+      "assumptions": [
+        "Corpus: 100M images, 50M videos (750M keyframes), 500M texts; 15,000 QPS sustained.",
+        "Latency SLO: p95 < 200 ms end-to-end across 48 vector shards."
+      ],
+      "codeExample": {
+        "language": "python",
+        "title": "Stage 2: Bounded Execution Contract",
+        "code": "async def search_multimodal(query_vec_768, query_patches_32x128, timeout_ms=180):\n    try:\n        # 1. Parallel 48-shard scatter-gather with 18ms replica hedging\n        hnsw_hits, diskann_hits, bm25_hits = await scatter_with_hedge(\n            query_vec_768, hedge_after_ms=18, budget_ms=45\n        )\n        # 2. Rank-only Reciprocal Rank Fusion (k=60) -> top-200\n        candidates = reciprocal_rank_fusion([hnsw_hits, diskann_hits, bm25_hits], k=60, limit=200)\n        # 3. Circuit-broken ColPali MaxSim reranking\n        if maxsim_circuit_breaker.allow():\n            reranked = await avx512_maxsim_rerank(query_patches_32x128, candidates, timeout_ms=65)\n            return temporal_collapse_video(reranked, window_sec=5)[:20]\n        return temporal_collapse_video(candidates, window_sec=5)[:20]\n    except TimeoutError:\n        return fallback_rrf_top_k(candidates, k=20)"
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 2 \u2022 Foundation",
+        "title": "The Single-Vector Information Bottleneck",
+        "nodes": [
+          {
+            "id": "dense-page",
+            "label": "Rich Visual / Chart",
+            "sub": "Dense OCR + layout",
+            "role": "input"
+          },
+          {
+            "id": "mean-pool",
+            "label": "Global Pooling",
+            "sub": "Collapses 1024 patches -> 1",
+            "role": "bottleneck"
+          },
+          {
+            "id": "ocr-loss",
+            "label": "OCR & Spatial Loss",
+            "sub": "Fails exact-region match",
+            "role": "failure"
+          }
+        ],
+        "edges": [
+          {
+            "from": "dense-page",
+            "to": "mean-pool",
+            "label": "pools spatial grid"
+          },
+          {
+            "from": "mean-pool",
+            "to": "ocr-loss",
+            "label": "loses local detail"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Information Bottleneck",
+            "detail": "1,024 visual patches compressed into 1 vector lose spatial coordinate grounding."
+          },
+          {
+            "label": "Fallback Need",
+            "detail": "Dense OCR and table queries require patch-level late interaction or lexical BM25."
+          }
+        ],
+        "summary": "Global pooling crushes spatial layout and dense OCR signals into a single vector.",
+        "caption": "Single-vector pooling bottleneck on dense visual pages."
+      }
+    },
+    {
+      "stage": 3,
+      "level": "intermediate",
+      "id": "colpali-patch-tokenization",
+      "title": "ColPali Multi-Vector Visual Patch Tokenization",
+      "purpose": "Encode images and document pages as a 32x32 grid of 1,024 contextualized 128-d patch vectors.",
+      "explanation": "Instead of pooling to one vector, ColPali passes a document or keyframe through a Vision-Language Model (PaliGemma) and projects each spatial patch to a 128-d embedding. Each asset becomes a 1024 x 128-d matrix preserving local OCR, chart bars, and object boundaries.",
+      "assumptions": [
+        "Corpus: 100M images, 50M videos (750M keyframes), 500M texts; 15,000 QPS sustained.",
+        "Latency SLO: p95 < 200 ms end-to-end across 48 vector shards."
+      ],
+      "codeExample": {
+        "language": "python",
+        "title": "Stage 3: Bounded Execution Contract",
+        "code": "async def search_multimodal(query_vec_768, query_patches_32x128, timeout_ms=180):\n    try:\n        # 1. Parallel 48-shard scatter-gather with 18ms replica hedging\n        hnsw_hits, diskann_hits, bm25_hits = await scatter_with_hedge(\n            query_vec_768, hedge_after_ms=18, budget_ms=45\n        )\n        # 2. Rank-only Reciprocal Rank Fusion (k=60) -> top-200\n        candidates = reciprocal_rank_fusion([hnsw_hits, diskann_hits, bm25_hits], k=60, limit=200)\n        # 3. Circuit-broken ColPali MaxSim reranking\n        if maxsim_circuit_breaker.allow():\n            reranked = await avx512_maxsim_rerank(query_patches_32x128, candidates, timeout_ms=65)\n            return temporal_collapse_video(reranked, window_sec=5)[:20]\n        return temporal_collapse_video(candidates, window_sec=5)[:20]\n    except TimeoutError:\n        return fallback_rrf_top_k(candidates, k=20)"
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 3 \u2022 Intermediate",
+        "title": "ColPali Multi-Vector Visual Patch Tokenization",
+        "nodes": [
+          {
+            "id": "vlm-grid",
+            "label": "32x32 Patch Grid",
+            "sub": "1,024 visual regions",
+            "role": "tokenizer"
+          },
+          {
+            "id": "proj-128",
+            "label": "Linear Projection",
+            "sub": "1024 x 128-d vectors",
+            "role": "projector"
+          },
+          {
+            "id": "nvme-mmap",
+            "label": "2-Bit Patch Store",
+            "sub": "32 B/patch on NVMe mmap",
+            "role": "storage"
+          }
+        ],
+        "edges": [
+          {
+            "from": "vlm-grid",
+            "to": "proj-128",
+            "label": "extracts patch tokens"
+          },
+          {
+            "from": "proj-128",
+            "to": "nvme-mmap",
+            "label": "quantizes to 2-bit"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Spatial Preservation",
+            "detail": "Each 128-d vector represents a localized 1/1024th visual region with VLM context."
+          },
+          {
+            "label": "2-Bit Compression",
+            "detail": "2-bit quantization shrinks 1024 patches from 256 KB (FP16) to 32 KB on NVMe."
+          }
+        ],
+        "summary": "ColPali preserves fine-grained visual regions via 1,024 contextualized 128-d patch vectors.",
+        "caption": "ColPali 32x32 patch tokenization and 2-bit NVMe storage."
+      }
+    },
+    {
+      "stage": 4,
+      "level": "intermediate",
+      "id": "maxsim-late-interaction",
+      "title": "Late-Interaction MaxSim Scoring Operator",
+      "purpose": "Compute exact token-to-patch alignment S(Q,D) = Sum_i max_j(q_i . d_j) without cross-encoder latency.",
+      "explanation": "At query time, each query token vector q_i computes its dot product against all 1,024 document patch vectors d_j, takes the maximum similarity per query token, and sums across all N_q=32 query tokens. Using AVX-512 VPDPBUSD or GPU INT4 kernels over 2-bit patches keeps top-200 reranking under 42 ms p95.",
+      "assumptions": [
+        "Corpus: 100M images, 50M videos (750M keyframes), 500M texts; 15,000 QPS sustained.",
+        "Latency SLO: p95 < 200 ms end-to-end across 48 vector shards."
+      ],
+      "codeExample": {
+        "language": "python",
+        "title": "Stage 4: Bounded Execution Contract",
+        "code": "async def search_multimodal(query_vec_768, query_patches_32x128, timeout_ms=180):\n    try:\n        # 1. Parallel 48-shard scatter-gather with 18ms replica hedging\n        hnsw_hits, diskann_hits, bm25_hits = await scatter_with_hedge(\n            query_vec_768, hedge_after_ms=18, budget_ms=45\n        )\n        # 2. Rank-only Reciprocal Rank Fusion (k=60) -> top-200\n        candidates = reciprocal_rank_fusion([hnsw_hits, diskann_hits, bm25_hits], k=60, limit=200)\n        # 3. Circuit-broken ColPali MaxSim reranking\n        if maxsim_circuit_breaker.allow():\n            reranked = await avx512_maxsim_rerank(query_patches_32x128, candidates, timeout_ms=65)\n            return temporal_collapse_video(reranked, window_sec=5)[:20]\n        return temporal_collapse_video(candidates, window_sec=5)[:20]\n    except TimeoutError:\n        return fallback_rrf_top_k(candidates, k=20)"
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 4 \u2022 Intermediate",
+        "title": "Late-Interaction MaxSim Scoring Operator",
+        "nodes": [
+          {
+            "id": "q-tokens",
+            "label": "Query Tokens (Q)",
+            "sub": "32 x 128-d vectors",
+            "role": "query"
+          },
+          {
+            "id": "maxsim-alu",
+            "label": "AVX-512 MaxSim Kernel",
+            "sub": "Sum_i max_j (q_i . d_j)",
+            "role": "compute"
+          },
+          {
+            "id": "rerank-top",
+            "label": "Reranked Top-20",
+            "sub": "42 ms p95 for top-200",
+            "role": "output"
+          }
+        ],
+        "edges": [
+          {
+            "from": "q-tokens",
+            "to": "maxsim-alu",
+            "label": "streams 32 tokens"
+          },
+          {
+            "from": "maxsim-alu",
+            "to": "rerank-top",
+            "label": "scores top-200 pool"
+          }
+        ],
+        "cards": [
+          {
+            "label": "FLOPs Budget",
+            "detail": "2 * 32 * 1024 * 128 = 8.39M FLOPs per candidate; 2-bit LUT cuts bandwidth 8x."
+          },
+          {
+            "label": "Two-Stage Gate",
+            "detail": "Never run MaxSim over 1B items; gate behind fast SigLIP + RRF candidate recall."
+          }
+        ],
+        "summary": "MaxSim aligns each query token to its best-matching visual patch in 42 ms p95.",
+        "caption": "ColPali MaxSim late-interaction scoring pipeline."
+      }
+    },
+    {
+      "stage": 5,
+      "level": "intermediate",
+      "id": "multi-index-rrf-fusion",
+      "title": "Multi-Index Reciprocal Rank Fusion (RRF)",
+      "purpose": "Merge heterogeneous HNSW, DiskANN, and BM25 candidate lists without cross-modal score calibration skew.",
+      "explanation": "Because image-to-image cosine scores (~0.68) are systematically higher than text-to-image (~0.29) and unbounded BM25 scores, naive linear score addition biases results. RRF (k=60) scores each item strictly by 1 / (60 + rank_m) across modalities, producing a balanced top-200 rerank pool in 4 ms.",
+      "assumptions": [
+        "Corpus: 100M images, 50M videos (750M keyframes), 500M texts; 15,000 QPS sustained.",
+        "Latency SLO: p95 < 200 ms end-to-end across 48 vector shards."
+      ],
+      "codeExample": {
+        "language": "python",
+        "title": "Stage 5: Bounded Execution Contract",
+        "code": "async def search_multimodal(query_vec_768, query_patches_32x128, timeout_ms=180):\n    try:\n        # 1. Parallel 48-shard scatter-gather with 18ms replica hedging\n        hnsw_hits, diskann_hits, bm25_hits = await scatter_with_hedge(\n            query_vec_768, hedge_after_ms=18, budget_ms=45\n        )\n        # 2. Rank-only Reciprocal Rank Fusion (k=60) -> top-200\n        candidates = reciprocal_rank_fusion([hnsw_hits, diskann_hits, bm25_hits], k=60, limit=200)\n        # 3. Circuit-broken ColPali MaxSim reranking\n        if maxsim_circuit_breaker.allow():\n            reranked = await avx512_maxsim_rerank(query_patches_32x128, candidates, timeout_ms=65)\n            return temporal_collapse_video(reranked, window_sec=5)[:20]\n        return temporal_collapse_video(candidates, window_sec=5)[:20]\n    except TimeoutError:\n        return fallback_rrf_top_k(candidates, k=20)"
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 5 \u2022 Intermediate",
+        "title": "Multi-Index Reciprocal Rank Fusion (RRF)",
+        "nodes": [
+          {
+            "id": "hnsw-list",
+            "label": "HNSW Image/Text Top-500",
+            "sub": "DRAM SQ8 <8ms",
+            "role": "index"
+          },
+          {
+            "id": "diskann-list",
+            "label": "DiskANN Video Top-500",
+            "sub": "NVMe PQ64 <22ms",
+            "role": "index"
+          },
+          {
+            "id": "rrf-merger",
+            "label": "RRF Merger (k=60)",
+            "sub": "Rank-only top-200 pool",
+            "role": "fusion"
+          }
+        ],
+        "edges": [
+          {
+            "from": "hnsw-list",
+            "to": "rrf-merger",
+            "label": "feeds ranks 1..500"
+          },
+          {
+            "from": "diskann-list",
+            "to": "rrf-merger",
+            "label": "feeds ranks 1..500"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Scale Invariance",
+            "detail": "Rank-based fusion is completely immune to modality-specific cosine calibration drift."
+          },
+          {
+            "label": "4 ms Overhead",
+            "detail": "Hash-map rank accumulation over 1,500 IDs executes in under 4 ms on coordinator CPU."
+          }
+        ],
+        "summary": "RRF (k=60) neutralizes cross-modal score skew by fusing candidate lists strictly by rank.",
+        "caption": "Multi-index RRF fusion across HNSW, DiskANN, and BM25."
+      }
+    },
+    {
+      "stage": 6,
+      "level": "advanced",
+      "id": "modality-gap-calibration",
+      "title": "Modality Gap Calibration & Hard-Negative Mining",
+      "purpose": "Sharpen contrastive decision boundaries using click-skip logs and adversarial OCR distractors.",
+      "explanation": "Production query logs reveal false positives where SigLIP matches surface texture but misses negation or small text. Mining top-K click-skip pairs and adversarial OCR distractors into periodic contrastive fine-tuning closes the modality gap while Platt z-score normalization stabilizes hybrid thresholds.",
+      "assumptions": [
+        "Corpus: 100M images, 50M videos (750M keyframes), 500M texts; 15,000 QPS sustained.",
+        "Latency SLO: p95 < 200 ms end-to-end across 48 vector shards."
+      ],
+      "codeExample": {
+        "language": "python",
+        "title": "Stage 6: Bounded Execution Contract",
+        "code": "async def search_multimodal(query_vec_768, query_patches_32x128, timeout_ms=180):\n    try:\n        # 1. Parallel 48-shard scatter-gather with 18ms replica hedging\n        hnsw_hits, diskann_hits, bm25_hits = await scatter_with_hedge(\n            query_vec_768, hedge_after_ms=18, budget_ms=45\n        )\n        # 2. Rank-only Reciprocal Rank Fusion (k=60) -> top-200\n        candidates = reciprocal_rank_fusion([hnsw_hits, diskann_hits, bm25_hits], k=60, limit=200)\n        # 3. Circuit-broken ColPali MaxSim reranking\n        if maxsim_circuit_breaker.allow():\n            reranked = await avx512_maxsim_rerank(query_patches_32x128, candidates, timeout_ms=65)\n            return temporal_collapse_video(reranked, window_sec=5)[:20]\n        return temporal_collapse_video(candidates, window_sec=5)[:20]\n    except TimeoutError:\n        return fallback_rrf_top_k(candidates, k=20)"
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 6 \u2022 Advanced",
+        "title": "Modality Gap Calibration & Hard-Negative Mining",
+        "nodes": [
+          {
+            "id": "click-logs",
+            "label": "Click-Skip Telemetry",
+            "sub": "High-sim false positives",
+            "role": "telemetry"
+          },
+          {
+            "id": "hard-miner",
+            "label": "Hard-Negative Miner",
+            "sub": "Adversarial OCR pairs",
+            "role": "trainer"
+          },
+          {
+            "id": "shadow-gate",
+            "label": "Shadow Recall@10 Gate",
+            "sub": "Blocks >0.03 cosine drift",
+            "role": "governance"
+          }
+        ],
+        "edges": [
+          {
+            "from": "click-logs",
+            "to": "hard-miner",
+            "label": "extracts false positives"
+          },
+          {
+            "from": "hard-miner",
+            "to": "shadow-gate",
+            "label": "validates new weights"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Drift Guardrail",
+            "detail": "Blue/green index swaps abort automatically if cosine centroid shift exceeds 0.03."
+          },
+          {
+            "label": "Temperature Tuning",
+            "detail": "Learnable temperature t and bias b prevent gradient collapse on hard negatives."
+          }
+        ],
+        "summary": "Hard-negative mining and shadow Recall@10 gates prevent silent embedding drift.",
+        "caption": "Cross-modal alignment calibration and drift governance."
+      }
+    },
+    {
+      "stage": 7,
+      "level": "advanced",
+      "id": "circuit-breakers-tail-latency",
+      "title": "Tail-at-Scale Hedging & MaxSim Circuit Breakers",
+      "purpose": "Protect the 200 ms p95 SLA across 48-shard fan-outs and GPU reranker saturation.",
+      "explanation": "Fanning out to 48 vector shards turns a 1% per-shard stall into a 38.3% query-level p99 failure. Hedged replica reads triggered at 18 ms eliminate stragglers, while a MaxSim circuit breaker sheds late-interaction reranking above queue depth 600 to serve RRF top-20 results in 44 ms.",
+      "assumptions": [
+        "Corpus: 100M images, 50M videos (750M keyframes), 500M texts; 15,000 QPS sustained.",
+        "Latency SLO: p95 < 200 ms end-to-end across 48 vector shards."
+      ],
+      "codeExample": {
+        "language": "python",
+        "title": "Stage 7: Bounded Execution Contract",
+        "code": "async def search_multimodal(query_vec_768, query_patches_32x128, timeout_ms=180):\n    try:\n        # 1. Parallel 48-shard scatter-gather with 18ms replica hedging\n        hnsw_hits, diskann_hits, bm25_hits = await scatter_with_hedge(\n            query_vec_768, hedge_after_ms=18, budget_ms=45\n        )\n        # 2. Rank-only Reciprocal Rank Fusion (k=60) -> top-200\n        candidates = reciprocal_rank_fusion([hnsw_hits, diskann_hits, bm25_hits], k=60, limit=200)\n        # 3. Circuit-broken ColPali MaxSim reranking\n        if maxsim_circuit_breaker.allow():\n            reranked = await avx512_maxsim_rerank(query_patches_32x128, candidates, timeout_ms=65)\n            return temporal_collapse_video(reranked, window_sec=5)[:20]\n        return temporal_collapse_video(candidates, window_sec=5)[:20]\n    except TimeoutError:\n        return fallback_rrf_top_k(candidates, k=20)"
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 7 \u2022 Advanced",
+        "title": "Tail-at-Scale Hedging & MaxSim Circuit Breakers",
+        "nodes": [
+          {
+            "id": "hedge-timer",
+            "label": "18 ms Hedge Timer",
+            "sub": "Replica read on straggler",
+            "role": "resilience"
+          },
+          {
+            "id": "cb-maxsim",
+            "label": "MaxSim Circuit Breaker",
+            "sub": "Trips at queue > 600",
+            "role": "resilience"
+          },
+          {
+            "id": "rrf-fallback",
+            "label": "RRF Top-20 Fallback",
+            "sub": "44 ms degraded SLA",
+            "role": "output"
+          }
+        ],
+        "edges": [
+          {
+            "from": "hedge-timer",
+            "to": "cb-maxsim",
+            "label": "bounds ANN p95 <28ms"
+          },
+          {
+            "from": "cb-maxsim",
+            "to": "rrf-fallback",
+            "label": "sheds load on spike"
+          }
+        ],
+        "cards": [
+          {
+            "label": "38.3% Tail Math",
+            "detail": "1 - (0.99)^48 = 38.3% probability of hitting a slow shard without replica hedging."
+          },
+          {
+            "label": "Graceful Degradation",
+            "detail": "Bypassing MaxSim preserves availability at 92% -> 86% Recall@10 during traffic surges."
+          }
+        ],
+        "summary": "Hedged 18 ms shard reads and MaxSim circuit breakers guarantee sub-200 ms p95 availability.",
+        "caption": "Tail-at-scale replica hedging and MaxSim circuit breaking."
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-1",
+        "question": "Why does Reciprocal Rank Fusion (RRF, k=60) outperform naive weighted cosine averaging when merging HNSW image hits, DiskANN video hits, and BM25 text hits?",
+        "options": [
+          {
+            "id": "a",
+            "text": "RRF requires fewer CPU instructions than floating-point addition.",
+            "correct": false,
+            "feedback": "Compute cost is negligible; the core issue is score scale calibration."
+          },
+          {
+            "id": "b",
+            "text": "Intra-modal and cross-modal cosine distributions have different means and variances (modality gap), so rank-only fusion eliminates calibration skew.",
+            "correct": true,
+            "feedback": "Correct! Image-to-image cosine scores (~0.68) systematically outrank text-to-image (~0.29) and unbounded BM25 scores."
+          },
+          {
+            "id": "c",
+            "text": "RRF automatically compresses 768-d vectors into 64-byte PQ codes.",
+            "correct": false,
+            "feedback": "RRF operates on candidate rank lists, not vector quantization."
+          },
+          {
+            "id": "d",
+            "text": "RRF eliminates the need for an HNSW index on text documents.",
+            "correct": false,
+            "feedback": "RRF merges candidate lists produced by HNSW, DiskANN, and BM25."
+          }
+        ],
+        "explanation": "Due to the contrastive modality gap, raw similarity scores across modalities are non-comparable; RRF (k=60) fuses strictly by rank."
+      },
+      {
+        "id": "kc-2",
+        "question": "How does ColPali preserve fine-grained OCR text and chart layout recall without incurring full VLM cross-encoder latency at 15,000 QPS?",
+        "options": [
+          {
+            "id": "a",
+            "text": "It precomputes 1,024 128-d visual patch vectors per asset offline and executes fast 2-bit quantized MaxSim over only the RRF top-200 candidates.",
+            "correct": true,
+            "feedback": "Correct! Late-interaction decouples heavy VLM encoding (offline) from lightweight MaxSim dot-product summation (42 ms p95)."
+          },
+          {
+            "id": "b",
+            "text": "It runs a full PaliGemma cross-encoder on all 1.35B assets per query.",
+            "correct": false,
+            "feedback": "Cross-encoding 1.35B items per query is physically impossible within 200 ms."
+          },
+          {
+            "id": "c",
+            "text": "It averages all 1,024 patches into a single 128-d vector.",
+            "correct": false,
+            "feedback": "Averaging destroys spatial layout and OCR fidelity."
+          },
+          {
+            "id": "d",
+            "text": "It converts every image into plain ASCII text using Tesseract only.",
+            "correct": false,
+            "feedback": "ColPali retains visual layout, charts, and non-textual cues alongside OCR."
+          }
+        ],
+        "explanation": "ColPali late-interaction precomputes 32x32 patch vectors offline and runs 2-bit MaxSim on the top-200 RRF pool."
+      },
+      {
+        "id": "kc-3",
+        "question": "When fanning out a query to 48 vector shards (each with 99% p99 SLA), what happens without hedged replica reads?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Overall query p99 remains 99% because shards run in parallel.",
+            "correct": false,
+            "feedback": "Parallel fan-out multiplies tail probability: 1 - 0.99^48 = 38.3%."
+          },
+          {
+            "id": "b",
+            "text": "The ColPali reranker automatically retries slow shards.",
+            "correct": false,
+            "feedback": "Reranking happens after scatter-gather completes."
+          },
+          {
+            "id": "c",
+            "text": "Approximately 38.3% of queries hit at least one slow shard, violating the 200 ms p95 SLO.",
+            "correct": true,
+            "feedback": "Correct! Tail-at-scale math (1 - 0.99^48 = 38.3%) makes 18 ms hedged replica reads mandatory."
+          },
+          {
+            "id": "d",
+            "text": "Video keyframe chunking doubles the shard count.",
+            "correct": false,
+            "feedback": "Keyframe chunking reduces index size during ingestion."
+          }
+        ],
+        "explanation": "48-shard fan-out amplifies a 1% shard stall into a 38.3% query-level tail-latency failure unless mitigated by 18 ms hedged reads."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Combine fast single-vector search (SigLIP) with patch-level reranking (ColPali) to search images, videos, and text accurately.",
+      "keyTakeaway": "Two-stage retrieval gives you both billion-scale speed and fine-grained OCR/visual accuracy.",
+      "byteSummary": "First, SigLIP and BM25 quickly narrow 1.35 billion items down to the top 200 candidates. Second, ColPali compares query words against 1,024 image patches to pick the exact best matches in under 200 ms."
+    },
+    "intermediate": {
+      "summary": "ColPali late-interaction retrieval and SigLIP joint-embedding spaces pair sub-30 ms billion-scale candidate recall with fine-grained 1,024-patch MaxSim scoring for dense OCR, charts, and cross-modal search.",
+      "keyTakeaway": "Pair HNSW (SQ8) + DiskANN (PQ64) + RRF (k=60) with 2-bit ColPali MaxSim reranking.",
+      "byteSummary": "Single-vector bi-encoders like CLIP and SigLIP map images and text onto a shared 768-d unit hypersphere, enabling sub-10 ms HNSW retrieval across hundreds of millions of assets. However, pooling an entire document page or complex video frame into one 768-d vector destroys spatial coordinates, dense table structure, and small OCR text.\n\nColPali solves this bottleneck via late-interaction multi-vector retrieval: a Vision-Language Model encodes each visual asset into a 32x32 grid of 1,024 contextualized 128-d patch vectors, quantized to 2-bit codes on NVMe mmap. At query time, fast single-vector SigLIP + DiskANN/HNSW + BM25 scatter-gather feeds Reciprocal Rank Fusion (RRF k=60) to select a unified top-200 pool, which is then reranked by exact AVX-512 MaxSim scoring in 42 ms p95.\n\nIn production, cross-modal alignment requires Platt z-score calibration to neutralize the modality gap, click-skip hard-negative mining, 18 ms hedged replica reads to survive 48-shard tail-at-scale amplification, and circuit breakers that fall back to RRF top-20 during GPU/CPU spikes."
+    },
+    "advanced": {
+      "summary": "End-to-end Principal architecture for 1.35B multimodal vectors at 15k QPS (<200 ms p95) with AVX-512 2-bit MaxSim, 18 ms hedged reads, and shadow Recall@10 drift gates.",
+      "keyTakeaway": "Bound 48-shard tail amplification (38.3% without hedging) and 25.2 PFLOPs/s MaxSim compute via 2-bit quantization and deterministic circuit breakers.",
+      "byteSummary": "Single-vector bi-encoders like CLIP and SigLIP map images and text onto a shared 768-d unit hypersphere, enabling sub-10 ms HNSW retrieval across hundreds of millions of assets. However, pooling an entire document page or complex video frame into one 768-d vector destroys spatial coordinates, dense table structure, and small OCR text.\n\nColPali solves this bottleneck via late-interaction multi-vector retrieval: a Vision-Language Model encodes each visual asset into a 32x32 grid of 1,024 contextualized 128-d patch vectors, quantized to 2-bit codes on NVMe mmap. At query time, fast single-vector SigLIP + DiskANN/HNSW + BM25 scatter-gather feeds Reciprocal Rank Fusion (RRF k=60) to select a unified top-200 pool, which is then reranked by exact AVX-512 MaxSim scoring in 42 ms p95.\n\nIn production, cross-modal alignment requires Platt z-score calibration to neutralize the modality gap, click-skip hard-negative mining, 18 ms hedged replica reads to survive 48-shard tail-at-scale amplification, and circuit breakers that fall back to RRF top-20 during GPU/CPU spikes."
+    }
+  }
+}

@@ -1,0 +1,678 @@
+{
+  "id": "kafka",
+  "slug": "kafka",
+  "title": "Apache Kafka",
+  "pedagogicalFramework": "SCOPE",
+  "spark": {
+    "summary": "Treating Apache Kafka like a traditional in-memory message queue\u2014with random key distribution, small unbatched sends, or unbounded consumer processing delays\u2014triggers partition ordering bugs, broker CPU saturation, and stop-the-world consumer group rebalance storms. Mastering Kafka requires thinking in immutable append-only commit logs, OS page-cache zero-copy (`sendfile`), ISR quorum durability (`acks=all` + `min.insync.replicas=2`), and cooperative incremental rebalancing.",
+    "keyTakeaway": "When building high-throughput event pipelines on Apache Kafka, partition strictly by business entity key, enforce `acks=all` with `min.insync.replicas=2` and idempotent producers, and bound `max.poll.interval.ms` with cooperative sticky assignors so throughput scales linearly without rebalance storms or message loss.",
+    "byteSummary": "Apache Kafka achieves millions of messages per second not by avoiding disk, but by turning writes into sequential appends on partitioned commit logs and serving consumers straight from the Linux kernel OS page cache via zero-copy `sendfile()`.\n\nUnlike RabbitMQ or SQS, Kafka does not delete records upon delivery; each consumer group tracks its own monotonic integer offset per partition, enabling deterministic replay, multi-subscriber fan-out, and event sourcing.\n\nAt production scale, stability hinges on four levers: (1) right-sizing partition counts to bound leader failover and controller metadata load, (2) eliminating consumer group rebalance storms via static membership and `CooperativeStickyAssignor`, (3) preventing split-brain data loss with `acks=all` + `min.insync.replicas=2`, and (4) routing poison-pill records to dead-letter topics without stalling partition head-of-line progress."
+  },
+  "domain": {
+    "purpose": "Design, tune, and operate durable, partitioned event-streaming backbones on Apache Kafka without data loss, rebalance storms, or hot-partition stalls.",
+    "audience": [
+      "Backend & Data Engineers",
+      "Staff/Principal Architects",
+      "Distributed Systems Interview Candidates"
+    ]
+  },
+  "prerequisites": [
+    {
+      "title": "Append-Only Partitioned Commit Log",
+      "summary": "Topics divide into ordered, immutable partitions where records receive monotonic offsets; strict ordering holds only within a single partition."
+    },
+    {
+      "title": "In-Sync Replicas (ISR) & Producer Acknowledgments",
+      "summary": "Durability requires `acks=all` paired with `min.insync.replicas=2` and `enable.idempotence=true` so leader crashes never lose committed writes or duplicate retried batches."
+    }
+  ],
+  "learningJourney": [
+    {
+      "id": "01-commit-log-and-zero-copy-physics",
+      "eyebrow": "STAGE 01 \u00b7 SHIFT IN MINDSET & STORAGE PHYSICS",
+      "title": "Why Sequential Disk + OS Page Cache Beats In-Memory Queues",
+      "level": "foundation",
+      "purpose": "Understand sequential segment writes, sparse offset indexes, and zero-copy sendfile() mechanics.",
+      "explanation": {
+        "foundation": "Traditional brokers (ActiveMQ/RabbitMQ) track per-message delivery state in B-trees and delete messages on ack\u2014causing random disk I/O and memory fragmentation when slow consumers build up multi-gigabyte backlogs. Kafka flips the model: partitions are append-only segment files (`.log` + `.index` + `.timeindex`) on disk.",
+        "core": "Sequential NVMe/disk throughput reaches hundreds of MB/s\u2014matching network NIC speeds\u2014while Linux kernel **Page Cache** keeps recent log segments in RAM without JVM heap GC overhead. When consumers read near the tail, Kafka calls `sendfile()` to transfer bytes directly from kernel page cache to the NIC socket buffer, bypassing user-space JVM copies completely.",
+        "deepDive": "**Partition Count Sizing**: Each partition is a single unit of consumer parallelism and leader I/O. However, thousands of partitions per broker inflate open file descriptors, page-cache fragmentation, and Raft/KRaft metadata replication. Target 10\u201330 MB/s per partition and cap total partitions per broker around ~2,000\u20134,000. [INSERT YOUR BENCHMARK / PROD NOTE]"
+      },
+      "sectionDiagram": {
+        "kind": "behavior-transition",
+        "eyebrow": "USER-SPACE COPY VS. ZERO-COPY SENDFILE",
+        "title": "Eliminating JVM Heap Copies on Kafka Consumer Fetch Paths",
+        "before": {
+          "label": "Traditional Broker Read Path (4 Copies)",
+          "metrics": [
+            "2 kernel/user context switches",
+            "JVM GC heap pressure",
+            "CPU-bound serialization"
+          ],
+          "steps": [
+            "Disk -> Kernel Page Cache (DMA)",
+            "Kernel -> JVM Heap Buffer (CPU copy)",
+            "JVM Heap -> Kernel Socket Buffer -> NIC"
+          ]
+        },
+        "after": {
+          "label": "Kafka Zero-Copy sendfile() (2 DMA Copies)",
+          "metrics": [
+            "Zero JVM heap allocation",
+            "Direct Page Cache -> NIC",
+            "Line-rate 10+ Gbps egress"
+          ],
+          "steps": [
+            "Producer appends sequentially to Page Cache",
+            "Consumer fetch invokes sendfile() syscall",
+            "DMA transfers segment bytes straight to NIC"
+          ]
+        }
+      }
+    },
+    {
+      "id": "02-isr-quorum-and-idempotent-producers",
+      "eyebrow": "STAGE 02 \u00b7 CORE PRIMITIVES & DURABILITY",
+      "title": "ISR Replication, High Watermark & Idempotent Producer Sequence Numbers",
+      "level": "core",
+      "purpose": "Prevent silent data loss on leader failover and eliminate duplicate records during network retries.",
+      "explanation": {
+        "foundation": "With `acks=1`, a leader writes to its local page cache and immediately acknowledges the producer. If the leader crashes before followers replicate that offset, the acknowledged message is permanently lost.",
+        "core": "Production durability requires three settings together:\n1. `acks=all` + `min.insync.replicas=2` (with `replication.factor=3`): A write commits only after the leader and at least one ISR follower persist it, advancing the **High Watermark (HW)**\u2014consumers can never read uncommitted offsets above HW.\n2. `enable.idempotence=true`: Assigns each producer a `(PID, epoch)` and monotonic per-partition sequence number so broker-side deduplication drops retried batches cleanly while preserving strict ordering (`max.in.flight.requests.per.connection <= 5`).",
+        "deepDive": "**Unclean Leader Election (`unclean.leader.election.enable=false`)**: Never enable unclean leader election on financial or state-mutation topics; promoting an out-of-sync replica truncates committed offsets above its log end and corrupts downstream consumer offsets."
+      },
+      "sectionDiagram": {
+        "kind": "quorum-cluster",
+        "eyebrow": "ISR QUORUM & HIGH WATERMARK",
+        "title": "Advancing High Watermark Only After Majority ISR Replication",
+        "nodes": [
+          {
+            "id": "prod",
+            "label": "Idempotent Producer (PID=42)",
+            "role": "acks=all, seq=109"
+          },
+          {
+            "id": "ldr",
+            "label": "Partition Leader (Broker 1)",
+            "role": "LEO=110, HW=109"
+          },
+          {
+            "id": "f1",
+            "label": "ISR Follower (Broker 2)",
+            "role": "Replicates offset 109"
+          },
+          {
+            "id": "f2",
+            "label": "Lagging Replica (Broker 3)",
+            "role": "Outside ISR (> replica.lag.time.max.ms)"
+          }
+        ],
+        "edges": [
+          {
+            "from": "prod",
+            "to": "ldr",
+            "label": "Produce batch (seq=109)"
+          },
+          {
+            "from": "ldr",
+            "to": "f1",
+            "label": "Follower fetch & ack"
+          },
+          {
+            "from": "ldr",
+            "to": "prod",
+            "label": "Ack after ISR quorum -> HW=110"
+          }
+        ],
+        "cards": [
+          {
+            "title": "Prevents Dirty Reads",
+            "body": "Consumers only see offsets <= High Watermark (HW)."
+          },
+          {
+            "title": "Zero Duplicate Retries",
+            "body": "Broker tracks last 5 sequence numbers per PID to deduplicate retries."
+          }
+        ],
+        "summary": "ISR quorums and producer sequence numbers guarantee zero committed data loss and zero retry duplicates."
+      }
+    },
+    {
+      "id": "03-consumer-groups-and-rebalancing",
+      "eyebrow": "STAGE 03 \u00b7 CONSUMER SCALING & REBALANCE STABILITY",
+      "title": "Cooperative Incremental Rebalancing & Static Group Membership",
+      "level": "core",
+      "purpose": "Eliminate stop-the-world consumer group pauses during rolling deployments and transient GC stalls.",
+      "explanation": {
+        "foundation": "Classic `Eager` rebalancing revokes **all** partitions across **every** consumer in a group whenever one pod restarts\u2014halting cluster-wide consumption for seconds to minutes.",
+        "core": "Configure `partition.assignment.strategy=org.apache.kafka.clients.consumer.CooperativeStickyAssignor` (revoking only the specific partitions moving to a new owner) and `group.instance.id` (Static Membership) so rolling pod restarts within `session.timeout.ms` (e.g., 45s) reclaim their exact partitions without triggering any rebalance.",
+        "deepDive": "**The `max.poll.interval.ms` Trap**: If a consumer batch takes 6 minutes to process while `max.poll.interval.ms=300000` (5 min), the broker kicks the consumer out as dead, triggers a rebalance, and another consumer reprocesses the exact same batch\u2014causing an infinite poison-pill rebalance loop. Shrink `max.poll.records` or offload slow work to a bounded worker pool with explicit pause/resume."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "COOPERATIVE STICKY REBALANCE",
+        "title": "Zero-Stop Partition Migration During Pod Scale-Out",
+        "actors": [
+          "Group Coordinator",
+          "Consumer A (P0, P1)",
+          "Consumer B (New Pod)"
+        ],
+        "events": [
+          {
+            "from": "Consumer B (New Pod)",
+            "to": "Group Coordinator",
+            "label": "1. JoinGroup (CooperativeSticky)"
+          },
+          {
+            "from": "Group Coordinator",
+            "to": "Consumer A (P0, P1)",
+            "label": "2. Keep P0 active; revoke only P1"
+          },
+          {
+            "from": "Consumer A (P0, P1)",
+            "to": "Group Coordinator",
+            "label": "3. Commit P1 offset & release P1"
+          },
+          {
+            "from": "Group Coordinator",
+            "to": "Consumer B (New Pod)",
+            "label": "4. Assign P1 to Consumer B (P0 never paused!)"
+          }
+        ],
+        "summary": "Cooperative rebalancing keeps unaffected partitions streaming continuously during scale events."
+      }
+    },
+    {
+      "id": "04-java-producer-consumer-and-dlq",
+      "eyebrow": "STAGE 04 \u00b7 PRODUCTION IMPLEMENTATION & POISON PILLS",
+      "title": "Manual Offset Commits, Dead-Letter Topics & Hot-Partition Mitigation",
+      "level": "core",
+      "purpose": "Implement at-least-once idempotent consumption with non-blocking Dead-Letter Queue (DLQ) routing in Java.",
+      "explanation": {
+        "foundation": "Enabling `enable.auto.commit=true` commits offsets on a background timer *before* your consumer finishes writing to the database\u2014silently losing messages if the pod crashes mid-batch.",
+        "core": "```java\nimport org.apache.kafka.clients.consumer.*;\nimport org.apache.kafka.clients.producer.*;\nimport java.time.Duration;\nimport java.util.*;\n\npublic final class SafeKafkaEventProcessor {\n    private final KafkaConsumer<String, String> consumer;\n    private final KafkaProducer<String, String> dlqProducer;\n    private final String dlqTopic;\n\n    public SafeKafkaEventProcessor(\n            KafkaConsumer<String, String> consumer,\n            KafkaProducer<String, String> dlqProducer,\n            String dlqTopic) {\n        this.consumer = consumer;\n        this.dlqProducer = dlqProducer;\n        this.dlqTopic = dlqTopic;\n    }\n\n    public void pollAndProcessBatch(RecordHandler handler) {\n        ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(250));\n        if (records.isEmpty()) return;\n\n        Map<TopicPartition, OffsetAndMetadata> offsetsToCommit = new HashMap<>();\n        for (TopicPartition tp : records.partitions()) {\n            List<ConsumerRecord<String, String>> partitionRecords = records.records(tp);\n            for (ConsumerRecord<String, String> rec : partitionRecords) {\n                try {\n                    handler.applyIdempotently(rec.key(), rec.value(), rec.offset());\n                } catch (NonRetryablePayloadException badPayload) {\n                    // Route poison pill to DLQ synchronously so partition is not blocked forever\n                    dlqProducer.send(new ProducerRecord<>(dlqTopic, rec.key(), rec.value()));\n                }\n                offsetsToCommit.put(tp, new OffsetAndMetadata(rec.offset() + 1));\n            }\n        }\n        dlqProducer.flush();\n        consumer.commitSync(offsetsToCommit);\n    }\n\n    @FunctionalInterface\n    public interface RecordHandler {\n        void applyIdempotently(String key, String value, long offset);\n    }\n}\n```",
+        "deepDive": "**Hot-Partition Skew**: If 1% of enterprise tenants generate 60% of events and you key by `tenant_id`, one partition saturates while 31 partitions sit idle. Salt high-volume tenant keys (`tenant_id + ':' + (seq % 8)`) when global tenant ordering is not required, or dedicate isolated high-throughput topics for whale tenants."
+      },
+      "decisionFramework": {
+        "problem": "How to handle malformed or permanently failing events in an ordered Kafka partition without stalling all subsequent events for healthy users.",
+        "naiveSolution": "Retry the failing record infinitely in a `while(true)` loop before calling `commitSync()`.",
+        "whyItFails": "One corrupted JSON payload blocks the entire partition indefinitely (Head-of-Line blocking), causing consumer lag to grow unboundedly.",
+        "alternatives": "Compare infinite blocking retries, silent drop on exception, and bounded retry topics + Dead-Letter Topic (DLQ).",
+        "decision": "Apply 2\u20133 fast in-memory retries for transient blips, then publish poison-pill records to a dedicated Dead-Letter Topic (`{topic}.dlq`) with original headers/offset metadata before advancing the committed offset.",
+        "tradeOffs": "Preserves partition availability and zero message loss in exchange for out-of-band DLQ replay tooling."
+      },
+      "decisionExercise": {
+        "prompt": "A consumer group reading a 24-partition `order-events` topic experiences a sudden rebalance storm every 6 minutes during peak hours. Metrics show `max.poll.interval.ms` is set to 300,000 ms (5 min) and `max.poll.records` is 2,000, while each record makes a 200 ms external HTTP call. What is the root cause and cleanest fix?",
+        "options": [
+          {
+            "id": "poll-interval-exceeded",
+            "label": "2,000 records * 200 ms = 400 seconds > 300s `max.poll.interval.ms`, causing the broker to evict active consumers; lower `max.poll.records` to 100 so each poll loop finishes in ~20 seconds.",
+            "isCorrect": true,
+            "explanation": "Correct: keeping batch processing time well below `max.poll.interval.ms` prevents false-positive consumer evictions and duplicate reprocessing."
+          },
+          {
+            "id": "increase-partitions-200",
+            "label": "Increase topic partitions from 24 to 240 without changing consumer settings.",
+            "isCorrect": false,
+            "explanation": "More partitions do not shorten the 400-second processing time of a 2,000-record poll batch."
+          },
+          {
+            "id": "enable-auto-commit",
+            "label": "Turn on `enable.auto.commit=true` every 5 seconds.",
+            "isCorrect": false,
+            "explanation": "Auto-commit commits offsets before slow HTTP calls finish (risking data loss) and does not prevent `max.poll.interval.ms` eviction."
+          }
+        ]
+      },
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "NON-BLOCKING ERROR RECOVERY",
+        "title": "Tiered Retry Topics & Dead-Letter Queue (DLQ) Topology",
+        "graphNodes": [
+          {
+            "id": "main",
+            "label": "orders.events (Main Topic)"
+          },
+          {
+            "id": "cons",
+            "label": "Idempotent Consumer"
+          },
+          {
+            "id": "r1",
+            "label": "orders.retry.30s (Delayed Retry)"
+          },
+          {
+            "id": "dlq",
+            "label": "orders.dlq (Poison-Pill Vault)"
+          }
+        ],
+        "graphEdges": [
+          {
+            "from": "main",
+            "to": "cons",
+            "label": "Poll batch (max 100)"
+          },
+          {
+            "from": "cons",
+            "to": "r1",
+            "label": "Transient 503 error"
+          },
+          {
+            "from": "cons",
+            "to": "dlq",
+            "label": "Schema/permanent error"
+          },
+          {
+            "from": "r1",
+            "to": "cons",
+            "label": "Re-attempt after 30s"
+          }
+        ]
+      }
+    },
+    {
+      "id": "05-eos-myths-and-when-not-to-use",
+      "eyebrow": "STAGE 05 \u00b7 PRODUCTION FAILURES & OPERATIONAL BOUNDARIES",
+      "title": "Exactly-Once Semantics (EOS) Realities & When Not to Use Kafka",
+      "level": "deepDive",
+      "purpose": "Clarify what Kafka EOS actually covers and identify workloads where simpler queues or databases win.",
+      "explanation": {
+        "foundation": "**The Exactly-Once Myth**: Kafka's transactional EOS (`isolation.level=read_committed` + transactional producer) guarantees atomic read-process-write **strictly inside Kafka-to-Kafka pipelines** (e.g., Kafka Streams). The moment a consumer writes to PostgreSQL, Redis, or an external REST API, Kafka cannot span a distributed 2PC transaction across that external system.",
+        "core": "For Kafka-to-Database pipelines, achieve **Effective Exactly-Once** via **At-Least-Once delivery + Idempotent Consumer writes** (deduplicating on `(topic, partition, offset)` or business `event_id` inside the target database transaction).\n\n**When NOT to Use Kafka**: Do not deploy Kafka for simple task queues needing per-message priority, delayed/scheduled retries on millions of arbitrary timestamps, or low-volume (< 500 msg/s) background jobs where Amazon SQS, RabbitMQ, or PostgreSQL `FOR UPDATE SKIP LOCKED` eliminates broker/KRaft cluster operations completely.",
+        "deepDive": "**Assumptions & Glossary**: **ISR**: In-Sync Replicas caught up within `replica.lag.time.max.ms`. **High Watermark (HW)**: Highest offset replicated across all ISR members and safe for consumer reads. **KRaft**: Kafka's built-in Raft metadata quorum replacing Apache ZooKeeper."
+      },
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "EFFECTIVE EXACTLY-ONCE CONSUMER STATE",
+        "title": "Atomic Offset Deduplication Inside Downstream Relational Storage",
+        "states": [
+          {
+            "id": "polled",
+            "label": "BATCH_POLLED"
+          },
+          {
+            "id": "dedup",
+            "label": "CHECK_EVENT_ID_TABLE"
+          },
+          {
+            "id": "committed_db",
+            "label": "DB_TX_COMMITTED"
+          },
+          {
+            "id": "committed_kafka",
+            "label": "KAFKA_OFFSET_COMMITTED"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "polled",
+            "to": "dedup",
+            "label": "Begin local DB TX"
+          },
+          {
+            "from": "dedup",
+            "to": "committed_db",
+            "label": "Insert event_id + domain write"
+          },
+          {
+            "from": "committed_db",
+            "to": "committed_kafka",
+            "label": "commitSync() to broker"
+          }
+        ]
+      }
+    }
+  ],
+  "endToEndExample": {
+    "title": "End-to-End High-Throughput Order & Inventory Streaming Backbone",
+    "scenario": "An e-commerce platform ingests 80,000 order state transitions/sec across 64 partitions keyed by `order_id`, feeding real-time inventory reservation, fraud scoring, and warehouse fulfillment with zero lost orders and < 200 ms end-to-end p99 lag.",
+    "architecture": "Producers publish with `acks=all`, `min.insync.replicas=2`, `enable.idempotence=true`, `linger.ms=5`, and `compression.type=lz4`. Independent consumer groups use `CooperativeStickyAssignor` and store processed `event_id` keys inside their local PostgreSQL transactions alongside domain mutations, routing malformed events to `orders.dlq`."
+  },
+  "decisionFramework": [
+    {
+      "question": "How do you prevent committed data loss during an abrupt broker crash?",
+      "reason": "Set `acks=all`, `min.insync.replicas=2`, `replication.factor=3`, and `unclean.leader.election.enable=false` so only ISR-replicated writes advance the High Watermark."
+    },
+    {
+      "question": "How do you achieve end-to-end deduplication when writing from Kafka into PostgreSQL?",
+      "reason": "Combine at-least-once consumer delivery with an atomic `INSERT INTO processed_events(event_id)` guard inside the same SQL transaction as the business update."
+    }
+  ],
+  "simulation": {
+    "title": "Kafka ISR Replication & Cooperative Consumer Rebalance Simulator",
+    "nodes": [
+      {
+        "id": "prod",
+        "label": "Idempotent Producer",
+        "role": "acks=all, lz4 batch"
+      },
+      {
+        "id": "ldr",
+        "label": "Partition 0 Leader",
+        "role": "Sequential Log + HW"
+      },
+      {
+        "id": "isr",
+        "label": "ISR Follower",
+        "role": "Sync Replication"
+      },
+      {
+        "id": "cons",
+        "label": "Consumer Group",
+        "role": "CooperativeSticky + DLQ"
+      }
+    ],
+    "edges": [
+      {
+        "from": "prod",
+        "to": "ldr",
+        "label": "1. Append batch"
+      },
+      {
+        "from": "ldr",
+        "to": "isr",
+        "label": "2. Replicate & advance HW"
+      },
+      {
+        "from": "ldr",
+        "to": "cons",
+        "label": "3. Zero-copy sendfile()"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "ISR Quorum Commit",
+        "actionLabel": "Leader + ISR persist batch -> High Watermark advances",
+        "status": "healthy",
+        "activeNodeIds": [
+          "prod",
+          "ldr",
+          "isr"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "hw_offset": 48210,
+          "isr_count": 3,
+          "p99_produce_ms": 4
+        },
+        "explanation": "High Watermark advances only after ISR quorum persistence, guaranteeing crash durability."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Zero-Copy Consumer Fetch",
+        "actionLabel": "sendfile() streams committed offsets to consumer",
+        "status": "healthy",
+        "activeNodeIds": [
+          "ldr",
+          "cons"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "consumer_lag": 0,
+          "jvm_heap_copy": false,
+          "throughput_mbps": 420
+        },
+        "explanation": "Linux page cache transfers segment bytes directly to the consumer socket without heap copies."
+      }
+    ]
+  },
+  "practice": {
+    "knowledgeCheck": {
+      "id": "kc-kafka-1",
+      "question": "Which combination of Kafka producer and topic settings guarantees that an acknowledged write will NOT be lost if the partition leader crashes immediately afterward?",
+      "options": [
+        {
+          "id": "a",
+          "text": "`acks=1` and `replication.factor=3`",
+          "correct": false,
+          "feedback": "With `acks=1`, the leader acknowledges before followers replicate the record; an immediate crash loses the write."
+        },
+        {
+          "id": "b",
+          "text": "`acks=all`, `min.insync.replicas=2`, `replication.factor=3`, and `unclean.leader.election.enable=false`",
+          "correct": true,
+          "feedback": "Correct: every acknowledged record is persisted on at least 2 in-sync replicas, and only an in-sync replica can become the new leader."
+        },
+        {
+          "id": "c",
+          "text": "`acks=0` with `linger.ms=0`",
+          "correct": false,
+          "feedback": "`acks=0` is fire-and-forget and drops messages on any network or broker failure."
+        },
+        {
+          "id": "d",
+          "text": "`enable.auto.commit=true` on the consumer",
+          "correct": false,
+          "feedback": "Consumer auto-commit controls consumer offset tracking, not broker replication durability."
+        }
+      ],
+      "explanation": "Durability requires majority ISR acknowledgment (`acks=all` + `min.insync.replicas=2`) and disabling unclean leader election."
+    },
+    "knowledgeChecks": [
+      {
+        "id": "kc-kafka-1",
+        "question": "Which combination of Kafka producer and topic settings guarantees that an acknowledged write will NOT be lost if the partition leader crashes immediately afterward?",
+        "options": [
+          {
+            "id": "a",
+            "text": "`acks=1` and `replication.factor=3`",
+            "correct": false,
+            "feedback": "With `acks=1`, the leader acknowledges before followers replicate the record; an immediate crash loses the write."
+          },
+          {
+            "id": "b",
+            "text": "`acks=all`, `min.insync.replicas=2`, `replication.factor=3`, and `unclean.leader.election.enable=false`",
+            "correct": true,
+            "feedback": "Correct: every acknowledged record is persisted on at least 2 in-sync replicas, and only an in-sync replica can become the new leader."
+          },
+          {
+            "id": "c",
+            "text": "`acks=0` with `linger.ms=0`",
+            "correct": false,
+            "feedback": "`acks=0` is fire-and-forget and drops messages on any network or broker failure."
+          },
+          {
+            "id": "d",
+            "text": "`enable.auto.commit=true` on the consumer",
+            "correct": false,
+            "feedback": "Consumer auto-commit controls consumer offset tracking, not broker replication durability."
+          }
+        ],
+        "explanation": "Durability requires majority ISR acknowledgment (`acks=all` + `min.insync.replicas=2`) and disabling unclean leader election."
+      },
+      {
+        "id": "kc-kafka-2",
+        "question": "Why does Kafka achieve high throughput using disk-backed partitions instead of keeping all messages purely in JVM heap memory?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Sequential disk appends match network speeds, and Linux OS page cache + `sendfile()` serve consumers directly without JVM garbage collection pauses.",
+            "correct": true,
+            "feedback": "Correct: sequential I/O and zero-copy kernel page cache transfer bypass user-space memory allocation and GC storms."
+          },
+          {
+            "id": "b",
+            "text": "Because disks have lower latency than CPU L1 cache.",
+            "correct": false,
+            "feedback": "RAM/cache is faster than disk, but sequential OS page cache avoids JVM heap bloat and random disk seeks."
+          },
+          {
+            "id": "c",
+            "text": "Because Kafka compresses every message into a single global lock.",
+            "correct": false,
+            "feedback": "Partitions operate independently without a global lock."
+          },
+          {
+            "id": "d",
+            "text": "Because Kafka deletes every message immediately after the first consumer reads it.",
+            "correct": false,
+            "feedback": "Kafka retains log segments by time/size retention policies regardless of consumer reads."
+          }
+        ],
+        "explanation": "Sequential append-only logs + OS page cache + `sendfile()` eliminate random disk seeks and JVM heap GC overhead."
+      },
+      {
+        "id": "kc-kafka-3",
+        "question": "A consumer group experiences frequent stop-the-world rebalances because slow downstream API calls cause batch processing to exceed `max.poll.interval.ms`. Which two changes resolve this cleanly?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Reduce `max.poll.records` so each poll batch finishes well within `max.poll.interval.ms`, and switch to `CooperativeStickyAssignor`.",
+            "correct": true,
+            "feedback": "Correct: smaller poll batches prevent heartbeat/poll-interval timeouts, and cooperative sticky assignment avoids revoking unaffected partitions."
+          },
+          {
+            "id": "b",
+            "text": "Set `acks=0` on all producers.",
+            "correct": false,
+            "feedback": "Producer acks have no effect on consumer poll intervals."
+          },
+          {
+            "id": "c",
+            "text": "Increase `max.poll.records` to 50,000.",
+            "correct": false,
+            "feedback": "Larger batches take even longer to process and worsen poll-interval timeouts."
+          },
+          {
+            "id": "d",
+            "text": "Enable `unclean.leader.election.enable=true`.",
+            "correct": false,
+            "feedback": "Unclean leader election risks data loss and does not affect consumer poll timeouts."
+          }
+        ],
+        "explanation": "Bounding `max.poll.records` keeps consumer loop duration safely below `max.poll.interval.ms`."
+      },
+      {
+        "id": "kc-kafka-4",
+        "question": "How should an at-least-once Kafka consumer handle a single corrupted JSON message that fails schema validation on every attempt?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Retry the record indefinitely in a tight loop until someone deploys a code fix.",
+            "correct": false,
+            "feedback": "Infinite blocking retries stall the entire partition (Head-of-Line blocking) and cause unbounded consumer lag."
+          },
+          {
+            "id": "b",
+            "text": "Route the poison-pill record to a dedicated Dead-Letter Topic (`{topic}.dlq`) with error metadata, then commit its offset so healthy records continue flowing.",
+            "correct": true,
+            "feedback": "Correct: isolating poison-pill records into a DLQ preserves partition throughput without losing the failed payload."
+          },
+          {
+            "id": "c",
+            "text": "Catch and ignore the exception silently without logging or saving the payload.",
+            "correct": false,
+            "feedback": "Silent drops cause unrecoverable data loss."
+          },
+          {
+            "id": "d",
+            "text": "Delete the entire Kafka topic and recreate it.",
+            "correct": false,
+            "feedback": "Deleting the topic destroys all valid messages across every partition."
+          }
+        ],
+        "explanation": "Dead-Letter Topics prevent single malformed messages from halting ordered partition consumption."
+      }
+    ]
+  },
+  "relatedConcepts": [
+    {
+      "slug": "replicated-logs-sequencing",
+      "title": "Replicated Logs & Monotonic Sequencing"
+    },
+    {
+      "slug": "poison-message-handling",
+      "title": "Poison Message & Dead-Letter Queue Patterns"
+    },
+    {
+      "slug": "backpressure-flow-control",
+      "title": "Backpressure & Flow Control"
+    }
+  ],
+  "courseCurriculum": [
+    {
+      "moduleNumber": 1,
+      "id": "01-commit-log-and-zero-copy-physics",
+      "title": "Append-Only Commit Logs & Zero-Copy Physics",
+      "description": "Sequential segment I/O, OS page cache, sendfile(), and partition sizing.",
+      "conceptSlugs": [
+        "replicated-logs-sequencing"
+      ]
+    },
+    {
+      "moduleNumber": 2,
+      "id": "02-isr-quorum-and-idempotent-producers",
+      "title": "ISR Quorums & Idempotent Producers",
+      "description": "acks=all, min.insync.replicas, High Watermark, and PID sequence deduplication.",
+      "conceptSlugs": [
+        "consistency-replication",
+        "idempotency-deduplication"
+      ]
+    },
+    {
+      "moduleNumber": 3,
+      "id": "03-consumer-groups-and-rebalancing",
+      "title": "Cooperative Rebalancing & Static Membership",
+      "description": "Eliminating stop-the-world consumer pauses and poll-interval timeouts.",
+      "conceptSlugs": [
+        "backpressure-flow-control"
+      ]
+    },
+    {
+      "moduleNumber": 4,
+      "id": "04-java-producer-consumer-and-dlq",
+      "title": "Manual Commits, DLQs & Hot-Partition Mitigation",
+      "description": "Non-blocking poison-pill handling and key salting for skewed tenants.",
+      "conceptSlugs": [
+        "poison-message-handling"
+      ]
+    },
+    {
+      "moduleNumber": 5,
+      "id": "05-eos-myths-and-when-not-to-use",
+      "title": "Exactly-Once Realities & Architectural Boundaries",
+      "description": "Effective EOS across DB boundaries and when simpler queues win.",
+      "conceptSlugs": [
+        "cqrs-event-sourcing"
+      ]
+    }
+  ],
+  "appliedCaseStudies": [
+    {
+      "source": "problem",
+      "slug": "design-payment-ledger",
+      "title": "Double-Entry Payment Ledger & Transactional Outbox",
+      "summary": "Reliably publishing committed ledger state changes into partitioned Kafka topics without dual-write holes."
+    },
+    {
+      "source": "problem",
+      "slug": "100m-player-leaderboard",
+      "title": "100M-Player Distributed Leaderboard at 200K Writes/Sec",
+      "summary": "Using userId-partitioned Kafka topics as a durable write-ahead buffer in front of sharded Redis ZSETs."
+    }
+  ],
+  "tipsAndTricks": [
+    "Never rely on `enable.auto.commit=true` when writing to external databases; commit offsets explicitly via `commitSync()` only after durable downstream persistence.",
+    "Always pair `acks=all` with `min.insync.replicas=2` and `enable.idempotence=true` on critical event streams.",
+    "Set `CooperativeStickyAssignor` + `group.instance.id` on Kubernetes consumer deployments to eliminate rebalance storms during rolling upgrades."
+  ],
+  "finalSummary": "Apache Kafka turns high-throughput event streaming into predictable sequential log engineering: partition by entity key for local ordering, protect committed offsets with ISR quorums and idempotent producers, isolate poison pills via Dead-Letter Topics, and keep consumer groups stable with cooperative rebalancing.",
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Apache Kafka is a durable, partitioned commit log where producers append events to ordered partitions and multiple independent consumer groups read at their own pace using numeric offsets.",
+      "keyTakeaway": "When streaming events across microservices, partition by entity ID so related events stay in order, and let each consumer group track its own offset for safe replay.",
+      "byteSummary": "Unlike traditional queues that delete messages as soon as one worker reads them, Kafka stores events in an ordered log on disk. Different services (billing, analytics, search) can each read the same stream independently without slowing each other down."
+    },
+    "intermediate": {
+      "summary": "Architect reliable Kafka pipelines using `acks=all` + `min.insync.replicas=2`, idempotent producers, manual offset commits after idempotent DB writes, `CooperativeStickyAssignor` rebalancing, and Dead-Letter Topics.",
+      "keyTakeaway": "When building high-throughput event pipelines on Apache Kafka, partition strictly by business entity key, enforce `acks=all` with `min.insync.replicas=2` and idempotent producers, and bound `max.poll.interval.ms` with cooperative sticky assignors so throughput scales linearly without rebalance storms or message loss.",
+      "byteSummary": "Kafka achieves line-rate throughput via sequential segment appends and Linux `sendfile()` zero-copy transfers from OS page cache. Production resilience requires pairing ISR durability with bounded poll batches and non-blocking DLQ routing for malformed payloads."
+    },
+    "advanced": {
+      "summary": "Optimize broker page-cache residency, cap per-broker partition density (~2,000\u20134,000), mitigate whale-tenant partition skew via bounded key salting, and implement effective exactly-once database sinks via atomic `(topic, partition, offset)` deduplication.",
+      "keyTakeaway": "When operating multi-tenant Kafka clusters at scale, bound per-broker partition counts to protect page-cache efficiency, salt skewed whale-tenant partition keys, and enforce atomic offset deduplication inside downstream transactional sinks.",
+      "byteSummary": "Kafka's transactional EOS covers Kafka-to-Kafka streams only; crossing into external SQL/NoSQL stores requires atomic offset/event_id deduplication inside the target transaction, alongside careful partition-count budgeting and hot-key salting."
+    }
+  }
+}

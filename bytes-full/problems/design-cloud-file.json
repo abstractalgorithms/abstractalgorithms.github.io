@@ -1,0 +1,720 @@
+{
+  "slug": "design-cloud-file",
+  "title": "Design a Cloud File Storage & Cross-Device Sync System (Dropbox Scale)",
+  "domain": "distributed-systems",
+  "diagram": "diagram.png",
+  "spark": {
+    "summary": "Design a Dropbox-scale cloud storage and cross-device sync system supporting multi-gigabyte delta uploads, hierarchical folder metadata, and instant multi-device change notifications.",
+    "keyTakeaway": "To bound blast radius during partial cluster failures, split the Control/Metadata plane (sharded MySQL + cursor-based delta sync) from the Data/Block plane (CDC chunks in S3), connected by a Long-Poll/WebSocket Notification Service.",
+    "byteSummary": "A cloud file sync engine must keep files consistent across laptops, phones, and web browsers while minimizing bandwidth and battery usage.\n\nOn the client, a local File Watcher + SQLite index detects filesystem changes, slices modified files via Content-Defined Chunking (CDC), and uploads only missing 4 MB SHA-256 blocks directly to the Block Service (S3).\n\nOnce blocks are durable, the client commits an ordered chunk manifest to the Metadata Service (MySQL sharded by `namespace_id`). A Notification Service using Long-Polling or WebSockets wakes sibling devices, which pull incremental metadata deltas via a monotonic `cursor`."
+  },
+  "learningJourney": [
+    {
+      "id": "stage-1-split-planes",
+      "title": "Decoupling the Block Plane from the Metadata Plane",
+      "level": "foundation",
+      "purpose": "Separate heavy binary chunk transfers from low-latency transactional folder tree updates.",
+      "explanation": {
+        "foundation": "Routing 100 MB file uploads through the same servers that serve folder listings exhausts database connections and API worker memory.",
+        "core": "Splitting into a stateless Block Service (backed by S3) and a Metadata Service (backed by sharded MySQL) allows independent scaling of bandwidth vs.",
+        "deepDive": "IOPS."
+      },
+      "codeExample": "def upload_and_commit(block_svc, meta_svc, file_path: str, chunks: list[bytes], base_rev: int):\n    hashes = [sha256(c) for c in chunks]\n    missing = block_svc.negotiate(hashes)\n    for h, c in zip(hashes, chunks):\n        if h in missing:\n            block_svc.put_chunk(h, c)\n    return meta_svc.commit_manifest(file_path, hashes, base_rev)",
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "FOUNDATION",
+        "title": "Block vs. Metadata Plane Split",
+        "cards": [
+          {
+            "label": "Durability Order",
+            "detail": "Always persist chunks to S3 BEFORE committing the metadata manifest."
+          },
+          {
+            "label": "Independent Scale",
+            "detail": "S3 handles exabytes of blobs while MySQL stores kilobyte manifests."
+          }
+        ],
+        "summary": "Separating binary chunk storage from relational metadata lets each tier scale independently.",
+        "caption": "Clients upload CDC blocks to S3 first, then commit lightweight chunk manifests to MySQL.",
+        "graphNodes": [
+          {
+            "id": "client",
+            "label": "Sync Client",
+            "role": "client",
+            "col": 0,
+            "row": 0,
+            "tone": "primary"
+          },
+          {
+            "id": "block",
+            "label": "Block Service -> S3",
+            "role": "storage",
+            "col": 1,
+            "row": 0,
+            "tone": "tint"
+          },
+          {
+            "id": "meta",
+            "label": "Metadata -> MySQL",
+            "role": "storage",
+            "col": 2,
+            "row": 0,
+            "tone": "tint"
+          }
+        ],
+        "graphEdges": [
+          {
+            "from": "client",
+            "to": "block",
+            "label": "uploads missing chunks",
+            "style": "solid",
+            "tone": "green"
+          },
+          {
+            "from": "client",
+            "to": "meta",
+            "label": "commits ordered hash manifest",
+            "style": "solid",
+            "tone": "green"
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-2-client-watcher",
+      "title": "Client File Watcher, Debouncing & Local SQLite Index",
+      "level": "foundation",
+      "purpose": "Coalesce rapid editor autosaves and ignore temporary lockfiles before triggering network sync.",
+      "explanation": {
+        "foundation": "Think of **Client File Watcher, Debouncing & Local SQLite Index** as the intuition layer for Design a Cloud File Storage & Cross-Device Sync System (Dropbox Scale): Coalesce rapid editor autosaves and ignore temporary lockfiles before triggering network sync.",
+        "core": "IDEs and Office apps write temporary `.tmp` files and emit dozens of `inotify`/`FSEvents` callbacks per second. The Desktop Sync Client buffers events in a 500ms debounce window, compares mtime + size + hash against its local SQLite state, and only runs CDC when a file stabilizes.",
+        "deepDive": "Under heavy load or partial failure, client file watcher, debouncing & local sqlite index becomes a critical lever for predictable latency and correctness. Dropbox-scale sync adds LAN peer-to-peer chunk sharing, 7-day grace-period GC, and instant ransomware snapshot rollbacks."
+      },
+      "codeExample": "def should_sync_file(sqlite_db, path: str, mtime: float, size: int) -> bool:\n    if path.endswith(('.tmp', '.swp', '~')):\n        return False\n    row = sqlite_db.get_file(path)\n    return row is None or row.mtime != mtime or row.size != size",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "FOUNDATION",
+        "title": "Debounced Client Sync Engine",
+        "nodes": [
+          {
+            "id": "os",
+            "label": "OS File Watcher",
+            "sub": "FSEvents / inotify",
+            "role": "ingress"
+          },
+          {
+            "id": "deb",
+            "label": "500ms Debouncer",
+            "sub": "Filters .tmp & bursts",
+            "role": "compute"
+          },
+          {
+            "id": "sql",
+            "label": "Local SQLite",
+            "sub": "Tracks synced rev & hashes",
+            "role": "storage"
+          }
+        ],
+        "edges": [
+          {
+            "from": "os",
+            "to": "deb",
+            "label": "streams filesystem events"
+          },
+          {
+            "from": "deb",
+            "to": "sql",
+            "label": "checks against local state"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Debounce Window",
+            "detail": "Waiting 500ms avoids uploading half-written files during saves."
+          },
+          {
+            "label": "Local Truth",
+            "detail": "SQLite remembers the last synced `rev` for offline diffing."
+          }
+        ],
+        "summary": "Client-side debouncing and local SQLite state prevent wasted uploads on noisy editor saves.",
+        "caption": "The desktop client debounces OS file events and checks local SQLite before running CDC."
+      },
+      "decisionFramework": {
+        "problem": "How to implement Design a Cloud File Storage & Cross-Device Sync System (Dropbox Scale) without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "To bound blast radius during partial cluster failures, split the Control/Metadata plane (sharded MySQL + cursor-based delta sync) from the Data/Block plane (CDC chunks in S3), connected by a Long-Poll/WebSocket Notification Service.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Design a Cloud File Storage & Cross-Device Sync System (Dropbox Scale) experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-3-metadata-sharding",
+      "title": "Sharding Metadata by Namespace & Journaled Sync Cursors",
+      "level": "intermediate",
+      "purpose": "Support shared folders and O(delta) reconnect catch-up using namespace-sharded journal logs.",
+      "explanation": {
+        "foundation": "Sharding metadata by `user_id` breaks when two users share a folder—a rename by Alice must appear in Bob's sync stream.",
+        "core": "Instead, each root or shared folder is a `namespace_id` (sharded by `namespace_id`).",
+        "deepDive": "Every mutation appends to an ordered `namespace_journal` with a monotonic `seq_id`, letting devices catch up via `GET /delta?cursor=seq_id`."
+      },
+      "codeExample": "def fetch_delta_since(conn, namespace_id: str, cursor: int, limit: int = 500) -> dict:\n    rows = conn.execute(\n        'SELECT seq_id, file_id, op_type, rev, chunks_json FROM namespace_journal '\n        'WHERE namespace_id=%s AND seq_id > %s ORDER BY seq_id ASC LIMIT %s',\n        (namespace_id, cursor, limit)\n    )\n    next_cursor = rows[-1]['seq_id'] if rows else cursor\n    return {'entries': rows, 'cursor': next_cursor, 'has_more': len(rows) == limit}",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "INTERMEDIATE",
+        "title": "Namespace Journal & Cursor Sync",
+        "nodes": [
+          {
+            "id": "ns",
+            "label": "Namespace Shard",
+            "sub": "Sharded by namespace_id",
+            "role": "storage"
+          },
+          {
+            "id": "jnl",
+            "label": "Journal Log (seq_id)",
+            "sub": "Append-only mutations",
+            "role": "storage"
+          },
+          {
+            "id": "pull",
+            "label": "/delta?cursor=seq_id",
+            "sub": "Incremental device catch-up",
+            "role": "output"
+          }
+        ],
+        "edges": [
+          {
+            "from": "ns",
+            "to": "jnl",
+            "label": "records atomic tree mutation"
+          },
+          {
+            "from": "jnl",
+            "to": "pull",
+            "label": "streams changes after cursor"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Shared Folders",
+            "detail": "Sharding by `namespace_id` keeps shared folder state on one shard."
+          },
+          {
+            "label": "Offline Catch-Up",
+            "detail": "Reconnecting devices fetch only changes since their saved `cursor`."
+          }
+        ],
+        "summary": "Namespace-sharded journals give every device an exact, resumable `cursor` for delta sync.",
+        "caption": "Every folder mutation increments a namespace seq_id for incremental cursor-based sync."
+      }
+    },
+    {
+      "id": "stage-4-notification-longpoll",
+      "title": "Low-Overhead Change Notifications (Long-Poll / WebSockets)",
+      "level": "intermediate",
+      "purpose": "Wake idle devices within 1 second of a remote edit without constant battery-draining polling.",
+      "explanation": {
+        "foundation": "With 100M connected devices, polling `/delta` every 5 seconds generates 20M QPS of empty responses.",
+        "core": "Instead, clients hold a lightweight Long-Poll or WebSocket connection to a Notification Service.",
+        "deepDive": "When `namespace_journal` advances, Redis Pub/Sub notifies connected listeners for that `namespace_id`, returning `{has_changes: true}` so clients pull `/delta`."
+      },
+      "codeExample": "async def notify_namespace_watchers(redis, namespace_id: str, new_seq: int) -> None:\n    await redis.publish(f'ns:{namespace_id}', json.dumps({'seq': new_seq}))",
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "INTERMEDIATE",
+        "title": "Long-Poll Wakeup Pipeline",
+        "cards": [
+          {
+            "label": "Thin Signal",
+            "detail": "Notifications only carry `{has_changes: true}`, keeping fan-out tiny."
+          },
+          {
+            "label": "Thundering Herd",
+            "detail": "Jittered reconnect backoff protects edges after regional restarts."
+          }
+        ],
+        "summary": "Thin wakeup signals via Long-Poll/WebSockets eliminate wasteful idle polling.",
+        "caption": "The Notification Service pushes lightweight wakeup signals so clients only call /delta when needed.",
+        "graphNodes": [
+          {
+            "id": "meta",
+            "label": "Metadata Service",
+            "role": "compute",
+            "col": 0,
+            "row": 0,
+            "tone": "primary"
+          },
+          {
+            "id": "redis",
+            "label": "Redis Pub/Sub",
+            "role": "broker",
+            "col": 1,
+            "row": 0,
+            "tone": "tint"
+          },
+          {
+            "id": "lp",
+            "label": "Notification Edge",
+            "role": "output",
+            "col": 2,
+            "row": 0,
+            "tone": "tint"
+          }
+        ],
+        "graphEdges": [
+          {
+            "from": "meta",
+            "to": "redis",
+            "label": "publishes new seq_id",
+            "style": "solid",
+            "tone": "green"
+          },
+          {
+            "from": "redis",
+            "to": "lp",
+            "label": "signals sibling devices to pull /delta",
+            "style": "solid",
+            "tone": "green"
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-5-tree-moves",
+      "title": "Atomic Folder Renames & Cycle-Free Tree Invariants",
+      "level": "intermediate",
+      "purpose": "Move a folder containing 100,000 files in O(1) without rewriting child rows or creating directory cycles.",
+      "explanation": {
+        "foundation": "Think of **Atomic Folder Renames & Cycle-Free Tree Invariants** as the intuition layer for Design a Cloud File Storage & Cross-Device Sync System (Dropbox Scale): Move a folder containing 100,000 files in O(1) without rewriting child rows or creating directory cycles.",
+        "core": "Storing full paths (`/Work/2026/Report.pdf`) forces O(N) updates when `/Work` is renamed to `/Archive`. Storing `(file_id, parent_id, name)` in an adjacency list makes folder renames an O(1) single-row UPDATE, while checking ancestor chains in the transaction prevents cyclic moves (`A` moved inside `A/B`).",
+        "deepDive": "Under heavy load or partial failure, atomic folder renames & cycle-free tree invariants becomes a critical lever for predictable latency and correctness. Dropbox-scale sync adds LAN peer-to-peer chunk sharing, 7-day grace-period GC, and instant ransomware snapshot rollbacks."
+      },
+      "codeExample": "def move_node_safe(conn, ns_id: str, node_id: str, new_parent_id: str) -> None:\n    with conn.transaction():\n        if is_descendant(conn, ns_id, candidate=new_parent_id, ancestor=node_id):\n            raise ValueError('Cannot move folder into its own descendant')\n        conn.execute('UPDATE nodes SET parent_id=%s WHERE namespace_id=%s AND id=%s', (new_parent_id, ns_id, node_id))",
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "INTERMEDIATE",
+        "title": "O(1) Adjacency-List Rename",
+        "cards": [
+          {
+            "label": "O(1) Rename",
+            "detail": "Moving a 100,000-file directory updates exactly 1 metadata row."
+          },
+          {
+            "label": "Cycle Guard",
+            "detail": "Ancestor walk inside the transaction prevents orphaned loops."
+          }
+        ],
+        "summary": "Adjacency-list parent pointers make massive folder moves O(1) while guarding against cycles.",
+        "caption": "Updating parent_id rather than full path strings makes 100k-file folder renames O(1).",
+        "states": [
+          {
+            "id": "req",
+            "label": "Move Folder A -> B",
+            "sublabel": "Single parent_id change",
+            "tone": "blue"
+          },
+          {
+            "id": "cyc",
+            "label": "Cycle Check",
+            "sublabel": "Verifies B not under A",
+            "tone": "amber"
+          },
+          {
+            "id": "upd",
+            "label": "O(1) Row Update",
+            "sublabel": "100k children untouched",
+            "tone": "blue"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "req",
+            "to": "cyc",
+            "label": "walks parent pointers"
+          },
+          {
+            "from": "cyc",
+            "to": "upd",
+            "label": "updates single parent_id"
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-6-lan-sync-cdn",
+      "title": "LAN Sync, Edge Caching & Bandwidth Throttling",
+      "level": "advanced",
+      "purpose": "Accelerate office team syncs via peer-to-peer LAN chunk discovery and pre-signed CDN downloads.",
+      "explanation": {
+        "foundation": "Think of **LAN Sync, Edge Caching & Bandwidth Throttling** as the intuition layer for Design a Cloud File Storage & Cross-Device Sync System (Dropbox Scale): Accelerate office team syncs via peer-to-peer LAN chunk discovery and pre-signed CDN downloads.",
+        "core": "When 50 engineers in the same office pull a new 2 GB design asset, downloading 100 GB from S3 wastes WAN bandwidth. Clients broadcast local UDP/mDNS announcements of available `chunk_hash` blocks on the subnet, fetching verified SHA-256 chunks directly over LAN TLS while falling back to CloudFront/S3 pre-signed URLs.",
+        "deepDive": "Under heavy load or partial failure, lan sync, edge caching & bandwidth throttling becomes a critical lever for predictable latency and correctness. Dropbox-scale sync adds LAN peer-to-peer chunk sharing, 7-day grace-period GC, and instant ransomware snapshot rollbacks."
+      },
+      "codeExample": "def fetch_chunk_prefer_lan(lan_peers, cdn_client, chunk_hash: str) -> bytes:\n    for peer in lan_peers.lookup(chunk_hash):\n        data = peer.try_fetch(chunk_hash, timeout=0.2)\n        if data and sha256(data) == chunk_hash:\n            return data\n    return cdn_client.download_presigned(chunk_hash)",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "ADVANCED",
+        "title": "LAN Peer-to-Peer Chunk Fetch",
+        "nodes": [
+          {
+            "id": "need",
+            "label": "Need Chunk h2",
+            "sub": "Checks local subnet peers",
+            "role": "client"
+          },
+          {
+            "id": "lan",
+            "label": "LAN Peer Fetch",
+            "sub": "Verifies SHA-256 integrity",
+            "role": "compute"
+          },
+          {
+            "id": "cdn",
+            "label": "CloudFront / S3",
+            "sub": "Fallback if no LAN peer",
+            "role": "storage"
+          }
+        ],
+        "edges": [
+          {
+            "from": "need",
+            "to": "lan",
+            "label": "requests h2 on subnet"
+          },
+          {
+            "from": "need",
+            "to": "cdn",
+            "label": "falls back on miss/timeout"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Zero-Trust Verify",
+            "detail": "Every LAN-fetched block is verified against its expected SHA-256 hash."
+          },
+          {
+            "label": "Office Savings",
+            "detail": "Reduces corporate WAN egress by up to 80% for shared folders."
+          }
+        ],
+        "summary": "SHA-256 verification makes peer-to-peer LAN chunk sharing both fast and tamper-proof.",
+        "caption": "Clients fetch verified SHA-256 chunks from local LAN peers before falling back to S3/CDN."
+      }
+    },
+    {
+      "id": "stage-7-versioning-restore",
+      "title": "Point-in-Time Ransomware Rollback & Cold Tiering",
+      "level": "advanced",
+      "purpose": "Restore an entire folder tree to a prior timestamp using immutable revision journals.",
+      "explanation": {
+        "foundation": "Think of **Point-in-Time Ransomware Rollback & Cold Tiering** as the intuition layer for Design a Cloud File Storage & Cross-Device Sync System (Dropbox Scale): Restore an entire folder tree to a prior timestamp using immutable revision journals.",
+        "core": "If ransomware encrypts 10,000 synced files, clients upload encrypted chunks as new revisions (`rev + 1`) while the old CDC chunks remain untouched in S3 during the 30-day retention window. Rolling back simply replays the `namespace_journal` in reverse to point `head_rev` back to pre-attack manifests in seconds.",
+        "deepDive": "Under heavy load or partial failure, point-in-time ransomware rollback & cold tiering becomes a critical lever for predictable latency and correctness. Dropbox-scale sync adds LAN peer-to-peer chunk sharing, 7-day grace-period GC, and instant ransomware snapshot rollbacks."
+      },
+      "codeExample": "def rollback_namespace(conn, ns_id: str, target_ts: str) -> int:\n    with conn.transaction():\n        revs = conn.fetch_last_revisions_before(ns_id, target_ts)\n        for file_id, rev in revs:\n            conn.execute('UPDATE files SET head_rev=%s WHERE id=%s', (rev, file_id))\n        return len(revs)",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "ADVANCED",
+        "title": "Instant Snapshot Rollback",
+        "nodes": [
+          {
+            "id": "attack",
+            "label": "Ransomware Event",
+            "sub": "Encrypted files at rev+1",
+            "role": "risk"
+          },
+          {
+            "id": "jnl",
+            "label": "Immutable Revisions",
+            "sub": "Pre-attack manifests intact",
+            "role": "storage"
+          },
+          {
+            "id": "restore",
+            "label": "Metadata Rewind",
+            "sub": "Restores pointers in seconds",
+            "role": "output"
+          }
+        ],
+        "edges": [
+          {
+            "from": "attack",
+            "to": "jnl",
+            "label": "preserves prior chunk manifests"
+          },
+          {
+            "from": "jnl",
+            "to": "restore",
+            "label": "rewinds head_rev pointers"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Zero Copy Restore",
+            "detail": "Rewinding metadata restores gigabytes without copying S3 objects."
+          },
+          {
+            "label": "Cold Tiering",
+            "detail": "Chunks older than 90 days transition to S3 Glacier Instant Retrieval."
+          }
+        ],
+        "summary": "Immutable chunk manifests turn ransomware recovery into an instant metadata pointer rewind.",
+        "caption": "Rewinding file head_rev pointers restores entire directories without copying S3 chunks."
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-1",
+        "question": "Why should cloud file sync metadata be sharded by `namespace_id` (root/shared folder) instead of `user_id`?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Users do not have unique IDs in MySQL.",
+            "correct": false,
+            "feedback": "Users have IDs, but shared folders span multiple users."
+          },
+          {
+            "id": "b",
+            "text": "Shared folders belong to multiple users; sharding by `namespace_id` keeps all files and journal cursors for a shared folder on one shard.",
+            "correct": true,
+            "feedback": "Correct! Co-locating shared folder trees and their monotonic `seq_id` journal avoids cross-shard transactions."
+          },
+          {
+            "id": "c",
+            "text": "S3 requires `namespace_id` as the bucket name.",
+            "correct": false,
+            "feedback": "S3 stores content-addressed chunks by SHA-256, independent of namespace."
+          },
+          {
+            "id": "d",
+            "text": "It eliminates the need for CDC chunking.",
+            "correct": false,
+            "feedback": "CDC chunking is still needed for delta transfers."
+          }
+        ],
+        "explanation": "Sharding by `namespace_id` gives shared folders a single-shard transactional journal and monotonic sync cursor."
+      },
+      {
+        "id": "kc-2",
+        "question": "In the upload commit sequence, why must CDC chunks be persisted in S3 BEFORE committing the metadata manifest in MySQL?",
+        "options": [
+          {
+            "id": "a",
+            "text": "S3 is faster than MySQL for small rows.",
+            "correct": false,
+            "feedback": "MySQL is used for metadata; S3 is for binary blobs."
+          },
+          {
+            "id": "b",
+            "text": "To prevent dangling metadata references where sibling devices wake up and try to download chunks that haven't finished uploading yet.",
+            "correct": true,
+            "feedback": "Correct! Writing blocks first guarantees that any committed manifest is 100% downloadable by other devices."
+          },
+          {
+            "id": "c",
+            "text": "MySQL cannot store SHA-256 strings until S3 returns an ETag.",
+            "correct": false,
+            "feedback": "The client already knows the SHA-256 hash before uploading."
+          },
+          {
+            "id": "d",
+            "text": "To bypass the client's 500ms debounce timer.",
+            "correct": false,
+            "feedback": "Debouncing happens before chunk upload."
+          }
+        ],
+        "explanation": "Persisting S3 blocks before committing metadata guarantees referential integrity for all syncing clients."
+      },
+      {
+        "id": "kc-3",
+        "question": "How does a desktop client safely verify a file chunk downloaded from a peer over LAN Sync?",
+        "options": [
+          {
+            "id": "a",
+            "text": "By trusting the peer's IP address.",
+            "correct": false,
+            "feedback": "IP addresses do not guarantee data integrity against corruption or tampering."
+          },
+          {
+            "id": "b",
+            "text": "By computing the SHA-256 hash of the received bytes and matching it against the Metadata Service manifest.",
+            "correct": true,
+            "feedback": "Correct! Content-addressable SHA-256 verification guarantees bit-for-bit integrity regardless of transport."
+          },
+          {
+            "id": "c",
+            "text": "By checking only the file's byte length.",
+            "correct": false,
+            "feedback": "Length alone cannot detect bit flips or tampering."
+          },
+          {
+            "id": "d",
+            "text": "By re-uploading the chunk to S3.",
+            "correct": false,
+            "feedback": "Re-uploading defeats the purpose of LAN Sync."
+          }
+        ],
+        "explanation": "Verifying the SHA-256 digest against the authoritative manifest makes LAN peer fetching tamper-proof."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "A cloud sync system splits file storage (S3) from folder info (database) and notifies your other devices when a file changes.",
+      "keyTakeaway": "To bound blast radius during partial cluster failures, split the Control/Metadata plane (sharded MySQL + cursor-based delta sync) from the Data/Block plane (CDC chunks in S3), connected by a Long-Poll/WebSocket Notification Service.",
+      "byteSummary": "When you save a file, the app on your laptop uploads only the changed pieces to cloud storage, updates the file list in a database, and sends a quick ping to your phone so it knows to download the update."
+    },
+    "intermediate": {
+      "summary": "Split Block Service (CDC + S3) and Metadata Service (namespace-sharded MySQL journals) with Long-Poll/WebSocket wakeups.",
+      "keyTakeaway": "To bound blast radius during partial cluster failures, split the Control/Metadata plane (sharded MySQL + cursor-based delta sync) from the Data/Block plane (CDC chunks in S3), connected by a Long-Poll/WebSocket Notification Service.",
+      "byteSummary": "Clients debounce local file events, upload missing CDC blocks to S3, and commit manifests to namespace-sharded MySQL. Thin Redis Pub/Sub wakeups trigger `/delta?cursor=` pulls, while adjacency-list parent pointers make folder moves O(1)."
+    },
+    "advanced": {
+      "summary": "Dropbox-scale sync adds LAN peer-to-peer chunk sharing, 7-day grace-period GC, and instant ransomware snapshot rollbacks.",
+      "keyTakeaway": "To bound blast radius during partial cluster failures, split the Control/Metadata plane (sharded MySQL + cursor-based delta sync) from the Data/Block plane (CDC chunks in S3), connected by a Long-Poll/WebSocket Notification Service.",
+      "byteSummary": "By combining content-addressable S3 blocks with immutable revision journals, the platform supports instant point-in-time ransomware recovery and SHA-256-verified LAN sync while preventing TOCTOU deletion races via grace-period GC."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "prerequisites": [
+    {
+      "title": "Content-Defined Chunking (CDC) & Cross-Device Delta Sync",
+      "summary": "Content-Defined Chunking uses a rolling hash (Rabin fingerprint) to slice files at content-dependent boundaries so byte insertions only invalidate the modified chunk instead of shifting every downstream block."
+    }
+  ],
+  "simulation": {
+    "title": "Design a Cloud File Storage & Cross-Device Sync System (Dropbox Scale) — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "user",
+        "label": "Caller / Agent",
+        "role": "Prompt & Tool Loop"
+      },
+      {
+        "id": "gw",
+        "label": "LLM Gateway",
+        "role": "Routing & Guardrails"
+      },
+      {
+        "id": "ret",
+        "label": "Radix / Vector",
+        "role": "Prefix & RAG Lookup"
+      },
+      {
+        "id": "gpu",
+        "label": "GPU Pool",
+        "role": "Paged KV & Decode"
+      }
+    ],
+    "edges": [
+      {
+        "from": "user",
+        "to": "gw",
+        "label": "prompt"
+      },
+      {
+        "from": "gw",
+        "to": "ret",
+        "label": "prefix / RAG"
+      },
+      {
+        "from": "ret",
+        "to": "gpu",
+        "label": "batched decode"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Decoupling the Block Plane from the Metadata Plane",
+        "actionLabel": "prompt",
+        "status": "healthy",
+        "activeNodeIds": [
+          "user",
+          "gw"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "prompt",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Caller / Agent sends work to LLM Gateway (Decoupling the Block Plane from the Metadata Plane)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Client File Watcher, Debouncing & Local SQLite Index",
+        "actionLabel": "prefix / RAG",
+        "status": "healthy",
+        "activeNodeIds": [
+          "gw",
+          "ret"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "prefix / RAG",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "LLM Gateway coordinates with Radix / Vector while preserving the core invariant (Client File Watcher, Debouncing & Local SQLite Index)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Sharding Metadata by Namespace & Journaled Sync Cursors",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "ret",
+          "gpu"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, GPU Pool absorbs pressure without cascading (Sharding Metadata by Namespace & Journaled Sync Cursors)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Point-in-Time Ransomware Rollback & Cold Tiering",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "user",
+          "gw",
+          "ret",
+          "gpu"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Point-in-Time Ransomware Rollback & Cold Tiering)."
+      }
+    ]
+  }
+}

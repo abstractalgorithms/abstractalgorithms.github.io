@@ -1,0 +1,827 @@
+{
+  "id": "llm-kv-cache",
+  "slug": "llm-kv-cache",
+  "title": "LLM KV-Cache Eviction & PagedAttention",
+  "problemType": "system-design",
+  "difficulty": "hard",
+  "prompt": "You are designing the inference engine memory manager for a Llama-3-70B (GQA, 80 layers, 8 KV heads, head_dim=128, FP16) serving cluster running on 8x H100-80GB GPUs (TP=8). Under continuous batching with mixed workloads (512-token chat + 32k-token RAG prompts with shared system prefixes), naive contiguous KV allocation wastes 68% of GPU HBM and triggers OOM crashes at 40 concurrent requests. Design a PagedAttention block manager and KV cache eviction/preemption policy.",
+  "spark": {
+    "summary": "Contiguous KV cache pre-allocation wastes 60-80% of HBM via internal fragmentation; PagedAttention virtualizes KV blocks to eliminate fragmentation and enable fine-grained preemption.",
+    "keyTakeaway": "If latency budgets leave no room for synchronous retries, partition KV caches into fixed-size 16-token physical blocks mapped via a block table, and handle memory pressure with prefix-aware LRU eviction, swap-to-CPU, or recomputation.",
+    "byteSummary": "**Core Mechanics:** Serving **Llama-3-70B (GQA, 80 layers, 8 KV heads, `head_dim=128`, FP16)** on **8× H100-80GB (TP=8)** leaves **57.5 GB/GPU (460 GB total)** for KV cache after weights (17.5 GB/GPU) and activations (5 GB/GPU).\n\n**Visual & Structural Flow:** Depicts Logical Token Blocks Mapped to Non-Contiguous 16-Token Physical KV Pages (Logical Seq (CoW) -> Block Table -> Physical KV Pool -> CPU Swap / Evict); GPU HBM Blocks, Prefix Cache & CPU Host Swap (GPU HBM (460 GB) -> Radix Prefix Cache -> CPU RAM Swap -> Recompute Queue).\n\n**Trade-Offs & Production:** Pre-allocating `max_seq_len` (32,768 tokens) per active sequence wastes gigabytes on short 512-token chats. Manage GPU HBM like OS virtual memory: **Fixed 16-Token Physical Blocks**: Divide the 460 GB KV pool into ~90,000 fixed 16-token blocks; allocate blocks on demand via a.\n\n**Failure Modes & Application:** Paged KV memory management powers modern LLM inference clusters: **vLLM / SGLang / TensorRT-LLM**: Enables high-concurrency multi-tenant serving on H100 clusters."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why LLM KV-Cache PagedAttention Matters",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "Serving **Llama-3-70B (GQA, 80 layers, 8 KV heads, `head_dim=128`, FP16)** on **8× H100-80GB (TP=8)** leaves **57.5 GB/GPU (460 GB total)** for KV cache after weights (17.5 GB/GPU) and activations (5 GB/GPU).",
+        "core": "Each token consumes $2 \\times 80 \\times 8 \\times 128 \\times 2\\text{ B} = 320\\text{ KB}$ globally (`40 KB/GPU`).",
+        "deepDive": "Reserving contiguous 32,768-token buffers per request wastes **10.5 GB/request**, capping batch size to ~43 requests and starving GPU Tensor Cores."
+      },
+      "purpose": "The mechanism: understand how Why LLM KV-Cache PagedAttention Matters works from first principles."
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "Real-World Impact of Contiguous KV Allocation",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Naive contiguous KV-cache allocation cripples LLM serving throughput:",
+        "core": "1. **60–80% Internal Fragmentation**: A 512-token chat request reserves a 32K-token slab (`10.5 GB`), leaving 98% unused.\n2. **Duplicate System Prefixes**: Identical 4K-token RAG/system prompts are recomputed and stored separately per user.\n3. **Preemption Thrashing**: Under memory pressure, dropping a request forces full O(N²) prefill recomputation unless blocks are swapped over PCIe Gen5 (64 GB/s).",
+        "deepDive": "In production deployments of LLM KV-Cache Eviction & PagedAttention, watch how real-world impact of contiguous kv allocation interacts with tail latency, retry amplification, and partial failures. Contiguous KV cache pre-allocation wastes 60-80% of HBM via internal fragmentation; PagedAttention virtualizes KV blocks to eliminate fragmentation and enable fine-grained preemption."
+      },
+      "sectionDiagram": {
+        "kind": "tree-index",
+        "eyebrow": "PagedAttention Virtual-to-Physical Block Table",
+        "title": "Logical Token Blocks Mapped to Non-Contiguous 16-Token Physical KV Pages",
+        "nodes": [
+          {
+            "label": "Logical Seq (CoW)",
+            "role": "Shared prefix + unique tail"
+          },
+          {
+            "label": "Block Table",
+            "role": "seq_id -> [phys_blk_id]"
+          },
+          {
+            "label": "Physical KV Pool",
+            "role": "16-token blocks (5.1 MB)"
+          },
+          {
+            "label": "CPU Swap / Evict",
+            "role": "PCIe Gen5 64 GB/s"
+          }
+        ],
+        "edges": [
+          {
+            "label": "Zero fragmentation"
+          },
+          {
+            "label": "Copy-on-Write prefix"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Block Size (16 tok)",
+            "detail": "320 KB/tok × 16 = 5.12 MB global block (640 KB/GPU)."
+          },
+          {
+            "label": "Prefix Sharing",
+            "detail": "Radix/hash-indexed shared blocks use refcount + Copy-on-Write."
+          },
+          {
+            "label": "Swap vs Recompute",
+            "detail": "PCIe Gen5 (64 GB/s) swaps 640 KB/GPU block in ~10 µs."
+          },
+          {
+            "label": "3-5x Batch Size",
+            "detail": "Eliminates reserved waste, saturating H100 Tensor Cores."
+          }
+        ],
+        "summary": "Virtual-to-physical block tables eliminate contiguous reservation waste and enable zero-copy prefix sharing."
+      },
+      "purpose": "The problem: see what breaks without Real-World Impact of Contiguous KV Allocation under real concurrency or scale.",
+      "decisionFramework": {
+        "problem": "How to implement LLM KV-Cache Eviction & PagedAttention without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "If latency budgets leave no room for synchronous retries, partition KV caches into fixed-size 16-token physical blocks mapped via a block table, and handle memory pressure with prefix-aware LRU eviction, swap-to-CPU, or recomputation.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When LLM KV-Cache Eviction & PagedAttention experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Naive Solution (and Why It Breaks)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Think of **Naive Solution (and Why It Breaks)** as the intuition layer for LLM KV-Cache Eviction & PagedAttention: The problem: see what breaks without Naive Solution under real concurrency or scale.",
+        "core": "Pre-allocating `max_seq_len` (32,768 tokens) per active sequence wastes gigabytes on short 512-token chats. Dynamically `realloc()`-ing contiguous tensors on every generated token forces expensive GPU-to-GPU memory copies and stalls CUDA kernels.",
+        "deepDive": "Under heavy load or partial failure, naive solution (and why it breaks) becomes a critical lever for predictable latency and correctness. Contiguous KV cache pre-allocation wastes 60-80% of HBM via internal fragmentation; PagedAttention virtualizes KV blocks to eliminate fragmentation and enable fine-grained preemption."
+      },
+      "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "Lifecycle & Failure Recovery",
+        "title": "Naive Solution (and Why It Breaks)",
+        "states": [
+          {
+            "id": "hit",
+            "label": "Cache Hit",
+            "tone": "good"
+          },
+          {
+            "id": "miss",
+            "label": "Cache Miss",
+            "tone": "info"
+          },
+          {
+            "id": "stampede",
+            "label": "Hot-Key Stampede",
+            "tone": "warn"
+          },
+          {
+            "id": "warm",
+            "label": "Coalesced Fill",
+            "tone": "good"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "hit",
+            "to": "miss",
+            "label": "TTL expired"
+          },
+          {
+            "from": "miss",
+            "to": "stampede",
+            "label": "concurrent misses"
+          },
+          {
+            "from": "stampede",
+            "to": "warm",
+            "label": "singleflight lock"
+          },
+          {
+            "from": "warm",
+            "to": "hit",
+            "label": "value cached"
+          }
+        ]
+      }
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise Solution: PagedAttention + Prefix Caching + Preemption Policy",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": {
+        "foundation": "Manage GPU HBM like OS virtual memory:",
+        "core": "- **Fixed 16-Token Physical Blocks**: Divide the 460 GB KV pool into ~90,000 fixed 16-token blocks; allocate blocks on demand via a per-sequence `BlockTable` so internal waste is at most 15 tokens per sequence.\n- **Automatic Prefix Caching (CoW)**: Hash completed 16-token prefix blocks; concurrent RAG requests share the same physical blocks with `ref_count > 1` and only allocate new blocks on divergence.\n- **Prefix-Aware Eviction & Swap**: Under memory pressure, evict unreferenced prefix-cache blocks via LRU first, then preempt lowest-priority sequences via PCIe Gen5 swap-to-CPU (for long prefills) or recompute (for short prompts).",
+        "deepDive": "In production deployments of LLM KV-Cache Eviction & PagedAttention, watch how enterprise solution: pagedattention + prefix caching + preemption policy interacts with tail latency, retry amplification, and partial failures. Contiguous KV cache pre-allocation wastes 60-80% of HBM via internal fragmentation; PagedAttention virtualizes KV blocks to eliminate fragmentation and enable fine-grained preemption."
+      },
+      "sectionDiagram": {
+        "kind": "cache-tier",
+        "eyebrow": "KV-Cache Memory Hierarchy",
+        "title": "GPU HBM Blocks, Prefix Cache & CPU Host Swap",
+        "nodes": [
+          {
+            "label": "GPU HBM (460 GB)",
+            "role": "Active 16-token blocks"
+          },
+          {
+            "label": "Radix Prefix Cache",
+            "role": "ref_count=0 LRU evictable"
+          },
+          {
+            "label": "CPU RAM Swap",
+            "role": "64 GB/s PCIe Gen5"
+          },
+          {
+            "label": "Recompute Queue",
+            "role": "Short prompts < 512 tok"
+          }
+        ],
+        "edges": [
+          {
+            "label": "CoW ref_count"
+          },
+          {
+            "label": "Preempt / Swap-in"
+          }
+        ],
+        "cards": [
+          {
+            "label": "HBM Capacity",
+            "detail": "460 GB / 320 KB/tok ≈ 1.43M active tokens across cluster."
+          },
+          {
+            "label": "No Contiguous Copy",
+            "detail": "PagedAttention CUDA kernel gathers non-contiguous blocks directly."
+          },
+          {
+            "label": "Eviction Order",
+            "detail": "1) Free unreferenced prefix blocks, 2) Swap/recompute lowest priority."
+          },
+          {
+            "label": "Continuous Batching",
+            "detail": "Iteration-level scheduling packs new tokens into freed slots."
+          }
+        ],
+        "summary": "PagedAttention + Radix prefix caching maximizes HBM utilization and continuous-batching throughput."
+      },
+      "markdownContent": "```python\nfrom collections import OrderedDict\nfrom dataclasses import dataclass\n\n@dataclass\nclass PhysicalBlock:\n    block_id: int\n    block_hash: int | None = None\n    ref_count: int = 0\n\nclass PrefixBlockAllocator:\n    def __init__(self, num_blocks: int):\n        self.blocks = [PhysicalBlock(i) for i in range(num_blocks)]\n        self.free_ids = list(range(num_blocks))\n        self.hash_to_id: dict[int, int] = {}\n        self.evict_lru: OrderedDict[int, int] = OrderedDict()\n\n    def allocate(self, block_hash: int | None = None) -> PhysicalBlock | None:\n        if block_hash is not None and block_hash in self.hash_to_id:\n            bid = self.hash_to_id[block_hash]\n            blk = self.blocks[bid]\n            if blk.ref_count == 0:\n                self.evict_lru.pop(bid, None)\n            blk.ref_count += 1\n            return blk\n        if self.free_ids:\n            bid = self.free_ids.pop()\n        elif self.evict_lru:\n            bid, _ = self.evict_lru.popitem(last=False)\n            old_hash = self.blocks[bid].block_hash\n            if old_hash is not None:\n                self.hash_to_id.pop(old_hash, None)\n        else:\n            return None  # Trigger LIFO preemption\n        blk = self.blocks[bid]\n        blk.block_hash = block_hash\n        blk.ref_count = 1\n        if block_hash is not None:\n            self.hash_to_id[block_hash] = bid\n        return blk\n\n    def free(self, bid: int) -> None:\n        blk = self.blocks[bid]\n        blk.ref_count -= 1\n        if blk.ref_count == 0:\n            if blk.block_hash is not None:\n                self.evict_lru[bid] = blk.block_hash\n            else:\n                self.free_ids.append(bid)\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where PagedAttention Applies in System Design",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Paged KV memory management powers modern LLM inference clusters:",
+        "core": "- **vLLM / SGLang / TensorRT-LLM**: Enables high-concurrency multi-tenant serving on H100 clusters.\n- **RAG & Agentic Workflows**: Prefix caching cuts TTFT (Time To First Token) by 5–10x on shared system/document prompts.\n- **Disaggregated Prefill-Decode**: Transfers paged KV blocks over NVLink/RDMA between prefill and decode pools.",
+        "deepDive": "In production deployments of LLM KV-Cache Eviction & PagedAttention, watch how where pagedattention applies in system design interacts with tail latency, retry amplification, and partial failures. Contiguous KV cache pre-allocation wastes 60-80% of HBM via internal fragmentation; PagedAttention virtualizes KV blocks to eliminate fragmentation and enable fine-grained preemption."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "model-serving-batching",
+          "title": "Concept: Model Serving & Batching",
+          "kind": "concept"
+        },
+        {
+          "slug": "quantization-llm-inference",
+          "title": "Concept: Quantization & LLM Inference",
+          "kind": "concept"
+        },
+        {
+          "slug": "memory-allocators",
+          "title": "Concept: Memory Allocators",
+          "kind": "concept"
+        },
+        {
+          "slug": "design-ai-agent",
+          "title": "System Design: AI Agent Task Orchestrator",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "How does PagedAttention eliminate the 60–80% memory waste of contiguous KV-cache allocation?",
+      "options": [
+        {
+          "id": "a",
+          "text": "It splits each sequence's KV cache into fixed-size (e.g., 16-token) physical blocks allocated on demand via a logical-to-physical block table",
+          "correct": true,
+          "feedback": "Correct: on-demand paging caps internal fragmentation to less than one block per sequence and enables Copy-on-Write prefix sharing."
+        },
+        {
+          "id": "b",
+          "text": "It discards KV-cache tensors after every attention layer and recomputes them",
+          "correct": false,
+          "feedback": "Discarding KV tensors every layer would destroy decode latency."
+        },
+        {
+          "id": "c",
+          "text": "It compresses all FP16 weights to INT2 during attention",
+          "correct": false,
+          "feedback": "PagedAttention is a memory-paging mechanism, not weight quantization."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "How does PagedAttention eliminate the 60–80% memory waste of contiguous KV-cache allocation?",
+        "options": [
+          {
+            "id": "a",
+            "text": "It splits each sequence's KV cache into fixed-size (e.g., 16-token) physical blocks allocated on demand via a logical-to-physical block table",
+            "correct": true,
+            "feedback": "Correct: on-demand paging caps internal fragmentation to less than one block per sequence and enables Copy-on-Write prefix sharing."
+          },
+          {
+            "id": "b",
+            "text": "It discards KV-cache tensors after every attention layer and recomputes them",
+            "correct": false,
+            "feedback": "Discarding KV tensors every layer would destroy decode latency."
+          },
+          {
+            "id": "c",
+            "text": "It compresses all FP16 weights to INT2 during attention",
+            "correct": false,
+            "feedback": "PagedAttention is a memory-paging mechanism, not weight quantization."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why LLM KV-Cache PagedAttention Matters', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "b",
+            "text": "Serving **Llama-3-70B (GQA, 80 layers, 8 KV heads, head_dim=128, FP16)** on **8× H100-80GB (TP=8)** leaves **57.5 GB/GPU (460 GB total)** for KV cache after weights (17.5…",
+            "correct": true,
+            "feedback": "Correct: Serving **Llama-3-70B (GQA, 80 layers, 8 KV heads, head_dim=128, FP16)** on **8× H100-80GB (TP=8)** leaves **57.5 GB/GPU (460 GB total)** for KV cache after weights (17.5…"
+          },
+          {
+            "id": "c",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Real-World Impact of Contiguous KV Allocation', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "b",
+            "text": "Naive contiguous KV-cache allocation cripples LLM serving throughput: 1.",
+            "correct": true,
+            "feedback": "Correct: Naive contiguous KV-cache allocation cripples LLM serving throughput: 1."
+          },
+          {
+            "id": "c",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** Serving **Llama-3-70B (GQA, 80 layers, 8 KV heads, `head_dim=128`, FP16)** on **8× H100-80GB (TP=8)** leaves **57.5 GB/GPU (460 GB total)** for KV cache after weights (17.5 GB/GPU) and activations (5 GB/GPU).\n\n**How It Flows:** Think of LLM KV-Cache Eviction & PagedAttention as a clear step-by-step chain: Logical Seq (CoW) -> Block Table -> Physical KV Pool -> CPU Swap / Evict -> GPU HBM (460 GB).\n\n**Why Beginners Should Care:** Partition KV caches into fixed-size 16-token physical blocks mapped via a block table, and handle memory pressure with prefix-aware LRU eviction, swap-to-CPU, or recomputation.",
+      "spark": {
+        "summary": "Serving **Llama-3-70B (GQA, 80 layers, 8 KV heads, `head_dim=128`, FP16)** on **8× H100-80GB (TP=8)** leaves **57.5 GB/GPU (460 GB total)** for KV cache after weights (17.5 GB/GPU) and activations (5 GB/GPU).",
+        "keyTakeaway": "Partition KV caches into fixed-size 16-token physical blocks mapped via a block table, and handle memory pressure with prefix-aware LRU eviction, swap-to-CPU, or recomputation."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why LLM KV-Cache PagedAttention Matters",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why LLM KV-Cache PagedAttention Matters works from first principles.",
+          "explanation": "Serving **Llama-3-70B (GQA, 80 layers, 8 KV heads, `head_dim=128`, FP16)** on **8× H100-80GB (TP=8)** leaves **57.5 GB/GPU (460 GB total)** for KV cache after weights (17.5 GB/GPU) and activations (5 GB/GPU). Each token consumes $2 \\times 80 \\times 8 \\times 128 \\times 2\\text{ B} = 320\\text{ KB}$ globally (`40 KB/GPU`).",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Real-World Impact of Contiguous KV Allocation",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without Real-World Impact of Contiguous KV Allocation under real concurrency or scale.",
+          "explanation": "Naive contiguous KV-cache allocation cripples LLM serving throughput: 1. **60–80% Internal Fragmentation**: A 512-token chat request reserves a 32K-token slab (`10.5 GB`), leaving 98% unused. 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "tree-index",
+            "eyebrow": "PagedAttention Virtual-to-Physical Block Table",
+            "title": "Logical Token Blocks Mapped to Non-Contiguous 16-Token Physical KV Pages",
+            "nodes": [
+              {
+                "label": "Logical Seq (CoW)",
+                "role": "Shared prefix + unique tail"
+              },
+              {
+                "label": "Block Table",
+                "role": "seq_id -> [phys_blk_id]"
+              },
+              {
+                "label": "Physical KV Pool",
+                "role": "16-token blocks (5.1 MB)"
+              },
+              {
+                "label": "CPU Swap / Evict",
+                "role": "PCIe Gen5 64 GB/s"
+              }
+            ],
+            "edges": [
+              {
+                "label": "Zero fragmentation"
+              },
+              {
+                "label": "Copy-on-Write prefix"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Block Size (16 tok)",
+                "detail": "320 KB/tok × 16 = 5.12 MB global block (640 KB/GPU)."
+              },
+              {
+                "label": "Prefix Sharing",
+                "detail": "Radix/hash-indexed shared blocks use refcount + Copy-on-Write."
+              },
+              {
+                "label": "Swap vs Recompute",
+                "detail": "PCIe Gen5 (64 GB/s) swaps 640 KB/GPU block in ~10 µs."
+              },
+              {
+                "label": "3-5x Batch Size",
+                "detail": "Eliminates reserved waste, saturating H100 Tensor Cores."
+              }
+            ],
+            "summary": "Virtual-to-physical block tables eliminate contiguous reservation waste and enable zero-copy prefix sharing."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive Solution (and Why It Breaks)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+          "explanation": "Pre-allocating `max_seq_len` (32,768 tokens) per active sequence wastes gigabytes on short 512-token chats. Dynamically `realloc()`-ing contiguous tensors on every generated token forces expensive GPU-to-GPU memory copies and stalls CUDA kernels.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise Solution: PagedAttention + Prefix Caching + Preemption Policy",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Manage GPU HBM like OS virtual memory: **Fixed 16-Token Physical Blocks**: Divide the 460 GB KV pool into ~90,000 fixed 16-token blocks; allocate blocks on demand via a per-sequence `BlockTable` so internal waste is at most 15 tokens per sequence.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "KV-Cache Memory Hierarchy",
+            "title": "GPU HBM Blocks, Prefix Cache & CPU Host Swap",
+            "nodes": [
+              {
+                "label": "GPU HBM (460 GB)",
+                "role": "Active 16-token blocks"
+              },
+              {
+                "label": "Radix Prefix Cache",
+                "role": "ref_count=0 LRU evictable"
+              },
+              {
+                "label": "CPU RAM Swap",
+                "role": "64 GB/s PCIe Gen5"
+              },
+              {
+                "label": "Recompute Queue",
+                "role": "Short prompts < 512 tok"
+              }
+            ],
+            "edges": [
+              {
+                "label": "CoW ref_count"
+              },
+              {
+                "label": "Preempt / Swap-in"
+              }
+            ],
+            "cards": [
+              {
+                "label": "HBM Capacity",
+                "detail": "460 GB / 320 KB/tok ≈ 1.43M active tokens across cluster."
+              },
+              {
+                "label": "No Contiguous Copy",
+                "detail": "PagedAttention CUDA kernel gathers non-contiguous blocks directly."
+              },
+              {
+                "label": "Eviction Order",
+                "detail": "1) Free unreferenced prefix blocks, 2) Swap/recompute lowest priority."
+              },
+              {
+                "label": "Continuous Batching",
+                "detail": "Iteration-level scheduling packs new tokens into freed slots."
+              }
+            ],
+            "summary": "PagedAttention + Radix prefix caching maximizes HBM utilization and continuous-batching throughput."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Partition KV caches into fixed-size 16-token physical blocks mapped via a block table, and handle memory pressure with prefix-aware LRU eviction, swap-to-CPU, or recomputation.",
+      "summary": "Contiguous KV cache pre-allocation wastes 60-80% of HBM via internal fragmentation; PagedAttention virtualizes KV blocks to eliminate fragmentation and enable fine-grained preemption.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, partition KV caches into fixed-size 16-token physical blocks mapped via a block table, and handle memory pressure with prefix-aware LRU eviction, swap-to-CPU, or recomputation."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** Serving **Llama-3-70B (GQA, 80 layers, 8 KV heads, `head_dim=128`, FP16)** on **8× H100-80GB (TP=8)** leaves **57.5 GB/GPU (460 GB total)** for KV cache after weights (17.5 GB/GPU) and activations (5 GB/GPU).\n\n**Visual & Structural Flow:** Depicts Logical Token Blocks Mapped to Non-Contiguous 16-Token Physical KV Pages (Logical Seq (CoW) -> Block Table -> Physical KV Pool -> CPU Swap / Evict); GPU HBM Blocks, Prefix Cache & CPU Host Swap (GPU HBM (460 GB) -> Radix Prefix Cache -> CPU RAM Swap -> Recompute Queue).\n\n**Trade-Offs & Production:** Pre-allocating `max_seq_len` (32,768 tokens) per active sequence wastes gigabytes on short 512-token chats. Manage GPU HBM like OS virtual memory: **Fixed 16-Token Physical Blocks**: Divide the 460 GB KV pool into ~90,000 fixed 16-token blocks; allocate blocks on demand via a.\n\n**Failure Modes & Application:** Paged KV memory management powers modern LLM inference clusters: **vLLM / SGLang / TensorRT-LLM**: Enables high-concurrency multi-tenant serving on H100 clusters.",
+      "spark": {
+        "summary": "Contiguous KV cache pre-allocation wastes 60-80% of HBM via internal fragmentation; PagedAttention virtualizes KV blocks to eliminate fragmentation and enable fine-grained preemption.",
+        "keyTakeaway": "Partition KV caches into fixed-size 16-token physical blocks mapped via a block table, and handle memory pressure with prefix-aware LRU eviction, swap-to-CPU, or recomputation."
+      },
+      "summary": "Contiguous KV cache pre-allocation wastes 60-80% of HBM via internal fragmentation; PagedAttention virtualizes KV blocks to eliminate fragmentation and enable fine-grained preemption.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, partition KV caches into fixed-size 16-token physical blocks mapped via a block table, and handle memory pressure with prefix-aware LRU eviction, swap-to-CPU, or recomputation."
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** Contiguous KV cache pre-allocation wastes 60-80% of HBM via internal fragmentation; PagedAttention virtualizes KV blocks to eliminate fragmentation and enable fine-grained preemption.\n\n**Production Trade-Offs:** Pre-allocating `max_seq_len` (32,768 tokens) per active sequence wastes gigabytes on short 512-token chats.\n\n**Failure Modes & Edge Cases:** Paged KV memory management powers modern LLM inference clusters: **vLLM / SGLang / TensorRT-LLM**: Enables high-concurrency multi-tenant serving on H100 clusters.\n\n**Principal Takeaway:** Partition KV caches into fixed-size 16-token physical blocks mapped via a block table, and handle memory pressure with prefix-aware LRU eviction, swap-to-CPU, or recomputation.",
+      "spark": {
+        "summary": "Contiguous KV cache pre-allocation wastes 60-80% of HBM via internal fragmentation; PagedAttention virtualizes KV blocks to eliminate fragmentation and enable fine-grained preemption.",
+        "keyTakeaway": "Partition KV caches into fixed-size 16-token physical blocks mapped via a block table, and handle memory pressure with prefix-aware LRU eviction, swap-to-CPU, or recomputation."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why LLM KV-Cache PagedAttention Matters",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why LLM KV-Cache PagedAttention Matters works from first principles.",
+          "explanation": "Serving **Llama-3-70B (GQA, 80 layers, 8 KV heads, `head_dim=128`, FP16)** on **8× H100-80GB (TP=8)** leaves **57.5 GB/GPU (460 GB total)** for KV cache after weights (17.5 GB/GPU) and activations (5 GB/GPU). Each token consumes $2 \\times 80 \\times 8 \\times 128 \\times 2\\text{ B} = 320\\text{ KB}$ globally (`40 KB/GPU`). Reserving contiguous 32,768-token buffers per request wastes **10.5 GB/request**, capping batch size to ~43 requests and starving GPU Tensor Cores.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Real-World Impact of Contiguous KV Allocation",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without Real-World Impact of Contiguous KV Allocation under real concurrency or scale.",
+          "explanation": "Naive contiguous KV-cache allocation cripples LLM serving throughput:\n\n1. **60–80% Internal Fragmentation**: A 512-token chat request reserves a 32K-token slab (`10.5 GB`), leaving 98% unused.\n2. **Duplicate System Prefixes**: Identical 4K-token RAG/system prompts are recomputed and stored separately per user.\n3. **Preemption Thrashing**: Under memory pressure, dropping a request forces full O(N²) prefill recomputation unless blocks are swapped over PCIe Gen5 (64 GB/s).",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "tree-index",
+            "eyebrow": "PagedAttention Virtual-to-Physical Block Table",
+            "title": "Logical Token Blocks Mapped to Non-Contiguous 16-Token Physical KV Pages",
+            "nodes": [
+              {
+                "label": "Logical Seq (CoW)",
+                "role": "Shared prefix + unique tail"
+              },
+              {
+                "label": "Block Table",
+                "role": "seq_id -> [phys_blk_id]"
+              },
+              {
+                "label": "Physical KV Pool",
+                "role": "16-token blocks (5.1 MB)"
+              },
+              {
+                "label": "CPU Swap / Evict",
+                "role": "PCIe Gen5 64 GB/s"
+              }
+            ],
+            "edges": [
+              {
+                "label": "Zero fragmentation"
+              },
+              {
+                "label": "Copy-on-Write prefix"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Block Size (16 tok)",
+                "detail": "320 KB/tok × 16 = 5.12 MB global block (640 KB/GPU)."
+              },
+              {
+                "label": "Prefix Sharing",
+                "detail": "Radix/hash-indexed shared blocks use refcount + Copy-on-Write."
+              },
+              {
+                "label": "Swap vs Recompute",
+                "detail": "PCIe Gen5 (64 GB/s) swaps 640 KB/GPU block in ~10 µs."
+              },
+              {
+                "label": "3-5x Batch Size",
+                "detail": "Eliminates reserved waste, saturating H100 Tensor Cores."
+              }
+            ],
+            "summary": "Virtual-to-physical block tables eliminate contiguous reservation waste and enable zero-copy prefix sharing."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive Solution (and Why It Breaks)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+          "explanation": "Pre-allocating `max_seq_len` (32,768 tokens) per active sequence wastes gigabytes on short 512-token chats. Dynamically `realloc()`-ing contiguous tensors on every generated token forces expensive GPU-to-GPU memory copies and stalls CUDA kernels.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise Solution: PagedAttention + Prefix Caching + Preemption Policy",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Manage GPU HBM like OS virtual memory:\n\n- **Fixed 16-Token Physical Blocks**: Divide the 460 GB KV pool into ~90,000 fixed 16-token blocks; allocate blocks on demand via a per-sequence `BlockTable` so internal waste is at most 15 tokens per sequence.\n- **Automatic Prefix Caching (CoW)**: Hash completed 16-token prefix blocks; concurrent RAG requests share the same physical blocks with `ref_count > 1` and only allocate new blocks on divergence.\n- **Prefix-Aware Eviction & Swap**: Under memory pressure, evict unreferenced prefix-cache blocks via LRU first, then preempt lowest-priority sequences via PCIe Gen5 swap-to-CPU (for long prefills) or recompute (for short prompts).",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "KV-Cache Memory Hierarchy",
+            "title": "GPU HBM Blocks, Prefix Cache & CPU Host Swap",
+            "nodes": [
+              {
+                "label": "GPU HBM (460 GB)",
+                "role": "Active 16-token blocks"
+              },
+              {
+                "label": "Radix Prefix Cache",
+                "role": "ref_count=0 LRU evictable"
+              },
+              {
+                "label": "CPU RAM Swap",
+                "role": "64 GB/s PCIe Gen5"
+              },
+              {
+                "label": "Recompute Queue",
+                "role": "Short prompts < 512 tok"
+              }
+            ],
+            "edges": [
+              {
+                "label": "CoW ref_count"
+              },
+              {
+                "label": "Preempt / Swap-in"
+              }
+            ],
+            "cards": [
+              {
+                "label": "HBM Capacity",
+                "detail": "460 GB / 320 KB/tok ≈ 1.43M active tokens across cluster."
+              },
+              {
+                "label": "No Contiguous Copy",
+                "detail": "PagedAttention CUDA kernel gathers non-contiguous blocks directly."
+              },
+              {
+                "label": "Eviction Order",
+                "detail": "1) Free unreferenced prefix blocks, 2) Swap/recompute lowest priority."
+              },
+              {
+                "label": "Continuous Batching",
+                "detail": "Iteration-level scheduling packs new tokens into freed slots."
+              }
+            ],
+            "summary": "PagedAttention + Radix prefix caching maximizes HBM utilization and continuous-batching throughput."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where PagedAttention Applies in System Design",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Paged KV memory management powers modern LLM inference clusters:\n\n- **vLLM / SGLang / TensorRT-LLM**: Enables high-concurrency multi-tenant serving on H100 clusters.\n- **RAG & Agentic Workflows**: Prefix caching cuts TTFT (Time To First Token) by 5–10x on shared system/document prompts.\n- **Disaggregated Prefill-Decode**: Transfers paged KV blocks over NVLink/RDMA between prefill and decode pools.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Partition KV caches into fixed-size 16-token physical blocks mapped via a block table, and handle memory pressure with prefix-aware LRU eviction, swap-to-CPU, or recomputation.",
+      "summary": "Contiguous KV cache pre-allocation wastes 60-80% of HBM via internal fragmentation; PagedAttention virtualizes KV blocks to eliminate fragmentation and enable fine-grained preemption.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, partition KV caches into fixed-size 16-token physical blocks mapped via a block table, and handle memory pressure with prefix-aware LRU eviction, swap-to-CPU, or recomputation."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "simulation": {
+    "title": "LLM KV-Cache Eviction & PagedAttention — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "app",
+        "label": "App Servers",
+        "role": "Concurrent Reads"
+      },
+      {
+        "id": "sf",
+        "label": "Singleflight",
+        "role": "In-Flight Coalescer"
+      },
+      {
+        "id": "redis",
+        "label": "Redis L2",
+        "role": "Hot Key Store"
+      },
+      {
+        "id": "db",
+        "label": "Primary DB",
+        "role": "Origin Source"
+      }
+    ],
+    "edges": [
+      {
+        "from": "app",
+        "to": "sf",
+        "label": "GET hot_key"
+      },
+      {
+        "from": "sf",
+        "to": "redis",
+        "label": "L2 lookup"
+      },
+      {
+        "from": "redis",
+        "to": "db",
+        "label": "1x origin fetch"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why LLM KV-Cache PagedAttention Matters",
+        "actionLabel": "GET hot_key",
+        "status": "healthy",
+        "activeNodeIds": [
+          "app",
+          "sf"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "GET hot_key",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "App Servers sends work to Singleflight (Why LLM KV-Cache PagedAttention Matters)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Real-World Impact of Contiguous KV Allocation",
+        "actionLabel": "L2 lookup",
+        "status": "healthy",
+        "activeNodeIds": [
+          "sf",
+          "redis"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "L2 lookup",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Singleflight coordinates with Redis L2 while preserving the core invariant (Real-World Impact of Contiguous KV Allocation)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Naive Solution (and Why It Breaks)",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "redis",
+          "db"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, Primary DB absorbs pressure without cascading (Naive Solution (and Why It Breaks))."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Where PagedAttention Applies in System Design",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "app",
+          "sf",
+          "redis",
+          "db"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Where PagedAttention Applies in System Design)."
+      }
+    ]
+  }
+}

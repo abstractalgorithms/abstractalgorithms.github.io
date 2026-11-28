@@ -1,0 +1,1058 @@
+{
+  "id": "concept-quantization-and-llm-inference",
+  "slug": "quantization-and-llm-inference",
+  "name": "LLM Quantization, GPTQ/AWQ & Inference Performance",
+  "domain": "AI & Machine Learning Engineering",
+  "tagline": "Compressing 16-bit weights and KV caches to FP8 or INT4 (AWQ/GPTQ) to cut VRAM 2–4x and break the HBM decode bandwidth wall.",
+  "purpose": "Build a progressive mental model of LLM quantization—from why decode is memory-bandwidth bound to protecting activation outliers with AWQ/FP8 and benchmarking concurrency curves.",
+  "spark": {
+    "summary": "LLM quantization compresses 16-bit model weights and KV caches into 8-bit or 4-bit representations (FP8, AWQ, GPTQ, GGUF) to slash VRAM usage by 2-4x and accelerate memory-bandwidth-bound token generation.",
+    "keyTakeaway": "When batching and tail latency compete for accelerator cycles, GPTQ/AWQ & Inference Performance, because autoregressive LLM decode is memory-bandwidth bound at low batch sizes, moving from FP16 to INT4/FP8 cuts HBM reads per token by 2-4x while keeping accuracy loss under ~1% when activation outliers are protected.",
+    "byteSummary": "**Core Mechanics:** Autoregressive LLM inference has two opposite regimes: **Prefill** (processes prompt tokens in parallel via large GEMMs -> **compute-bound**) and **Decode** (generates 1 token per step -> **memory-bandwidth bound**).\n\n**Visual & Structural Flow:** Depicts HBM3 Bandwidth Bottleneck & Quantized Weight/KV-Cache Footprint (HBM3 (35 GB INT4) -> Tensor Core / Regs -> FP8 KV Cache -> Decode (~95 tok/s)); 3-Layer Calibration, Accuracy & Concurrency Benchmark Flow (Calibration Set -> AWQ / FP8 Pass -> Task Eval Gate -> vLLM Serving).\n\n**Trade-Offs & Production:** Match the quantization scheme to your GPU architecture and concurrency regime. An ML platform calibrates AWQ (`group_size=128`) on 256 production prompts, gates the checkpoint against BF16 on JSON-schema + GSM8K evals, sweeps batch=1..64 latency, and deploys.\n\n**Failure Modes & Application:** Explore PagedAttention KV-cache management, speculative decoding, and continuous batching."
+  },
+  "learningJourney": [
+    {
+      "id": "01-what-it-is",
+      "eyebrow": "STAGE 01 · WHAT IT IS",
+      "title": "What is LLM Quantization (Prefill vs. Decode)",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "Autoregressive LLM inference has two opposite regimes: **Prefill** (processes prompt tokens in parallel via large GEMMs -> **compute-bound**) and **Decode** (generates 1 token per step -> **memory-bandwidth bound**).",
+        "core": "A 70B model in FP16 consumes **140 GB** of weights—requiring 2x 80 GB H100s—and batch-1 decode on an H100 (3.35 TB/s HBM3) is capped near ~24 tok/s. Quantizing weights to **INT4 (W4A16)** shrinks weights to **~35 GB** (fitting on 1x GPU) and lifts the bandwidth ceiling near ~95 tok/s; **FP8 (W8A8)** uses Hopper Tensor Cores to accelerate *both* prefill and high-batch decode.",
+        "deepDive": "In production deployments of LLM Quantization, GPTQ/AWQ & Inference Performance, watch how what is llm quantization (prefill vs. decode) interacts with tail latency, retry amplification, and partial failures. LLM quantization compresses 16-bit model weights and KV caches into 8-bit or 4-bit representations (FP8, AWQ, GPTQ, GGUF) to slash VRAM usage by 2-4x and accelerate memory-bandwidth-bound token generation."
+      },
+      "sectionDiagram": {
+        "kind": "cache-tier",
+        "eyebrow": "GPU Memory Hierarchy",
+        "title": "HBM3 Bandwidth Bottleneck & Quantized Weight/KV-Cache Footprint",
+        "nodes": [
+          {
+            "id": "hbm",
+            "label": "HBM3 (35 GB INT4)",
+            "role": "vs 140 GB FP16"
+          },
+          {
+            "id": "sram",
+            "label": "Tensor Core / Regs",
+            "role": "Marlin / FP8 GEMM"
+          },
+          {
+            "id": "kv",
+            "label": "FP8 KV Cache",
+            "role": "4x context concurrency"
+          },
+          {
+            "id": "tok",
+            "label": "Decode (~95 tok/s)",
+            "role": "HBM read / token"
+          }
+        ],
+        "edges": [
+          {
+            "label": "4x less HBM traffic"
+          },
+          {
+            "label": "E4M3 KV read"
+          }
+        ],
+        "cards": [
+          {
+            "label": "1. Weight Compression",
+            "detail": "INT4 (AWQ/GPTQ) cuts 70B weights from 140 GB to ~35 GB, fitting on a single 80 GB GPU."
+          },
+          {
+            "label": "2. Outlier Protection",
+            "detail": "AWQ scales salient ~1% activation outlier channels before group-wise (128) quantization."
+          },
+          {
+            "label": "3. KV-Cache FP8",
+            "detail": "At 32k-128k contexts, quantizing KV cache to FP8 prevents VRAM OOM under concurrency."
+          }
+        ],
+        "summary": "Shrinking bytes read from HBM per token directly multiplies low-batch decode speed."
+      },
+      "purpose": "The mechanism: understand how LLM Quantization (Prefill vs. Decode) works from first principles."
+    },
+    {
+      "id": "02-why-we-need-it",
+      "eyebrow": "STAGE 02 · WHY WE NEED IT",
+      "title": "Why Naive Rounding Fails (Activation Outliers)",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "Think of **Why Naive Rounding Fails (Activation Outliers)** as the intuition layer for LLM Quantization, GPTQ/AWQ & Inference Performance: The problem: see what breaks without Why Naive Rounding Fails under real concurrency or scale.",
+        "core": "Transformer activations in models >6B parameters exhibit systematic **outlier features**: ~0.1%–1% of hidden channels reach magnitudes 10x–100x larger than the median. Naive Round-To-Nearest (RTN) stretches the quantization grid to fit one outlier, crushing normal weights into 1–2 bits and destroying reasoning and JSON tool calling.",
+        "deepDive": "Under heavy load or partial failure, why naive rounding fails (activation outliers) becomes a critical lever for predictable latency and correctness. LLM quantization compresses 16-bit model weights and KV caches into 8-bit or 4-bit representations (FP8, AWQ, GPTQ, GGUF) to slash VRAM usage by 2-4x and accelerate memory-bandwidth-bound token generation."
+      },
+      "ideas": [
+        {
+          "title": "AWQ, GPTQ & SmoothQuant",
+          "description": "AWQ protects salient weight channels identified by activation magnitude; GPTQ uses second-order Hessian error compensation; SmoothQuant migrates outlier difficulty from activations into weights."
+        },
+        {
+          "title": "High-Batch W4A16 Inversion",
+          "description": "At batch > 32, W4A16 register dequantization ALU overhead saturates compute—making FP8 W8A8 faster on H100/L40S."
+        }
+      ],
+      "purpose": "The problem: see what breaks without Why Naive Rounding Fails under real concurrency or scale.",
+      "sectionDiagram": {
+        "kind": "behavior-transition",
+        "eyebrow": "Stage 2 Trade-Off",
+        "title": "Why Naive Rounding Fails (Activation Outliers)",
+        "before": {
+          "label": "Naive Unbounded Path",
+          "metrics": [
+            "Unbounded retries",
+            "Tail latency spikes",
+            "Silent state drift"
+          ]
+        },
+        "after": {
+          "label": "Bounded Engineering Path",
+          "metrics": [
+            "Explicit budgets",
+            "Predictable p99",
+            "Verifiable invariants"
+          ]
+        }
+      },
+      "decisionFramework": {
+        "problem": "How to implement LLM Quantization, GPTQ/AWQ & Inference Performance without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "When batching and tail latency compete for accelerator cycles, GPTQ/AWQ & Inference Performance, because autoregressive LLM decode is memory-bandwidth bound at low batch sizes, moving from FP16 to INT4/FP8 cuts HBM reads per token by 2-4x while keeping accuracy loss under ~1% when activation outliers are protected.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When LLM Quantization, GPTQ/AWQ & Inference Performance experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-where-it-is-used",
+      "eyebrow": "STAGE 03 · WHERE IT IS USED",
+      "title": "Where Quantization fits (and where BF16/QAT wins)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Think of **Where Quantization fits (and where BF16/QAT wins)** as the intuition layer for LLM Quantization, GPTQ/AWQ & Inference Performance: Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+        "core": "Choose W4A16 (AWQ+Marlin) for single-GPU 70B / low-latency decode, FP8 (W8A8) for high-batch Hopper serving, and skip sub-4-bit PTQ on complex coding/reasoning.",
+        "deepDive": "Under heavy load or partial failure, where quantization fits (and where bf16/qat wins) becomes a critical lever for predictable latency and correctness. LLM quantization compresses 16-bit model weights and KV caches into 8-bit or 4-bit representations (FP8, AWQ, GPTQ, GGUF) to slash VRAM usage by 2-4x and accelerate memory-bandwidth-bound token generation."
+      },
+      "comparison": [
+        {
+          "choice": "Good Candidate: 7B–70B+ Interactive Serving (FP8 / AWQ)",
+          "benefits": [
+            "2–4x VRAM reduction and 2–3x higher decode tok/s with <1% accuracy drop."
+          ],
+          "costs": [
+            "Requires fused kernels (Marlin, ExLlamaV2, FP8 Tensor Cores) and domain-matched calibration data."
+          ]
+        },
+        {
+          "choice": "Avoid: Sub-4-Bit PTQ (INT2) on Code/Math Reasoning",
+          "benefits": [
+            "Keep BF16/FP8 or use Quantization-Aware Training (QAT) for strict JSON/SQL/reasoning fidelity."
+          ],
+          "costs": [
+            "Post-training 2-bit quantization degrades multi-step reasoning severely."
+          ]
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+      "sectionDiagram": {
+        "kind": "behavior-transition",
+        "eyebrow": "Stage 3 Trade-Off",
+        "title": "Where Quantization fits (and where BF16/QAT wins)",
+        "before": {
+          "label": "Naive Unbounded Path",
+          "metrics": [
+            "Unbounded retries",
+            "Tail latency spikes",
+            "Silent state drift"
+          ]
+        },
+        "after": {
+          "label": "Bounded Engineering Path",
+          "metrics": [
+            "Explicit budgets",
+            "Predictable p99",
+            "Verifiable invariants"
+          ]
+        }
+      }
+    },
+    {
+      "id": "04-how-it-is-managed",
+      "eyebrow": "STAGE 04 · HOW IT IS MANAGED",
+      "title": "How Quantized Serving & Task-Specific Evals are managed",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Think of **How Quantized Serving & Task-Specific Evals are managed** as the intuition layer for LLM Quantization, GPTQ/AWQ & Inference Performance: Operational control: configure bounds, failure handling, and safe production defaults.",
+        "core": "Never ship a quantized checkpoint on WikiText perplexity alone. Calibrate on 256 domain-representative samples (code, JSON, target languages), enable `--kv-cache-dtype fp8` for long contexts, and run task-specific evals (HumanEval, JSON schema adherence) + concurrency sweeps against BF16.",
+        "deepDive": "Under heavy load or partial failure, how quantized serving & task-specific evals are managed becomes a critical lever for predictable latency and correctness. LLM quantization compresses 16-bit model weights and KV caches into 8-bit or 4-bit representations (FP8, AWQ, GPTQ, GGUF) to slash VRAM usage by 2-4x and accelerate memory-bandwidth-bound token generation."
+      },
+      "markdownContent": "```bash\n# Production vLLM launch with FP8 weights + FP8 KV-cache & Marlin/PagedAttention\npython -m vllm.entrypoints.openai.api_server \\\n  --model meta-llama/Llama-3.1-70B-Instruct-FP8 \\\n  --quantization fp8 \\\n  --kv-cache-dtype fp8 \\\n  --max-model-len 32768 \\\n  --gpu-memory-utilization 0.92\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+      "sectionDiagram": {
+        "kind": "behavior-transition",
+        "eyebrow": "Stage 4 Trade-Off",
+        "title": "How Quantized Serving & Task-Specific Evals are managed",
+        "before": {
+          "label": "Naive Unbounded Path",
+          "metrics": [
+            "Unbounded retries",
+            "Tail latency spikes",
+            "Silent state drift"
+          ]
+        },
+        "after": {
+          "label": "Bounded Engineering Path",
+          "metrics": [
+            "Explicit budgets",
+            "Predictable p99",
+            "Verifiable invariants"
+          ]
+        }
+      }
+    },
+    {
+      "id": "05-alternatives",
+      "eyebrow": "STAGE 05 · ALTERNATIVES",
+      "title": "Alternatives: FP8 (W8A8) vs. AWQ (W4A16) vs. GGUF K-Quants",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": {
+        "foundation": "Think of **Alternatives: FP8 (W8A8) vs. AWQ (W4A16) vs. GGUF K-Quants** as the intuition layer for LLM Quantization, GPTQ/AWQ & Inference Performance: The trade-off: compare competing approaches across latency, consistency, and operational cost.",
+        "core": "Match the quantization scheme to your GPU architecture and concurrency regime.",
+        "deepDive": "Under heavy load or partial failure, alternatives: fp8 (w8a8) vs. awq (w4a16) vs. gguf k-quants becomes a critical lever for predictable latency and correctness. LLM quantization compresses 16-bit model weights and KV caches into 8-bit or 4-bit representations (FP8, AWQ, GPTQ, GGUF) to slash VRAM usage by 2-4x and accelerate memory-bandwidth-bound token generation."
+      },
+      "comparison": [
+        {
+          "choice": "FP8 E4M3 (W8A8 on H100 / L40S)",
+          "benefits": [
+            "<0.2% accuracy drop and native Tensor Core acceleration for both prefill and high-batch decode."
+          ],
+          "costs": [
+            "Only 2x VRAM savings (~70 GB for 70B) and requires Ada/Hopper+ GPUs."
+          ]
+        },
+        {
+          "choice": "AWQ / GPTQ with Marlin Kernel (W4A16)",
+          "benefits": [
+            "~4x VRAM savings (~35 GB for 70B) and fastest batch-1 decode."
+          ],
+          "costs": [
+            "Degrades at high batch (>32) due to register dequantization overhead."
+          ]
+        },
+        {
+          "choice": "GGUF K-Quants (Q4_K_M)",
+          "benefits": [
+            "Mixed-precision layer allocation ideal for edge/CPU/Apple Silicon (`llama.cpp`)."
+          ],
+          "costs": [
+            "Not optimized for high-concurrency datacenter continuous batching."
+          ]
+        }
+      ],
+      "purpose": "The trade-off: compare competing approaches across latency, consistency, and operational cost.",
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Stage 5 Interaction",
+        "title": "Alternatives: FP8 (W8A8) vs. AWQ (W4A16) vs. GGUF K-Quants",
+        "actors": [
+          {
+            "id": "caller",
+            "label": "Client / Caller"
+          },
+          {
+            "id": "coord",
+            "label": "Coordinator"
+          },
+          {
+            "id": "store",
+            "label": "State / Engine"
+          }
+        ],
+        "steps": [
+          {
+            "from": "caller",
+            "to": "coord",
+            "label": "1. Dispatch request + bounds"
+          },
+          {
+            "from": "coord",
+            "to": "store",
+            "label": "2. Execute deterministic step"
+          },
+          {
+            "from": "store",
+            "to": "coord",
+            "label": "3. Return state & proof"
+          },
+          {
+            "from": "coord",
+            "to": "caller",
+            "label": "4. Ack with bounded latency"
+          }
+        ]
+      }
+    },
+    {
+      "id": "06-production-architecture",
+      "eyebrow": "STAGE 06 · PRODUCTION ARCHITECTURE",
+      "title": "Production example: Calibration -> Eval Gate -> Continuous Batching",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Think of **Production example: Calibration -> Eval Gate -> Continuous Batching** as the intuition layer for LLM Quantization, GPTQ/AWQ & Inference Performance: Production architecture: see how the components compose end to end under real load.",
+        "core": "An ML platform calibrates AWQ (`group_size=128`) on 256 production prompts, gates the checkpoint against BF16 on JSON-schema + GSM8K evals, sweeps batch=1..64 latency, and deploys on vLLM with FP8 KV-cache PagedAttention.",
+        "deepDive": "Under heavy load or partial failure, production example: calibration -> eval gate -> continuous batching becomes a critical lever for predictable latency and correctness. LLM quantization compresses 16-bit model weights and KV caches into 8-bit or 4-bit representations (FP8, AWQ, GPTQ, GGUF) to slash VRAM usage by 2-4x and accelerate memory-bandwidth-bound token generation."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Quantization Release Gate",
+        "title": "3-Layer Calibration, Accuracy & Concurrency Benchmark Flow",
+        "actors": [
+          {
+            "id": "cal",
+            "label": "Calibration Set"
+          },
+          {
+            "id": "qtz",
+            "label": "AWQ / FP8 Pass"
+          },
+          {
+            "id": "eval",
+            "label": "Task Eval Gate"
+          },
+          {
+            "id": "vllm",
+            "label": "vLLM Serving"
+          }
+        ],
+        "events": [
+          {
+            "from": "cal",
+            "to": "qtz",
+            "label": "256 code/JSON/prose samples",
+            "status": "ok"
+          },
+          {
+            "from": "qtz",
+            "to": "eval",
+            "label": "Compare vs BF16 (HumanEval/JSON)",
+            "status": "warn"
+          },
+          {
+            "from": "eval",
+            "to": "vllm",
+            "label": "Sweep batch=1 vs batch=64 tok/s",
+            "status": "ok"
+          },
+          {
+            "from": "vllm",
+            "to": "vllm",
+            "label": "Serve with FP8 KV-cache",
+            "status": "ok"
+          }
+        ],
+        "summary": "Task-specific evals and concurrency sweeps prevent silent tool-calling breakage and high-batch slowdowns."
+      },
+      "purpose": "Production architecture: see how the components compose end to end under real load."
+    },
+    {
+      "id": "07-problems-and-further-reading",
+      "eyebrow": "STAGE 07 · PROBLEMS SOLVED & FURTHER DEEP DIVE",
+      "title": "Problems solved by Quantization & Related LLM Serving Concepts",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Think of **Problems solved by Quantization & Related LLM Serving Concepts** as the intuition layer for LLM Quantization, GPTQ/AWQ & Inference Performance: Applied problems: connect these internals to concrete system design and debugging scenarios.",
+        "core": "Explore PagedAttention KV-cache management, speculative decoding, and continuous batching.",
+        "deepDive": "Under heavy load or partial failure, problems solved by quantization & related llm serving concepts becomes a critical lever for predictable latency and correctness. LLM quantization compresses 16-bit model weights and KV caches into 8-bit or 4-bit representations (FP8, AWQ, GPTQ, GGUF) to slash VRAM usage by 2-4x and accelerate memory-bandwidth-bound token generation."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "llm-kv-cache-pagedattention",
+          "title": "Problem: LLM KV Cache & PagedAttention",
+          "kind": "problem"
+        },
+        {
+          "slug": "speculative-decoding-llm-inference",
+          "title": "Problem: Speculative Decoding for LLM Inference",
+          "kind": "problem"
+        },
+        {
+          "slug": "model-serving-batching",
+          "title": "Concept: Model Serving & Continuous Batching",
+          "kind": "concept"
+        },
+        {
+          "slug": "semantic-llm-caching",
+          "title": "Concept: Semantic Caching for LLMs",
+          "kind": "concept"
+        }
+      ],
+      "purpose": "Applied problems: connect these internals to concrete system design and debugging scenarios.",
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "Stage 7 Topology",
+        "title": "Problems solved by Quantization & Related LLM Serving Conc...",
+        "nodes": [
+          {
+            "id": "edge",
+            "label": "Edge Router",
+            "tier": "ingress"
+          },
+          {
+            "id": "worker",
+            "label": "LLM Quantization, GP Worker",
+            "tier": "compute"
+          },
+          {
+            "id": "state",
+            "label": "Primary State",
+            "tier": "storage"
+          },
+          {
+            "id": "obs",
+            "label": "Telemetry & Audit",
+            "tier": "control"
+          }
+        ],
+        "edges": [
+          {
+            "from": "edge",
+            "to": "worker",
+            "label": "route"
+          },
+          {
+            "from": "worker",
+            "to": "state",
+            "label": "read / mutate"
+          },
+          {
+            "from": "worker",
+            "to": "obs",
+            "label": "emit metrics"
+          }
+        ]
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "On an NVIDIA H100 serving high-concurrency traffic (batch size = 64), why can FP8 (W8A8) outperform INT4 (W4A16)?",
+      "options": [
+        {
+          "id": "a",
+          "text": "At high batch sizes, inference becomes compute-bound and W4A16's register dequantization overhead slows execution compared to native FP8 Tensor Core GEMMs",
+          "correct": true,
+          "feedback": "Correct: W4A16 shines at low batch sizes (bandwidth-bound), while FP8 W8A8 uses Tensor Cores directly at high batch."
+        },
+        {
+          "id": "b",
+          "text": "Because FP8 uses half as much VRAM as INT4",
+          "correct": false,
+          "feedback": "INT4 uses ~2x less VRAM than FP8, but pays dequantization ALU cost at high batch."
+        },
+        {
+          "id": "c",
+          "text": "Because INT4 cannot run with PagedAttention",
+          "correct": false,
+          "feedback": "vLLM supports PagedAttention with both INT4 and FP8."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "On an NVIDIA H100 serving high-concurrency traffic (batch size = 64), why can FP8 (W8A8) outperform INT4 (W4A16)?",
+        "options": [
+          {
+            "id": "a",
+            "text": "At high batch sizes, inference becomes compute-bound and W4A16's register dequantization overhead slows execution compared to native FP8 Tensor Core GEMMs",
+            "correct": true,
+            "feedback": "Correct: W4A16 shines at low batch sizes (bandwidth-bound), while FP8 W8A8 uses Tensor Cores directly at high batch."
+          },
+          {
+            "id": "b",
+            "text": "Because FP8 uses half as much VRAM as INT4",
+            "correct": false,
+            "feedback": "INT4 uses ~2x less VRAM than FP8, but pays dequantization ALU cost at high batch."
+          },
+          {
+            "id": "c",
+            "text": "Because INT4 cannot run with PagedAttention",
+            "correct": false,
+            "feedback": "vLLM supports PagedAttention with both INT4 and FP8."
+          }
+        ]
+      },
+      {
+        "question": "What is the main benefit—and corresponding operational trade-off—of using Good Candidate: 7B–70B+ Interactive Serving (FP8 / AWQ) in LLM Quantization, GPTQ/AWQ & Inference Performance?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Advantage: Keep BF16/FP8 or use Quantization-Aware Training (QAT) for strict JSON/SQL/reasoning fidelity. It has zero operational or latency overhead compared to Avoid: Sub-4-Bit PTQ (INT2) on Code/Math Reasoning.",
+            "correct": false,
+            "feedback": "Not quite: that describes Avoid: Sub-4-Bit PTQ (INT2) on Code/Math Reasoning, whereas Good Candidate: 7B–70B+ Interactive Serving (FP8 / AWQ) specifically trades off: Requires fused kernels (Marlin, ExLlamaV2, FP8 Tensor Cores) and domain-matched calibration data."
+          },
+          {
+            "id": "b",
+            "text": "Ignoring requires fused kernels (marlin, exllamav2, fp8 tensor cores) and domain-matched calibration data. removes the need for any trade-off evaluation",
+            "correct": false,
+            "feedback": "Incorrect: every production option in LLM Quantization, GPTQ/AWQ & Inference Performance carries concrete latency, consistency, or operational costs."
+          },
+          {
+            "id": "c",
+            "text": "Advantage: 2–4x VRAM reduction and 2–3x higher decode tok/s with <1% accuracy drop. Cost: Requires fused kernels (Marlin, ExLlamaV2, FP8 Tensor Cores) and domain-matched calibration data.",
+            "correct": true,
+            "feedback": "Correct: Good Candidate: 7B–70B+ Interactive Serving (FP8 / AWQ) delivers 2–4x VRAM reduction and 2–3x higher decode tok/s with <1% accuracy drop. while requiring you to manage requires fused kernels (Marlin, ExLlamaV2, FP8 Tensor Cores) and domain-matched calibration data."
+          }
+        ]
+      },
+      {
+        "question": "Why is High-Batch W4A16 Inversion critical when operating LLM Quantization, GPTQ/AWQ & Inference Performance in production?",
+        "options": [
+          {
+            "id": "a",
+            "text": "At batch > 32, W4A16 register dequantization ALU overhead saturates compute—making FP8 W8A8 faster on H100/L40S.",
+            "correct": true,
+            "feedback": "Correct: At batch > 32, W4A16 register dequantization ALU overhead saturates compute—making FP8 W8A8 faster on H100/L40S."
+          },
+          {
+            "id": "b",
+            "text": "It only applies during local unit testing and can be disabled in production to save memory.",
+            "correct": false,
+            "feedback": "Incorrect: 'High-Batch W4A16 Inversion' directly governs production reliability and correctness under real traffic."
+          },
+          {
+            "id": "c",
+            "text": "It replaces the need for observability, timeouts, or capacity planning across LLM Quantization, GPTQ/AWQ & Inference Performance.",
+            "correct": false,
+            "feedback": "Incorrect: 'High-Batch W4A16 Inversion' works alongside proper bounds, monitoring, and failure isolation."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** Autoregressive LLM inference has two opposite regimes: **Prefill** (processes prompt tokens in parallel via large GEMMs -> **compute-bound**) and **Decode** (generates 1 token per step -> **memory-bandwidth bound**).\n\n**How It Flows:** Think of LLM Quantization, GPTQ/AWQ & Inference Performance as a clear step-by-step chain: HBM3 (35 GB INT4) -> Tensor Core / Regs -> FP8 KV Cache -> Decode (~95 tok/s) -> Calibration Set.\n\n**Why Beginners Should Care:** Because autoregressive LLM decode is memory-bandwidth bound at low batch sizes, moving from FP16 to INT4/FP8 cuts HBM reads per token by 2-4x while keeping accuracy loss under ~1% when activation outliers are protected.",
+      "spark": {
+        "summary": "Autoregressive LLM inference has two opposite regimes: **Prefill** (processes prompt tokens in parallel via large GEMMs -> **compute-bound**) and **Decode** (generates 1 token per step -> **memory-bandwidth bound**).",
+        "keyTakeaway": "Because autoregressive LLM decode is memory-bandwidth bound at low batch sizes, moving from FP16 to INT4/FP8 cuts HBM reads per token by 2-4x while keeping accuracy loss under ~1% when activation outliers are protected."
+      },
+      "learningJourney": [
+        {
+          "id": "01-what-it-is",
+          "title": "What is LLM Quantization (Prefill vs. Decode)",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how LLM Quantization (Prefill vs. Decode) works from first principles.",
+          "explanation": "Autoregressive LLM inference has two opposite regimes: **Prefill** (processes prompt tokens in parallel via large GEMMs -> **compute-bound**) and **Decode** (generates 1 token per step -> **memory-bandwidth bound**). A 70B model in FP16 consumes **140 GB** of weights—requiring 2x 80 GB H100s—and batch-1 decode on an H100 (3.35 TB/s HBM3) is capped near ~24 tok/s.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "GPU Memory Hierarchy",
+            "title": "HBM3 Bandwidth Bottleneck & Quantized Weight/KV-Cache Footprint",
+            "nodes": [
+              {
+                "id": "hbm",
+                "label": "HBM3 (35 GB INT4)",
+                "role": "vs 140 GB FP16"
+              },
+              {
+                "id": "sram",
+                "label": "Tensor Core / Regs",
+                "role": "Marlin / FP8 GEMM"
+              },
+              {
+                "id": "kv",
+                "label": "FP8 KV Cache",
+                "role": "4x context concurrency"
+              },
+              {
+                "id": "tok",
+                "label": "Decode (~95 tok/s)",
+                "role": "HBM read / token"
+              }
+            ],
+            "edges": [
+              {
+                "label": "4x less HBM traffic"
+              },
+              {
+                "label": "E4M3 KV read"
+              }
+            ],
+            "cards": [
+              {
+                "label": "1. Weight Compression",
+                "detail": "INT4 (AWQ/GPTQ) cuts 70B weights from 140 GB to ~35 GB, fitting on a single 80 GB GPU."
+              },
+              {
+                "label": "2. Outlier Protection",
+                "detail": "AWQ scales salient ~1% activation outlier channels before group-wise (128) quantization."
+              },
+              {
+                "label": "3. KV-Cache FP8",
+                "detail": "At 32k-128k contexts, quantizing KV cache to FP8 prevents VRAM OOM under concurrency."
+              }
+            ],
+            "summary": "Shrinking bytes read from HBM per token directly multiplies low-batch decode speed."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-why-we-need-it",
+          "title": "Why Naive Rounding Fails (Activation Outliers)",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without Why Naive Rounding Fails under real concurrency or scale.",
+          "explanation": "Transformer activations in models >6B parameters exhibit systematic **outlier features**: ~0.1%–1% of hidden channels reach magnitudes 10x–100x larger than the median. Naive Round-To-Nearest (RTN) stretches the quantization grid to fit one outlier, crushing normal weights into 1–2 bits and destroying reasoning and JSON tool calling.",
+          "ideas": [
+            {
+              "title": "AWQ, GPTQ & SmoothQuant",
+              "description": "AWQ protects salient weight channels identified by activation magnitude; GPTQ uses second-order Hessian error compensation; SmoothQuant migrates outlier difficulty from activations into weights."
+            },
+            {
+              "title": "High-Batch W4A16 Inversion",
+              "description": "At batch > 32, W4A16 register dequantization ALU overhead saturates compute—making FP8 W8A8 faster on H100/L40S."
+            }
+          ],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-where-it-is-used",
+          "title": "Where Quantization fits (and where BF16/QAT wins)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Choose W4A16 (AWQ+Marlin) for single-GPU 70B / low-latency decode, FP8 (W8A8) for high-batch Hopper serving, and skip sub-4-bit PTQ on complex coding/reasoning.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "06-production-architecture",
+          "title": "Production example: Calibration -> Eval Gate -> Continuous Batching",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Production architecture: see how the components compose end to end under real load.",
+          "explanation": "An ML platform calibrates AWQ (`group_size=128`) on 256 production prompts, gates the checkpoint against BF16 on JSON-schema + GSM8K evals, sweeps batch=1..64 latency, and deploys on vLLM with FP8 KV-cache PagedAttention.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Quantization Release Gate",
+            "title": "3-Layer Calibration, Accuracy & Concurrency Benchmark Flow",
+            "actors": [
+              {
+                "id": "cal",
+                "label": "Calibration Set"
+              },
+              {
+                "id": "qtz",
+                "label": "AWQ / FP8 Pass"
+              },
+              {
+                "id": "eval",
+                "label": "Task Eval Gate"
+              },
+              {
+                "id": "vllm",
+                "label": "vLLM Serving"
+              }
+            ],
+            "events": [
+              {
+                "from": "cal",
+                "to": "qtz",
+                "label": "256 code/JSON/prose samples",
+                "status": "ok"
+              },
+              {
+                "from": "qtz",
+                "to": "eval",
+                "label": "Compare vs BF16 (HumanEval/JSON)",
+                "status": "warn"
+              },
+              {
+                "from": "eval",
+                "to": "vllm",
+                "label": "Sweep batch=1 vs batch=64 tok/s",
+                "status": "ok"
+              },
+              {
+                "from": "vllm",
+                "to": "vllm",
+                "label": "Serve with FP8 KV-cache",
+                "status": "ok"
+              }
+            ],
+            "summary": "Task-specific evals and concurrency sweeps prevent silent tool-calling breakage and high-batch slowdowns."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Because autoregressive LLM decode is memory-bandwidth bound at low batch sizes, moving from FP16 to INT4/FP8 cuts HBM reads per token by 2-4x while keeping accuracy loss under ~1% when activation outliers are protected.",
+      "summary": "LLM quantization compresses 16-bit model weights and KV caches into 8-bit or 4-bit representations (FP8, AWQ, GPTQ, GGUF) to slash VRAM usage by 2-4x and accelerate memory-bandwidth-bound token generation.",
+      "keyTakeaway": "When batching and tail latency compete for accelerator cycles, GPTQ/AWQ & Inference Performance, because autoregressive LLM decode is memory-bandwidth bound at low batch sizes, moving from FP16 to INT4/FP8 cuts HBM reads per token by 2-4x while keeping accuracy loss under ~1% when activation outliers are protected."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** Autoregressive LLM inference has two opposite regimes: **Prefill** (processes prompt tokens in parallel via large GEMMs -> **compute-bound**) and **Decode** (generates 1 token per step -> **memory-bandwidth bound**).\n\n**Visual & Structural Flow:** Depicts HBM3 Bandwidth Bottleneck & Quantized Weight/KV-Cache Footprint (HBM3 (35 GB INT4) -> Tensor Core / Regs -> FP8 KV Cache -> Decode (~95 tok/s)); 3-Layer Calibration, Accuracy & Concurrency Benchmark Flow (Calibration Set -> AWQ / FP8 Pass -> Task Eval Gate -> vLLM Serving).\n\n**Trade-Offs & Production:** Match the quantization scheme to your GPU architecture and concurrency regime. An ML platform calibrates AWQ (`group_size=128`) on 256 production prompts, gates the checkpoint against BF16 on JSON-schema + GSM8K evals, sweeps batch=1..64 latency, and deploys.\n\n**Failure Modes & Application:** Explore PagedAttention KV-cache management, speculative decoding, and continuous batching.",
+      "spark": {
+        "summary": "LLM quantization compresses 16-bit model weights and KV caches into 8-bit or 4-bit representations (FP8, AWQ, GPTQ, GGUF) to slash VRAM usage by 2-4x and accelerate memory-bandwidth-bound token generation.",
+        "keyTakeaway": "Because autoregressive LLM decode is memory-bandwidth bound at low batch sizes, moving from FP16 to INT4/FP8 cuts HBM reads per token by 2-4x while keeping accuracy loss under ~1% when activation outliers are protected."
+      },
+      "summary": "LLM quantization compresses 16-bit model weights and KV caches into 8-bit or 4-bit representations (FP8, AWQ, GPTQ, GGUF) to slash VRAM usage by 2-4x and accelerate memory-bandwidth-bound token generation.",
+      "keyTakeaway": "When batching and tail latency compete for accelerator cycles, GPTQ/AWQ & Inference Performance, because autoregressive LLM decode is memory-bandwidth bound at low batch sizes, moving from FP16 to INT4/FP8 cuts HBM reads per token by 2-4x while keeping accuracy loss under ~1% when activation outliers are protected."
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** LLM quantization compresses 16-bit model weights and KV caches into 8-bit or 4-bit representations (FP8, AWQ, GPTQ, GGUF) to slash VRAM usage by 2-4x and accelerate memory-bandwidth-bound token generation.\n\n**Production Trade-Offs:** Never ship a quantized checkpoint on WikiText perplexity alone.\n\n**Failure Modes & Edge Cases:** Explore PagedAttention KV-cache management, speculative decoding, and continuous batching.\n\n**Principal Takeaway:** Because autoregressive LLM decode is memory-bandwidth bound at low batch sizes, moving from FP16 to INT4/FP8 cuts HBM reads per token by 2-4x while keeping accuracy loss under ~1% when activation outliers are protected.",
+      "spark": {
+        "summary": "LLM quantization compresses 16-bit model weights and KV caches into 8-bit or 4-bit representations (FP8, AWQ, GPTQ, GGUF) to slash VRAM usage by 2-4x and accelerate memory-bandwidth-bound token generation.",
+        "keyTakeaway": "Because autoregressive LLM decode is memory-bandwidth bound at low batch sizes, moving from FP16 to INT4/FP8 cuts HBM reads per token by 2-4x while keeping accuracy loss under ~1% when activation outliers are protected."
+      },
+      "learningJourney": [
+        {
+          "id": "01-what-it-is",
+          "title": "What is LLM Quantization (Prefill vs. Decode)",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how LLM Quantization (Prefill vs. Decode) works from first principles.",
+          "explanation": "Autoregressive LLM inference has two opposite regimes: **Prefill** (processes prompt tokens in parallel via large GEMMs -> **compute-bound**) and **Decode** (generates 1 token per step -> **memory-bandwidth bound**).\n\nA 70B model in FP16 consumes **140 GB** of weights—requiring 2x 80 GB H100s—and batch-1 decode on an H100 (3.35 TB/s HBM3) is capped near ~24 tok/s. Quantizing weights to **INT4 (W4A16)** shrinks weights to **~35 GB** (fitting on 1x GPU) and lifts the bandwidth ceiling near ~95 tok/s; **FP8 (W8A8)** uses Hopper Tensor Cores to accelerate *both* prefill and high-batch decode.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "GPU Memory Hierarchy",
+            "title": "HBM3 Bandwidth Bottleneck & Quantized Weight/KV-Cache Footprint",
+            "nodes": [
+              {
+                "id": "hbm",
+                "label": "HBM3 (35 GB INT4)",
+                "role": "vs 140 GB FP16"
+              },
+              {
+                "id": "sram",
+                "label": "Tensor Core / Regs",
+                "role": "Marlin / FP8 GEMM"
+              },
+              {
+                "id": "kv",
+                "label": "FP8 KV Cache",
+                "role": "4x context concurrency"
+              },
+              {
+                "id": "tok",
+                "label": "Decode (~95 tok/s)",
+                "role": "HBM read / token"
+              }
+            ],
+            "edges": [
+              {
+                "label": "4x less HBM traffic"
+              },
+              {
+                "label": "E4M3 KV read"
+              }
+            ],
+            "cards": [
+              {
+                "label": "1. Weight Compression",
+                "detail": "INT4 (AWQ/GPTQ) cuts 70B weights from 140 GB to ~35 GB, fitting on a single 80 GB GPU."
+              },
+              {
+                "label": "2. Outlier Protection",
+                "detail": "AWQ scales salient ~1% activation outlier channels before group-wise (128) quantization."
+              },
+              {
+                "label": "3. KV-Cache FP8",
+                "detail": "At 32k-128k contexts, quantizing KV cache to FP8 prevents VRAM OOM under concurrency."
+              }
+            ],
+            "summary": "Shrinking bytes read from HBM per token directly multiplies low-batch decode speed."
+          },
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-why-we-need-it",
+          "title": "Why Naive Rounding Fails (Activation Outliers)",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without Why Naive Rounding Fails under real concurrency or scale.",
+          "explanation": "Transformer activations in models >6B parameters exhibit systematic **outlier features**: ~0.1%–1% of hidden channels reach magnitudes 10x–100x larger than the median. Naive Round-To-Nearest (RTN) stretches the quantization grid to fit one outlier, crushing normal weights into 1–2 bits and destroying reasoning and JSON tool calling.",
+          "caveats": null,
+          "ideas": [
+            {
+              "title": "AWQ, GPTQ & SmoothQuant",
+              "description": "AWQ protects salient weight channels identified by activation magnitude; GPTQ uses second-order Hessian error compensation; SmoothQuant migrates outlier difficulty from activations into weights."
+            },
+            {
+              "title": "High-Batch W4A16 Inversion",
+              "description": "At batch > 32, W4A16 register dequantization ALU overhead saturates compute—making FP8 W8A8 faster on H100/L40S."
+            }
+          ],
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "03-where-it-is-used",
+          "title": "Where Quantization fits (and where BF16/QAT wins)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Choose W4A16 (AWQ+Marlin) for single-GPU 70B / low-latency decode, FP8 (W8A8) for high-batch Hopper serving, and skip sub-4-bit PTQ on complex coding/reasoning.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-how-it-is-managed",
+          "title": "How Quantized Serving & Task-Specific Evals are managed",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Never ship a quantized checkpoint on WikiText perplexity alone. Calibrate on 256 domain-representative samples (code, JSON, target languages), enable `--kv-cache-dtype fp8` for long contexts, and run task-specific evals (HumanEval, JSON schema adherence) + concurrency sweeps against BF16.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "05-alternatives",
+          "title": "Alternatives: FP8 (W8A8) vs. AWQ (W4A16) vs. GGUF K-Quants",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "The trade-off: compare competing approaches across latency, consistency, and operational cost.",
+          "explanation": "Match the quantization scheme to your GPU architecture and concurrency regime.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "06-production-architecture",
+          "title": "Production example: Calibration -> Eval Gate -> Continuous Batching",
+          "eyebrow": "Advanced Path · Stage 06",
+          "purpose": "Production architecture: see how the components compose end to end under real load.",
+          "explanation": "An ML platform calibrates AWQ (`group_size=128`) on 256 production prompts, gates the checkpoint against BF16 on JSON-schema + GSM8K evals, sweeps batch=1..64 latency, and deploys on vLLM with FP8 KV-cache PagedAttention.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Quantization Release Gate",
+            "title": "3-Layer Calibration, Accuracy & Concurrency Benchmark Flow",
+            "actors": [
+              {
+                "id": "cal",
+                "label": "Calibration Set"
+              },
+              {
+                "id": "qtz",
+                "label": "AWQ / FP8 Pass"
+              },
+              {
+                "id": "eval",
+                "label": "Task Eval Gate"
+              },
+              {
+                "id": "vllm",
+                "label": "vLLM Serving"
+              }
+            ],
+            "events": [
+              {
+                "from": "cal",
+                "to": "qtz",
+                "label": "256 code/JSON/prose samples",
+                "status": "ok"
+              },
+              {
+                "from": "qtz",
+                "to": "eval",
+                "label": "Compare vs BF16 (HumanEval/JSON)",
+                "status": "warn"
+              },
+              {
+                "from": "eval",
+                "to": "vllm",
+                "label": "Sweep batch=1 vs batch=64 tok/s",
+                "status": "ok"
+              },
+              {
+                "from": "vllm",
+                "to": "vllm",
+                "label": "Serve with FP8 KV-cache",
+                "status": "ok"
+              }
+            ],
+            "summary": "Task-specific evals and concurrency sweeps prevent silent tool-calling breakage and high-batch slowdowns."
+          },
+          "level": "L7 · STAFF / PRINCIPAL"
+        },
+        {
+          "id": "07-problems-and-further-reading",
+          "title": "Problems solved by Quantization & Related LLM Serving Concepts",
+          "eyebrow": "Advanced Path · Stage 07",
+          "purpose": "Applied problems: connect these internals to concrete system design and debugging scenarios.",
+          "explanation": "Explore PagedAttention KV-cache management, speculative decoding, and continuous batching.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Because autoregressive LLM decode is memory-bandwidth bound at low batch sizes, moving from FP16 to INT4/FP8 cuts HBM reads per token by 2-4x while keeping accuracy loss under ~1% when activation outliers are protected.",
+      "summary": "LLM quantization compresses 16-bit model weights and KV caches into 8-bit or 4-bit representations (FP8, AWQ, GPTQ, GGUF) to slash VRAM usage by 2-4x and accelerate memory-bandwidth-bound token generation.",
+      "keyTakeaway": "When batching and tail latency compete for accelerator cycles, GPTQ/AWQ & Inference Performance, because autoregressive LLM decode is memory-bandwidth bound at low batch sizes, moving from FP16 to INT4/FP8 cuts HBM reads per token by 2-4x while keeping accuracy loss under ~1% when activation outliers are protected."
+    }
+  },
+  "pedagogicalFramework": "PRIME",
+  "prerequisites": [
+    {
+      "title": "Distributed & Application Caching",
+      "summary": "Caching keeps a reusable copy of data so an application can avoid repeating a database query, calculation, or network call. It can make responses faster and reduce database load. The trade-off: the copy may be out of date."
+    }
+  ],
+  "simulation": {
+    "title": "LLM Quantization, GPTQ/AWQ & Inference Performance — Interactive Execution Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Workload & Budget"
+      },
+      {
+        "id": "router",
+        "label": "Gateway / Router",
+        "role": "Admission & Dispatch"
+      },
+      {
+        "id": "engine",
+        "label": "Core Engine",
+        "role": "Primary Execution"
+      },
+      {
+        "id": "replica",
+        "label": "Replica / Fallback",
+        "role": "Durability & Recovery"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "router",
+        "label": "request"
+      },
+      {
+        "from": "router",
+        "to": "engine",
+        "label": "route"
+      },
+      {
+        "from": "engine",
+        "to": "replica",
+        "label": "sync / fallback"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "What is LLM Quantization (Prefill vs. Decode)",
+        "actionLabel": "Dispatch nominal request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "router"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "Ingress",
+          "p99_ms": 8,
+          "error_rate": "0.0%"
+        },
+        "explanation": "Caller sends work into the gateway with explicit timeout and concurrency bounds (What is LLM Quantization (Prefill vs. Decode))."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Why Naive Rounding Fails (Activation Outliers)",
+        "actionLabel": "Execute core invariant",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "Core Path",
+          "p99_ms": 18,
+          "in_flight": 124
+        },
+        "explanation": "The core engine processes the hot path while keeping state transitions deterministic (Why Naive Rounding Fails (Activation Outliers))."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Where Quantization fits (and where BF16/QAT wins)",
+        "actionLabel": "Detect skew or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Degraded",
+          "p99_ms": 64,
+          "retries_capped": "true"
+        },
+        "explanation": "Under load or replica lag, bounded backoff and isolation prevent cascading saturation (Where Quantization fits (and where BF16/QAT wins))."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Problems solved by Quantization & Related LLM Serving Concep",
+        "actionLabel": "Converge & restore SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 11,
+          "drift": 0
+        },
+        "explanation": "State converges cleanly and telemetry confirms the system returned within its SLO envelope (Problems solved by Quantization & Related LLM Serving Concepts)."
+      }
+    ]
+  }
+}

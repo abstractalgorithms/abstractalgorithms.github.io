@@ -1,0 +1,781 @@
+{
+  "slug": "hybrid-newsfeed-fanout",
+  "title": "Social Newsfeed Hybrid Fan-Out & Ranking",
+  "domain": "system-design",
+  "diagram": "diagram.png",
+  "spark": {
+    "summary": "Hybrid newsfeed fan-out combines Fan-Out-on-Write (pushing post IDs to follower Redis timelines for normal users) with Fan-Out-on-Read (pulling celebrity posts at read time), followed by two-stage ML ranking and diversity deduplication.",
+    "keyTakeaway": "If latency budgets leave no room for synchronous retries, route authors below the celebrity threshold (e.g., <100K followers) via async push workers to Redis Sorted Sets, merge celebrity posts at read time, and rank candidates with a two-stage L1/L2 ML pipeline.",
+    "byteSummary": "Pure Fan-Out-on-Write collapses when a celebrity with 50 million followers publishes a post—triggering 50M Redis writes that saturate worker queues for minutes (the Justin Bieber / Taylor Swift problem). Conversely, pure Fan-Out-on-Read forces every feed load to scatter-gather across 500 followed authors' databases, blowing latency budgets.\n\nProduction social networks (X, Instagram, LinkedIn) use Hybrid Fan-Out: normal users (<100K followers) push lightweight `(post_id, timestamp)` tuples into active followers' Redis Sorted Set (`ZSET`) inboxes asynchronously via Kafka. Celebrities (>=100K followers) skip fan-out completely, writing only to a compact Celebrity Post Cache merged at read time.\n\nBefore rendering, the merged candidate pool (~500-1,000 post IDs) is hydrated, filtered by a per-user Seen-Post Bloom Filter, and scored by a two-stage ML Ranker (fast Two-Tower retrieval + heavy LightGBM/DeepFM scorer) with author-diversity caps and cursor-based pagination."
+  },
+  "learningJourney": [
+    {
+      "stage": 1,
+      "level": "foundation",
+      "title": "Fan-Out-on-Write (Push) vs. Fan-Out-on-Read (Pull)",
+      "purpose": "Understand the write-amplification vs. read-latency trade-off at social scale.",
+      "explanation": {
+        "foundation": "Think of **Fan-Out-on-Write (Push) vs. Fan-Out-on-Read (Pull)** as the intuition layer for Social Newsfeed Hybrid Fan-Out & Ranking: Understand the write-amplification vs. read-latency trade-off at social scale.",
+        "core": "In Push (Fan-Out-on-Write), a post triggers N writes to N followers' precomputed Redis timelines, giving O(1) <20ms reads—until a 50M-follower celebrity posts and stalls the queue. In Pull (Fan-Out-on-Read), writes are O(1), but reading a feed requires querying K=500 followed authors' timelines and k-way merging them on every scroll.",
+        "deepDive": "Under heavy load or partial failure, fan-out-on-write (push) vs. fan-out-on-read (pull) becomes a critical lever for predictable latency and correctness. Optimize snapshot-backed cursor pagination, author-diversity decay, instant block filtering, and cold-start backfills."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 1 - Push vs Pull",
+        "title": "Push Write-Amplification vs Pull Scatter-Gather",
+        "nodes": [
+          {
+            "id": "push",
+            "label": "Push (Write-Time)",
+            "sub": "O(1) read, O(N) write",
+            "role": "processor"
+          },
+          {
+            "id": "celeb",
+            "label": "50M-Follower Spike",
+            "sub": "Stalls push workers",
+            "role": "router"
+          },
+          {
+            "id": "pull",
+            "label": "Pull (Read-Time)",
+            "sub": "O(1) write, O(K) read",
+            "role": "cache"
+          },
+          {
+            "id": "hyb",
+            "label": "Hybrid Threshold",
+            "sub": "Best of both worlds",
+            "role": "sink"
+          }
+        ],
+        "edges": [
+          {
+            "from": "push",
+            "to": "celeb",
+            "label": "Breaks at 50M followers"
+          },
+          {
+            "from": "pull",
+            "to": "hyb",
+            "label": "Merge celebrity pull"
+          },
+          {
+            "from": "push",
+            "to": "hyb",
+            "label": "Push normal users"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Active-Only Push",
+            "detail": "Only push into Redis inboxes of followers active in the last 14-30 days."
+          },
+          {
+            "label": "Tiny Payloads",
+            "detail": "Push only 16-byte (post_id, score) pairs, never full post text or media URLs."
+          }
+        ],
+        "summary": "Pure push breaks on celebrities while pure pull breaks on read latency.",
+        "caption": "Capping push to recently active followers cuts wasted Redis RAM by 70%+."
+      },
+      "id": "stage-1-fan-out-on-write-push-vs-fan-out-on-read-pull"
+    },
+    {
+      "stage": 2,
+      "level": "foundation",
+      "title": "The Celebrity Threshold Gate & Hybrid Merge",
+      "purpose": "Split ingestion dynamically by follower count and merge seamlessly at read time.",
+      "explanation": {
+        "foundation": "When a post is published to Kafka, a Fan-Out Worker queries the Social Graph Service for `follower_count`.",
+        "core": "If `< 100K`, it pushes `(post_id, ts)` into followers' Redis `ZSET`s (capped at `ZREMRANGEBYRANK` top 800 items). If `>= 100K`, it appends only to that celebrity's own `celeb_posts:<author_id>` Redis `ZSET`.",
+        "deepDive": "At read time, the Feed Service merges the user's inbox `ZSET` with their followed celebrities' `ZSET`s."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 2 - Hybrid Fan-Out",
+        "title": "Celebrity Threshold Split & Read Merge",
+        "nodes": [
+          {
+            "id": "pub",
+            "label": "Post Published",
+            "sub": "Kafka by author_id",
+            "role": "source"
+          },
+          {
+            "id": "gate",
+            "label": "Follower Gate (>=100K)",
+            "sub": "Checks Social Graph",
+            "role": "router"
+          },
+          {
+            "id": "inbox",
+            "label": "Follower Redis ZSET",
+            "sub": "Push <100K (cap 800)",
+            "role": "cache"
+          },
+          {
+            "id": "celeb_c",
+            "label": "Celebrity Post Cache",
+            "sub": "Pulled at read time",
+            "role": "storage"
+          }
+        ],
+        "edges": [
+          {
+            "from": "pub",
+            "to": "gate",
+            "label": "Route by fanout size"
+          },
+          {
+            "from": "gate",
+            "to": "inbox",
+            "label": "Push to active followers"
+          },
+          {
+            "from": "gate",
+            "to": "celeb_c",
+            "label": "Write once for celebs"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Dynamic Promotion",
+            "detail": "Promote an author to celebrity-pull automatically if they cross 100K followers."
+          },
+          {
+            "label": "Bounded ZSET",
+            "detail": "Trim inbox ZSETs to 800 IDs; older history falls back to DB pagination."
+          }
+        ],
+        "summary": "Threshold gating keeps write amplification bounded while preserving sub-50ms feed candidate fetch.",
+        "caption": "Bounded 800-item Redis ZSETs cap per-user memory overhead predictably."
+      },
+      "decisionFramework": {
+        "problem": "How to implement Social Newsfeed Hybrid Fan-Out & Ranking without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "If latency budgets leave no room for synchronous retries, route authors below the celebrity threshold (e.g., <100K followers) via async push workers to Redis Sorted Sets, merge celebrity posts at read time, and rank candidates with a two-stage L1/L2 ML pipeline.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Social Newsfeed Hybrid Fan-Out & Ranking experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      },
+      "id": "stage-2-the-celebrity-threshold-gate-hybrid-merge"
+    },
+    {
+      "stage": 3,
+      "level": "intermediate",
+      "title": "Post Hydration & Multi-Get Batching",
+      "purpose": "Fetch full post text, media metadata, and live like/comment counts without N+1 queries.",
+      "explanation": {
+        "foundation": "After merging candidate `post_id`s, the Feed Hydrator must turn 500 IDs into renderable objects.",
+        "core": "Issuing 500 sequential DB queries causes N+1 latency collapse.",
+        "deepDive": "Instead, it fires parallel `MGET` batches to Redis Post Cache + Author Profile Cache, falling back to Cassandra/DynamoDB `BatchGetItem` only for uncached cold posts."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 3 - Feed Hydration",
+        "title": "Parallel Batch Hydration Pipeline",
+        "nodes": [
+          {
+            "id": "ids",
+            "label": "500 Candidate IDs",
+            "sub": "From inbox + celebs",
+            "role": "source"
+          },
+          {
+            "id": "mget",
+            "label": "Redis MGET Batch",
+            "sub": "Posts + Author profiles",
+            "role": "cache"
+          },
+          {
+            "id": "miss",
+            "label": "NoSQL BatchGet",
+            "sub": "Cold post fallback",
+            "role": "storage"
+          },
+          {
+            "id": "hyd",
+            "label": "Hydrated Candidates",
+            "sub": "Ready for ML ranker",
+            "role": "sink"
+          }
+        ],
+        "edges": [
+          {
+            "from": "ids",
+            "to": "mget",
+            "label": "Batch fetch metadata"
+          },
+          {
+            "from": "mget",
+            "to": "miss",
+            "label": "Fill cold misses"
+          },
+          {
+            "from": "miss",
+            "to": "hyd",
+            "label": "Assemble objects"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Filter Deleted/Blocked",
+            "detail": "Drop deleted posts or muted/blocked authors during hydration before ranking."
+          },
+          {
+            "label": "Separate Counters",
+            "detail": "Fetch volatile like/reply counts from a dedicated counter cache, not immutable post blobs."
+          }
+        ],
+        "summary": "Parallel Redis MGETs and batched NoSQL fallbacks hydrate 500 candidates in <15ms.",
+        "caption": "Separating mutable engagement counters from immutable post text maximizes cache hit rates."
+      },
+      "id": "stage-3-post-hydration-multi-get-batching"
+    },
+    {
+      "stage": 4,
+      "level": "intermediate",
+      "title": "Two-Stage ML Candidate Ranking (L1 Retrieval -> L2 Scorer)",
+      "purpose": "Score 1,000+ in-network and out-of-network candidates within a 50ms ranking budget.",
+      "explanation": {
+        "foundation": "Modern feeds blend in-network posts with out-of-network 'For You' recommendations.",
+        "core": "An L1 lightweight Two-Tower / Logistic model narrows 5,000+ candidates down to 300 in <10ms using cached user/post embeddings.",
+        "deepDive": "An L2 heavy LightGBM / Deep Neural Ranker fetches real-time features from a Redis Feature Store and predicts `P(like)`, `P(reply)`, `P(dwell)` to produce the final ranked order."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 4 - Two-Stage Ranking",
+        "title": "L1 Retrieval + L2 Feature-Store Ranker",
+        "nodes": [
+          {
+            "id": "pool",
+            "label": "In-Net + For-You Pool",
+            "sub": "~5,000 candidates",
+            "role": "source"
+          },
+          {
+            "id": "l1",
+            "label": "L1 Two-Tower Filter",
+            "sub": "Top 300 in <10ms",
+            "role": "processor"
+          },
+          {
+            "id": "fs",
+            "label": "Redis Feature Store",
+            "sub": "User-author affinity",
+            "role": "cache"
+          },
+          {
+            "id": "l2",
+            "label": "L2 LightGBM / DNN",
+            "sub": "Multi-task engagement",
+            "role": "sink"
+          }
+        ],
+        "edges": [
+          {
+            "from": "pool",
+            "to": "l1",
+            "label": "Fast dot-product score"
+          },
+          {
+            "from": "l1",
+            "to": "fs",
+            "label": "Hydrate 300 feature rows"
+          },
+          {
+            "from": "fs",
+            "to": "l2",
+            "label": "Compute final rank"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Graceful Fallback",
+            "detail": "If the ML Ranker times out at 50ms, fall back to reverse-chronological ZSET order."
+          },
+          {
+            "label": "Negative Signals",
+            "detail": "Penalize 'hide', 'mute', and fast-scroll-past signals heavily in L2 weights."
+          }
+        ],
+        "summary": "Two-stage ranking balances deep personalization accuracy with strict <50ms tail latency.",
+        "caption": "Chronological fallback guarantees feed availability even if ML inference degrades."
+      },
+      "id": "stage-4-two-stage-ml-candidate-ranking-l1-retrieval-l2-s"
+    },
+    {
+      "stage": 5,
+      "level": "intermediate",
+      "title": "Diversity Deduplication & Seen-Post Bloom Filter",
+      "purpose": "Prevent showing the same author 5 times in a row or repeating already-viewed posts.",
+      "explanation": {
+        "foundation": "Pure ML scoring often clusters 6 posts from one viral author back-to-back.",
+        "core": "A post-ranking Diversity Re-Ranker applies sliding-window rules (e.g., max 1 post per author per 5 slots, interleave video/text/ads).",
+        "deepDive": "Simultaneously, a per-user Seen-Post Bloom Filter (last 7 days of viewed `post_id`s in Redis) strips already-seen items before returning the page."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 5 - Diversity & Dedupe",
+        "title": "Seen-Post Bloom & Diversity Re-Ranker",
+        "nodes": [
+          {
+            "id": "ranked",
+            "label": "L2 Ranked List",
+            "sub": "300 scored posts",
+            "role": "source"
+          },
+          {
+            "id": "seen",
+            "label": "Seen-Post Bloom",
+            "sub": "7-day viewed filter",
+            "role": "router"
+          },
+          {
+            "id": "div",
+            "label": "Diversity Re-Ranker",
+            "sub": "Author & media spacing",
+            "role": "processor"
+          },
+          {
+            "id": "page",
+            "label": "Top-20 Feed Page",
+            "sub": "Clean, fresh timeline",
+            "role": "sink"
+          }
+        ],
+        "edges": [
+          {
+            "from": "ranked",
+            "to": "seen",
+            "label": "Strip viewed posts"
+          },
+          {
+            "from": "seen",
+            "to": "div",
+            "label": "Enforce author spacing"
+          },
+          {
+            "from": "div",
+            "to": "page",
+            "label": "Slice top-20 page"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Soft Decay Penalty",
+            "detail": "Instead of hard-dropping an author's 2nd post, multiply its score by 0.5x per repeat."
+          },
+          {
+            "label": "Async Seen Write",
+            "detail": "Mark posts as seen asynchronously via client viewport-impression beacons."
+          }
+        ],
+        "summary": "Seen-post Bloom filters and diversity re-ranking turn raw ML scores into engaging timelines.",
+        "caption": "Soft score decay spaces out repeat authors without losing high-value content."
+      },
+      "id": "stage-5-diversity-deduplication-seen-post-bloom-filter"
+    },
+    {
+      "stage": 6,
+      "level": "advanced",
+      "title": "Cursor-Based Pagination & Snapshot Consistency",
+      "purpose": "Prevent duplicate or skipped posts when users scroll through a live, mutating feed.",
+      "explanation": {
+        "foundation": "Think of **Cursor-Based Pagination & Snapshot Consistency** as the intuition layer for Social Newsfeed Hybrid Fan-Out & Ranking: Prevent duplicate or skipped posts when users scroll through a live, mutating feed.",
+        "core": "Using `OFFSET 20 LIMIT 20` breaks immediately on live feeds: if 5 new posts arrive while you read page 1, page 2 shifts by 5 and repeats items. Instead, the Feed Service caches the user's ranked candidate snapshot (`feed_session_id` in Redis, TTL 10m) or encodes an opaque `(last_score, last_post_id)` cursor so scrolling pages 2..N is fast, deterministic, and duplicate-free.",
+        "deepDive": "Under heavy load or partial failure, cursor-based pagination & snapshot consistency becomes a critical lever for predictable latency and correctness. Optimize snapshot-backed cursor pagination, author-diversity decay, instant block filtering, and cold-start backfills."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 6 - Cursor Pagination",
+        "title": "Snapshot-Backed Opaque Cursor",
+        "nodes": [
+          {
+            "id": "p1",
+            "label": "Page 1 Request",
+            "sub": "Generates ranked list",
+            "role": "source"
+          },
+          {
+            "id": "snap",
+            "label": "Redis Feed Snapshot",
+            "sub": "10m TTL ranked IDs",
+            "role": "cache"
+          },
+          {
+            "id": "cur",
+            "label": "Opaque Base64 Cursor",
+            "sub": "session_id + offset",
+            "role": "router"
+          },
+          {
+            "id": "p2",
+            "label": "Page 2..N Scroll",
+            "sub": "Deterministic slice",
+            "role": "sink"
+          }
+        ],
+        "edges": [
+          {
+            "from": "p1",
+            "to": "snap",
+            "label": "Cache ranked 300 IDs"
+          },
+          {
+            "from": "snap",
+            "to": "cur",
+            "label": "Return next_cursor"
+          },
+          {
+            "from": "cur",
+            "to": "p2",
+            "label": "Slice [20:40] cleanly"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Pull-to-Refresh",
+            "detail": "Explicit pull-to-refresh invalidates the snapshot and recomputes fresh candidates."
+          },
+          {
+            "label": "Zero Re-Ranking Cost",
+            "detail": "Pages 2-5 skip the ML ranker entirely, slicing the cached snapshot in <5ms."
+          }
+        ],
+        "summary": "Session-cached ranked snapshots eliminate scroll duplicates and skip re-running ML on page 2+.",
+        "caption": "Opaque cursors hide internal pagination state while guaranteeing smooth scrolling."
+      },
+      "id": "stage-6-cursor-based-pagination-snapshot-consistency"
+    },
+    {
+      "stage": 7,
+      "level": "advanced",
+      "title": "Cold-Start Onboarding & Backfill on Follow/Unfollow",
+      "purpose": "Keep timelines populated for new users and clean up immediately on unfollow/block.",
+      "explanation": {
+        "foundation": "A brand-new user with 0 follows sees an empty inbox `ZSET`.",
+        "core": "Cold-start fallback injects trending regional/topic posts and suggested creators until they follow >=5 accounts.",
+        "deepDive": "When a user unfollows or blocks `@bob`, async workers do not need to scan 800-item ZSETs synchronously: a fast `blocked_authors` set in Redis filters `@bob` at hydration time while background jobs prune the ZSET."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 7 - Lifecycle & Safety",
+        "title": "Cold-Start & Instant Block Filter",
+        "nodes": [
+          {
+            "id": "new_u",
+            "label": "0-Follow Cold User",
+            "sub": "Empty Redis ZSET",
+            "role": "source"
+          },
+          {
+            "id": "trend",
+            "label": "Trending Topic Pool",
+            "sub": "Geo + interest backfill",
+            "role": "cache"
+          },
+          {
+            "id": "blk",
+            "label": "Instant Block/Mute Set",
+            "sub": "Filtered at hydration",
+            "role": "router"
+          },
+          {
+            "id": "clean",
+            "label": "Safe Populated Feed",
+            "sub": "Zero stale blocked posts",
+            "role": "sink"
+          }
+        ],
+        "edges": [
+          {
+            "from": "new_u",
+            "to": "trend",
+            "label": "Inject trending pool"
+          },
+          {
+            "from": "trend",
+            "to": "blk",
+            "label": "Apply mute/block set"
+          },
+          {
+            "from": "blk",
+            "to": "clean",
+            "label": "Render safe timeline"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Instant Block Guarantee",
+            "detail": "Hydration-time block filtering takes effect in <1ms without waiting for ZSET pruning."
+          },
+          {
+            "label": "Follow Backfill",
+            "detail": "Following a new user backfills their last 10 posts asynchronously into your inbox ZSET."
+          }
+        ],
+        "summary": "Hydration-time block filtering and trending cold-start pools keep feeds safe and engaging.",
+        "caption": "Async follow-backfill populates new connections without blocking the Follow button."
+      },
+      "id": "stage-7-cold-start-onboarding-backfill-on-follow-unfollo"
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-1",
+        "question": "Why do large social networks switch from Fan-Out-on-Write (Push) to Fan-Out-on-Read (Pull) for celebrity accounts with >100K followers?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Pushing a single celebrity post to 50M follower Redis timelines causes massive write amplification and stalls fan-out queues.",
+            "correct": true,
+            "feedback": "Correct! Skipping push for celebrities and merging their posts at read time eliminates 50M-write spikes."
+          },
+          {
+            "id": "b",
+            "text": "Redis Sorted Sets cannot store celebrity post IDs.",
+            "correct": false,
+            "feedback": "Redis ZSETs store any post ID; the problem is 50M writes per post."
+          },
+          {
+            "id": "c",
+            "text": "Fan-Out-on-Read is faster than reading a precomputed Redis ZSET.",
+            "correct": false,
+            "feedback": "Precomputed reads are faster, which is why Push is still used for normal users."
+          },
+          {
+            "id": "d",
+            "text": "Because celebrities do not use cursor pagination.",
+            "correct": false,
+            "feedback": "Pagination is independent of fan-out mode."
+          }
+        ],
+        "explanation": "Hybrid fan-out avoids the 50M-write 'celebrity problem' while keeping normal users' timelines precomputed in Redis."
+      },
+      {
+        "id": "kc-2",
+        "question": "Why does `OFFSET/LIMIT` SQL-style pagination fail on a live social media newsfeed?",
+        "options": [
+          {
+            "id": "a",
+            "text": "As new posts arrive at the top of the feed, numeric offsets shift, causing users to see duplicate posts on page 2.",
+            "correct": true,
+            "feedback": "Correct! Snapshot-backed or opaque cursor pagination keeps scrolling deterministic."
+          },
+          {
+            "id": "b",
+            "text": "Redis does not support integer offsets.",
+            "correct": false,
+            "feedback": "Redis ZRANGE supports offsets, but live insertions still shift indices."
+          },
+          {
+            "id": "c",
+            "text": "OFFSET/LIMIT disables the Seen-Post Bloom Filter.",
+            "correct": false,
+            "feedback": "Bloom filters run independently of pagination."
+          },
+          {
+            "id": "d",
+            "text": "ML rankers only return 10 items.",
+            "correct": false,
+            "feedback": "ML rankers typically score hundreds of candidates."
+          }
+        ],
+        "explanation": "Live feeds mutate continuously. Caching the ranked snapshot in Redis (or using a monotonic cursor) prevents scroll duplicates and skips re-running ML."
+      },
+      {
+        "id": "kc-3",
+        "question": "When User A blocks User B, how does the feed guarantee User B's already-fanned-out posts vanish immediately without scanning millions of Redis ZSETs?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Filter against User A's `blocked_authors` Redis set during feed hydration (<1ms) while pruning ZSETs asynchronously.",
+            "correct": true,
+            "feedback": "Correct! Read-time block filtering is instant, and async cleanup reclaims space later."
+          },
+          {
+            "id": "b",
+            "text": "Flush the entire global Redis Cluster.",
+            "correct": false,
+            "feedback": "Flushing Redis would destroy caches for 300M users."
+          },
+          {
+            "id": "c",
+            "text": "Wait for the 7-day Seen-Post Bloom Filter to expire.",
+            "correct": false,
+            "feedback": "Blocked posts must disappear immediately, not after 7 days."
+          },
+          {
+            "id": "d",
+            "text": "Delete User B's account.",
+            "correct": false,
+            "feedback": "Blocking is a per-user relationship, not a global account deletion."
+          }
+        ],
+        "explanation": "Filtering against a per-user `blocked_authors` set at hydration time guarantees immediate safety without expensive synchronous ZSET scans."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Learn how social media apps build your personalized home feed in milliseconds without crashing on celebrity posts.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, route authors below the celebrity threshold (e.g., <100K followers) via async push workers to Redis Sorted Sets, merge celebrity posts at read time, and rank candidates with a two-stage L1/L2 ML pipeline.",
+      "byteSummary": "When someone with 200 friends posts a photo, the system pushes that post ID into their friends' Redis feeds right away. But if a celebrity with 50 million followers posts, pushing 50 million times would crash the servers—so the app pulls celebrity posts only when you open your feed.\n\nAn ML ranker then sorts the top posts and filters out anything you already saw."
+    },
+    "intermediate": {
+      "summary": "Architect 300M-DAU hybrid fan-out, active-only Redis ZSET inboxes, batched MGET hydration, and two-stage ML ranking.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, route authors below the celebrity threshold (e.g., <100K followers) via async push workers to Redis Sorted Sets, merge celebrity posts at read time, and rank candidates with a two-stage L1/L2 ML pipeline.",
+      "byteSummary": "Hybrid fan-out routes posts via Kafka through a 100K-follower threshold gate: normal authors push 16-byte `(post_id, ts)` entries to active followers' 800-item Redis `ZSET`s, while celebrities write once to a Celebrity Post Cache merged at read time.\n\nThe Feed Hydrator batches Redis `MGET`s, runs L1 Two-Tower + L2 LightGBM ranking in <50ms (with chronological fallback), and filters seen posts via Bloom filters."
+    },
+    "advanced": {
+      "summary": "Optimize snapshot-backed cursor pagination, author-diversity decay, instant block filtering, and cold-start backfills.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, route authors below the celebrity threshold (e.g., <100K followers) via async push workers to Redis Sorted Sets, merge celebrity posts at read time, and rank candidates with a two-stage L1/L2 ML pipeline.",
+      "byteSummary": "To eliminate scroll duplicates and redundant ML calls on pages 2..N, page 1 caches a 10-minute ranked snapshot in Redis keyed by an opaque cursor. A Diversity Re-Ranker applies soft score decay to space out repeat authors.\n\nSafety and lifecycle invariants are enforced via hydration-time `blocked_authors` filtering (<1ms), async follow-backfills, and trending topic pools for 0-follow cold-start users."
+    }
+  },
+  "pedagogicalFramework": "PRIME",
+  "prerequisites": [
+    {
+      "title": "Real-Time Presence, Heartbeat Hysteresis & Hybrid Fan-Out",
+      "summary": "Real-time presence uses periodic WebSocket heartbeats into TTL-backed Redis keys (`SETEX 45s`) with online/offline hysteresis, paired with hybrid push/pull fan-out for small vs. massive channels."
+    },
+    {
+      "title": "Base62 URL Shortening & Edge Redirection",
+      "summary": "Base62 URL shortening maps 64-bit distributed counter IDs into compact 7-character alphanumeric codes (`62^7 = 3.52T` combinations), pairing collision-free writes with edge-cached HTTP 301/302 redirection."
+    }
+  ],
+  "simulation": {
+    "title": "Social Newsfeed Hybrid Fan-Out & Ranking — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Input Workload"
+      },
+      {
+        "id": "entry",
+        "label": "Router / API",
+        "role": "Admission Control"
+      },
+      {
+        "id": "worker",
+        "label": "Processor",
+        "role": "Domain Logic"
+      },
+      {
+        "id": "store",
+        "label": "State Layer",
+        "role": "Durable Store"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "entry",
+        "label": "request"
+      },
+      {
+        "from": "entry",
+        "to": "worker",
+        "label": "dispatch"
+      },
+      {
+        "from": "worker",
+        "to": "store",
+        "label": "read/write"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Fan-Out-on-Write (Push) vs. Fan-Out-on-Read (Pull)",
+        "actionLabel": "request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "entry"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "request",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Caller sends work to Router / API (Fan-Out-on-Write (Push) vs. Fan-Out-on-Read (Pull))."
+      },
+      {
+        "stepNumber": 2,
+        "title": "The Celebrity Threshold Gate & Hybrid Merge",
+        "actionLabel": "dispatch",
+        "status": "healthy",
+        "activeNodeIds": [
+          "entry",
+          "worker"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "dispatch",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Router / API coordinates with Processor while preserving the core invariant (The Celebrity Threshold Gate & Hybrid Merge)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Post Hydration & Multi-Get Batching",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "worker",
+          "store"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, State Layer absorbs pressure without cascading (Post Hydration & Multi-Get Batching)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Cold-Start Onboarding & Backfill on Follow/Unfollow",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "entry",
+          "worker",
+          "store"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Cold-Start Onboarding & Backfill on Follow/Unfollow)."
+      }
+    ]
+  }
+}

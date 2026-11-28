@@ -1,0 +1,777 @@
+{
+  "slug": "design-social-media",
+  "title": "Design a Global Social Media Newsfeed & Timeline Engine (300M DAU)",
+  "domain": "system-design",
+  "diagram": "diagram.png",
+  "spark": {
+    "summary": "Design a 300M DAU social media newsfeed and timeline engine supporting 200K RPS feed reads (<150ms p99), 50M-follower celebrity posts, two-stage ML ranking, and duplicate-free cursor pagination.",
+    "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, separate ingestion (Kafka partitioned by AuthorID + Media CDN) from Hybrid Fan-Out (active-only Redis ZSETs + Celebrity Pull Cache), Two-Stage ML Ranking, and Snapshot Cursor Pagination.",
+    "byteSummary": "Designing a 300M DAU social media newsfeed (e.g., X/Instagram scale) requires serving ~200K RPS feed reads under 150ms p99 while ingesting ~10K RPS posts—including viral celebrity posts with 50M+ followers. Storing and ranking billions of timeline entries in real time demands strict separation between ingestion, fan-out, hydration, and ML scoring.\n\nThe architecture spans four tiers: (1) Post Ingestion writing media to S3/CDN, metadata to sharded Cassandra/Postgres, and events to Kafka partitioned by `author_id`; (2) a Hybrid Fan-Out Service querying the Social Graph Service to push normal posts (<100K followers) to active followers' Redis Sorted-Set inboxes while routing celebrities to a Pull Cache; (3) a Two-Stage Feed Hydrator & Feature Store feeding a LightGBM/Two-Tower ML Ranker; and (4) a Seen-Post Bloom Filter + Snapshot Cursor Paginator.\n\nKey trade-offs include pushing only to 14-day active followers to cut Redis RAM by 70%, and caching ranked page-1 snapshots for 10 minutes so pages 2..N scroll smoothly without re-running ML."
+  },
+  "learningJourney": [
+    {
+      "stage": 1,
+      "level": "foundation",
+      "title": "300M DAU Capacity Sizing & Redis Inbox Memory",
+      "purpose": "Calculate read/write QPS, Kafka fan-out throughput, and Redis RAM for active inboxes.",
+      "explanation": {
+        "foundation": "300M DAU * 10 feed loads/day = 3B reads/day (~35K avg, ~200K peak RPS).",
+        "core": "At 10K peak post writes/sec with avg 200 active followers, push fan-out generates ~2M Redis `ZADD` ops/sec.",
+        "deepDive": "Keeping 800 `(post_id, ts)` entries (16B each = ~13KB) for 150M recently active users requires ~2TB of Redis Cluster RAM—completely feasible across ~40 memory-optimized nodes."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 1 - Capacity Model",
+        "title": "300M DAU & 2TB Redis Inbox Sizing",
+        "nodes": [
+          {
+            "id": "dau",
+            "label": "300M DAU",
+            "sub": "200K peak read RPS",
+            "role": "source"
+          },
+          {
+            "id": "post",
+            "label": "10K Post Writes/s",
+            "sub": "2M Redis ZADD/sec",
+            "role": "processor"
+          },
+          {
+            "id": "ram",
+            "label": "2 TB Redis Cluster",
+            "sub": "150M active x 13KB",
+            "role": "cache"
+          },
+          {
+            "id": "slo",
+            "label": "<150ms p99 Feed",
+            "sub": "99.99% availability",
+            "role": "sink"
+          }
+        ],
+        "edges": [
+          {
+            "from": "dau",
+            "to": "ram",
+            "label": "Active-user inbox budget"
+          },
+          {
+            "from": "post",
+            "to": "ram",
+            "label": "Async ZADD fan-out"
+          },
+          {
+            "from": "ram",
+            "to": "slo",
+            "label": "Serve sub-150ms reads"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Active-Only Savings",
+            "detail": "Skipping 150M dormant accounts saves ~2TB of Redis RAM; dormant users fall back to DB merge."
+          },
+          {
+            "label": "Pipelined ZADD",
+            "detail": "Batch 100 ZADDs per Redis pipeline to cut network syscall overhead by 100x."
+          }
+        ],
+        "summary": "Sizing active-user Redis inboxes at ~2TB makes precomputed timelines economical at 300M DAU.",
+        "caption": "Pipelined Redis writes absorb 2M ZADDs/sec cleanly."
+      },
+      "id": "stage-1-300m-dau-capacity-sizing-redis-inbox-memory"
+    },
+    {
+      "stage": 2,
+      "level": "foundation",
+      "title": "Post Ingestion, Media CDN & Author-Partitioned Kafka",
+      "purpose": "Decouple heavy image/video uploads from lightweight timeline fan-out events.",
+      "explanation": {
+        "foundation": "Think of **Post Ingestion, Media CDN & Author-Partitioned Kafka** as the intuition layer for Design a Global Social Media Newsfeed & Timeline Engine (300M DAU): Decouple heavy image/video uploads from lightweight timeline fan-out events.",
+        "core": "Clients upload images/videos directly to S3 via presigned URLs served behind CloudFront/Cloudflare CDN. The API Gateway validates the post, persists metadata to sharded Cassandra/MySQL (`posts` partitioned by `post_id`, `author_timeline` partitioned by `author_id`), and publishes a tiny `PostCreated` event to Kafka partitioned by `author_id`.",
+        "deepDive": "Under heavy load or partial failure, post ingestion, media cdn & author-partitioned kafka becomes a critical lever for predictable latency and correctness. Engineer 7-day rotating Seen-Post Bloom filters, 10m snapshot cursors, diversity decay, and non-jumping live pills."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 2 - Post Ingestion",
+        "title": "Media CDN + Author-Partitioned Kafka",
+        "nodes": [
+          {
+            "id": "client",
+            "label": "Mobile Writer",
+            "sub": "Direct S3 media upload",
+            "role": "source"
+          },
+          {
+            "id": "cdn",
+            "label": "Media CDN",
+            "sub": "Offloads bytes from API",
+            "role": "cache"
+          },
+          {
+            "id": "db",
+            "label": "Sharded Post Store",
+            "sub": "Writes post + timeline",
+            "role": "storage"
+          },
+          {
+            "id": "kafka",
+            "label": "Kafka (by AuthorID)",
+            "sub": "Triggers fan-out",
+            "role": "processor"
+          }
+        ],
+        "edges": [
+          {
+            "from": "client",
+            "to": "cdn",
+            "label": "Upload media blob"
+          },
+          {
+            "from": "client",
+            "to": "db",
+            "label": "Persist post metadata"
+          },
+          {
+            "from": "db",
+            "to": "kafka",
+            "label": "Emit PostCreated"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Presigned Uploads",
+            "detail": "Keep multi-megabyte media bytes completely off the API/Kafka path."
+          },
+          {
+            "label": "Per-Author Ordering",
+            "detail": "Partitioning Kafka by author_id preserves chronological order per creator."
+          }
+        ],
+        "summary": "Direct-to-CDN media uploads keep the ingestion and Kafka fan-out path ultra-lightweight.",
+        "caption": "Partitioning Kafka by author_id guarantees ordered timeline updates."
+      },
+      "decisionFramework": {
+        "problem": "How to implement Design a Global Social Media Newsfeed & Timeline Engine (300M DAU) without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "To keep the architecture evolvable without sacrificing reliability, separate ingestion (Kafka partitioned by AuthorID + Media CDN) from Hybrid Fan-Out (active-only Redis ZSETs + Celebrity Pull Cache), Two-Stage ML Ranking, and Snapshot Cursor Pagination.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Design a Global Social Media Newsfeed & Timeline Engine (300M DAU) experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      },
+      "id": "stage-2-post-ingestion-media-cdn-author-partitioned-kafk"
+    },
+    {
+      "stage": 3,
+      "level": "intermediate",
+      "title": "Social Graph Service & Hybrid Fan-Out Workers",
+      "purpose": "Route normal vs. celebrity posts dynamically using sharded follower adjacency lists.",
+      "explanation": {
+        "foundation": "Fan-Out Workers query the Social Graph Service (sharded Redis/TAO-style graph cache backed by MySQL/Cassandra) for the author's `follower_count` and active follower IDs.",
+        "core": "Authors `< 100K` followers fan out to follower Redis `ZSET`s (`ZADD` + `ZREMRANGEBYRANK` cap 800).",
+        "deepDive": "Authors `>= 100K` write once to `celeb_posts:<author_id>`."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 3 - Hybrid Fan-Out",
+        "title": "Social Graph + Push/Pull Split",
+        "nodes": [
+          {
+            "id": "kaf",
+            "label": "Kafka Consumer",
+            "sub": "Reads PostCreated",
+            "role": "source"
+          },
+          {
+            "id": "sg",
+            "label": "Social Graph Service",
+            "sub": "Active follower list",
+            "role": "cache"
+          },
+          {
+            "id": "push",
+            "label": "Push Workers (<100K)",
+            "sub": "Batch ZADD to inboxes",
+            "role": "processor"
+          },
+          {
+            "id": "pull",
+            "label": "Celebrity Cache (>=100K)",
+            "sub": "Single ZSET append",
+            "role": "storage"
+          }
+        ],
+        "edges": [
+          {
+            "from": "kaf",
+            "to": "sg",
+            "label": "Fetch follower count"
+          },
+          {
+            "from": "sg",
+            "to": "push",
+            "label": "<100K -> fan-out"
+          },
+          {
+            "from": "sg",
+            "to": "pull",
+            "label": ">=100K -> single write"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Dead-Letter Isolation",
+            "detail": "Route mega-fanout retries to a separate Kafka DLQ so one glitch doesn't stall normal posts."
+          },
+          {
+            "label": "Graph Caching",
+            "detail": "Cache follower lists in Redis/TAO with write-through invalidation on follow/unfollow."
+          }
+        ],
+        "summary": "Social Graph caching and threshold splitting keep fan-out workers fast under celebrity bursts.",
+        "caption": "Isolated retry queues prevent single-author glitches from blocking global timelines."
+      },
+      "id": "stage-3-social-graph-service-hybrid-fan-out-workers"
+    },
+    {
+      "stage": 4,
+      "level": "intermediate",
+      "title": "Two-Stage Feed Hydrator & Feature Store",
+      "purpose": "Merge push inboxes, celebrity pulls, and out-of-network candidates under 40ms.",
+      "explanation": {
+        "foundation": "Think of **Two-Stage Feed Hydrator & Feature Store** as the intuition layer for Design a Global Social Media Newsfeed & Timeline Engine (300M DAU): Merge push inboxes, celebrity pulls, and out-of-network candidates under 40ms.",
+        "core": "On `GET /v1/feed`, the Timeline Service fetches the user's inbox `ZSET` (top 400), pulls top 50 posts from followed celebrities, and queries an ANN vector index for 200 out-of-network 'For You' posts. The Hydrator runs parallel Redis `MGET`s for post/author objects, filters `blocked_authors`, and fetches user-author affinity features from a Redis Feature Store.",
+        "deepDive": "Under heavy load or partial failure, two-stage feed hydrator & feature store becomes a critical lever for predictable latency and correctness. Engineer 7-day rotating Seen-Post Bloom filters, 10m snapshot cursors, diversity decay, and non-jumping live pills."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 4 - Merge & Hydrate",
+        "title": "Three-Source Candidate Merge & Hydration",
+        "nodes": [
+          {
+            "id": "inbox",
+            "label": "User Inbox ZSET",
+            "sub": "Top 400 push IDs",
+            "role": "cache"
+          },
+          {
+            "id": "celeb",
+            "label": "Celebrity Pull Merge",
+            "sub": "Followed >=100K authors",
+            "role": "processor"
+          },
+          {
+            "id": "oon",
+            "label": "Out-of-Network ANN",
+            "sub": "200 discovery posts",
+            "role": "storage"
+          },
+          {
+            "id": "hyd",
+            "label": "Batch MGET + Features",
+            "sub": "Filters blocks (<40ms)",
+            "role": "sink"
+          }
+        ],
+        "edges": [
+          {
+            "from": "inbox",
+            "to": "hyd",
+            "label": "Merge push IDs"
+          },
+          {
+            "from": "celeb",
+            "to": "hyd",
+            "label": "Merge celebrity IDs"
+          },
+          {
+            "from": "oon",
+            "to": "hyd",
+            "label": "Merge For-You IDs"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Timeout Budgets",
+            "detail": "Set a hard 25ms timeout on out-of-network ANN; serve in-network feed if ANN lags."
+          },
+          {
+            "label": "Parallel Scatter",
+            "detail": "Execute inbox, celebrity, and OON fetches concurrently in one fan-out."
+          }
+        ],
+        "summary": "Parallel candidate fetching and batched MGET hydration assemble 650+ candidates in <40ms.",
+        "caption": "Hard timeouts on discovery ANN keep core in-network timelines resilient."
+      },
+      "id": "stage-4-two-stage-feed-hydrator-feature-store"
+    },
+    {
+      "stage": 5,
+      "level": "intermediate",
+      "title": "LightGBM / Two-Tower ML Ranker & Diversity Pass",
+      "purpose": "Maximize user engagement while enforcing author diversity and fallback safety.",
+      "explanation": {
+        "foundation": "Think of **LightGBM / Two-Tower ML Ranker & Diversity Pass** as the intuition layer for Design a Global Social Media Newsfeed & Timeline Engine (300M DAU): Maximize user engagement while enforcing author diversity and fallback safety.",
+        "core": "The ML Ranking Service (GPU/CPU Triton inference) scores the ~650 hydrated candidates using LightGBM or a multi-task Deep Neural Network predicting `P(click)`, `P(like)`, `P(repost)`, and `P(negative_feedback)`. A Diversity Re-Ranker applies exponential author-repeat decay (`0.5^k`) and injects sponsored slots before returning the ranked list.",
+        "deepDive": "Under heavy load or partial failure, lightgbm / two-tower ml ranker & diversity pass becomes a critical lever for predictable latency and correctness. Engineer 7-day rotating Seen-Post Bloom filters, 10m snapshot cursors, diversity decay, and non-jumping live pills."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 5 - ML Ranking",
+        "title": "Triton ML Scorer & Diversity Re-Ranker",
+        "nodes": [
+          {
+            "id": "cand",
+            "label": "650 Hydrated Posts",
+            "sub": "+ Feature vectors",
+            "role": "source"
+          },
+          {
+            "id": "triton",
+            "label": "Triton ML Ranker",
+            "sub": "LightGBM / DNN (<40ms)",
+            "role": "processor"
+          },
+          {
+            "id": "div",
+            "label": "Diversity Re-Ranker",
+            "sub": "Author decay 0.5^k",
+            "role": "router"
+          },
+          {
+            "id": "fb",
+            "label": "Chrono Fallback",
+            "sub": "If ML > 50ms timeout",
+            "role": "sink"
+          }
+        ],
+        "edges": [
+          {
+            "from": "cand",
+            "to": "triton",
+            "label": "Batch score 650 rows"
+          },
+          {
+            "from": "triton",
+            "to": "div",
+            "label": "Space out authors"
+          },
+          {
+            "from": "cand",
+            "to": "fb",
+            "label": "Fallback on timeout"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Batch Inference",
+            "detail": "Score all 650 candidates in one vectorized Triton batch rather than per-item RPCs."
+          },
+          {
+            "label": "Explainable Weights",
+            "detail": "Keep engagement-vs-recency weights configurable via dynamic experiment flags."
+          }
+        ],
+        "summary": "Vectorized Triton scoring and author-decay re-ranking deliver personalized feeds in <40ms.",
+        "caption": "Automatic chronological fallback guarantees zero downtime during ML deploys."
+      },
+      "id": "stage-5-lightgbm-two-tower-ml-ranker-diversity-pass"
+    },
+    {
+      "stage": 6,
+      "level": "advanced",
+      "title": "Seen-Post Bloom Filter & Snapshot Cursor Pagination",
+      "purpose": "Eliminate already-viewed posts and guarantee smooth, duplicate-free infinite scroll.",
+      "explanation": {
+        "foundation": "Think of **Seen-Post Bloom Filter & Snapshot Cursor Pagination** as the intuition layer for Design a Global Social Media Newsfeed & Timeline Engine (300M DAU): Eliminate already-viewed posts and guarantee smooth, duplicate-free infinite scroll.",
+        "core": "To avoid showing posts the user scrolled past 10 minutes ago, the Feed Service checks a per-user 7-day Seen-Post Bloom Filter (~2KB per active user in Redis, updated asynchronously by client viewport beacons). The final ranked list is stored as a 10-minute Feed Snapshot in Redis, returning an opaque Base64 cursor for instant <5ms page 2..N slices.",
+        "deepDive": "Under heavy load or partial failure, seen-post bloom filter & snapshot cursor pagination becomes a critical lever for predictable latency and correctness. Engineer 7-day rotating Seen-Post Bloom filters, 10m snapshot cursors, diversity decay, and non-jumping live pills."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 6 - Seen & Scroll",
+        "title": "Seen-Post Bloom + 10m Feed Snapshot",
+        "nodes": [
+          {
+            "id": "rank",
+            "label": "Ranked 300 Posts",
+            "sub": "From ML Ranker",
+            "role": "source"
+          },
+          {
+            "id": "bloom",
+            "label": "Per-User Seen Bloom",
+            "sub": "2KB/user 7d history",
+            "role": "router"
+          },
+          {
+            "id": "snap",
+            "label": "10m Redis Snapshot",
+            "sub": "Stores ranked IDs",
+            "role": "cache"
+          },
+          {
+            "id": "page",
+            "label": "Opaque Cursor Page",
+            "sub": "<5ms scroll pages",
+            "role": "sink"
+          }
+        ],
+        "edges": [
+          {
+            "from": "rank",
+            "to": "bloom",
+            "label": "Drop already-viewed"
+          },
+          {
+            "from": "bloom",
+            "to": "snap",
+            "label": "Save session snapshot"
+          },
+          {
+            "from": "snap",
+            "to": "page",
+            "label": "Return cursor slice"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Rotating Daily Blooms",
+            "detail": "Use 7 daily 300-byte Bloom filters per user so old seen history expires cleanly."
+          },
+          {
+            "label": "Zero ML on Scroll",
+            "detail": "Paging down slices the cached snapshot without re-invoking Triton."
+          }
+        ],
+        "summary": "Per-user rotating Bloom filters and 10m feed snapshots make infinite scroll fast and duplicate-free.",
+        "caption": "Splitting 7-day seen history into daily bitsets enables effortless TTL expiration."
+      },
+      "id": "stage-6-seen-post-bloom-filter-snapshot-cursor-paginatio"
+    },
+    {
+      "stage": 7,
+      "level": "advanced",
+      "title": "Multi-Region Active-Active & Live Streaming Updates",
+      "purpose": "Scale globally across continents and push real-time 'New Posts' pills to active clients.",
+      "explanation": {
+        "foundation": "Think of **Multi-Region Active-Active & Live Streaming Updates** as the intuition layer for Design a Global Social Media Newsfeed & Timeline Engine (300M DAU): Scale globally across continents and push real-time 'New Posts' pills to active clients.",
+        "core": "Each region hosts full Read/Cache/ML stacks with local Redis clusters and async cross-region Cassandra/Kafka replication for posts and social graph edges. For users actively viewing the top of their feed, lightweight SSE/WebSocket gateways subscribe to followed-author Redis Pub/Sub channels to display a non-disruptive '3 new posts' pill without jumping the scroll position.",
+        "deepDive": "Under heavy load or partial failure, multi-region active-active & live streaming updates becomes a critical lever for predictable latency and correctness. Engineer 7-day rotating Seen-Post Bloom filters, 10m snapshot cursors, diversity decay, and non-jumping live pills."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 7 - Global & Real-Time",
+        "title": "Multi-Region Stacks & Live Pill Gateway",
+        "nodes": [
+          {
+            "id": "reg_us",
+            "label": "US Feed Stack",
+            "sub": "Local Redis + Triton",
+            "role": "processor"
+          },
+          {
+            "id": "reg_eu",
+            "label": "EU Feed Stack",
+            "sub": "Local Redis + Triton",
+            "role": "processor"
+          },
+          {
+            "id": "rep",
+            "label": "Cross-Region Sync",
+            "sub": "Posts + Social Graph",
+            "role": "storage"
+          },
+          {
+            "id": "pill",
+            "label": "SSE New-Post Pill",
+            "sub": "Non-jumping live badge",
+            "role": "sink"
+          }
+        ],
+        "edges": [
+          {
+            "from": "reg_us",
+            "to": "rep",
+            "label": "Async replicate posts"
+          },
+          {
+            "from": "rep",
+            "to": "reg_eu",
+            "label": "Update EU caches"
+          },
+          {
+            "from": "reg_eu",
+            "to": "pill",
+            "label": "Push 'New Posts' badge"
+          }
+        ],
+        "cards": [
+          {
+            "label": "No Scroll Jumps",
+            "detail": "Never auto-prepend live posts while a user is reading; show a tappable pill instead."
+          },
+          {
+            "label": "Regional Isolation",
+            "detail": "Local Redis/Triton stacks keep feed reads <150ms even during WAN degradation."
+          }
+        ],
+        "summary": "Regionalized read/ML stacks and non-disruptive live pills complete a global 300M-DAU timeline.",
+        "caption": "Async cross-region post replication keeps multi-continent latency consistently low."
+      },
+      "id": "stage-7-multi-region-active-active-live-streaming-update"
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-1",
+        "question": "How does caching a 150M-active-user Redis inbox tier (rather than all 300M+ registered accounts) affect system cost and correctness?",
+        "options": [
+          {
+            "id": "a",
+            "text": "It cuts Redis RAM in half (~2TB saved) while dormant users who return simply fall back to a read-time DB merge.",
+            "correct": true,
+            "feedback": "Correct! Pushing only to recently active users saves massive RAM with a clean read-time fallback for dormant accounts."
+          },
+          {
+            "id": "b",
+            "text": "Dormant users permanently lose all their posts.",
+            "correct": false,
+            "feedback": "All posts remain durably stored in Cassandra/MySQL; only the precomputed Redis cache is skipped."
+          },
+          {
+            "id": "c",
+            "text": "It breaks celebrity Fan-Out-on-Read.",
+            "correct": false,
+            "feedback": "Celebrity Fan-Out-on-Read is already computed at read time."
+          },
+          {
+            "id": "d",
+            "text": "It disables Media CDN uploads.",
+            "correct": false,
+            "feedback": "Media CDN is completely independent of Redis inbox caching."
+          }
+        ],
+        "explanation": "Precomputing Redis timelines only for users active in the last 14-30 days slashes memory costs by 50-70% without losing data."
+      },
+      {
+        "id": "kc-2",
+        "question": "Why should a per-user 7-day Seen-Post Bloom Filter be implemented as 7 rotating daily filters instead of one single Bloom filter?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Standard Bloom filters do not support deletions; rotating 7 daily filters lets expired days drop via simple Redis TTLs.",
+            "correct": true,
+            "feedback": "Correct! Time-bucketed daily Bloom filters expire old items cleanly via Redis TTL without false-positive saturation."
+          },
+          {
+            "id": "b",
+            "text": "Redis keys cannot be larger than 300 bytes.",
+            "correct": false,
+            "feedback": "Redis strings can be up to 512MB; rotation is for clean TTL expiration."
+          },
+          {
+            "id": "c",
+            "text": "To force the ML ranker to run on every scroll page.",
+            "correct": false,
+            "feedback": "Scroll pages slice the cached snapshot without re-running ML."
+          },
+          {
+            "id": "d",
+            "text": "Because Kafka only retains 1 day of data.",
+            "correct": false,
+            "feedback": "Kafka retention is unrelated to per-user Redis Bloom expiration."
+          }
+        ],
+        "explanation": "A single non-expiring Bloom filter eventually fills up and hits 100% false positives. Rotating 7 daily filters with 7-day TTLs keeps memory and FP rate constant."
+      },
+      {
+        "id": "kc-3",
+        "question": "What is the best fallback if the Triton ML Ranking Service exceeds its 50ms latency budget during a traffic spike?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Return HTTP 500 Internal Server Error to the mobile app.",
+            "correct": false,
+            "feedback": "Failing the entire feed when chronological candidates are already hydrated ruins availability."
+          },
+          {
+            "id": "b",
+            "text": "Degrade gracefully to reverse-chronological ordering of the hydrated in-network candidates.",
+            "correct": true,
+            "feedback": "Correct! Chronological fallback keeps feeds fast and available even if ML inference degrades."
+          },
+          {
+            "id": "c",
+            "text": "Block the request for 10 seconds waiting for Triton.",
+            "correct": false,
+            "feedback": "Waiting 10s violates the <150ms p99 feed SLA."
+          },
+          {
+            "id": "d",
+            "text": "Disable the Social Graph Service.",
+            "correct": false,
+            "feedback": "The Social Graph is needed for fan-out, not ML fallback."
+          }
+        ],
+        "explanation": "Because candidate IDs are already fetched and hydrated in chronological order, falling back to reverse-chronological sort on ML timeout preserves 99.99% feed availability."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Design a 300M-user social media newsfeed that loads in under 150ms and handles viral celebrity posts.",
+      "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, separate ingestion (Kafka partitioned by AuthorID + Media CDN) from Hybrid Fan-Out (active-only Redis ZSETs + Celebrity Pull Cache), Two-Stage ML Ranking, and Snapshot Cursor Pagination.",
+      "byteSummary": "At 300 million users, a newsfeed separates uploading photos (straight to a CDN) from building timelines. Normal users push new post IDs to active friends' Redis feeds, while celebrities wait for readers to pull their latest posts.\n\nWhen you open the app, a fast ranker sorts the best posts, hides ones you already saw, and saves your scroll page so nothing repeats."
+    },
+    "intermediate": {
+      "summary": "Architect 200K RPS reads, 2TB active-only Redis ZSETs, author-partitioned Kafka, and <40ms Triton ML ranking.",
+      "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, separate ingestion (Kafka partitioned by AuthorID + Media CDN) from Hybrid Fan-Out (active-only Redis ZSETs + Celebrity Pull Cache), Two-Stage ML Ranking, and Snapshot Cursor Pagination.",
+      "byteSummary": "At 200K peak read RPS, media uploads go straight to S3/CDN while Kafka partitioned by `author_id` drives Hybrid Fan-Out across a 100K-follower threshold. Only 150M recently active users hold 800-item Redis `ZSET` inboxes (~2TB RAM).\n\nFeed reads merge push inboxes, celebrity pulls, and out-of-network ANN candidates, hydrating via Redis `MGET` before <40ms LightGBM/DNN scoring with chronological timeout fallback."
+    },
+    "advanced": {
+      "summary": "Engineer 7-day rotating Seen-Post Bloom filters, 10m snapshot cursors, diversity decay, and non-jumping live pills.",
+      "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, separate ingestion (Kafka partitioned by AuthorID + Media CDN) from Hybrid Fan-Out (active-only Redis ZSETs + Celebrity Pull Cache), Two-Stage ML Ranking, and Snapshot Cursor Pagination.",
+      "byteSummary": "Duplicate-free infinite scroll relies on a 10-minute ranked Redis snapshot keyed by an opaque cursor (skipping ML on pages 2..N) and 7 rotating daily Seen-Post Bloom filters (~2KB/user) for clean TTL expiration.\n\nDiversity re-ranking applies `0.5^k` author decay, hydration-time `blocked_authors` checks enforce instant safety, and regionalized stacks push non-jumping SSE 'New Posts' pills."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "prerequisites": [
+    {
+      "title": "Social Newsfeed Hybrid Fan-Out & Ranking",
+      "summary": "Hybrid newsfeed fan-out combines Fan-Out-on-Write (pushing post IDs to follower Redis timelines for normal users) with Fan-Out-on-Read (pulling celebrity posts at read time), followed by two-stage ML ranking and diversity deduplication."
+    }
+  ],
+  "simulation": {
+    "title": "Design a Global Social Media Newsfeed & Timeline Engine (300M DAU) — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Input Workload"
+      },
+      {
+        "id": "entry",
+        "label": "Router / API",
+        "role": "Admission Control"
+      },
+      {
+        "id": "worker",
+        "label": "Processor",
+        "role": "Domain Logic"
+      },
+      {
+        "id": "store",
+        "label": "State Layer",
+        "role": "Durable Store"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "entry",
+        "label": "request"
+      },
+      {
+        "from": "entry",
+        "to": "worker",
+        "label": "dispatch"
+      },
+      {
+        "from": "worker",
+        "to": "store",
+        "label": "read/write"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "300M DAU Capacity Sizing & Redis Inbox Memory",
+        "actionLabel": "request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "entry"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "request",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Caller sends work to Router / API (300M DAU Capacity Sizing & Redis Inbox Memory)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Post Ingestion, Media CDN & Author-Partitioned Kafka",
+        "actionLabel": "dispatch",
+        "status": "healthy",
+        "activeNodeIds": [
+          "entry",
+          "worker"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "dispatch",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Router / API coordinates with Processor while preserving the core invariant (Post Ingestion, Media CDN & Author-Partitioned Kafka)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Social Graph Service & Hybrid Fan-Out Workers",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "worker",
+          "store"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, State Layer absorbs pressure without cascading (Social Graph Service & Hybrid Fan-Out Workers)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Multi-Region Active-Active & Live Streaming Updates",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "entry",
+          "worker",
+          "store"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Multi-Region Active-Active & Live Streaming Updates)."
+      }
+    ]
+  }
+}

@@ -1,0 +1,526 @@
+{
+  "id": "design-priority-load-shedding-gateway",
+  "slug": "design-priority-load-shedding-gateway",
+  "title": "Design a 500K-RPS Priority-Aware Load Shedding Gateway with CoDel & Little's Law",
+  "problemType": "architecture",
+  "difficulty": "hard",
+  "domain": "Distributed Systems",
+  "tagline": "Keeping P0 checkout at 100% goodput and <15 ms p99 during 3x traffic spikes by shedding P2/P3 work proactively.",
+  "purpose": "Design an API edge gateway that prevents metastable retry storms, enforces criticality tiers (P0–P3), and adapts concurrency limits dynamically without manual threshold tuning.",
+  "prompt": "Design a distributed API Gateway handling 500K RPS normal / 1.5M RPS burst across 4 criticality tiers (P0 Checkout/Auth, P1 Core Reads, P2 Analytics, P3 Background), keeping P0/P1 p99 <15 ms and preventing downstream collapse during 5x database slowdowns.",
+  "pedagogicalFramework": "RESHADED",
+  "prerequisites": [
+    {
+      "title": "CoDel Sojourn-Time Load Shedding",
+      "summary": "Know how `target = 5 ms` / `interval = 100 ms` detects standing queues and sheds stale requests."
+    },
+    {
+      "title": "Adaptive Concurrency Limiting (Gradient2)",
+      "summary": "Understand how Little's Law (`L = lambda * W`) dynamically adjusts in-flight concurrency limits from `RTT_min` vs. `RTT_sample`."
+    }
+  ],
+  "spark": {
+    "summary": "Combine a Deficit Round-Robin + CoDel priority scheduler with Little's Law adaptive concurrency limits so P3/P2 traffic sheds with 503 + Retry-After before P0/P1 queues back up.",
+    "keyTakeaway": "When designing a high-RPS gateway that must protect critical flows during overload, pair priority-tiered CoDel queues with Little's Law adaptive concurrency limits and explicit 503 Retry-After budgets so retry storms never overwhelm downstream pools.",
+    "byteSummary": "At 500K RPS bursting to 1.5M RPS, treating `POST /checkout` (P0) identically to `POST /analytics/event` (P3) guarantees that an analytics spike or DB slowdown takes down revenue-critical checkout. Worse, naive HTTP 503s trigger immediate client retries that turn a 3x burst into a 10x metastable retry storm.\n\nThe gateway solves this in three coordinated stages: (1) Every incoming request is tagged at the edge with a criticality tier (`P0`–`P3`) and routed into per-tier CoDel queues scheduled via weighted Deficit Round-Robin; (2) An Adaptive Concurrency Controller (Gradient2) continuously compares baseline `RTT_min` against current `RTT_ema` to shrink the global in-flight concurrency limit `L` the moment downstream latency climbs; (3) When `L` is saturated or CoDel sojourn exceeds target, the gateway sheds lowest-priority tiers first (`P3` -> `P2`) with `HTTP 503` + jittered `Retry-After` headers and client-side retry budgets.\n\nDownstream services stay strictly within their healthy Little's Law operating point—preserving 100% goodput and <15 ms p99 for P0/P1 even during severe 5x backend degradations."
+  },
+  "learningJourney": [
+    {
+      "id": "stage-1-requirements-estimations",
+      "stageNumber": 1,
+      "title": "R & E · Requirements, Little's Law & Overload Math",
+      "whyThisMatters": "Shows exact concurrency math for 500K RPS and why unbounded queues trigger metastable collapse.",
+      "explanation": {
+        "foundation": "By Little's Law (`L = lambda * W`), 500,000 req/s with a healthy 10 ms downstream service time holds `L = 500,000 * 0.010 = 5,000` concurrent in-flight requests across the gateway fleet.",
+        "core": "Illustrative Sizing: Suppose 100 gateway pods handle 5,000 RPS each (`L = 50` in-flight/pod). If a downstream DB slows 5x (`W = 50 ms`) while traffic bursts 3x (`1.5M RPS`), unthrottled concurrency would jump to `L = 1,500,000 * 0.050 = 75,000` (15x overload!). By capping per-pod concurrency dynamically at `~50–65` and shedding `P3` (30% of traffic) + `P2` (25% of traffic) early, P0/P1 (`45%` of traffic) stays inside the healthy capacity envelope.",
+        "deepDive": "If clients retry 3x immediately on `503`, a 1.5M RPS spike becomes 4.5M RPS of ingress TLS/header parsing. Returning `Retry-After` + enforcing a 10% client retry-budget token bucket prevents retry amplification from saturating gateway CPUs."
+      },
+      "sectionDiagram": {
+        "kind": "behavior-transition",
+        "eyebrow": "Overload Protection",
+        "title": "Unbounded FIFO Gateway vs. Priority CoDel + Little's Law",
+        "before": {
+          "label": "Unbounded Shared Queue",
+          "metrics": [
+            "75,000 in-flight saturates DB",
+            "P3 analytics starves P0 checkout",
+            "3x retries collapse gateway CPU"
+          ]
+        },
+        "after": {
+          "label": "Priority CoDel + Gradient2",
+          "metrics": [
+            "P3/P2 shed at edge (<1 ms)",
+            "P0/P1 stays at 100% goodput",
+            "Retry-After + 10% retry budget"
+          ]
+        }
+      }
+    },
+    {
+      "id": "stage-2-storage-schema-priority-policy",
+      "stageNumber": 2,
+      "title": "S · Policy & Priority Tier Classification",
+      "whyThisMatters": "Defines how criticality tags (`P0`–`P3`) are assigned safely without trusting untrusted client headers.",
+      "explanation": {
+        "foundation": "Never trust a client-supplied `X-Priority: P0` header—every caller would mark their traffic P0!",
+        "core": "The edge gateway derives criticality deterministically from route + authenticated tenant tier: e.g., `POST /v1/checkout` & `/v1/auth` -> `P0`; `GET /v1/catalog` -> `P1`; `POST /v1/telemetry` -> `P2`; `POST /v1/export` -> `P3`. Each gateway pod maintains 4 lock-free ring queues (`Q0..Q3`) with independent CoDel sojourn timers.",
+        "deepDive": "To avoid CPU starvation on `P2/P3` during normal load while protecting `P0` under overload, use weighted Deficit Round-Robin (weights e.g. `8:4:2:1`) combined with global Gradient2 concurrency permits."
+      },
+      "sectionDiagram": {
+        "kind": "cache-tier",
+        "eyebrow": "4-Tier Admission",
+        "title": "Route Classifier -> P0..P3 CoDel Queues -> Gradient2 Permit Pool",
+        "nodes": [
+          {
+            "label": "P0 Checkout/Auth",
+            "sub": "Reserved 40% min"
+          },
+          {
+            "label": "P1 Core Reads",
+            "sub": "High weight DRR"
+          },
+          {
+            "label": "P2 Analytics",
+            "sub": "Shed on lag > 5ms"
+          },
+          {
+            "label": "P3 Background",
+            "sub": "Shed first (503)"
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-3-high-level-architecture",
+      "stageNumber": 3,
+      "title": "H & A · Gateway Data Plane & Adaptive Concurrency",
+      "whyThisMatters": "Traces how Gradient2 + CoDel coordinate admission without centralized coordination.",
+      "explanation": {
+        "foundation": "Each gateway pod runs its own local Gradient2 + CoDel controller—zero cross-pod Redis round-trips on the hot path!",
+        "core": "When a request arrives, the pod checks `in_flight < limit`. If `limit` is reached, it immediately sheds the lowest-priority queued item (`P3`, then `P2`) rather than dropping an incoming `P0`! As downstream responses return, Gradient2 updates `limit_new = limit * (RTT_min / RTT_sample) + queue_allowance`, automatically shrinking `limit` during DB slowdowns.",
+        "deepDive": "For `P0` requests, reserve a non-preemptible floor (e.g., 30% of `limit`) that `P1–P3` can borrow when `P0` is idle, but `P0` can always reclaim by shedding queued `P2/P3` work."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Admission & Shedding Flow",
+        "title": "Edge Classify -> Priority CoDel -> Gradient2 Permit -> Upstream / 503",
+        "actors": [
+          {
+            "id": "cli",
+            "label": "Client"
+          },
+          {
+            "id": "gw",
+            "label": "Gateway Classifier"
+          },
+          {
+            "id": "adm",
+            "label": "CoDel + Gradient2"
+          },
+          {
+            "id": "up",
+            "label": "Downstream Pool"
+          }
+        ],
+        "steps": [
+          {
+            "from": "cli",
+            "to": "gw",
+            "label": "Request (route -> P0..P3)"
+          },
+          {
+            "from": "gw",
+            "to": "adm",
+            "label": "Check limit & sojourn"
+          },
+          {
+            "from": "adm",
+            "to": "up",
+            "label": "Admit P0/P1; update RTT_min"
+          },
+          {
+            "from": "adm",
+            "to": "cli",
+            "label": "Shed P2/P3 -> 503 + Retry-After"
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-4-detailed-design-retry-storms",
+      "stageNumber": 4,
+      "title": "D · Detailed Design: Anti-Retry-Storm & Edge Shedding",
+      "whyThisMatters": "Prevents rejected 503 traffic from looping back as a 10x retry storm.",
+      "explanation": {
+        "foundation": "Shedding a request at the gateway only saves downstream CPU—if 500K clients retry immediately, the gateway itself still spends CPU on TLS and routing.",
+        "core": "Three defenses stop retry storms: (1) Return `HTTP 503` with a jittered `Retry-After` header (e.g., `2–5s` for P2/P3); (2) Enforce a 10% retry-ratio token bucket in official SDKs (`retry_tokens` refilled by successful responses); (3) Tag retried requests (`X-Retry-Attempt: 1`) so CoDel drops retries before fresh P0 attempts during overload.",
+        "deepDive": "If a pod's CPU exceeds 85% parsing rejected traffic, push L4/XDP or Envoy edge rate-shedding rules upstream so P3 drops happen before full HTTP/JSON parsing."
+      },
+      "codeExample": {
+        "language": "python",
+        "title": "Priority-Aware Admission Controller with Gradient2 & Retry Budget",
+        "code": "class PriorityGatewayLimiter:\n    def __init__(self, initial_limit=50, min_limit=10, max_limit=200):\n        self.limit = float(initial_limit)\n        self.min_limit = min_limit\n        self.max_limit = max_limit\n        self.rtt_min = float('inf')\n        self.in_flight = 0\n\n    def admit(self, priority: int, is_retry: bool) -> bool:\n        # Reserve 30% floor for P0; drop retries & P2/P3 first when near limit\n        effective_cap = self.limit if priority == 0 else self.limit * (0.70 if priority >= 2 else 0.90)\n        if is_retry and self.in_flight >= self.limit * 0.75:\n            return False  # Protect fresh requests from retry storms\n        if self.in_flight >= effective_cap:\n            return False\n        self.in_flight += 1\n        return True\n\n    def on_complete(self, rtt_ms: float):\n        self.in_flight = max(0, self.in_flight - 1)\n        self.rtt_min = min(self.rtt_min, rtt_ms)\n        gradient = min(1.0, self.rtt_min / max(rtt_ms, 0.1))\n        self.limit = max(self.min_limit, min(self.max_limit, self.limit * gradient + 1.0))\n"
+      },
+      "decisionFramework": {
+        "problem": "How to protect P0 checkout traffic and prevent retry storms during 3x spikes or 5x DB slowdowns.",
+        "naiveSolution": "Use a static global rate limit and blind client retries on 503.",
+        "whyItFails": "Static rate limits can't adapt when DB latency rises 5x, and blind retries turn 3x spikes into 10x metastable outages.",
+        "alternatives": "Static global token bucket vs. Priority CoDel + Gradient2 + Retry Budgets.",
+        "decision": "Run per-pod Priority CoDel + Gradient2 concurrency limits, reserve a P0 floor, and enforce 10% SDK retry budgets + jittered Retry-After.",
+        "tradeOffs": "Requires maintaining route-to-priority mappings and SDK retry-budget discipline in exchange for autonomous overload survival."
+      },
+      "decisionExercise": {
+        "prompt": "During a DB slowdown, your gateway sheds 40% of P2/P3 requests with `HTTP 503`, but gateway CPU jumps to 100% and P0 latency spikes anyway. Logs show `X-Retry-Attempt` on 70% of incoming traffic. What is missing?",
+        "options": [
+          {
+            "id": "a",
+            "label": "Clients lack jittered `Retry-After` backoff and retry budgets, causing a retry storm; shed retried requests earlier and enforce a 10% SDK retry cap.",
+            "isCorrect": true,
+            "explanation": "Correct! Unbounded client retries amplify overload; capping retries at ~10% of successful requests and dropping retries first breaks the metastable loop."
+          },
+          {
+            "id": "b",
+            "label": "Increase the gateway's FIFO queue size from 1,000 to 100,000.",
+            "isCorrect": false,
+            "explanation": "Larger queues worsen latency and memory pressure without reducing retry volume."
+          },
+          {
+            "id": "c",
+            "label": "Promote P3 analytics requests to P0.",
+            "isCorrect": false,
+            "explanation": "Promoting P3 destroys priority isolation."
+          }
+        ]
+      },
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "Gateway Overload State",
+        "title": "Normal (All Tiers) -> Shed P3 -> Shed P2+Retries -> P0 Floor Protected",
+        "states": [
+          {
+            "id": "norm",
+            "label": "All Tiers Admitted",
+            "tone": "good"
+          },
+          {
+            "id": "p3",
+            "label": "Shed P3 + Retries",
+            "tone": "info"
+          },
+          {
+            "id": "p2",
+            "label": "Shed P2 + P3 (503)",
+            "tone": "warn"
+          },
+          {
+            "id": "p0",
+            "label": "P0 Floor Protected",
+            "tone": "good"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "norm",
+            "to": "p3",
+            "label": "L > 70% limit"
+          },
+          {
+            "from": "p3",
+            "to": "p2",
+            "label": "CoDel sojourn > 5ms"
+          },
+          {
+            "from": "p2",
+            "to": "p0",
+            "label": "30% P0 floor"
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-5-evaluation-assumptions-glossary",
+      "stageNumber": 5,
+      "title": "E & D · Evaluation, Assumptions, Limitations & Glossary",
+      "whyThisMatters": "Documents traffic-mix assumptions, `RTT_min` drift traps, and core resilience terms.",
+      "explanation": {
+        "foundation": "This design assumes gateway pods are stateless per-request and that downstream services degrade gracefully when concurrency is capped.",
+        "core": "Assumptions & Limitations: Sizing assumes 500K RPS normal / 1.5M RPS burst across 100 pods with P0/P1 <= 50% of total traffic. Because Gradient2 relies on `RTT_min` as its baseline, periodically decay or window `RTT_min` (e.g., reset every 5–10 minutes) so a topology change or cross-AZ shift doesn't permanently pin `RTT_min` to a stale value.",
+        "deepDive": "Glossary: Goodput (requests completed successfully before client timeout); Metastable Failure (feedback loop where retries keep a system overloaded even after the initial spike ends); Gradient2 (Netflix's Little's Law adaptive concurrency limiter); Retry Budget (per-client cap on retry ratio, typically 10%)."
+      },
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "End-to-End Edge Gateway",
+        "title": "Route Classifier -> Priority CoDel + Gradient2 -> Downstream + 503 Retry-After",
+        "nodes": [
+          {
+            "id": "cls",
+            "label": "Route Classifier (P0-P3)",
+            "tier": "ingress"
+          },
+          {
+            "id": "cod",
+            "label": "DRR + CoDel Queues",
+            "tier": "compute"
+          },
+          {
+            "id": "grd",
+            "label": "Gradient2 Concurrency",
+            "tier": "control"
+          },
+          {
+            "id": "up",
+            "label": "Healthy Downstream",
+            "tier": "storage"
+          }
+        ],
+        "edges": [
+          {
+            "from": "cls",
+            "to": "cod",
+            "label": "tier tag"
+          },
+          {
+            "from": "cod",
+            "to": "grd",
+            "label": "admit / shed 503"
+          },
+          {
+            "from": "grd",
+            "to": "up",
+            "label": "bounded L = lambda*W"
+          }
+        ]
+      }
+    }
+  ],
+  "simulation": {
+    "title": "500K-RPS Priority Gateway — 5x DB Slowdown & Shedding",
+    "nodes": [
+      {
+        "id": "in",
+        "label": "Ingress (P0..P3)",
+        "role": "Route Priority Tag"
+      },
+      {
+        "id": "codel",
+        "label": "CoDel + DRR",
+        "role": "Sojourn Scheduler"
+      },
+      {
+        "id": "grad",
+        "label": "Gradient2 Limiter",
+        "role": "L = lambda * W"
+      },
+      {
+        "id": "db",
+        "label": "Downstream DB",
+        "role": "Protected Capacity"
+      }
+    ],
+    "edges": [
+      {
+        "from": "in",
+        "to": "codel",
+        "label": "classify P0..P3"
+      },
+      {
+        "from": "codel",
+        "to": "grad",
+        "label": "admit by tier"
+      },
+      {
+        "from": "grad",
+        "to": "db",
+        "label": "bounded in-flight"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Normal 500K RPS Operation",
+        "actionLabel": "All tiers < 10 ms",
+        "status": "healthy",
+        "activeNodeIds": [
+          "in",
+          "codel",
+          "grad",
+          "db"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "rps": "500K",
+          "in_flight": 5000,
+          "p0_p99_ms": 9
+        },
+        "explanation": "Downstream latency is 10 ms; all P0–P3 tiers pass with zero shedding."
+      },
+      {
+        "stepNumber": 2,
+        "title": "5x DB Slowdown + 3x Spike",
+        "actionLabel": "Gradient2 shrinks limit",
+        "status": "warning",
+        "activeNodeIds": [
+          "grad",
+          "db"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "db_rtt_ms": 50,
+          "limit_action": "Shrink L",
+          "sojourn_ms": 12
+        },
+        "explanation": "RTT jumps from 10 ms to 50 ms; Gradient2 shrinks concurrency permits and CoDel detects >5 ms sojourn."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Shed P3 Analytics & P2 + Retries",
+        "actionLabel": "Return 503 + Retry-After",
+        "status": "warning",
+        "activeNodeIds": [
+          "codel",
+          "grad"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "p3_p2_status": "503 Shed",
+          "p0_goodput": "100%",
+          "retry_storm": "Blocked"
+        },
+        "explanation": "Gateway sheds P3/P2 and retry traffic at the edge so downstream concurrency stays bounded."
+      },
+      {
+        "stepNumber": 4,
+        "title": "P0 Checkout Holds <15 ms p99",
+        "actionLabel": "P0 floor preserved",
+        "status": "healthy",
+        "activeNodeIds": [
+          "in",
+          "codel",
+          "db"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "p0_p99_ms": 14,
+          "p0_goodput": "100%",
+          "errors_p0": 0
+        },
+        "explanation": "P0 checkout and auth continue with 100% goodput and <15 ms p99 throughout the incident."
+      }
+    ]
+  },
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-1",
+        "question": "Why must the API gateway derive request criticality (`P0`–`P3`) from route + authenticated tenant metadata rather than a client-supplied header?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Untrusted clients or buggy SDKs would mark all traffic as `P0`, defeating priority isolation under overload.",
+            "correct": true,
+            "feedback": "Correct! Priority classification must be server-enforced at the edge."
+          },
+          {
+            "id": "b",
+            "text": "HTTP headers cannot hold strings like `P0`.",
+            "correct": false,
+            "feedback": "HTTP headers hold arbitrary strings; the issue is trust and security."
+          },
+          {
+            "id": "c",
+            "text": "CoDel only supports integer priorities.",
+            "correct": false,
+            "feedback": "Priority mapping is independent of header encoding."
+          },
+          {
+            "id": "d",
+            "text": "Client headers bypass TLS encryption.",
+            "correct": false,
+            "feedback": "Headers are encrypted inside TLS."
+          }
+        ],
+        "explanation": "Server-side route + tenant classification prevents priority inflation."
+      },
+      {
+        "id": "kc-2",
+        "question": "By Little's Law (`L = lambda * W`), if 100 gateway pods normally serve 500K RPS at 10 ms service time (`L = 50`/pod) and DB latency jumps 5x to 50 ms, what happens without adaptive concurrency limits?",
+        "options": [
+          {
+            "id": "a",
+            "text": "In-flight concurrency balloons 5x (or 15x during a 3x burst) to 25,000–75,000, exhausting DB connections and crashing workers.",
+            "correct": true,
+            "feedback": "Correct! Higher `W` multiplies in-flight `L` unless admission limits shrink and shed excess load."
+          },
+          {
+            "id": "b",
+            "text": "In-flight concurrency drops to zero automatically.",
+            "correct": false,
+            "feedback": "Slower `W` increases `L` unless arrival rate `lambda` is shed."
+          },
+          {
+            "id": "c",
+            "text": "DB latency automatically drops back to 10 ms.",
+            "correct": false,
+            "feedback": "Added concurrency worsens DB contention."
+          },
+          {
+            "id": "d",
+            "text": "TCP merges all 75,000 requests into one packet.",
+            "correct": false,
+            "feedback": "TCP does not merge separate HTTP requests."
+          }
+        ],
+        "explanation": "Adaptive concurrency limits cap `L` to protect downstream pools when `W` spikes."
+      },
+      {
+        "id": "kc-3",
+        "question": "Why should `RTT_min` in a Gradient2 concurrency limiter be periodically decayed or windowed (e.g., every 5–10 minutes)?",
+        "options": [
+          {
+            "id": "a",
+            "text": "So a permanent routing or cross-AZ latency shift doesn't leave `RTT_min` pinned to an unreachably low historical value, which would permanently under-admit traffic.",
+            "correct": true,
+            "feedback": "Correct! Windowing `RTT_min` lets the limiter recalibrate to baseline infrastructure shifts."
+          },
+          {
+            "id": "b",
+            "text": "Because floating-point numbers overflow after 10 minutes.",
+            "correct": false,
+            "feedback": "Floats do not overflow from age."
+          },
+          {
+            "id": "c",
+            "text": "To disable CoDel dropping completely.",
+            "correct": false,
+            "feedback": "CoDel and Gradient2 work together."
+          },
+          {
+            "id": "d",
+            "text": "To force all clients to reconnect.",
+            "correct": false,
+            "feedback": "Windowing `RTT_min` does not close TCP connections."
+          }
+        ],
+        "explanation": "Stale `RTT_min` values cause persistent false-positive throttling after network topology changes."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Protect critical APIs like checkout during traffic spikes by tagging requests P0–P3, shedding low-priority traffic first, and capping retries.",
+      "keyTakeaway": "When an API gateway gets overloaded, drop low-priority background traffic and retries early so critical checkout requests stay fast.",
+      "byteSummary": "By sorting requests into P0–P3 tiers, measuring queue wait times with CoDel, and returning 503 with Retry-After to P2/P3 traffic, critical P0 checkout flows stay at 100% goodput."
+    },
+    "intermediate": {
+      "summary": "Combine per-tier CoDel queues, DRR scheduling, Gradient2 adaptive concurrency limits, and 10% client retry budgets to keep P0 p99 <15 ms.",
+      "keyTakeaway": "When designing a priority load-shedding gateway, pair CoDel sojourn queues with Gradient2 Little's Law limits and Retry-After budgets.",
+      "byteSummary": "Per-pod CoDel + Gradient2 detects downstream slowdowns locally with zero Redis hops, shedding P3/P2 and retries first while reserving a 30% P0 floor."
+    },
+    "advanced": {
+      "summary": "Local per-pod DRR + CoDel priority scheduler, windowed Gradient2 concurrency control, 30% P0 floor, and upstream retry-storm shedding.",
+      "keyTakeaway": "When defending 500K+ RPS gateways against metastable retry storms, enforce server-side priority tags, shed retries before fresh P0 attempts, and window RTT_min.",
+      "byteSummary": "Combining server-derived P0–P3 DRR + CoDel queues, windowed Gradient2 `L = lambda * W` limits, and 10% retry budgets keeps P0 <15 ms p99 even under 5x DB slowdowns and 3x bursts."
+    }
+  }
+}

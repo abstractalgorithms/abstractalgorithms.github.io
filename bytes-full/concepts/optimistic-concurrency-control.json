@@ -1,0 +1,1058 @@
+{
+  "id": "concept-optimistic-concurrency-control",
+  "slug": "optimistic-concurrency-control",
+  "name": "Optimistic Concurrency Control",
+  "domain": "Databases & Storage Engines",
+  "tagline": "Lock-free concurrency control that validates a monotonic version or ETag at commit time to prevent lost updates.",
+  "purpose": "Build a progressive mental model of Optimistic Concurrency Control—from why holding DB locks over HTTP fails to how versioned CAS and `If-Match` headers scale under low contention.",
+  "spark": {
+    "summary": "A lock-free concurrency pattern that lets readers and writers proceed without blocking, validating at commit time via a version number or ETag that no one else modified the record.",
+    "keyTakeaway": "If disk I/O or compaction stalls threaten tail latency, use atomic compare-and-swap (`UPDATE ... WHERE id = ? AND version = ?` or HTTP `If-Match`) when conflicts are rare (<5%), and pair retries with exponential backoff and full jitter.",
+    "byteSummary": "**Core Mechanics:** Formalized by Kung and Robinson (1981), **Optimistic Concurrency Control (OCC)** bets that conflicts are the exception.\n\n**Visual & Structural Flow:** Depicts Two Concurrent Writers Resolved by Monotonic Version (Worker A -> Orders DB (v=42) -> Worker B); HTTP If-Match -> PostgreSQL MVCC Version Check (PATCH + If-Match -> API Gateway -> WAL + Tuple Lock -> 1 Row -> 200 OK).\n\n**Trade-Offs & Production:** Match the concurrency control mechanism to conflict probability and multi-row invariants. A REST API serves `ETag: \"42\"` on `GET /orders/9001`.\n\n**Failure Modes & Application:** Compare OCC with pessimistic locking, database isolation levels, and retry-storm prevention."
+  },
+  "learningJourney": [
+    {
+      "id": "01-what-it-is",
+      "eyebrow": "STAGE 01 · WHAT IT IS",
+      "title": "What is Optimistic Concurrency Control (OCC)",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "Formalized by Kung and Robinson (1981), **Optimistic Concurrency Control (OCC)** bets that conflicts are the exception. Instead of acquiring locks before reading, a transaction runs in three phases: **Read** (fetch record + monotonic `version` or `ETag`), **Modify** (compute new state in memory), and **Validate/Write** (execute an atomic compare-and-swap such as `UPDATE ... SET version = version + 1 WHERE id = $1 AND version = $2`).",
+        "core": "If 0 rows are affected—or DynamoDB raises `ConditionalCheckFailedException` or HTTP returns `412 Precondition Failed`—the writer aborts and retries or prompts the user.",
+        "deepDive": "In production deployments of Optimistic Concurrency Control, watch how what is optimistic concurrency control (occ) interacts with tail latency, retry amplification, and partial failures. A lock-free concurrency pattern that lets readers and writers proceed without blocking, validating at commit time via a version number or ETag that no one else modified the record."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Compare-And-Swap Race",
+        "title": "Two Concurrent Writers Resolved by Monotonic Version",
+        "actors": [
+          {
+            "id": "wa",
+            "label": "Worker A"
+          },
+          {
+            "id": "db",
+            "label": "Orders DB (v=42)"
+          },
+          {
+            "id": "wb",
+            "label": "Worker B"
+          }
+        ],
+        "events": [
+          {
+            "from": "wa",
+            "to": "db",
+            "label": "SELECT id=9001 -> v=42",
+            "status": "ok"
+          },
+          {
+            "from": "wb",
+            "to": "db",
+            "label": "SELECT id=9001 -> v=42",
+            "status": "ok"
+          },
+          {
+            "from": "wa",
+            "to": "db",
+            "label": "UPDATE SET v=43 WHERE v=42 (1 row)",
+            "status": "ok"
+          },
+          {
+            "from": "wb",
+            "to": "db",
+            "label": "UPDATE SET v=43 WHERE v=42 (0 rows!)",
+            "status": "fail"
+          },
+          {
+            "from": "wb",
+            "to": "wb",
+            "label": "Jittered backoff + re-read v=43",
+            "status": "warn"
+          }
+        ],
+        "summary": "Zero read locks are held; Worker B detects the concurrent write atomically at commit time instead of silently overwriting Worker A."
+      },
+      "purpose": "The mechanism: understand how Optimistic Concurrency Control (OCC) works from first principles."
+    },
+    {
+      "id": "02-why-we-need-it",
+      "eyebrow": "STAGE 02 · WHY WE NEED IT",
+      "title": "Why we need OCC (and why wall-clock timestamps fail)",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "Holding database row locks across network calls or human think-time (like editing a document or checking out a cart) stalls concurrent users and saturates connection pools.",
+        "core": "OCC eliminates lock waiting on reads.",
+        "deepDive": "Crucially, **never use `updated_at` wall-clock timestamps** for OCC comparisons: NTP drift and sub-millisecond collisions silently cause lost updates."
+      },
+      "ideas": [
+        {
+          "title": "Full Jitter Stops Retry Storms",
+          "description": "If 100 workers collide on `v=42` and retry in a tight loop, DB load multiplies 10x. Cap attempts (3–5) and sleep `random(0, min(cap, base * 2^attempt))`."
+        },
+        {
+          "title": "Keep Side Effects Outside the Retry Loop",
+          "description": "Never charge a credit card inside an OCC loop; if the DB CAS fails and retries, you double-charge the customer. Use a Transactional Outbox instead."
+        }
+      ],
+      "purpose": "The problem: see what breaks without OCC under real concurrency or scale.",
+      "decisionFramework": {
+        "problem": "How to implement Optimistic Concurrency Control without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "If disk I/O or compaction stalls threaten tail latency, use atomic compare-and-swap (`UPDATE ... WHERE id = ? AND version = ?` or HTTP `If-Match`) when conflicts are rare (<5%), and pair retries with exponential backoff and full jitter.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Optimistic Concurrency Control experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-where-it-is-used",
+      "eyebrow": "STAGE 03 · WHERE IT IS USED",
+      "title": "Where OCC excels (and where Pessimistic Locking wins)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Think of **Where OCC excels (and where Pessimistic Locking wins)** as the intuition layer for Optimistic Concurrency Control: Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+        "core": "OCC shines under low-to-moderate contention (<5–10% conflict rate) and stateless HTTP APIs; high-contention hot keys need pessimistic locks or atomic increments.",
+        "deepDive": "Under heavy load or partial failure, where occ excels (and where pessimistic locking wins) becomes a critical lever for predictable latency and correctness. A lock-free concurrency pattern that lets readers and writers proceed without blocking, validating at commit time via a version number or ETag that no one else modified the record."
+      },
+      "comparison": [
+        {
+          "choice": "Good Candidate: Low Contention (<5% conflicts) & Stateless REST",
+          "benefits": [
+            "1-RTT writes with zero lock wait; works cleanly across disconnected HTTP calls via `ETag` + `If-Match`."
+          ],
+          "costs": [
+            "Callers must handle `409 Conflict` / `412 Precondition Failed` and retry or merge."
+          ]
+        },
+        {
+          "choice": "Good Candidate: Distributed NoSQL (DynamoDB, etcd, K8s)",
+          "benefits": [
+            "Native `ConditionExpression` and `resourceVersion` CAS without cross-node lock managers."
+          ],
+          "costs": [
+            "Read-modify-write requires an extra read RTT if the caller does not already hold the latest version."
+          ]
+        },
+        {
+          "choice": "Avoid: Flash-Sale Hot Keys (>20% conflict rate)",
+          "benefits": [
+            "Use `SELECT ... FOR UPDATE`, atomic SQL `SET qty = qty - 1 WHERE qty >= 1`, or a single-writer queue."
+          ],
+          "costs": [
+            "At 30%+ conflicts, OCC wastes more DB IOPS failing and re-reading than queuing behind a lock."
+          ]
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    },
+    {
+      "id": "04-how-it-is-managed",
+      "eyebrow": "STAGE 04 · HOW IT IS MANAGED",
+      "title": "How OCC Retry Loops and `If-Match` APIs are implemented",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Think of **How OCC Retry Loops and `If-Match` APIs are implemented** as the intuition layer for Optimistic Concurrency Control: Operational control: configure bounds, failure handling, and safe production defaults.",
+        "core": "Assert `rows_affected == 1` on every SQL CAS update (many ORMs silently succeed on 0 rows unless `@Version` throws `OptimisticLockingFailureException`), enforce `If-Match` on `PUT`/`PATCH` (returning `428 Precondition Required` if omitted), and bound retries with full jitter.",
+        "deepDive": "Under heavy load or partial failure, how occ retry loops and `if-match` apis are implemented becomes a critical lever for predictable latency and correctness. A lock-free concurrency pattern that lets readers and writers proceed without blocking, validating at commit time via a version number or ETag that no one else modified the record."
+      },
+      "markdownContent": "```python\nimport random, time\n\ndef update_with_occ(repo, order_id: str, cmd, max_attempts: int = 4, base_ms: int = 20, cap_ms: int = 400):\n    for attempt in range(max_attempts):\n        record = repo.get(order_id)\n        updated = record.apply_change(cmd)\n        # Executes: UPDATE orders SET ..., version = version + 1 WHERE id = %s AND version = %s\n        if repo.compare_and_swap(updated, expected_version=record.version):\n            return updated\n        sleep_ms = random.uniform(0, min(cap_ms, base_ms * (2 ** attempt)))\n        time.sleep(sleep_ms / 1000.0)\n    raise ConflictError(\"Max OCC retries exceeded\")\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "Component Topology",
+        "title": "How OCC Retry Loops and `If-Match` APIs are implemented",
+        "graphNodes": [
+          {
+            "id": "client",
+            "label": "Caller",
+            "role": "ingress",
+            "col": 0,
+            "row": 0,
+            "tone": "primary"
+          },
+          {
+            "id": "entry",
+            "label": "Router / API",
+            "role": "compute",
+            "col": 1,
+            "row": 0,
+            "tone": "tint"
+          },
+          {
+            "id": "worker",
+            "label": "Processor",
+            "role": "storage",
+            "col": 2,
+            "row": 0,
+            "tone": "tint"
+          },
+          {
+            "id": "store",
+            "label": "State Layer",
+            "role": "control",
+            "col": 0,
+            "row": 1,
+            "tone": "tint"
+          }
+        ],
+        "graphEdges": [
+          {
+            "from": "client",
+            "to": "entry",
+            "label": "request",
+            "style": "solid",
+            "tone": "green"
+          },
+          {
+            "from": "entry",
+            "to": "worker",
+            "label": "dispatch",
+            "style": "solid",
+            "tone": "green"
+          },
+          {
+            "from": "worker",
+            "to": "store",
+            "label": "read/write",
+            "style": "solid",
+            "tone": "green"
+          }
+        ]
+      }
+    },
+    {
+      "id": "05-alternatives",
+      "eyebrow": "STAGE 05 · ALTERNATIVES",
+      "title": "Alternatives: OCC vs. Pessimistic Locking vs. Atomic Deltas",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": {
+        "foundation": "Think of **Alternatives: OCC vs. Pessimistic Locking vs. Atomic Deltas** as the intuition layer for Optimistic Concurrency Control: The trade-off: compare competing approaches across latency, consistency, and operational cost.",
+        "core": "Match the concurrency control mechanism to conflict probability and multi-row invariants.",
+        "deepDive": "Under heavy load or partial failure, alternatives: occ vs. pessimistic locking vs. atomic deltas becomes a critical lever for predictable latency and correctness. A lock-free concurrency pattern that lets readers and writers proceed without blocking, validating at commit time via a version number or ETag that no one else modified the record."
+      },
+      "comparison": [
+        {
+          "choice": "Optimistic Concurrency Control (Version / ETag)",
+          "benefits": [
+            "Zero deadlocks, zero lock-wait timeouts, and optimal throughput when conflicts < 5%."
+          ],
+          "costs": [
+            "Throughput collapses under heavy hot-key contention due to wasted read-compute-abort cycles."
+          ]
+        },
+        {
+          "choice": "Pessimistic Locking (`SELECT ... FOR UPDATE`)",
+          "benefits": [
+            "Predictable queuing under >20% contention and enforces multi-row invariants cleanly."
+          ],
+          "costs": [
+            "Ties up DB connections while waiting and risks AB-BA deadlocks without canonical lock ordering."
+          ]
+        },
+        {
+          "choice": "Commutative Atomic Updates (`SET qty = qty - 1`)",
+          "benefits": [
+            "Single SQL statement with no client read-modify-write round trip."
+          ],
+          "costs": [
+            "Only works for simple arithmetic/append predicates, not complex multi-field business rules."
+          ]
+        }
+      ],
+      "purpose": "The trade-off: compare competing approaches across latency, consistency, and operational cost.",
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "Lifecycle & Failure Recovery",
+        "title": "Alternatives: OCC vs. Pessimistic Locking vs. Atomic Deltas",
+        "states": [
+          {
+            "id": "init",
+            "label": "Initialized",
+            "tone": "neutral"
+          },
+          {
+            "id": "active",
+            "label": "Processing",
+            "tone": "info"
+          },
+          {
+            "id": "stable",
+            "label": "Invariant Met",
+            "tone": "good"
+          },
+          {
+            "id": "fallback",
+            "label": "Degraded Fallback",
+            "tone": "warn"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "init",
+            "to": "active",
+            "label": "admit"
+          },
+          {
+            "from": "active",
+            "to": "stable",
+            "label": "succeed"
+          },
+          {
+            "from": "active",
+            "to": "fallback",
+            "label": "budget exceeded"
+          }
+        ]
+      }
+    },
+    {
+      "id": "06-production-architecture",
+      "eyebrow": "STAGE 06 · PRODUCTION ARCHITECTURE",
+      "title": "Production example: HTTP `ETag` + PostgreSQL MVCC Version Guard",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "A REST API serves `ETag: \"42\"` on `GET /orders/9001`.",
+        "core": "Clients send `If-Match: \"42\"` on `PATCH`.",
+        "deepDive": "PostgreSQL executes `UPDATE orders SET ..., version = 43 WHERE id = 9001 AND version = 42` using its MVCC tuple visibility; 0 affected rows maps cleanly to `412 Precondition Failed`."
+      },
+      "sectionDiagram": {
+        "kind": "wal-mvcc",
+        "eyebrow": "Storage-Layer CAS",
+        "title": "HTTP If-Match -> PostgreSQL MVCC Version Check",
+        "nodes": [
+          {
+            "id": "cli",
+            "label": "PATCH + If-Match",
+            "role": "ETag: \"42\""
+          },
+          {
+            "id": "api",
+            "label": "API Gateway",
+            "role": "428 if missing"
+          },
+          {
+            "id": "wal",
+            "label": "WAL + Tuple Lock",
+            "role": "WHERE version=42"
+          },
+          {
+            "id": "res",
+            "label": "1 Row -> 200 OK",
+            "role": "0 Rows -> 412"
+          }
+        ],
+        "edges": [
+          {
+            "label": "atomic CAS"
+          },
+          {
+            "label": "commit or abort"
+          }
+        ],
+        "cards": [
+          {
+            "label": "1. Strict Precondition",
+            "detail": "Requests omitting If-Match receive 428 Precondition Required so old clients cannot silently clobber state."
+          },
+          {
+            "label": "2. Row-Level CAS",
+            "detail": "Postgres acquires a brief tuple lock only for the commit instant of the UPDATE statement."
+          },
+          {
+            "label": "3. Deterministic Status",
+            "detail": "0 rows affected returns 412 Precondition Failed, never 500 Internal Server Error."
+          }
+        ],
+        "summary": "MVCC + versioned WHERE clauses enforce lock-free safety across disconnected HTTP clients."
+      },
+      "purpose": "Production architecture: see how the components compose end to end under real load."
+    },
+    {
+      "id": "07-problems-and-further-reading",
+      "eyebrow": "STAGE 07 · PROBLEMS SOLVED & FURTHER DEEP DIVE",
+      "title": "Problems solved by OCC & Related Concurrency Concepts",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Think of **Problems solved by OCC & Related Concurrency Concepts** as the intuition layer for Optimistic Concurrency Control: Applied problems: connect these internals to concrete system design and debugging scenarios.",
+        "core": "Compare OCC with pessimistic locking, database isolation levels, and retry-storm prevention.",
+        "deepDive": "Under heavy load or partial failure, problems solved by occ & related concurrency concepts becomes a critical lever for predictable latency and correctness. A lock-free concurrency pattern that lets readers and writers proceed without blocking, validating at commit time via a version number or ETag that no one else modified the record."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "sql-isolation-levels",
+          "title": "Problem: SQL Isolation Levels & Phantom Reads",
+          "kind": "problem"
+        },
+        {
+          "slug": "retry-storms-jitter",
+          "title": "Problem: Preventing Retry Storms with Jitter & Budgets",
+          "kind": "problem"
+        },
+        {
+          "slug": "pessimistic-locking-strategies",
+          "title": "Concept: Pessimistic Locking Strategies",
+          "kind": "concept"
+        },
+        {
+          "slug": "database-isolation-levels",
+          "title": "Concept: Database Isolation Levels & Anomalies",
+          "kind": "concept"
+        },
+        {
+          "slug": "rest-resource-modeling",
+          "title": "Concept: REST Resource Modeling",
+          "kind": "concept"
+        }
+      ],
+      "purpose": "Applied problems: connect these internals to concrete system design and debugging scenarios.",
+      "sectionDiagram": {
+        "kind": "behavior-transition",
+        "eyebrow": "Design Trade-Off",
+        "title": "Problems solved by OCC & Related Concurrency Concepts",
+        "before": {
+          "label": "Unbounded Coupling",
+          "metrics": [
+            "No backpressure on spikes",
+            "Implicit shared state",
+            "Cascading tail latency"
+          ]
+        },
+        "after": {
+          "label": "Bounded & Observable",
+          "metrics": [
+            "Explicit capacity budgets",
+            "Isolated failure domains",
+            "Predictable p99 latency"
+          ]
+        }
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why is using a client- or server-generated `updated_at` timestamp unsafe as the sole version check in Optimistic Concurrency Control?",
+      "options": [
+        {
+          "id": "a",
+          "text": "Clock skew across nodes or two writes within the same timestamp resolution can pass the check and cause silent lost updates",
+          "correct": true,
+          "feedback": "Correct: always use a strictly monotonic integer (`version = version + 1`) or storage-assigned revision/ETag."
+        },
+        {
+          "id": "b",
+          "text": "Databases cannot index timestamp columns in a WHERE clause",
+          "correct": false,
+          "feedback": "Timestamps are indexable, but they are not strictly monotonic across concurrent writers."
+        },
+        {
+          "id": "c",
+          "text": "Timestamps force PostgreSQL to upgrade to a full table lock",
+          "correct": false,
+          "feedback": "The issue is ABA/collision lost updates, not table locks."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why is using a client- or server-generated `updated_at` timestamp unsafe as the sole version check in Optimistic Concurrency Control?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Clock skew across nodes or two writes within the same timestamp resolution can pass the check and cause silent lost updates",
+            "correct": true,
+            "feedback": "Correct: always use a strictly monotonic integer (`version = version + 1`) or storage-assigned revision/ETag."
+          },
+          {
+            "id": "b",
+            "text": "Databases cannot index timestamp columns in a WHERE clause",
+            "correct": false,
+            "feedback": "Timestamps are indexable, but they are not strictly monotonic across concurrent writers."
+          },
+          {
+            "id": "c",
+            "text": "Timestamps force PostgreSQL to upgrade to a full table lock",
+            "correct": false,
+            "feedback": "The issue is ABA/collision lost updates, not table locks."
+          }
+        ]
+      },
+      {
+        "question": "What is the main benefit—and corresponding operational trade-off—of using Good Candidate: Low Contention (<5% conflicts) & Stateless REST in Optimistic Concurrency Control?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Advantage: Native ConditionExpression and resourceVersion CAS without cross-node lock managers. It has zero operational or latency overhead compared to Good Candidate: Distributed NoSQL (DynamoDB, etcd, K8s).",
+            "correct": false,
+            "feedback": "Not quite: that describes Good Candidate: Distributed NoSQL (DynamoDB, etcd, K8s), whereas Good Candidate: Low Contention (<5% conflicts) & Stateless REST specifically trades off: Callers must handle 409 Conflict / 412 Precondition Failed and retry or merge."
+          },
+          {
+            "id": "b",
+            "text": "Relying solely on Flash-Sale Hot Keys (>20% conflict rate) avoids all operational and latency trade-offs",
+            "correct": false,
+            "feedback": "Incorrect: every production option in Optimistic Concurrency Control carries concrete latency, consistency, or operational costs."
+          },
+          {
+            "id": "c",
+            "text": "Advantage: 1-RTT writes with zero lock wait; works cleanly across disconnected HTTP calls via ETag + If-Match. Cost: Callers must handle 409 Conflict / 412 Precondition Failed and retry or merge.",
+            "correct": true,
+            "feedback": "Correct: Good Candidate: Low Contention (<5% conflicts) & Stateless REST delivers 1-RTT writes with zero lock wait; works cleanly across disconnected HTTP calls via ETag + If-Match. while requiring you to manage callers must handle 409 Conflict / 412 Precondition Failed and retry or merge."
+          }
+        ]
+      },
+      {
+        "question": "Why is Keep Side Effects Outside the Retry Loop critical when operating Optimistic Concurrency Control in production?",
+        "options": [
+          {
+            "id": "a",
+            "text": "It only applies during local unit testing and can be disabled in production to save memory.",
+            "correct": false,
+            "feedback": "Incorrect: 'Keep Side Effects Outside the Retry Loop' directly governs production reliability and correctness under real traffic."
+          },
+          {
+            "id": "b",
+            "text": "It replaces the need for observability, timeouts, or capacity planning across Optimistic Concurrency Control.",
+            "correct": false,
+            "feedback": "Incorrect: 'Keep Side Effects Outside the Retry Loop' works alongside proper bounds, monitoring, and failure isolation."
+          },
+          {
+            "id": "c",
+            "text": "Never charge a credit card inside an OCC loop; if the DB CAS fails and retries, you double-charge the customer.",
+            "correct": true,
+            "feedback": "Correct: Never charge a credit card inside an OCC loop; if the DB CAS fails and retries, you double-charge the customer."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** Formalized by Kung and Robinson (1981), **Optimistic Concurrency Control (OCC)** bets that conflicts are the exception.\n\n**How It Flows:** Think of Optimistic Concurrency Control as a clear step-by-step chain: Worker A -> Orders DB (v=42) -> Worker B -> PATCH + If-Match -> API Gateway.\n\n**Why Beginners Should Care:** Use atomic compare-and-swap (`UPDATE ... WHERE id = ?",
+      "spark": {
+        "summary": "Formalized by Kung and Robinson (1981), **Optimistic Concurrency Control (OCC)** bets that conflicts are the exception.",
+        "keyTakeaway": "Use atomic compare-and-swap (`UPDATE ..."
+      },
+      "learningJourney": [
+        {
+          "id": "01-what-it-is",
+          "title": "What is Optimistic Concurrency Control (OCC)",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Optimistic Concurrency Control (OCC) works from first principles.",
+          "explanation": "Formalized by Kung and Robinson (1981), **Optimistic Concurrency Control (OCC)** bets that conflicts are the exception. Instead of acquiring locks before reading, a transaction runs in three phases: **Read** (fetch record + monotonic `version` or `ETag`), **Modify** (compute new state in memory), and **Validate/Write** (execute an atomic compare-and-swap such as `UPDATE ...",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Compare-And-Swap Race",
+            "title": "Two Concurrent Writers Resolved by Monotonic Version",
+            "actors": [
+              {
+                "id": "wa",
+                "label": "Worker A"
+              },
+              {
+                "id": "db",
+                "label": "Orders DB (v=42)"
+              },
+              {
+                "id": "wb",
+                "label": "Worker B"
+              }
+            ],
+            "events": [
+              {
+                "from": "wa",
+                "to": "db",
+                "label": "SELECT id=9001 -> v=42",
+                "status": "ok"
+              },
+              {
+                "from": "wb",
+                "to": "db",
+                "label": "SELECT id=9001 -> v=42",
+                "status": "ok"
+              },
+              {
+                "from": "wa",
+                "to": "db",
+                "label": "UPDATE SET v=43 WHERE v=42 (1 row)",
+                "status": "ok"
+              },
+              {
+                "from": "wb",
+                "to": "db",
+                "label": "UPDATE SET v=43 WHERE v=42 (0 rows!)",
+                "status": "fail"
+              },
+              {
+                "from": "wb",
+                "to": "wb",
+                "label": "Jittered backoff + re-read v=43",
+                "status": "warn"
+              }
+            ],
+            "summary": "Zero read locks are held; Worker B detects the concurrent write atomically at commit time instead of silently overwriting Worker A."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-why-we-need-it",
+          "title": "Why we need OCC (and why wall-clock timestamps fail)",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without OCC under real concurrency or scale.",
+          "explanation": "Holding database row locks across network calls or human think-time (like editing a document or checking out a cart) stalls concurrent users and saturates connection pools. OCC eliminates lock waiting on reads. Crucially, **never use `updated_at` wall-clock timestamps** for OCC comparisons: NTP drift and sub-millisecond collisions silently cause lost updates.",
+          "ideas": [
+            {
+              "title": "Full Jitter Stops Retry Storms",
+              "description": "If 100 workers collide on `v=42` and retry in a tight loop, DB load multiplies 10x. Cap attempts (3–5) and sleep `random(0, min(cap, base * 2^attempt))`."
+            },
+            {
+              "title": "Keep Side Effects Outside the Retry Loop",
+              "description": "Never charge a credit card inside an OCC loop; if the DB CAS fails and retries, you double-charge the customer. Use a Transactional Outbox instead."
+            }
+          ],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-where-it-is-used",
+          "title": "Where OCC excels (and where Pessimistic Locking wins)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "OCC shines under low-to-moderate contention (<5–10% conflict rate) and stateless HTTP APIs; high-contention hot keys need pessimistic locks or atomic increments.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "06-production-architecture",
+          "title": "Production example: HTTP `ETag` + PostgreSQL MVCC Version Guard",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Production architecture: see how the components compose end to end under real load.",
+          "explanation": "A REST API serves `ETag: \"42\"` on `GET /orders/9001`. Clients send `If-Match: \"42\"` on `PATCH`. PostgreSQL executes `UPDATE orders SET ..., version = 43 WHERE id = 9001 AND version = 42` using its MVCC tuple visibility; 0 affected rows maps cleanly to `412 Precondition Failed`.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "wal-mvcc",
+            "eyebrow": "Storage-Layer CAS",
+            "title": "HTTP If-Match -> PostgreSQL MVCC Version Check",
+            "nodes": [
+              {
+                "id": "cli",
+                "label": "PATCH + If-Match",
+                "role": "ETag: \"42\""
+              },
+              {
+                "id": "api",
+                "label": "API Gateway",
+                "role": "428 if missing"
+              },
+              {
+                "id": "wal",
+                "label": "WAL + Tuple Lock",
+                "role": "WHERE version=42"
+              },
+              {
+                "id": "res",
+                "label": "1 Row -> 200 OK",
+                "role": "0 Rows -> 412"
+              }
+            ],
+            "edges": [
+              {
+                "label": "atomic CAS"
+              },
+              {
+                "label": "commit or abort"
+              }
+            ],
+            "cards": [
+              {
+                "label": "1. Strict Precondition",
+                "detail": "Requests omitting If-Match receive 428 Precondition Required so old clients cannot silently clobber state."
+              },
+              {
+                "label": "2. Row-Level CAS",
+                "detail": "Postgres acquires a brief tuple lock only for the commit instant of the UPDATE statement."
+              },
+              {
+                "label": "3. Deterministic Status",
+                "detail": "0 rows affected returns 412 Precondition Failed, never 500 Internal Server Error."
+              }
+            ],
+            "summary": "MVCC + versioned WHERE clauses enforce lock-free safety across disconnected HTTP clients."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Use atomic compare-and-swap (`UPDATE ...",
+      "summary": "A lock-free concurrency pattern that lets readers and writers proceed without blocking, validating at commit time via a version number or ETag that no one else modified the record.",
+      "keyTakeaway": "If disk I/O or compaction stalls threaten tail latency, use atomic compare-and-swap (`UPDATE ... WHERE id = ? AND version = ?` or HTTP `If-Match`) when conflicts are rare (<5%), and pair retries with exponential backoff and full jitter."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** Formalized by Kung and Robinson (1981), **Optimistic Concurrency Control (OCC)** bets that conflicts are the exception.\n\n**Visual & Structural Flow:** Depicts Two Concurrent Writers Resolved by Monotonic Version (Worker A -> Orders DB (v=42) -> Worker B); HTTP If-Match -> PostgreSQL MVCC Version Check (PATCH + If-Match -> API Gateway -> WAL + Tuple Lock -> 1 Row -> 200 OK).\n\n**Trade-Offs & Production:** Match the concurrency control mechanism to conflict probability and multi-row invariants. A REST API serves `ETag: \"42\"` on `GET /orders/9001`.\n\n**Failure Modes & Application:** Compare OCC with pessimistic locking, database isolation levels, and retry-storm prevention.",
+      "spark": {
+        "summary": "A lock-free concurrency pattern that lets readers and writers proceed without blocking, validating at commit time via a version number or ETag that no one else modified the record.",
+        "keyTakeaway": "Use atomic compare-and-swap (`UPDATE ... WHERE id = ? AND version = ?` or HTTP `If-Match`) when conflicts are rare (<5%), and pair retries with exponential backoff and full jitter."
+      },
+      "summary": "A lock-free concurrency pattern that lets readers and writers proceed without blocking, validating at commit time via a version number or ETag that no one else modified the record.",
+      "keyTakeaway": "If disk I/O or compaction stalls threaten tail latency, use atomic compare-and-swap (`UPDATE ... WHERE id = ? AND version = ?` or HTTP `If-Match`) when conflicts are rare (<5%), and pair retries with exponential backoff and full jitter."
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** A lock-free concurrency pattern that lets readers and writers proceed without blocking, validating at commit time via a version number or ETag that no one else modified the record.\n\n**Production Trade-Offs:** Assert `rows_affected == 1` on every SQL CAS update (many ORMs silently succeed on 0 rows unless `@Version` throws `OptimisticLockingFailureException`), enforce `If-Match` on `PUT`/`PATCH` (returning `428 Precondition.\n\n**Failure Modes & Edge Cases:** Compare OCC with pessimistic locking, database isolation levels, and retry-storm prevention.\n\n**Principal Takeaway:** Use atomic compare-and-swap (`UPDATE ... WHERE id = ?",
+      "spark": {
+        "summary": "A lock-free concurrency pattern that lets readers and writers proceed without blocking, validating at commit time via a version number or ETag that no one else modified the record.",
+        "keyTakeaway": "Use atomic compare-and-swap (`UPDATE ..."
+      },
+      "learningJourney": [
+        {
+          "id": "01-what-it-is",
+          "title": "What is Optimistic Concurrency Control (OCC)",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Optimistic Concurrency Control (OCC) works from first principles.",
+          "explanation": "Formalized by Kung and Robinson (1981), **Optimistic Concurrency Control (OCC)** bets that conflicts are the exception. Instead of acquiring locks before reading, a transaction runs in three phases: **Read** (fetch record + monotonic `version` or `ETag`), **Modify** (compute new state in memory), and **Validate/Write** (execute an atomic compare-and-swap such as `UPDATE ... SET version = version + 1 WHERE id = $1 AND version = $2`).\n\nIf 0 rows are affected—or DynamoDB raises `ConditionalCheckFailedException` or HTTP returns `412 Precondition Failed`—the writer aborts and retries or prompts the user.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Compare-And-Swap Race",
+            "title": "Two Concurrent Writers Resolved by Monotonic Version",
+            "actors": [
+              {
+                "id": "wa",
+                "label": "Worker A"
+              },
+              {
+                "id": "db",
+                "label": "Orders DB (v=42)"
+              },
+              {
+                "id": "wb",
+                "label": "Worker B"
+              }
+            ],
+            "events": [
+              {
+                "from": "wa",
+                "to": "db",
+                "label": "SELECT id=9001 -> v=42",
+                "status": "ok"
+              },
+              {
+                "from": "wb",
+                "to": "db",
+                "label": "SELECT id=9001 -> v=42",
+                "status": "ok"
+              },
+              {
+                "from": "wa",
+                "to": "db",
+                "label": "UPDATE SET v=43 WHERE v=42 (1 row)",
+                "status": "ok"
+              },
+              {
+                "from": "wb",
+                "to": "db",
+                "label": "UPDATE SET v=43 WHERE v=42 (0 rows!)",
+                "status": "fail"
+              },
+              {
+                "from": "wb",
+                "to": "wb",
+                "label": "Jittered backoff + re-read v=43",
+                "status": "warn"
+              }
+            ],
+            "summary": "Zero read locks are held; Worker B detects the concurrent write atomically at commit time instead of silently overwriting Worker A."
+          },
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-why-we-need-it",
+          "title": "Why we need OCC (and why wall-clock timestamps fail)",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without OCC under real concurrency or scale.",
+          "explanation": "Holding database row locks across network calls or human think-time (like editing a document or checking out a cart) stalls concurrent users and saturates connection pools. OCC eliminates lock waiting on reads. Crucially, **never use `updated_at` wall-clock timestamps** for OCC comparisons: NTP drift and sub-millisecond collisions silently cause lost updates.",
+          "caveats": null,
+          "ideas": [
+            {
+              "title": "Full Jitter Stops Retry Storms",
+              "description": "If 100 workers collide on `v=42` and retry in a tight loop, DB load multiplies 10x. Cap attempts (3–5) and sleep `random(0, min(cap, base * 2^attempt))`."
+            },
+            {
+              "title": "Keep Side Effects Outside the Retry Loop",
+              "description": "Never charge a credit card inside an OCC loop; if the DB CAS fails and retries, you double-charge the customer. Use a Transactional Outbox instead."
+            }
+          ],
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "03-where-it-is-used",
+          "title": "Where OCC excels (and where Pessimistic Locking wins)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "OCC shines under low-to-moderate contention (<5–10% conflict rate) and stateless HTTP APIs; high-contention hot keys need pessimistic locks or atomic increments.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-how-it-is-managed",
+          "title": "How OCC Retry Loops and `If-Match` APIs are implemented",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Assert `rows_affected == 1` on every SQL CAS update (many ORMs silently succeed on 0 rows unless `@Version` throws `OptimisticLockingFailureException`), enforce `If-Match` on `PUT`/`PATCH` (returning `428 Precondition Required` if omitted), and bound retries with full jitter.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "05-alternatives",
+          "title": "Alternatives: OCC vs. Pessimistic Locking vs. Atomic Deltas",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "The trade-off: compare competing approaches across latency, consistency, and operational cost.",
+          "explanation": "Match the concurrency control mechanism to conflict probability and multi-row invariants.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "06-production-architecture",
+          "title": "Production example: HTTP `ETag` + PostgreSQL MVCC Version Guard",
+          "eyebrow": "Advanced Path · Stage 06",
+          "purpose": "Production architecture: see how the components compose end to end under real load.",
+          "explanation": "A REST API serves `ETag: \"42\"` on `GET /orders/9001`. Clients send `If-Match: \"42\"` on `PATCH`. PostgreSQL executes `UPDATE orders SET ..., version = 43 WHERE id = 9001 AND version = 42` using its MVCC tuple visibility; 0 affected rows maps cleanly to `412 Precondition Failed`.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "wal-mvcc",
+            "eyebrow": "Storage-Layer CAS",
+            "title": "HTTP If-Match -> PostgreSQL MVCC Version Check",
+            "nodes": [
+              {
+                "id": "cli",
+                "label": "PATCH + If-Match",
+                "role": "ETag: \"42\""
+              },
+              {
+                "id": "api",
+                "label": "API Gateway",
+                "role": "428 if missing"
+              },
+              {
+                "id": "wal",
+                "label": "WAL + Tuple Lock",
+                "role": "WHERE version=42"
+              },
+              {
+                "id": "res",
+                "label": "1 Row -> 200 OK",
+                "role": "0 Rows -> 412"
+              }
+            ],
+            "edges": [
+              {
+                "label": "atomic CAS"
+              },
+              {
+                "label": "commit or abort"
+              }
+            ],
+            "cards": [
+              {
+                "label": "1. Strict Precondition",
+                "detail": "Requests omitting If-Match receive 428 Precondition Required so old clients cannot silently clobber state."
+              },
+              {
+                "label": "2. Row-Level CAS",
+                "detail": "Postgres acquires a brief tuple lock only for the commit instant of the UPDATE statement."
+              },
+              {
+                "label": "3. Deterministic Status",
+                "detail": "0 rows affected returns 412 Precondition Failed, never 500 Internal Server Error."
+              }
+            ],
+            "summary": "MVCC + versioned WHERE clauses enforce lock-free safety across disconnected HTTP clients."
+          },
+          "level": "L7 · STAFF / PRINCIPAL"
+        },
+        {
+          "id": "07-problems-and-further-reading",
+          "title": "Problems solved by OCC & Related Concurrency Concepts",
+          "eyebrow": "Advanced Path · Stage 07",
+          "purpose": "Applied problems: connect these internals to concrete system design and debugging scenarios.",
+          "explanation": "Compare OCC with pessimistic locking, database isolation levels, and retry-storm prevention.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Use atomic compare-and-swap (`UPDATE ...",
+      "summary": "A lock-free concurrency pattern that lets readers and writers proceed without blocking, validating at commit time via a version number or ETag that no one else modified the record.",
+      "keyTakeaway": "If disk I/O or compaction stalls threaten tail latency, use atomic compare-and-swap (`UPDATE ... WHERE id = ? AND version = ?` or HTTP `If-Match`) when conflicts are rare (<5%), and pair retries with exponential backoff and full jitter."
+    }
+  },
+  "pedagogicalFramework": "PRIME",
+  "prerequisites": [
+    {
+      "title": "Database Indexing: B-Trees vs LSM-Trees",
+      "summary": "B-Trees organize sorted keys into fixed-size mutable pages optimized for fast, predictable point and range reads, whereas LSM-Trees buffer writes in memory and flush immutable sorted runs to disk for high write throughput."
+    }
+  ],
+  "simulation": {
+    "title": "Optimistic Concurrency Control — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Input Workload"
+      },
+      {
+        "id": "entry",
+        "label": "Router / API",
+        "role": "Admission Control"
+      },
+      {
+        "id": "worker",
+        "label": "Processor",
+        "role": "Domain Logic"
+      },
+      {
+        "id": "store",
+        "label": "State Layer",
+        "role": "Durable Store"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "entry",
+        "label": "request"
+      },
+      {
+        "from": "entry",
+        "to": "worker",
+        "label": "dispatch"
+      },
+      {
+        "from": "worker",
+        "to": "store",
+        "label": "read/write"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "What is Optimistic Concurrency Control (OCC)",
+        "actionLabel": "request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "entry"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "request",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Caller sends work to Router / API (What is Optimistic Concurrency Control (OCC))."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Why we need OCC (and why wall-clock timestamps fail)",
+        "actionLabel": "dispatch",
+        "status": "healthy",
+        "activeNodeIds": [
+          "entry",
+          "worker"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "dispatch",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Router / API coordinates with Processor while preserving the core invariant (Why we need OCC (and why wall-clock timestamps fail))."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Where OCC excels (and where Pessimistic Locking wins)",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "worker",
+          "store"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, State Layer absorbs pressure without cascading (Where OCC excels (and where Pessimistic Locking wins))."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Problems solved by OCC & Related Concurrency Concepts",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "entry",
+          "worker",
+          "store"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Problems solved by OCC & Related Concurrency Concepts)."
+      }
+    ]
+  }
+}

@@ -1,0 +1,603 @@
+{
+  "id": "semantic-and-prompt-caching-llm",
+  "slug": "semantic-and-prompt-caching-llm",
+  "title": "Semantic & KV Prompt Caching for Low-Latency LLM Inference",
+  "domain": "ai-machine-learning-systems",
+  "spark": {
+    "summary": "Combining L1 exact-hash + L2 HNSW semantic response caching (with cross-encoder verification) and L3 RadixAttention KV-prefix caching eliminates redundant LLM prefill and decode compute, cutting hit latency to < 15 ms and TTFT by 80%+.",
+    "keyTakeaway": "Semantic caching bypasses the LLM entirely on paraphrased queries (cos >= 0.94 + cross-encoder guard), while KV prompt caching reuses precomputed attention states for shared system prompts and RAG context on cache misses.",
+    "byteSummary": "LLM inference is bottlenecked by two distinct costs: compute-bound prefill over long system/RAG prompts (driving Time-to-First-Token) and memory-bandwidth-bound autoregressive decode. A unified caching strategy attacks both layers.\n\nAt the response layer, L1 exact SHA-256 hash lookup and L2 HNSW vector similarity search (over normalized MiniLM/BGE query embeddings) detect repeated or paraphrased questions. Because raw cosine similarity can conflate near-opposite queries ('cancel my order' vs. 'confirm my order'), a lightweight cross-encoder or NLI gate verifies semantic equivalence before serving a cached completion in < 15 ms.\n\nWhen a query is genuinely novel (cache miss), L3 KV Prompt Caching (such as SGLang RadixAttention or vLLM Automatic Prefix Caching) matches shared token prefixes (system instructions, few-shot examples, tool schemas) in a radix tree of paged KV blocks—skipping redundant prefill and cutting TTFT by 80%+."
+  },
+  "learningJourney": [
+    {
+      "level": "foundation",
+      "title": "Stage 1: Response Caching vs. Prefix KV Caching",
+      "purpose": "Distinguish full-response semantic caching (skips entire LLM) from KV prompt caching (skips prefill on misses).",
+      "explanation": "Semantic caching stores `(query_embedding, prompt_metadata) -> final_completion` and bypasses GPU inference completely on hits. KV prompt caching operates inside the inference engine, storing precomputed Key/Value attention tensors for shared prompt prefixes so novel user suffixes skip O(N^2) prefill computation.",
+      "codeExample": "def route_cache_tier(exact_hit: bool, semantic_hit: bool, prefix_overlap_tokens: int) -> str:\n    if exact_hit:\n        return 'L1_EXACT_HASH_HIT'\n    if semantic_hit:\n        return 'L2_SEMANTIC_HIT'\n    if prefix_overlap_tokens >= 256:\n        return 'L3_KV_PREFIX_REUSE_AND_DECODE'\n    return 'FULL_PREFILL_AND_DECODE'\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "FOUNDATION · TWO COMPLEMENTARY CACHES",
+        "title": "Response Bypass (L1/L2) vs. Prefill Reuse (L3 KV Prefix)",
+        "nodes": [
+          {
+            "id": "q",
+            "label": "Incoming LLM Request",
+            "sub": "System prompt + user query",
+            "role": "Ingress"
+          },
+          {
+            "id": "l12",
+            "label": "L1 Exact + L2 Semantic",
+            "sub": "Skip prefill & decode (<15ms)",
+            "role": "Response Cache"
+          },
+          {
+            "id": "l3",
+            "label": "L3 RadixAttention KV",
+            "sub": "Reuse shared prefix blocks",
+            "role": "Prefill Cache"
+          },
+          {
+            "id": "gpu",
+            "label": "GPU Suffix Decode",
+            "sub": "Compute only novel tokens",
+            "role": "LLM Engine"
+          }
+        ],
+        "edges": [
+          {
+            "from": "q",
+            "to": "l12",
+            "label": "Probe response cache"
+          },
+          {
+            "from": "l12",
+            "to": "l3",
+            "label": "On miss, match prefix"
+          },
+          {
+            "from": "l3",
+            "to": "gpu",
+            "label": "Decode remaining suffix"
+          }
+        ],
+        "cards": [
+          {
+            "label": "100% Cost Avoidance",
+            "detail": "L1/L2 hits consume zero GPU FLOPs and return in 10-15 ms."
+          },
+          {
+            "label": "80%+ TTFT Reduction",
+            "detail": "L3 prefix KV reuse skips prefilling 8K-32K system/RAG tokens on cache misses."
+          }
+        ],
+        "summary": "L1/L2 response caches bypass GPU inference on repeated intents, while L3 KV prefix caches skip redundant prefill on novel queries.",
+        "caption": "L1/L2 response caching bypasses the LLM on hits, while L3 KV prefix caching skips prefill on misses."
+      },
+      "id": "stage-1-stage-1-response-caching-vs-prefix-kv-caching"
+    },
+    {
+      "level": "foundation",
+      "title": "Stage 2: L1 Exact Hash & Canonical Prompt Normalization",
+      "purpose": "Capture deterministic repeats in < 1 ms using canonicalized SHA-256 keys scoped by tenant and model version.",
+      "explanation": "Before spending embedding FLOPs, an L1 Redis/Valkey lookup checks `SHA256(tenant_id || model_id || temperature || canonical_messages)`. Normalizing whitespace and stripping volatile trace IDs boosts L1 hit rates without risking cross-tenant leaks or stale model-version responses.",
+      "codeExample": "import hashlib\nimport json\n\ndef build_l1_key(tenant_id: str, model_id: str, temperature: float, messages: list[dict]) -> str:\n    if not tenant_id or not model_id:\n        raise ValueError('tenant_id and model_id are required')\n    payload = {'t': tenant_id, 'm': model_id, 'temp': round(temperature, 2), 'msgs': messages}\n    digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode('utf-8')).hexdigest()\n    return f'llm:l1:{tenant_id}:{digest}'\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "FOUNDATION · L1 EXACT CACHE",
+        "title": "Tenant-Scoped Canonical SHA-256 Lookup in < 1 ms",
+        "nodes": [
+          {
+            "id": "norm",
+            "label": "Prompt Normalizer",
+            "sub": "Trim whitespace, strip trace_id",
+            "role": "Canonicalizer"
+          },
+          {
+            "id": "key",
+            "label": "SHA-256 Composite Key",
+            "sub": "tenant + model + temp + msgs",
+            "role": "Key Builder"
+          },
+          {
+            "id": "red",
+            "label": "Redis/Valkey L1 Store",
+            "sub": "< 1 ms O(1) GET",
+            "role": "Exact Cache"
+          },
+          {
+            "id": "hit",
+            "label": "Deterministic Hit",
+            "sub": "Zero embedding cost",
+            "role": "Fast Return"
+          }
+        ],
+        "edges": [
+          {
+            "from": "norm",
+            "to": "key",
+            "label": "Serialize sorted JSON"
+          },
+          {
+            "from": "key",
+            "to": "red",
+            "label": "Lookup exact key"
+          },
+          {
+            "from": "red",
+            "to": "hit",
+            "label": "Return cached completion"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Temperature Guard",
+            "detail": "High-temperature creative prompts (temp > 0.3) are typically bypassed or keyed separately to preserve diversity."
+          },
+          {
+            "label": "Tenant Isolation",
+            "detail": "Prefixing every key with tenant_id and RBAC policy hash prevents cross-tenant data leakage."
+          }
+        ],
+        "summary": "L1 exact-hash caching resolves identical prompts in < 1 ms while enforcing tenant, model-version, and temperature isolation.",
+        "caption": "Canonicalized prompts hashed with tenant_id and model_id resolve exact hits in Redis/Valkey in under 1 ms."
+      },
+      "id": "stage-2-stage-2-l1-exact-hash-canonical-prompt-normaliza"
+    },
+    {
+      "level": "intermediate",
+      "title": "Stage 3: L2 HNSW Semantic Lookup & Embedding Vectorization",
+      "purpose": "Match paraphrased queries using compact bi-encoder embeddings and metadata-filtered HNSW search.",
+      "explanation": "On an L1 miss, the router embeds the user query (plus intent context) using a fast CPU/ONNX bi-encoder (e.g., all-MiniLM-L6-v2 or BGE-small, ~4 ms) and queries a metadata-filtered HNSW index scoped to `tenant_id` and `model_id`. Candidates with cosine similarity >= 0.94 advance to verification.",
+      "codeExample": "import numpy as np\n\ndef cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:\n    denom = float(np.linalg.norm(a) * np.linalg.norm(b))\n    if denom < 1e-12:\n        return 0.0\n    return float(np.dot(a, b) / denom)\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "INTERMEDIATE · L2 HNSW SEMANTIC",
+        "title": "4 ms ONNX Embedding + Tenant-Filtered HNSW Candidate Search",
+        "nodes": [
+          {
+            "id": "emb",
+            "label": "ONNX Bi-Encoder (MiniLM)",
+            "sub": "384-D L2-norm (~4 ms)",
+            "role": "Vectorizer"
+          },
+          {
+            "id": "flt",
+            "label": "Tenant + Model Filter",
+            "sub": "Pre-filter bitset in HNSW",
+            "role": "Isolation Gate"
+          },
+          {
+            "id": "hnsw",
+            "label": "HNSW Vector Index",
+            "sub": "Top-3 nearest neighbors (~3 ms)",
+            "role": "ANN Search"
+          },
+          {
+            "id": "thr",
+            "label": "Threshold Gate (cos >= 0.94)",
+            "sub": "Filter low-similarity misses",
+            "role": "Candidate Pass"
+          }
+        ],
+        "edges": [
+          {
+            "from": "emb",
+            "to": "flt",
+            "label": "Emit 384-D query vector"
+          },
+          {
+            "from": "flt",
+            "to": "hnsw",
+            "label": "Search tenant subgraph"
+          },
+          {
+            "from": "hnsw",
+            "to": "thr",
+            "label": "Keep cos >= 0.94"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Pre-Filtered HNSW",
+            "detail": "Filtering by tenant_id inside HNSW traversal prevents empty results when another tenant dominates Top-K."
+          },
+          {
+            "label": "384-D Speed",
+            "detail": "Compact 384-D embeddings keep ONNX inference under 5 ms on CPU and shrink HNSW RAM by 4x vs 1536-D."
+          }
+        ],
+        "summary": "L2 semantic search embeds queries in ~4 ms and runs tenant-filtered HNSW ANN lookup for candidates >= 0.94 cosine similarity.",
+        "caption": "ONNX MiniLM embedding and tenant-filtered HNSW retrieval surface semantic cache candidates in ~7 ms."
+      },
+      "id": "stage-3-stage-3-l2-hnsw-semantic-lookup-embedding-vector"
+    },
+    {
+      "level": "intermediate",
+      "title": "Stage 4: Cross-Encoder False-Positive Guard",
+      "purpose": "Prevent dangerous semantic cache collisions on negated, numeric, or entity-swapped queries.",
+      "explanation": "Bi-encoder cosine similarity frequently scores 'Transfer $100 to Alice' and 'Transfer $1000 to Bob' (or 'enable MFA' vs. 'disable MFA') above 0.94. Passing Top-1/Top-3 HNSW hits through a fast cross-encoder / entity-diff gate (e.g., 5 ms) catches polarity flips, number mismatches, and entity swaps before serving.",
+      "codeExample": "import re\n\ndef entity_and_number_guard(query_a: str, query_b: str, cross_encoder_score: float, min_ce: float = 0.90) -> bool:\n    nums_a = re.findall(r'\\b\\d+(?:\\.\\d+)?\\b', query_a)\n    nums_b = re.findall(r'\\b\\d+(?:\\.\\d+)?\\b', query_b)\n    if nums_a != nums_b:\n        return False\n    return cross_encoder_score >= min_ce\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "INTERMEDIATE · FALSE-POSITIVE GUARD",
+        "title": "Entity/Numeric Parity + Cross-Encoder Equivalence Verification",
+        "nodes": [
+          {
+            "id": "cand",
+            "label": "HNSW Candidate (cos >= 0.94)",
+            "sub": "Raw bi-encoder match",
+            "role": "Candidate"
+          },
+          {
+            "id": "num",
+            "label": "Numeric & Entity Diff",
+            "sub": "Reject ID/amount mismatch",
+            "role": "Exact Guard"
+          },
+          {
+            "id": "ce",
+            "label": "Tiny Cross-Encoder (~5 ms)",
+            "sub": "Detect negation / intent flip",
+            "role": "Semantic Gate"
+          },
+          {
+            "id": "serve",
+            "label": "Verified Cache Hit (< 15 ms)",
+            "sub": "Safe response returned",
+            "role": "Verified Output"
+          }
+        ],
+        "edges": [
+          {
+            "from": "cand",
+            "to": "num",
+            "label": "Check numbers & entities"
+          },
+          {
+            "from": "num",
+            "to": "ce",
+            "label": "Score full pair attention"
+          },
+          {
+            "from": "ce",
+            "to": "serve",
+            "label": "Accept if score >= 0.90"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Zero Polarity Bugs",
+            "detail": "Full cross-attention catches single-word negations ('not', 'disable', 'cancel') that pooling erases."
+          },
+          {
+            "label": "Numeric Invariant",
+            "detail": "Exact regex parity on numbers, dates, and UUIDs guarantees no wrong-amount cache hits."
+          }
+        ],
+        "summary": "Numeric/entity parity checks and a 5 ms cross-encoder gate block false-positive semantic hits on negations or changed parameters.",
+        "caption": "Numeric parity checks and a cross-encoder equivalence gate block dangerous semantic cache false positives."
+      },
+      "id": "stage-4-stage-4-cross-encoder-false-positive-guard"
+    },
+    {
+      "level": "intermediate",
+      "title": "Stage 5: L3 RadixAttention KV-Cache Prefix Trees",
+      "purpose": "Reuse precomputed Key/Value attention tensors across requests sharing system prompts, tools, or RAG documents.",
+      "explanation": "When L1/L2 miss, L3 prefix caching inside vLLM/SGLang organizes token sequences into a compressed Radix Tree whose edges point to paged KV-cache blocks in GPU HBM and host DRAM. Matching a 4,096-token system+RAG prefix skips prefilling those 4,096 tokens, computing attention only over the new 64-token user question.",
+      "codeExample": "def prefix_prefill_savings(total_prompt_tokens: int, cached_prefix_tokens: int) -> float:\n    if total_prompt_tokens <= 0 or cached_prefix_tokens < 0:\n        raise ValueError('Token counts must be valid')\n    reused = min(total_prompt_tokens, cached_prefix_tokens)\n    return round(reused / total_prompt_tokens, 4)\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "INTERMEDIATE · L3 KV PREFIX CACHE",
+        "title": "RadixAttention Prefix Tree Mapping Token Chains to Paged KV Blocks",
+        "nodes": [
+          {
+            "id": "tok",
+            "label": "Tokenized Prompt [4160 tok]",
+            "sub": "4096 prefix + 64 user suffix",
+            "role": "Token Stream"
+          },
+          {
+            "id": "rad",
+            "label": "Radix Tree Longest Match",
+            "sub": "Match 4096-token prefix",
+            "role": "Prefix Index"
+          },
+          {
+            "id": "kv",
+            "label": "Paged KV Blocks (HBM/DRAM)",
+            "sub": "Zero-copy block refcount++",
+            "role": "Tensor Store"
+          },
+          {
+            "id": "dec",
+            "label": "64-Token Suffix Prefill",
+            "sub": "80%+ TTFT reduction",
+            "role": "GPU Compute"
+          }
+        ],
+        "edges": [
+          {
+            "from": "tok",
+            "to": "rad",
+            "label": "Walk compressed trie"
+          },
+          {
+            "from": "rad",
+            "to": "kv",
+            "label": "Pin matched KV blocks"
+          },
+          {
+            "from": "kv",
+            "to": "dec",
+            "label": "Prefill only 64 new tokens"
+          }
+        ],
+        "cards": [
+          {
+            "label": "HBM -> DRAM Offload",
+            "detail": "Cold KV blocks are evicted from GPU HBM to host DRAM (LMCache/Mooncake) before deletion, expanding prefix capacity 10x."
+          },
+          {
+            "label": "LRU Eviction",
+            "detail": "Leaf nodes in the radix tree with refcount == 0 are evicted first under HBM pressure."
+          }
+        ],
+        "summary": "RadixAttention matches shared prompt prefixes in O(prefix_len) to reuse paged KV blocks and slash TTFT by 80%+.",
+        "caption": "RadixAttention matches shared 4096-token prefixes to pinned KV blocks, prefilling only the 64-token user suffix."
+      },
+      "id": "stage-5-stage-5-l3-radixattention-kv-cache-prefix-trees"
+    },
+    {
+      "level": "advanced",
+      "title": "Stage 6: Prefix-Aware Consistent Hash Routing",
+      "purpose": "Route cache misses to the specific GPU replica that already holds the warm KV prefix blocks in HBM.",
+      "explanation": "If round-robin load balancing sprays requests for the same 8K-token agent system prompt across 32 GPU workers, L3 KV cache hit rates drop to 1/32 (3%). Prefix-aware consistent hashing hashes the first K tokens (e.g., first 512 tokens) to pick primary/secondary workers, bounded by a load-skew cap so hot prefixes spill cleanly.",
+      "codeExample": "import hashlib\n\ndef route_prefix_worker(prefix_tokens: list[int], num_workers: int, max_load_ratio: float, worker_loads: list[float]) -> int:\n    key = ','.join(map(str, prefix_tokens[:512])).encode('utf-8')\n    primary = int(hashlib.sha256(key).hexdigest(), 16) % num_workers\n    avg_load = sum(worker_loads) / max(1, len(worker_loads))\n    if worker_loads[primary] <= avg_load * max_load_ratio:\n        return primary\n    return min(range(num_workers), key=lambda idx: worker_loads[idx])\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "ADVANCED · PREFIX-AWARE ROUTING",
+        "title": "Bounded-Load Consistent Hashing for Distributed KV Locality",
+        "nodes": [
+          {
+            "id": "hdr",
+            "label": "Extract First 512 Tokens",
+            "sub": "System prompt + tool schema",
+            "role": "Prefix Key"
+          },
+          {
+            "id": "ch",
+            "label": "Consistent Hash Ring",
+            "sub": "Map prefix -> primary GPU",
+            "role": "Locality Router"
+          },
+          {
+            "id": "skew",
+            "label": "Bounded-Load Check (1.25x)",
+            "sub": "Prevent hot-shard overload",
+            "role": "Skew Guard"
+          },
+          {
+            "id": "gpu",
+            "label": "Warm KV GPU Replica",
+            "sub": "85%+ L3 prefix hit rate",
+            "role": "Target Worker"
+          }
+        ],
+        "edges": [
+          {
+            "from": "hdr",
+            "to": "ch",
+            "label": "Hash prefix slice"
+          },
+          {
+            "from": "ch",
+            "to": "skew",
+            "label": "Check target queue depth"
+          },
+          {
+            "from": "skew",
+            "to": "gpu",
+            "label": "Route or spill to least-loaded"
+          }
+        ],
+        "cards": [
+          {
+            "label": "28x Higher KV Hit Rate",
+            "detail": "Prefix affinity turns a 3% random-routing hit rate into 85%+ across a 32-GPU fleet."
+          },
+          {
+            "label": "Bounded-Load Spillover",
+            "detail": "Capping load at 1.25x cluster average ensures a viral tenant prompt spills to a secondary replica instead of queuing."
+          }
+        ],
+        "summary": "Bounded-load consistent hashing on the first 512 prompt tokens preserves L3 KV cache locality without creating hot GPU shards.",
+        "caption": "Prefix-aware consistent hashing with a 1.25x load cap routes misses to warm KV GPU replicas."
+      },
+      "id": "stage-6-stage-6-prefix-aware-consistent-hash-routing"
+    },
+    {
+      "level": "advanced",
+      "title": "Stage 7: Cache Invalidation, TTLs & Write-Back Consistency",
+      "purpose": "Prevent stale RAG/tool answers and cache poisoning using model-version epochs, corpus-version tags, and async write-back.",
+      "explanation": "Semantic caches must never return stale answers after a knowledge-base update, model weights upgrade, or RBAC permission change. Every cached entry is tagged with `(model_epoch, kb_version, policy_epoch, ttl_sec)` and written asynchronously after stream completion—never caching error responses, empty outputs, or PII-bearing user-specific replies.",
+      "codeExample": "def is_cache_entry_valid(entry_model: str, cur_model: str, entry_kb_ver: int, cur_kb_ver: int, age_sec: float, ttl_sec: float) -> bool:\n    if entry_model != cur_model or entry_kb_ver != cur_kb_ver:\n        return False\n    return 0.0 <= age_sec <= ttl_sec\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "ADVANCED · INVALIDATION & SAFETY",
+        "title": "Epoch-Based Invalidation & Safe Async Write-Back",
+        "nodes": [
+          {
+            "id": "gen",
+            "label": "Completed LLM Stream",
+            "sub": "finish_reason == 'stop'",
+            "role": "Write Candidate"
+          },
+          {
+            "id": "pii",
+            "label": "PII / Error / Volatility Gate",
+            "sub": "Skip time-sensitive & PII",
+            "role": "Write Filter"
+          },
+          {
+            "id": "tag",
+            "label": "Epoch + TTL Tagging",
+            "sub": "model_ver + kb_ver + TTL",
+            "role": "Version Guard"
+          },
+          {
+            "id": "wb",
+            "label": "Async Kafka/Redis Write-Back",
+            "sub": "0 ms added to user TTFT",
+            "role": "Cache Commit"
+          }
+        ],
+        "edges": [
+          {
+            "from": "gen",
+            "to": "pii",
+            "label": "Validate cacheability"
+          },
+          {
+            "from": "pii",
+            "to": "tag",
+            "label": "Attach epoch & TTL"
+          },
+          {
+            "from": "tag",
+            "to": "wb",
+            "label": "Commit asynchronously"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Instant Epoch Invalidation",
+            "detail": "Bumping kb_version or model_epoch invalidates stale entries in O(1) without scanning Redis keys."
+          },
+          {
+            "label": "Zero Poisoned Entries",
+            "detail": "Never cache truncated responses (finish_reason='length'), 5xx fallbacks, or real-time 'what time is it' queries."
+          }
+        ],
+        "summary": "Epoch versioning, TTLs, and async PII/error-filtered write-back keep semantic caches fresh and safe without slowing responses.",
+        "caption": "Completed responses pass PII/volatility filters and epoch tagging before async write-back to L1/L2 caches."
+      },
+      "id": "stage-7-stage-7-cache-invalidation-ttls-write-back-consi"
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-sc-1",
+        "question": "Why is a cross-encoder + numeric/entity parity gate needed on top of HNSW cosine similarity (>= 0.94) in an L2 semantic cache?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Because bi-encoder embeddings can score near-opposite or parameter-changed queries (e.g. 'enable MFA' vs 'disable MFA', or '$100' vs '$1000') above 0.94.",
+            "correct": true,
+            "feedback": "Correct. Bi-encoders compress queries into a single vector, losing fine negation or numeric differences that cross-encoders catch."
+          },
+          {
+            "id": "b",
+            "text": "Because HNSW cannot compute dot products on 384-D vectors.",
+            "correct": false,
+            "feedback": "Incorrect. HNSW computes exact or quantized vector distances natively."
+          },
+          {
+            "id": "c",
+            "text": "Because Redis does not support SHA-256 keys.",
+            "correct": false,
+            "feedback": "Incorrect. Redis supports arbitrary string/binary keys for L1 exact lookup."
+          },
+          {
+            "id": "d",
+            "text": "Because cross-encoders generate the final LLM tokens directly.",
+            "correct": false,
+            "feedback": "Incorrect. Cross-encoders only score equivalence (0..1) between the incoming query and cached candidate."
+          }
+        ],
+        "explanation": "Bi-encoder cosine similarity alone risks false-positive hits on negations or swapped numbers/entities, so a cross-encoder + parity gate is essential."
+      },
+      {
+        "id": "kc-sc-2",
+        "question": "What happens when L1 and L2 response caches miss on a query that shares a 4,096-token system prompt and tool schema with prior requests?",
+        "options": [
+          {
+            "id": "a",
+            "text": "L3 RadixAttention KV-prefix caching reuses the pinned 4,096-token KV blocks and only prefills the new user suffix tokens.",
+            "correct": true,
+            "feedback": "Correct. Prefix KV reuse skips redundant attention computation over the shared 4,096-token prefix, cutting TTFT by 80%+."
+          },
+          {
+            "id": "b",
+            "text": "The gateway returns a 504 error because L1 and L2 missed.",
+            "correct": false,
+            "feedback": "Incorrect. Cache misses route to the GPU inference cluster."
+          },
+          {
+            "id": "c",
+            "text": "The L2 HNSW index deletes the user's embedding.",
+            "correct": false,
+            "feedback": "Incorrect. On a valid miss, the new response is written back asynchronously."
+          },
+          {
+            "id": "d",
+            "text": "The GPU recomputes all 4,096 prefix tokens from scratch on every request.",
+            "correct": false,
+            "feedback": "Incorrect. RadixAttention avoids recomputing matched prefix tokens."
+          }
+        ],
+        "explanation": "L3 KV prompt caching matches the shared 4,096-token prefix in a radix tree and reuses precomputed KV blocks in HBM/DRAM."
+      },
+      {
+        "id": "kc-sc-3",
+        "question": "Why does prefix-aware consistent hashing use bounded-load spillover (e.g., 1.25x average load) when routing misses to GPU workers?",
+        "options": [
+          {
+            "id": "a",
+            "text": "To preserve L3 KV cache locality on warm GPU replicas while preventing a single viral prefix from overloading one GPU.",
+            "correct": true,
+            "feedback": "Correct. Bounded-load consistent hashing gives high KV hit rates under normal traffic and spills cleanly during hot-prefix spikes."
+          },
+          {
+            "id": "b",
+            "text": "To disable L1 exact-hash caching in Redis.",
+            "correct": false,
+            "feedback": "Incorrect. L1/L2 caches sit in front of GPU routing."
+          },
+          {
+            "id": "c",
+            "text": "To force every request to hit a different GPU worker.",
+            "correct": false,
+            "feedback": "Incorrect. Round-robin destroys KV prefix locality; consistent hashing preserves it."
+          },
+          {
+            "id": "d",
+            "text": "To compress 384-D vectors into 8-bit integers.",
+            "correct": false,
+            "feedback": "Incorrect. Vector quantization is unrelated to GPU request routing."
+          }
+        ],
+        "explanation": "Bounded-load consistent hashing balances L3 KV prefix locality against hot-shard overload."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "LLM caching uses two tricks: a smart response cache that recognizes rephrased questions, and a prompt prefix cache that reuses shared system instructions.",
+      "keyTakeaway": "Reusing past answers for similar questions and shared prompt prefixes makes AI responses much faster and cheaper.",
+      "byteSummary": "Running a large language model for every single question is slow and expensive. A semantic cache stores past answers and matches rephrased questions so the model doesn't have to run again.\n\nFor brand-new questions that share the same long system instructions, prompt caching reuses the model's internal memory of those instructions."
+    },
+    "intermediate": {
+      "summary": "Layer L1 SHA-256 exact caching, L2 tenant-filtered HNSW semantic caching with a cross-encoder guard, and L3 RadixAttention KV prefix caching.",
+      "keyTakeaway": "Adding a cross-encoder + numeric parity gate stops dangerous semantic false positives while L3 KV reuse cuts TTFT by 80%+ on misses.",
+      "byteSummary": "An L1 Redis SHA-256 lookup resolves exact repeats in < 1 ms. On a miss, an ONNX MiniLM embedding + tenant-filtered HNSW search surfaces semantic matches (>= 0.94) verified by a cross-encoder and numeric parity gate.\n\nTrue misses route to vLLM/SGLang RadixAttention workers to reuse precomputed KV blocks for shared system/RAG prefixes."
+    },
+    "advanced": {
+      "summary": "Scale to 100K QPS with bounded-load (1.25x) prefix-aware consistent hashing, HBM-to-DRAM KV offloading, and epoch-tagged async write-back.",
+      "keyTakeaway": "Prefix-aware consistent hashing raises L3 KV hit rates from ~3% (round-robin) to 85%+, while epoch tags invalidate stale KB/model entries in O(1).",
+      "byteSummary": "At 100K QPS across multi-GPU fleets, bounded-load consistent hashing on the first 512 tokens preserves 85%+ L3 KV locality without hot-sharding, while HBM-to-DRAM KV offloading expands prefix capacity 10x.\n\nAsync write-back filters out PII, volatile queries, and truncated generations while tagging `(model_epoch, kb_version, ttl_sec)` for O(1) invalidation."
+    }
+  }
+}

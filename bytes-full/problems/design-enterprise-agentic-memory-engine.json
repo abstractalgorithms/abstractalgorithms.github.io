@@ -1,0 +1,825 @@
+{
+  "slug": "design-enterprise-agentic-memory-engine",
+  "title": "Design a 250K-QPS Enterprise Agentic Memory & Knowledge Graph Engine",
+  "domain": "ai-machine-learning",
+  "kind": "problem",
+  "spark": {
+    "summary": "Architect a multi-tenant agentic memory platform serving 250K recall QPS (<=25ms p99) and 50K write QPS (<=5ms ack) across 50M namespaces and 100B facts.",
+    "keyTakeaway": "When batching and tail latency compete for accelerator cycles, size 240 GB Redis DRAM, 120 Qdrant Int8 HNSW shards (115.2 TB NVMe), 32 TB Neo4j KG, and 160 H100 GPUs for async 8B SLM conflict resolution.",
+    "byteSummary": "Designing an Enterprise Agentic Memory & Knowledge Graph Engine at Mem0, Zep, or Letta scale requires sustaining 250,000 recall QPS (600,000 burst) within <=25ms p99 across 50M+ namespaces and 100B stored facts.\n\nCapacity modeling allocates 240-343 GB Redis Cluster DRAM for Tier 1 working memory, 120 Qdrant Int8 scalar-quantized HNSW shards on NVMe for Tier 2 episodic vectors, 32 TB Neo4j/FalkorDB storage for Tier 3 bi-temporal graphs, and 160 NVIDIA H100 GPUs for async 8B SLM extraction via Kafka.\n\nTo maintain <=25ms p99 across 3-way scatter-gather reads, the gRPC gateway fires 8.5ms hedged reads and degrades gracefully to Tier 1+2 if Tier 3 trips. Per-namespace KMS DEKs guarantee <=60s GDPR crypto-shredding."
+  },
+  "learningJourney": [
+    {
+      "stage": 1,
+      "level": "foundation",
+      "title": "Capacity Math: 50M Namespaces, 100B Facts & 250K Recall QPS",
+      "purpose": "Derive DRAM, Int8 HNSW NVMe, Knowledge Graph, and H100 extraction sizing.",
+      "explanation": {
+        "foundation": "At 250,000 recall QPS and 15 ms target service window, Little's Law requires L = 3,750 in-flight RPCs (9,000 at 36 ms burst).",
+        "core": "Tier 1 Redis holds 50M active sessions x 2.4 KB (~240-343 GB DRAM with RF=2). Tier 2 Int8 quantized 1536-dim vectors (1,920 bytes/vector including HNSW links) span 120 Qdrant shards on NVMe.",
+        "deepDive": "Tier 3 stores 100B bi-temporal edges (~14-32 TB provisioned), backed by 160 H100 GPUs for 50K write QPS."
+      },
+      "assumptions": [
+        "Assumes 1536-dim embeddings with Int8 scalar quantization (1,920 B/vec)",
+        "Assumes 250K sustained / 600K burst recall QPS"
+      ],
+      "codeExample": {
+        "language": "python",
+        "code": "def size_qdrant_int8_memory_gb(num_vectors_billions: float, dim: int = 1536, hnsw_overhead_b: int = 384) -> float:\n    bytes_per_vec = dim + hnsw_overhead_b\n    total_bytes = num_vectors_billions * 1e9 * bytes_per_vec\n    return round(total_bytes / (1024**3), 1)"
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 1 • Capacity Sizing",
+        "title": "3-Tier Memory & 160-H100 Extraction Sizing",
+        "nodes": [
+          {
+            "id": "redis",
+            "label": "Tier 1: Redis DRAM",
+            "sub": "240-343 GB, <=3ms p99",
+            "role": "cache"
+          },
+          {
+            "id": "qdrant",
+            "label": "Tier 2: 120 Qdrant Shards",
+            "sub": "Int8 HNSW, <=12ms p99",
+            "role": "index"
+          },
+          {
+            "id": "neo4j",
+            "label": "Tier 3: Neo4j / FalkorDB",
+            "sub": "32 TB bi-temporal KG, <=15ms",
+            "role": "storage"
+          },
+          {
+            "id": "h100",
+            "label": "160x H100 SLM Fleet",
+            "sub": "50K write QPS extraction",
+            "role": "compute"
+          }
+        ],
+        "edges": [
+          {
+            "from": "redis",
+            "to": "qdrant",
+            "label": "Parallel Tier 1+2 lookup"
+          },
+          {
+            "from": "qdrant",
+            "to": "neo4j",
+            "label": "Parallel Tier 3 lookup"
+          },
+          {
+            "from": "h100",
+            "to": "neo4j",
+            "label": "Async <=2.0s convergence"
+          }
+        ],
+        "cards": [
+          {
+            "label": "4x Vector Savings",
+            "detail": "Int8 quantization shrinks 1536-dim vectors from 6,144 B to 1,536 B."
+          },
+          {
+            "label": "3,750 In-Flight RPCs",
+            "detail": "Little's Law (250K QPS x 0.015s) sizes gateway concurrency."
+          }
+        ],
+        "summary": "Int8 quantization and 3-tier sizing bound DRAM, NVMe, and GPU footprints for 250K QPS.",
+        "caption": "First-principles sizing prevents memory exhaustion across 50M namespaces."
+      }
+    },
+    {
+      "stage": 2,
+      "level": "foundation",
+      "title": "gRPC Recall & Async Ingestion API Contracts",
+      "purpose": "Define typed contracts for <=25ms hybrid recall and <=5ms write acknowledgment.",
+      "explanation": {
+        "foundation": "Think of **gRPC Recall & Async Ingestion API Contracts** as the intuition layer for Design a 250K-QPS Enterprise Agentic Memory & Knowledge Graph Engine: Define typed contracts for <=25ms hybrid recall and <=5ms write acknowledgment.",
+        "core": "The gRPC Recall Gateway exposes RecallMemory(tenant_id, namespace_id, query, as_of_ts, budget_ms) returning ranked facts with bi-temporal metadata and degraded_tiers flags. IngestTurn(tenant_id, namespace_id, turn_payload) writes synchronously to Redis Tier 1 + Kafka and returns 202 Accepted in <=5ms without waiting for SLM extraction.",
+        "deepDive": "Under heavy load or partial failure, grpc recall & async ingestion api contracts becomes a critical lever for predictable latency and correctness. Principal architecture for 250K QPS / 100B facts: 8.5ms hedged scatter-gather, Tier 3 circuit breaking, and <=60s KMS DEK GDPR crypto-shredding."
+      },
+      "assumptions": [
+        "Assumes Protobuf/gRPC with strict deadline propagation",
+        "Assumes optional as_of_ts for point-in-time recall"
+      ],
+      "codeExample": {
+        "language": "protobuf",
+        "code": "service AgenticMemoryService {\n  rpc RecallMemory (RecallRequest) returns (RecallResponse);\n  rpc IngestTurn (IngestRequest) returns (IngestAck);\n  rpc PurgeNamespace (PurgeRequest) returns (PurgeStatus);\n}"
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 2 • gRPC Contracts",
+        "title": "Sync <=25ms Recall vs Async <=5ms Ingest",
+        "nodes": [
+          {
+            "id": "client",
+            "label": "Agentic Client",
+            "sub": "Propagates 25ms gRPC deadline",
+            "role": "ingress"
+          },
+          {
+            "id": "recall",
+            "label": "RecallMemory RPC",
+            "sub": "3-way scatter + RRF",
+            "role": "compute"
+          },
+          {
+            "id": "ingest",
+            "label": "IngestTurn RPC",
+            "sub": "<=5ms Redis + Kafka ack",
+            "role": "ingress"
+          },
+          {
+            "id": "purge",
+            "label": "PurgeNamespace RPC",
+            "sub": "Triggers GDPR DEK shred",
+            "role": "security"
+          }
+        ],
+        "edges": [
+          {
+            "from": "client",
+            "to": "recall",
+            "label": "Synchronous context fetch"
+          },
+          {
+            "from": "client",
+            "to": "ingest",
+            "label": "Non-blocking turn append"
+          },
+          {
+            "from": "client",
+            "to": "purge",
+            "label": "Compliance erasure call"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Deadline Propagation",
+            "detail": "25ms budget splits into Tier 1 (4ms), Tier 2 (15ms), Tier 3 (18ms)."
+          },
+          {
+            "label": "Speculative Read-Your-Writes",
+            "detail": "Tier 1 Redis serves turns not yet committed to Tier 3."
+          }
+        ],
+        "summary": "Typed gRPC contracts enforce strict per-tier deadlines and non-blocking write acks.",
+        "caption": "Tier 1 speculative reads guarantee session consistency while async SLMs converge."
+      },
+      "decisionFramework": {
+        "problem": "How to implement Design a 250K-QPS Enterprise Agentic Memory & Knowledge Graph Engine without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "When batching and tail latency compete for accelerator cycles, size 240 GB Redis DRAM, 120 Qdrant Int8 HNSW shards (115.2 TB NVMe), 32 TB Neo4j KG, and 160 H100 GPUs for async 8B SLM conflict resolution.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Design a 250K-QPS Enterprise Agentic Memory & Knowledge Graph Engine experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "stage": 3,
+      "level": "intermediate",
+      "title": "Single-Stage Filterable HNSW vs Per-Tenant Collections",
+      "purpose": "Select bitset-masked shared HNSW over 50M separate collections.",
+      "explanation": {
+        "foundation": "Creating 50M separate HNSW collections exhausts OS file descriptors and per-index graph RAM overhead.",
+        "core": "Conversely, post-filtering a global index collapses recall for small tenants.",
+        "deepDive": "A shared 120-shard Qdrant cluster using single-stage payload bitset filtering restricts HNSW edge traversal strictly to the target {tenant_id}_{namespace_id}, sustaining >95% recall in <=12ms."
+      },
+      "assumptions": [
+        "Assumes 120 Qdrant shards hashed by tenant_id",
+        "Assumes inline payload bitset index"
+      ],
+      "codeExample": {
+        "language": "python",
+        "code": "def shard_for_namespace(tenant_id: str, num_shards: int = 120) -> int:\n    import hashlib\n    h = int.from_bytes(hashlib.blake2b(tenant_id.encode(), digest_size=8).digest(), \"little\")\n    return h % num_shards"
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 3 • Multi-Tenant Vector Index",
+        "title": "Single-Stage Bitset-Filtered HNSW",
+        "nodes": [
+          {
+            "id": "router",
+            "label": "Tenant Hash Router",
+            "sub": "Maps tenant_id -> 120 shards",
+            "role": "router"
+          },
+          {
+            "id": "bitset",
+            "label": "Namespace Bitset Mask",
+            "sub": "O(1) Roaring/bitset filter",
+            "role": "filter"
+          },
+          {
+            "id": "hnsw",
+            "label": "Int8 HNSW Traversal",
+            "sub": "Visits only matching tenant",
+            "role": "index"
+          },
+          {
+            "id": "rescore",
+            "label": "SIMD Rescoring",
+            "sub": "Returns top-k in <=12ms",
+            "role": "output"
+          }
+        ],
+        "edges": [
+          {
+            "from": "router",
+            "to": "bitset",
+            "label": "Targets single shard"
+          },
+          {
+            "from": "bitset",
+            "to": "hnsw",
+            "label": "Masks HNSW hop traversal"
+          },
+          {
+            "from": "hnsw",
+            "to": "rescore",
+            "label": "Outputs >95% recall top-k"
+          }
+        ],
+        "cards": [
+          {
+            "label": ">95% Recall",
+            "detail": "Single-pass bitset masking avoids post-filter empty sets."
+          },
+          {
+            "label": "Zero FD Bloat",
+            "detail": "120 shared shards replace 50M separate HNSW indexes."
+          }
+        ],
+        "summary": "Bitset-filtered shared HNSW shards preserve >95% recall across 50M namespaces without FD bloat.",
+        "caption": "Consistent tenant sharding keeps Qdrant searches localized and cache-friendly."
+      }
+    },
+    {
+      "stage": 4,
+      "level": "intermediate",
+      "title": "Kafka Partitioning & 8B SLM Conflict Resolution Pipeline",
+      "purpose": "Guarantee per-namespace ordering during asynchronous fact extraction.",
+      "explanation": {
+        "foundation": "To prevent race conditions when two turns from the same user arrive back-to-back, Kafka partitions ingestion topics by {tenant_id}:{namespace_id}.",
+        "core": "Consumer groups batch turns to 160 H100 GPUs running an 8B SLM that outputs ADD, UPDATE, DELETE, or NOOP ops.",
+        "deepDive": "Idempotent edge version checks ensure safe retries without duplicate graph mutations."
+      },
+      "assumptions": [
+        "Assumes Kafka key = {tenant_id}:{namespace_id}",
+        "Assumes <=2.0s end-to-end convergence SLA"
+      ],
+      "codeExample": {
+        "language": "python",
+        "code": "def kafka_partition_key(tenant_id: str, namespace_id: str) -> bytes:\n    return f\"{tenant_id}:{namespace_id}\".encode(\"utf-8\")"
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 4 • Ordered Async Extraction",
+        "title": "Namespace-Keyed Kafka -> 160x H100 SLM",
+        "nodes": [
+          {
+            "id": "kafka",
+            "label": "Kafka (512 Partitions)",
+            "sub": "Keyed by tenant:namespace",
+            "role": "ingress"
+          },
+          {
+            "id": "gpu",
+            "label": "160x H100 8B SLM",
+            "sub": "Extracts structured triplets",
+            "role": "compute"
+          },
+          {
+            "id": "idem",
+            "label": "Idempotent Graph Writer",
+            "sub": "Version-checked Neo4j ops",
+            "role": "guard"
+          },
+          {
+            "id": "vec",
+            "label": "Qdrant Upsert",
+            "sub": "Syncs updated fact embeddings",
+            "role": "storage"
+          }
+        ],
+        "edges": [
+          {
+            "from": "kafka",
+            "to": "gpu",
+            "label": "Preserves turn order"
+          },
+          {
+            "from": "gpu",
+            "to": "idem",
+            "label": "Emits ADD/UPDATE/DELETE/NOOP"
+          },
+          {
+            "from": "idem",
+            "to": "vec",
+            "label": "Updates episodic vectors"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Ordered Per-Namespace",
+            "detail": "Keyed Kafka partitions prevent out-of-order state flips."
+          },
+          {
+            "label": "<=2.0s Convergence",
+            "detail": "Async GPU batching keeps extraction throughput at 50K QPS."
+          }
+        ],
+        "summary": "Namespace-keyed Kafka partitions preserve causal ordering across async 8B SLM mutations.",
+        "caption": "Ordered consumption prevents concurrent turns from racing on bi-temporal edges."
+      }
+    },
+    {
+      "stage": 5,
+      "level": "intermediate",
+      "title": "3-Way Scatter-Gather Fusion & Lazy Ebbinghaus Scoring",
+      "purpose": "Combine Redis, Qdrant, and Neo4j outputs within a 25ms p99 recall budget.",
+      "explanation": {
+        "foundation": "The Recall Gateway dispatches parallel RPCs to Tier 1 (4ms cap), Tier 2 (15ms cap), and Tier 3 (18ms cap).",
+        "core": "Results are deduplicated by fact_id, fused via Reciprocal Rank Fusion (RRF), and re-scored using lazy Ebbinghaus decay R(t) = exp(-d*dt/(S*I)).",
+        "deepDive": "An async fire-and-forget update increments stability S for returned facts."
+      },
+      "assumptions": [
+        "Assumes RRF constant k=60",
+        "Assumes hard per-tier deadlines"
+      ],
+      "codeExample": {
+        "language": "python",
+        "code": "def rrf_plus_decay(ranks: list[int], retention_score: float, k: int = 60) -> float:\n    rrf = sum(1.0 / (k + r) for r in ranks)\n    return rrf * (0.5 + 0.5 * retention_score)"
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 5 • Hybrid Fusion",
+        "title": "Per-Tier Deadlines -> RRF -> Ebbinghaus Boost",
+        "nodes": [
+          {
+            "id": "scatter",
+            "label": "3-Way Scatter",
+            "sub": "4ms / 15ms / 18ms caps",
+            "role": "router"
+          },
+          {
+            "id": "dedup",
+            "label": "Fact ID Deduplicator",
+            "sub": "Merges Tier 1+2+3 hits",
+            "role": "compute"
+          },
+          {
+            "id": "rrf",
+            "label": "RRF + Decay Ranker",
+            "sub": "Weights relevance x R(t)",
+            "role": "compute"
+          },
+          {
+            "id": "ctx",
+            "label": "Prompt Memory Block",
+            "sub": "Top-N facts <=25ms p99",
+            "role": "output"
+          }
+        ],
+        "edges": [
+          {
+            "from": "scatter",
+            "to": "dedup",
+            "label": "Collects within deadlines"
+          },
+          {
+            "from": "dedup",
+            "to": "rrf",
+            "label": "Fuses multi-tier ranks"
+          },
+          {
+            "from": "rrf",
+            "to": "ctx",
+            "label": "Emits consolidated context"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Strict Tier Caps",
+            "detail": "One slow tier never stalls the entire 25ms recall SLA."
+          },
+          {
+            "label": "Hybrid Grounding",
+            "detail": "Balances semantic similarity with recency and graph structure."
+          }
+        ],
+        "summary": "Hard per-tier deadlines and RRF + Ebbinghaus scoring deliver ranked context within 25 ms.",
+        "caption": "Multi-tier fusion surfaces recent turns, semantic episodes, and verified graph facts together."
+      }
+    },
+    {
+      "stage": 6,
+      "level": "advanced",
+      "title": "Hedged Reads & Graceful Tier-3 Circuit Breaking",
+      "purpose": "Eliminate 2.97% tail amplification across 3-way parallel scatter-gather.",
+      "explanation": {
+        "foundation": "At 250K QPS, 3-way scatter-gather amplifies independent 1% tail stalls into a 2.97% system tail rate.",
+        "core": "Firing an 8.5 ms hedged read to a replica cuts tail probability to ~0.12%.",
+        "deepDive": "If Neo4j/FalkorDB exceeds its 18 ms deadline or trips its circuit breaker, the gateway returns Tier 1 + Tier 2 results marked degraded_tiers=['tier3_graph'] so agent conversations never stall."
+      },
+      "assumptions": [
+        "Assumes 8.5 ms p95 hedge trigger",
+        "Assumes ~5% hedged QPS budget"
+      ],
+      "codeExample": {
+        "language": "python",
+        "code": "def assemble_degraded_response(t1_hits: list, t2_hits: list, t3_hits: list | None) -> dict:\n    degraded = [] if t3_hits is not None else [\"tier3_graph\"]\n    merged = t1_hits + t2_hits + (t3_hits or [])\n    return {\"facts\": merged, \"degraded_tiers\": degraded}"
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 6 • Tail & Degraded Mode",
+        "title": "8.5ms Hedging + Tier-3 Fallback",
+        "nodes": [
+          {
+            "id": "p95",
+            "label": "8.5ms Hedge Trigger",
+            "sub": "Fires replica RPC on lag",
+            "role": "guard"
+          },
+          {
+            "id": "cancel",
+            "label": "Context Cancel",
+            "sub": "Aborts slower in-flight RPC",
+            "role": "compute"
+          },
+          {
+            "id": "cb",
+            "label": "Tier-3 Circuit Breaker",
+            "sub": "Opens on >18ms / 5xx spike",
+            "role": "circuit"
+          },
+          {
+            "id": "fb",
+            "label": "Tier 1+2 Fallback",
+            "sub": "Returns vector context safely",
+            "role": "output"
+          }
+        ],
+        "edges": [
+          {
+            "from": "p95",
+            "to": "cancel",
+            "label": "Takes first replica reply"
+          },
+          {
+            "from": "cancel",
+            "to": "cb",
+            "label": "Monitors Tier 3 health"
+          },
+          {
+            "from": "cb",
+            "to": "fb",
+            "label": "Serves degraded_tiers flag"
+          }
+        ],
+        "cards": [
+          {
+            "label": "0.12% Tail Rate",
+            "detail": "8.5ms hedging reduces 3-way tail stalls by 24x."
+          },
+          {
+            "label": "Zero Hard Outages",
+            "detail": "Graph stalls degrade cleanly to vector + working memory."
+          }
+        ],
+        "summary": "8.5 ms hedged reads and Tier 3 circuit breakers protect the 25 ms p99 SLA under partial failure.",
+        "caption": "Graceful degradation keeps agents responsive even during graph shard failovers."
+      }
+    },
+    {
+      "stage": 7,
+      "level": "advanced",
+      "title": "GDPR Cascading Purge Saga & KMS DEK Crypto-Shredding",
+      "purpose": "Execute verifiable <=60s tenant erasure across DRAM, NVMe, Graph, and cold backups.",
+      "explanation": {
+        "foundation": "Think of **GDPR Cascading Purge Saga & KMS DEK Crypto-Shredding** as the intuition layer for Design a 250K-QPS Enterprise Agentic Memory & Knowledge Graph Engine: Execute verifiable <=60s tenant erasure across DRAM, NVMe, Graph, and cold backups.",
+        "core": "A GDPR deletion saga executes in three stages: Stage 1 (<=100ms) deletes Tier 1 Redis keys and sets a namespace tombstone blocking all recalls; Stage 2 (<=5m) asynchronously purges Qdrant payloads and Neo4j subgraphs; Stage 3 (<=60s) destroys the namespace's KMS Data Encryption Key (DEK), cryptographically shredding all live records and immutable S3/NVMe snapshots.",
+        "deepDive": "Under heavy load or partial failure, gdpr cascading purge saga & kms dek crypto-shredding becomes a critical lever for predictable latency and correctness. Principal architecture for 250K QPS / 100B facts: 8.5ms hedged scatter-gather, Tier 3 circuit breaking, and <=60s KMS DEK GDPR crypto-shredding."
+      },
+      "assumptions": [
+        "Assumes per-namespace KMS DEK envelope encryption",
+        "Assumes <=60s cryptographic erasure SLA"
+      ],
+      "codeExample": {
+        "language": "python",
+        "code": "def check_tombstone_before_decrypt(is_tombstoned: bool, dek_active: bool) -> bool:\n    if is_tombstoned or not dek_active:\n        return False\n    return True"
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 7 • Privacy & Erasure",
+        "title": "3-Stage GDPR Purge & KMS DEK Shredding",
+        "nodes": [
+          {
+            "id": "s1",
+            "label": "Stage 1: Redis Tombstone",
+            "sub": "<=100ms recall block",
+            "role": "guard"
+          },
+          {
+            "id": "s2",
+            "label": "Stage 2: Async Purge",
+            "sub": "Cleans Qdrant & Neo4j",
+            "role": "compute"
+          },
+          {
+            "id": "s3",
+            "label": "Stage 3: KMS DEK Shred",
+            "sub": "Destroys key in <=60s",
+            "role": "security"
+          },
+          {
+            "id": "audit",
+            "label": "Immutable Purge Receipt",
+            "sub": "Logs compliance proof",
+            "role": "output"
+          }
+        ],
+        "edges": [
+          {
+            "from": "s1",
+            "to": "s2",
+            "label": "Enqueues async disk scrub"
+          },
+          {
+            "from": "s1",
+            "to": "s3",
+            "label": "Invokes KMS key destruction"
+          },
+          {
+            "from": "s3",
+            "to": "audit",
+            "label": "Emits verifiable receipt"
+          }
+        ],
+        "cards": [
+          {
+            "label": "<=100ms Cut-Off",
+            "detail": "Tombstone prevents any post-delete recall immediately."
+          },
+          {
+            "label": "Snapshot-Safe",
+            "detail": "Deleted DEKs render offline disk backups permanently unreadable."
+          }
+        ],
+        "summary": "Three-stage GDPR sagas and KMS DEK crypto-shredding guarantee <=60s irreversible erasure.",
+        "caption": "Envelope encryption eliminates multi-hour HNSW compaction during privacy purges."
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-prob-mem-1",
+        "question": "If each of the 3 memory tiers (Redis, Qdrant, Neo4j) has an independent 99% probability of meeting its latency target, what is the unhedged 3-way scatter-gather tail delay probability?",
+        "options": [
+          {
+            "id": "a",
+            "text": "1.00%",
+            "correct": false,
+            "feedback": "1% applies to a single tier, not 3 independent parallel tiers."
+          },
+          {
+            "id": "b",
+            "text": "2.97% (1 - 0.99^3)",
+            "correct": true,
+            "feedback": "Correct. Because the gateway waits for all 3 tiers, tail probability amplifies to 1 - 0.99^3 = 2.97%, which 8.5 ms hedged reads reduce to ~0.12%."
+          },
+          {
+            "id": "c",
+            "text": "0.01%",
+            "correct": false,
+            "feedback": "0.01% would be 0.01^2, not 3-way scatter-gather amplification."
+          },
+          {
+            "id": "d",
+            "text": "50.0%",
+            "correct": false,
+            "feedback": "Independent 99% percentiles do not amplify to 50%."
+          }
+        ],
+        "explanation": "Parallel scatter-gather amplifies tail latency via 1 - p^n; hedged reads at p95 (8.5 ms) counter this amplification."
+      },
+      {
+        "id": "kc-prob-mem-2",
+        "question": "Why are Kafka ingestion messages partitioned by {tenant_id}:{namespace_id}?",
+        "options": [
+          {
+            "id": "a",
+            "text": "To ensure all turns for a given namespace are processed in strict causal order by the 8B SLM conflict resolver",
+            "correct": true,
+            "feedback": "Correct. Keyed partitioning prevents out-of-order turns from racing on bi-temporal t_valid/t_invalid updates."
+          },
+          {
+            "id": "b",
+            "text": "To allow Redis Cluster to bypass Int8 quantization",
+            "correct": false,
+            "feedback": "Redis stores raw working memory, not quantized HNSW vectors."
+          },
+          {
+            "id": "c",
+            "text": "To double the size of each Neo4j graph edge",
+            "correct": false,
+            "feedback": "Partitioning orders message delivery and does not alter edge byte size."
+          },
+          {
+            "id": "d",
+            "text": "To disable GDPR tombstones during peak traffic",
+            "correct": false,
+            "feedback": "GDPR tombstones remain active regardless of Kafka partitioning."
+          }
+        ],
+        "explanation": "Namespace-keyed Kafka partitions serialize state transitions per user/agent while scaling horizontally across 512 partitions."
+      },
+      {
+        "id": "kc-prob-mem-3",
+        "question": "What does the gRPC Recall Gateway do if Tier 3 (Neo4j/FalkorDB) exceeds its 18 ms deadline or trips its circuit breaker?",
+        "options": [
+          {
+            "id": "a",
+            "text": "It blocks the entire 250K QPS fleet until Neo4j recovers",
+            "correct": false,
+            "feedback": "Blocking the gateway would cause cascading outages."
+          },
+          {
+            "id": "b",
+            "text": "It falls back to an unfiltered global HNSW scan",
+            "correct": false,
+            "feedback": "Unfiltered scans violate tenant isolation."
+          },
+          {
+            "id": "c",
+            "text": "It returns synthesized Tier 1 + Tier 2 results with a degraded_tiers flag so the agent continues smoothly",
+            "correct": true,
+            "feedback": "Correct. Graceful degradation preserves the <=25ms SLA using working memory and episodic vector recall."
+          },
+          {
+            "id": "d",
+            "text": "It triggers KMS DEK crypto-shredding on the namespace",
+            "correct": false,
+            "feedback": "Crypto-shredding is only for GDPR deletion requests."
+          }
+        ],
+        "explanation": "Hard per-tier deadlines and graceful Tier 1+2 fallback prevent graph latency spikes from breaking agent responsiveness."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Design a fast memory system for millions of AI agents using a short-term cache, a vector search engine, and a fact graph.",
+      "keyTakeaway": "When batching and tail latency compete for accelerator cycles, size 240 GB Redis DRAM, 120 Qdrant Int8 HNSW shards (115.2 TB NVMe), 32 TB Neo4j KG, and 160 H100 GPUs for async 8B SLM conflict resolution.",
+      "byteSummary": "A large-scale agent memory platform answers questions in under 25 milliseconds by checking three places at once: recent chat cache, vector search, and a fact graph.\n\nNew facts are processed in the background so users never wait, and if one database slows down, the other two still return useful context."
+    },
+    "intermediate": {
+      "summary": "Size a 250K-QPS memory engine across Redis, 120 Qdrant Int8 shards, Neo4j bi-temporal KG, and 160 H100 GPUs with namespace-keyed Kafka.",
+      "keyTakeaway": "When batching and tail latency compete for accelerator cycles, size 240 GB Redis DRAM, 120 Qdrant Int8 HNSW shards (115.2 TB NVMe), 32 TB Neo4j KG, and 160 H100 GPUs for async 8B SLM conflict resolution.",
+      "byteSummary": "Serving 250K recall QPS across 50M namespaces requires 240-343 GB Redis DRAM, 120 bitset-filtered Qdrant Int8 shards, 32 TB Neo4j storage, and 160 H100 GPUs for 50K write QPS.\n\nKafka partitions by {tenant_id}:{namespace_id} to serialize 8B SLM ADD/UPDATE/DELETE/NOOP mutations, while RRF + lazy Ebbinghaus decay ranks recalled facts."
+    },
+    "advanced": {
+      "summary": "Principal architecture for 250K QPS / 100B facts: 8.5ms hedged scatter-gather, Tier 3 circuit breaking, and <=60s KMS DEK GDPR crypto-shredding.",
+      "keyTakeaway": "When batching and tail latency compete for accelerator cycles, size 240 GB Redis DRAM, 120 Qdrant Int8 HNSW shards (115.2 TB NVMe), 32 TB Neo4j KG, and 160 H100 GPUs for async 8B SLM conflict resolution.",
+      "byteSummary": "Under Little's Law (3,750 baseline / 9,000 burst RPCs), 3-way scatter-gather tail amplification (2.97%) is neutralized via 8.5ms hedged reads (~0.12% tail) and Tier 3 circuit breakers that degrade cleanly to Tier 1+2.\n\nGDPR Article 17 erasures execute in three phases: <=100ms Redis tombstone, async Qdrant/Neo4j scrub, and <=60s KMS DEK zeroization."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "prerequisites": [
+    {
+      "title": "Enterprise Agentic Memory, Bi-Temporal Knowledge Graphs & Decay",
+      "summary": "Scale agentic long-term memory across 50M+ namespaces without contradiction poisoning, HNSW post-filtering collapse, or slow GDPR erasure."
+    }
+  ],
+  "simulation": {
+    "title": "Design a 250K-QPS Enterprise Agentic Memory & Knowledge Graph Engine — Interactive Execution Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Workload & Budget"
+      },
+      {
+        "id": "router",
+        "label": "Gateway / Router",
+        "role": "Admission & Dispatch"
+      },
+      {
+        "id": "engine",
+        "label": "Core Engine",
+        "role": "Primary Execution"
+      },
+      {
+        "id": "replica",
+        "label": "Replica / Fallback",
+        "role": "Durability & Recovery"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "router",
+        "label": "request"
+      },
+      {
+        "from": "router",
+        "to": "engine",
+        "label": "route"
+      },
+      {
+        "from": "engine",
+        "to": "replica",
+        "label": "sync / fallback"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Capacity Math: 50M Namespaces, 100B Facts & 250K Recall QPS",
+        "actionLabel": "Dispatch nominal request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "router"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "Ingress",
+          "p99_ms": 8,
+          "error_rate": "0.0%"
+        },
+        "explanation": "Caller sends work into the gateway with explicit timeout and concurrency bounds (Capacity Math: 50M Namespaces, 100B Facts & 250K Recall QPS)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "gRPC Recall & Async Ingestion API Contracts",
+        "actionLabel": "Execute core invariant",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "Core Path",
+          "p99_ms": 18,
+          "in_flight": 124
+        },
+        "explanation": "The core engine processes the hot path while keeping state transitions deterministic (gRPC Recall & Async Ingestion API Contracts)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Single-Stage Filterable HNSW vs Per-Tenant Collections",
+        "actionLabel": "Detect skew or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Degraded",
+          "p99_ms": 64,
+          "retries_capped": "true"
+        },
+        "explanation": "Under load or replica lag, bounded backoff and isolation prevent cascading saturation (Single-Stage Filterable HNSW vs Per-Tenant Collections)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "GDPR Cascading Purge Saga & KMS DEK Crypto-Shredding",
+        "actionLabel": "Converge & restore SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 11,
+          "drift": 0
+        },
+        "explanation": "State converges cleanly and telemetry confirms the system returned within its SLO envelope (GDPR Cascading Purge Saga & KMS DEK Crypto-Shredding)."
+      }
+    ]
+  }
+}

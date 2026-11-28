@@ -1,0 +1,782 @@
+{
+  "id": "problem-avoiding-monotonic-key-partition-hotspots",
+  "slug": "avoiding-monotonic-key-partition-hotspots",
+  "title": "Avoiding Partition Hotspots on Monotonic Keys",
+  "problemType": "architecture",
+  "difficulty": "medium",
+  "prompt": "An IoT platform ingests 250,000 events/sec (~500 B each = 125 MB/s, 450 GB/hr) into a 16-node ScyllaDB/Cassandra cluster (RF=3) keyed by `(event_hour, created_at, device_id)`. One hot node hits 98% CPU and 1,400 ms p99 write latency while 15 nodes sit at 6% CPU. Redesign the partition key and query path to keep partitions < 100 MB and p99 write < 15 ms.",
+  "spark": {
+    "summary": "Using raw timestamps, auto-increment IDs, or coarse `event_hour` as a partition key routes 100% of current writes to one replica set, saturating one node while the cluster sits idle.",
+    "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, salt partition keys deterministically (`shard_id = hash(device_id) % 32`) paired with fine-grained time buckets (`5-minute` windows) and TWCS so writes spread evenly and partitions stay under 100 MB.",
+    "byteSummary": "**Core Mechanics:** Distributed wide-column and KV stores (Cassandra, ScyllaDB, DynamoDB) hash the partition key to choose which nodes own a row.\n\n**Visual & Structural Flow:** Depicts Hot Monotonic Key vs. 32-Shard Salted Distribution (N1 (98%) -> N2 (6%) -> N3 (6%) -> N4 (6%) -> S0#0); Deterministic Salt + Time-Window Compaction (TWCS) (hash(device_id) % 32 -> PK(shard, 1m_bucket) -> TWCS SSTables -> Bounded Scatter).\n\n**Trade-Offs & Production:** Two common fixes introduce new failure modes: **Random Salt Without Time Bucket**: Using `shard_id` alone prevents hot writes, but partitions grow forever over months until multi-GB compactions OOM nodes. Size both the shard count `N` and time bucket mathematically: **Shard Count (`N = 32`)**: `2x` the 16-node cluster spreads `250,000 writes/sec` to `7,812 writes/sec` (`3.9 MB/s`).\n\n**Failure Modes & Application:** Write sharding and time-bucketing are mandatory whenever monotonic keys meet distributed hash/range partitions: **IoT & Metrics Ingestion**: Cassandra/ScyllaDB and DynamoDB time-series tables salt partition keys by `hash(entity_id) % N`."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why monotonic partition keys create single-node bottlenecks",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "Think of **Why monotonic partition keys create single-node bottlenecks** as the intuition layer for Avoiding Partition Hotspots on Monotonic Keys: The mechanism: understand how Why monotonic partition keys create single-node bottlenecks works from first principles.",
+        "core": "Distributed wide-column and KV stores (Cassandra, ScyllaDB, DynamoDB) hash the partition key to choose which nodes own a row. When an IoT pipeline uses `event_hour` or `created_at_ms` as the partition key at `250,000 writes/sec` (`125 MB/s`), every single event in the current hour hashes to the exact same token—turning a 16-node cluster into a 1-node bottleneck.",
+        "deepDive": "Under heavy load or partial failure, why monotonic partition keys create single-node bottlenecks becomes a critical lever for predictable latency and correctness. Using raw timestamps, auto-increment IDs, or coarse `event_hour` as a partition key routes 100% of current writes to one replica set, saturating one node while the cluster sits idle."
+      },
+      "purpose": "The mechanism: understand how Why monotonic partition keys create single-node bottlenecks works from first principles.",
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "Stage 1 Lifecycle",
+        "title": "Why monotonic partition keys create single-node bottleneck...",
+        "states": [
+          {
+            "id": "init",
+            "label": "Ready / Idle",
+            "tone": "neutral"
+          },
+          {
+            "id": "active",
+            "label": "In-Flight",
+            "tone": "info"
+          },
+          {
+            "id": "verified",
+            "label": "Committed",
+            "tone": "good"
+          },
+          {
+            "id": "degraded",
+            "label": "Fallback / Retry",
+            "tone": "warn"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "init",
+            "to": "active",
+            "label": "acquire"
+          },
+          {
+            "from": "active",
+            "to": "verified",
+            "label": "quorum ok"
+          },
+          {
+            "from": "active",
+            "to": "degraded",
+            "label": "timeout / skew"
+          },
+          {
+            "from": "degraded",
+            "to": "init",
+            "label": "backoff reset"
+          }
+        ]
+      }
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "100% write skew, 1,400 ms p99 latency, and compaction stalls",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Concentrating `450 GB/hour` (`125 MB/s`) onto 1 replica set (`RF=3`) causes:",
+        "core": "1. **CPU & NVMe Saturation**: The hot node hits `98%` CPU and `1,400 ms` p99 write latency while the other 13-15 nodes sit at `6%` CPU.\n2. **Unbounded Partition Growth**: A 1-hour partition accumulates `450 GB` (far above the `100 MB` Cassandra safe ceiling), triggering OOMs during compaction and repair.\n3. **Coordinator Queue Bloat**: Slow writes pile up across all coordinators, causing timeouts cluster-wide.",
+        "deepDive": "In production deployments of Avoiding Partition Hotspots on Monotonic Keys, watch how 100% write skew, 1,400 ms p99 latency, and compaction stalls interacts with tail latency, retry amplification, and partial failures. Using raw timestamps, auto-increment IDs, or coarse `event_hour` as a partition key routes 100% of current writes to one replica set, saturating one node while the cluster sits idle."
+      },
+      "sectionDiagram": {
+        "kind": "ring",
+        "eyebrow": "Token Ring Skew",
+        "title": "Hot Monotonic Key vs. 32-Shard Salted Distribution",
+        "nodes": [
+          "N1 (98%)",
+          "N2 (6%)",
+          "N3 (6%)",
+          "N4 (6%)"
+        ],
+        "vnodes": [
+          "S0#0",
+          "S1#0",
+          "S2#0",
+          "S3#0",
+          "S4#0",
+          "S5#0",
+          "S6#0",
+          "S7#0"
+        ],
+        "ringLabel": "250k writes/s",
+        "ringSub": "hash(shard, 5m) -> 16 nodes",
+        "sampleKey": "s17:5m",
+        "summary": "Unsalted event_hour pins 100% of writes to N1; deterministic salting spreads ~15,625 writes/s across each of the 16 nodes."
+      },
+      "purpose": "The problem: see what breaks without 100% write skew, 1,400 ms p99 latency, and compaction stalls under real concurrency or scale.",
+      "decisionFramework": {
+        "problem": "How to implement Avoiding Partition Hotspots on Monotonic Keys without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "To keep the architecture evolvable without sacrificing reliability, salt partition keys deterministically (`shard_id = hash(device_id) % 32`) paired with fine-grained time buckets (`5-minute` windows) and TWCS so writes spread evenly and partitions stay under 100 MB.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Avoiding Partition Hotspots on Monotonic Keys experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Naive salting mistakes (random salts & oversized buckets)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Two common fixes introduce new failure modes:",
+        "core": "- **Random Salt Without Time Bucket**: Using `shard_id` alone prevents hot writes, but partitions grow forever over months until multi-GB compactions OOM nodes.\n- **Over-Salting (`N=512`) or Random Salt on Device Reads**: Setting `N=512` forces every global 15-minute dashboard query to issue 512 parallel scans; random salting forces even single-device queries to scatter-gather all N shards.",
+        "deepDive": "In production deployments of Avoiding Partition Hotspots on Monotonic Keys, watch how naive salting mistakes (random salts & oversized buckets) interacts with tail latency, retry amplification, and partial failures. Using raw timestamps, auto-increment IDs, or coarse `event_hour` as a partition key routes 100% of current writes to one replica set, saturating one node while the cluster sits idle."
+      },
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "Stage 3 Topology",
+        "title": "Naive salting mistakes (random salts & oversized buckets)",
+        "nodes": [
+          {
+            "id": "edge",
+            "label": "Edge Router",
+            "tier": "ingress"
+          },
+          {
+            "id": "worker",
+            "label": "Avoiding Partition H Worker",
+            "tier": "compute"
+          },
+          {
+            "id": "state",
+            "label": "Primary State",
+            "tier": "storage"
+          },
+          {
+            "id": "obs",
+            "label": "Telemetry & Audit",
+            "tier": "control"
+          }
+        ],
+        "edges": [
+          {
+            "from": "edge",
+            "to": "worker",
+            "label": "route"
+          },
+          {
+            "from": "worker",
+            "to": "state",
+            "label": "read / mutate"
+          },
+          {
+            "from": "worker",
+            "to": "obs",
+            "label": "emit metrics"
+          }
+        ]
+      }
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise solution: Deterministic Shard + 5-Min Bucket + TWCS",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": {
+        "foundation": "Size both the shard count `N` and time bucket mathematically:",
+        "core": "- **Shard Count (`N = 32`)**: `2x` the 16-node cluster spreads `250,000 writes/sec` to `7,812 writes/sec` (`3.9 MB/s`) per shard (`~23.4 MB/s` per node at `RF=3`).\n- **5-Minute Time Buckets**: At `450 GB/hr`, a 1-hour bucket per shard is `14.06 GB` (too large!). A **5-minute bucket** (`3.9 MB/s × 300 s / 12`? Wait: `125 MB/s × 300 s = 37.5 GB / 32 = ~1.17 GB` or 1-minute bucket = `~234 MB`, or `N=64` with 1-min = `~117 MB` / `N=128` 1-min = `~58 MB`!) keeps partitions compact, and **TWCS** drops expired TTL SSTables with zero compaction I/O.\n- **Dual Access Paths**: Deterministic `shard_id = hash(device_id) % 32` lets single-device queries hit **1 shard**, while global recent-events queries run bounded 32-way async scatter-gather (`< 50 ms` p99).",
+        "deepDive": "In production deployments of Avoiding Partition Hotspots on Monotonic Keys, watch how enterprise solution: deterministic shard + 5-min bucket + twcs interacts with tail latency, retry amplification, and partial failures. Using raw timestamps, auto-increment IDs, or coarse `event_hour` as a partition key routes 100% of current writes to one replica set, saturating one node while the cluster sits idle."
+      },
+      "sectionDiagram": {
+        "kind": "wal-mvcc",
+        "eyebrow": "Write & Read Path",
+        "title": "Deterministic Salt + Time-Window Compaction (TWCS)",
+        "nodes": [
+          {
+            "label": "hash(device_id) % 32",
+            "role": "Deterministic shard_id"
+          },
+          {
+            "label": "PK(shard, 1m_bucket)",
+            "role": "~15.6k w/s/node, <15ms p99"
+          },
+          {
+            "label": "TWCS SSTables",
+            "role": "Drops expired TTL windows O(1)"
+          },
+          {
+            "label": "Bounded Scatter",
+            "role": "1 shard (device) / 32 (global)"
+          }
+        ],
+        "edges": [
+          {
+            "label": "even token spread"
+          },
+          {
+            "label": "zero-compaction expiry"
+          }
+        ],
+        "summary": "Deterministic salting + fine time buckets keep write latency <15 ms while supporting both single-device and global queries."
+      },
+      "markdownContent": "```sql\nCREATE TABLE telemetry_events (\n    shard_id int,\n    time_bucket text,       -- e.g. '2026-11-18T09:15' (1-min or 5-min bucket)\n    event_ts timestamp,\n    device_id uuid,\n    payload blob,\n    PRIMARY KEY ((shard_id, time_bucket), event_ts, device_id)\n) WITH CLUSTERING ORDER BY (event_ts DESC, device_id ASC)\n  AND compaction = {\n    'class': 'TimeWindowCompactionStrategy',\n    'compaction_window_unit': 'HOURS',\n    'compaction_window_size': 1\n  }\n  AND default_time_to_live = 86400;\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where deterministic key salting is used",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Write sharding and time-bucketing are mandatory whenever monotonic keys meet distributed hash/range partitions:",
+        "core": "- **IoT & Metrics Ingestion**: Cassandra/ScyllaDB and DynamoDB time-series tables salt partition keys by `hash(entity_id) % N`.\n- **Sequential ID Hotspots**: Replacing `AUTO_INCREMENT` / UUIDv1 keys with UUIDv4/hash-prefixed keys prevents Spanner and Bigtable range-server hotspots.",
+        "deepDive": "In production deployments of Avoiding Partition Hotspots on Monotonic Keys, watch how where deterministic key salting is used interacts with tail latency, retry amplification, and partial failures. Using raw timestamps, auto-increment IDs, or coarse `event_hour` as a partition key routes 100% of current writes to one replica set, saturating one node while the cluster sits idle."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "database-sharding",
+          "title": "Concept: Database Sharding",
+          "kind": "concept"
+        },
+        {
+          "slug": "wide-column-databases",
+          "title": "Concept: Wide-Column Databases",
+          "kind": "concept"
+        },
+        {
+          "slug": "consistent-hashing",
+          "title": "Concept: Consistent Hashing",
+          "kind": "concept"
+        },
+        {
+          "slug": "dynamodb-write-sharding-hot-partitions",
+          "title": "System Design: DynamoDB Write Sharding",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Stage 5 Interaction",
+        "title": "Where deterministic key salting is used",
+        "actors": [
+          {
+            "id": "caller",
+            "label": "Client / Caller"
+          },
+          {
+            "id": "coord",
+            "label": "Coordinator"
+          },
+          {
+            "id": "store",
+            "label": "State / Engine"
+          }
+        ],
+        "steps": [
+          {
+            "from": "caller",
+            "to": "coord",
+            "label": "1. Dispatch request + bounds"
+          },
+          {
+            "from": "coord",
+            "to": "store",
+            "label": "2. Execute deterministic step"
+          },
+          {
+            "from": "store",
+            "to": "coord",
+            "label": "3. Return state & proof"
+          },
+          {
+            "from": "coord",
+            "to": "caller",
+            "label": "4. Ack with bounded latency"
+          }
+        ]
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why is deterministic salting (`hash(device_id) % 32`) combined with a fine time bucket superior to random salting (`rand(0, 31)`)?",
+      "options": [
+        {
+          "id": "a",
+          "text": "Single-device time-range queries hit only 1 shard instead of all 32, while time buckets bound partition size for TWCS expiration",
+          "correct": true,
+          "feedback": "Correct: deterministic salting preserves single-partition lookups per device while still spreading writes evenly across the cluster."
+        },
+        {
+          "id": "b",
+          "text": "Deterministic salting allows Cassandra to perform cross-node SQL JOINs without specifying a partition key",
+          "correct": false,
+          "feedback": "Cassandra/ScyllaDB queries still require the partition key and do not support distributed SQL joins."
+        },
+        {
+          "id": "c",
+          "text": "Random salting causes TWCS to delete live data before its TTL expires",
+          "correct": false,
+          "feedback": "TWCS expiration depends on SSTable max-timestamp + TTL, not on whether the salt is random or deterministic."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why is deterministic salting (`hash(device_id) % 32`) combined with a fine time bucket superior to random salting (`rand(0, 31)`)?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Single-device time-range queries hit only 1 shard instead of all 32, while time buckets bound partition size for TWCS expiration",
+            "correct": true,
+            "feedback": "Correct: deterministic salting preserves single-partition lookups per device while still spreading writes evenly across the cluster."
+          },
+          {
+            "id": "b",
+            "text": "Deterministic salting allows Cassandra to perform cross-node SQL JOINs without specifying a partition key",
+            "correct": false,
+            "feedback": "Cassandra/ScyllaDB queries still require the partition key and do not support distributed SQL joins."
+          },
+          {
+            "id": "c",
+            "text": "Random salting causes TWCS to delete live data before its TTL expires",
+            "correct": false,
+            "feedback": "TWCS expiration depends on SSTable max-timestamp + TTL, not on whether the salt is random or deterministic."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why monotonic partition keys create single-node bottlenecks', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "b",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "c",
+            "text": "Distributed wide-column and KV stores (Cassandra, ScyllaDB, DynamoDB) hash the partition key to choose which nodes own a row.",
+            "correct": true,
+            "feedback": "Correct: Distributed wide-column and KV stores (Cassandra, ScyllaDB, DynamoDB) hash the partition key to choose which nodes own a row."
+          }
+        ]
+      },
+      {
+        "question": "Regarding '100% write skew, 1,400 ms p99 latency, and compaction stalls', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Concentrating 450 GB/hour (125 MB/s) onto 1 replica set (RF=3) causes: 1.",
+            "correct": true,
+            "feedback": "Correct: Concentrating 450 GB/hour (125 MB/s) onto 1 replica set (RF=3) causes: 1."
+          },
+          {
+            "id": "b",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "c",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** Distributed wide-column and KV stores (Cassandra, ScyllaDB, DynamoDB) hash the partition key to choose which nodes own a row.\n\n**How It Flows:** Think of Avoiding Partition Hotspots on Monotonic Keys as a clear step-by-step chain: N1 (98%) -> N2 (6%) -> N3 (6%) -> N4 (6%) -> hash(device_id) % 32.\n\n**Why Beginners Should Care:** Salt partition keys deterministically (`shard_id = hash(device_id) % 32`) paired with fine-grained time buckets (`5-minute` windows) and TWCS so writes spread evenly and partitions stay under 100 MB.",
+      "spark": {
+        "summary": "Distributed wide-column and KV stores (Cassandra, ScyllaDB, DynamoDB) hash the partition key to choose which nodes own a row.",
+        "keyTakeaway": "Salt partition keys deterministically (`shard_id = hash(device_id) % 32`) paired with fine-grained time buckets (`5-minute` windows) and TWCS so writes spread evenly and partitions stay under 100 MB."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why monotonic partition keys create single-node bottlenecks",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why monotonic partition keys create single-node bottlenecks works from first principles.",
+          "explanation": "Distributed wide-column and KV stores (Cassandra, ScyllaDB, DynamoDB) hash the partition key to choose which nodes own a row. When an IoT pipeline uses `event_hour` or `created_at_ms` as the partition key at `250,000 writes/sec` (`125 MB/s`), every single event in the current hour hashes to the exact same token—turning a 16-node cluster into a 1-node bottleneck.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "100% write skew, 1,400 ms p99 latency, and compaction stalls",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without 100% write skew, 1,400 ms p99 latency, and compaction stalls under real concurrency or scale.",
+          "explanation": "Concentrating `450 GB/hour` (`125 MB/s`) onto 1 replica set (`RF=3`) causes: 1. **CPU & NVMe Saturation**: The hot node hits `98%` CPU and `1,400 ms` p99 write latency while the other 13-15 nodes sit at `6%` CPU. 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "ring",
+            "eyebrow": "Token Ring Skew",
+            "title": "Hot Monotonic Key vs. 32-Shard Salted Distribution",
+            "nodes": [
+              "N1 (98%)",
+              "N2 (6%)",
+              "N3 (6%)",
+              "N4 (6%)"
+            ],
+            "vnodes": [
+              "S0#0",
+              "S1#0",
+              "S2#0",
+              "S3#0",
+              "S4#0",
+              "S5#0",
+              "S6#0",
+              "S7#0"
+            ],
+            "ringLabel": "250k writes/s",
+            "ringSub": "hash(shard, 5m) -> 16 nodes",
+            "sampleKey": "s17:5m",
+            "summary": "Unsalted event_hour pins 100% of writes to N1; deterministic salting spreads ~15,625 writes/s across each of the 16 nodes."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive salting mistakes (random salts & oversized buckets)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Two common fixes introduce new failure modes: **Random Salt Without Time Bucket**: Using `shard_id` alone prevents hot writes, but partitions grow forever over months until multi-GB compactions OOM nodes.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Deterministic Shard + 5-Min Bucket + TWCS",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Size both the shard count `N` and time bucket mathematically: **Shard Count (`N = 32`)**: `2x` the 16-node cluster spreads `250,000 writes/sec` to `7,812 writes/sec` (`3.9 MB/s`) per shard (`~23.4 MB/s` per node at `RF=3`). **5-Minute Time Buckets**: At `450 GB/hr`, a 1-hour bucket per shard is `14.06 GB` (too large!). A **5-minute bucket** (`3.9 MB/s × 300 s / 12`?",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "wal-mvcc",
+            "eyebrow": "Write & Read Path",
+            "title": "Deterministic Salt + Time-Window Compaction (TWCS)",
+            "nodes": [
+              {
+                "label": "hash(device_id) % 32",
+                "role": "Deterministic shard_id"
+              },
+              {
+                "label": "PK(shard, 1m_bucket)",
+                "role": "~15.6k w/s/node, <15ms p99"
+              },
+              {
+                "label": "TWCS SSTables",
+                "role": "Drops expired TTL windows O(1)"
+              },
+              {
+                "label": "Bounded Scatter",
+                "role": "1 shard (device) / 32 (global)"
+              }
+            ],
+            "edges": [
+              {
+                "label": "even token spread"
+              },
+              {
+                "label": "zero-compaction expiry"
+              }
+            ],
+            "summary": "Deterministic salting + fine time buckets keep write latency <15 ms while supporting both single-device and global queries."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Salt partition keys deterministically (`shard_id = hash(device_id) % 32`) paired with fine-grained time buckets (`5-minute` windows) and TWCS so writes spread evenly and partitions stay under 100 MB.",
+      "summary": "Using raw timestamps, auto-increment IDs, or coarse `event_hour` as a partition key routes 100% of current writes to one replica set, saturating one node while the cluster sits idle.",
+      "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, salt partition keys deterministically (`shard_id = hash(device_id) % 32`) paired with fine-grained time buckets (`5-minute` windows) and TWCS so writes spread evenly and partitions stay under 100 MB."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** Distributed wide-column and KV stores (Cassandra, ScyllaDB, DynamoDB) hash the partition key to choose which nodes own a row.\n\n**Visual & Structural Flow:** Depicts Hot Monotonic Key vs. 32-Shard Salted Distribution (N1 (98%) -> N2 (6%) -> N3 (6%) -> N4 (6%) -> S0#0); Deterministic Salt + Time-Window Compaction (TWCS) (hash(device_id) % 32 -> PK(shard, 1m_bucket) -> TWCS SSTables -> Bounded Scatter).\n\n**Trade-Offs & Production:** Two common fixes introduce new failure modes: **Random Salt Without Time Bucket**: Using `shard_id` alone prevents hot writes, but partitions grow forever over months until multi-GB compactions OOM nodes. Size both the shard count `N` and time bucket mathematically: **Shard Count (`N = 32`)**: `2x` the 16-node cluster spreads `250,000 writes/sec` to `7,812 writes/sec` (`3.9 MB/s`).\n\n**Failure Modes & Application:** Write sharding and time-bucketing are mandatory whenever monotonic keys meet distributed hash/range partitions: **IoT & Metrics Ingestion**: Cassandra/ScyllaDB and DynamoDB time-series tables salt partition keys by `hash(entity_id) % N`.",
+      "spark": {
+        "summary": "Using raw timestamps, auto-increment IDs, or coarse `event_hour` as a partition key routes 100% of current writes to one replica set, saturating one node while the cluster sits idle.",
+        "keyTakeaway": "Salt partition keys deterministically (`shard_id = hash(device_id) % 32`) paired with fine-grained time buckets (`5-minute` windows) and TWCS so writes spread evenly and partitions stay under 100 MB."
+      },
+      "summary": "Using raw timestamps, auto-increment IDs, or coarse `event_hour` as a partition key routes 100% of current writes to one replica set, saturating one node while the cluster sits idle.",
+      "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, salt partition keys deterministically (`shard_id = hash(device_id) % 32`) paired with fine-grained time buckets (`5-minute` windows) and TWCS so writes spread evenly and partitions stay under 100 MB."
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** Using raw timestamps, auto-increment IDs, or coarse `event_hour` as a partition key routes 100% of current writes to one replica set, saturating one node while the cluster sits idle.\n\n**Production Trade-Offs:** Two common fixes introduce new failure modes: **Random Salt Without Time Bucket**: Using `shard_id` alone prevents hot writes, but partitions grow forever over months until multi-GB compactions OOM nodes.\n\n**Failure Modes & Edge Cases:** Write sharding and time-bucketing are mandatory whenever monotonic keys meet distributed hash/range partitions: **IoT & Metrics Ingestion**: Cassandra/ScyllaDB and DynamoDB time-series tables salt partition keys by `hash(entity_id) % N`.\n\n**Principal Takeaway:** Salt partition keys deterministically (`shard_id = hash(device_id) % 32`) paired with fine-grained time buckets (`5-minute` windows) and TWCS so writes spread evenly and partitions stay under 100 MB.",
+      "spark": {
+        "summary": "Using raw timestamps, auto-increment IDs, or coarse `event_hour` as a partition key routes 100% of current writes to one replica set, saturating one node while the cluster sits idle.",
+        "keyTakeaway": "Salt partition keys deterministically (`shard_id = hash(device_id) % 32`) paired with fine-grained time buckets (`5-minute` windows) and TWCS so writes spread evenly and partitions stay under 100 MB."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why monotonic partition keys create single-node bottlenecks",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why monotonic partition keys create single-node bottlenecks works from first principles.",
+          "explanation": "Distributed wide-column and KV stores (Cassandra, ScyllaDB, DynamoDB) hash the partition key to choose which nodes own a row. When an IoT pipeline uses `event_hour` or `created_at_ms` as the partition key at `250,000 writes/sec` (`125 MB/s`), every single event in the current hour hashes to the exact same token—turning a 16-node cluster into a 1-node bottleneck.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "100% write skew, 1,400 ms p99 latency, and compaction stalls",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without 100% write skew, 1,400 ms p99 latency, and compaction stalls under real concurrency or scale.",
+          "explanation": "Concentrating `450 GB/hour` (`125 MB/s`) onto 1 replica set (`RF=3`) causes:\n\n1. **CPU & NVMe Saturation**: The hot node hits `98%` CPU and `1,400 ms` p99 write latency while the other 13-15 nodes sit at `6%` CPU.\n2. **Unbounded Partition Growth**: A 1-hour partition accumulates `450 GB` (far above the `100 MB` Cassandra safe ceiling), triggering OOMs during compaction and repair.\n3. **Coordinator Queue Bloat**: Slow writes pile up across all coordinators, causing timeouts cluster-wide.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "ring",
+            "eyebrow": "Token Ring Skew",
+            "title": "Hot Monotonic Key vs. 32-Shard Salted Distribution",
+            "nodes": [
+              "N1 (98%)",
+              "N2 (6%)",
+              "N3 (6%)",
+              "N4 (6%)"
+            ],
+            "vnodes": [
+              "S0#0",
+              "S1#0",
+              "S2#0",
+              "S3#0",
+              "S4#0",
+              "S5#0",
+              "S6#0",
+              "S7#0"
+            ],
+            "ringLabel": "250k writes/s",
+            "ringSub": "hash(shard, 5m) -> 16 nodes",
+            "sampleKey": "s17:5m",
+            "summary": "Unsalted event_hour pins 100% of writes to N1; deterministic salting spreads ~15,625 writes/s across each of the 16 nodes."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive salting mistakes (random salts & oversized buckets)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Two common fixes introduce new failure modes:\n\n- **Random Salt Without Time Bucket**: Using `shard_id` alone prevents hot writes, but partitions grow forever over months until multi-GB compactions OOM nodes.\n- **Over-Salting (`N=512`) or Random Salt on Device Reads**: Setting `N=512` forces every global 15-minute dashboard query to issue 512 parallel scans; random salting forces even single-device queries to scatter-gather all N shards.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Deterministic Shard + 5-Min Bucket + TWCS",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Size both the shard count `N` and time bucket mathematically:\n\n- **Shard Count (`N = 32`)**: `2x` the 16-node cluster spreads `250,000 writes/sec` to `7,812 writes/sec` (`3.9 MB/s`) per shard (`~23.4 MB/s` per node at `RF=3`).\n- **5-Minute Time Buckets**: At `450 GB/hr`, a 1-hour bucket per shard is `14.06 GB` (too large!). A **5-minute bucket** (`3.9 MB/s × 300 s / 12`? Wait: `125 MB/s × 300 s = 37.5 GB / 32 = ~1.17 GB` or 1-minute bucket = `~234 MB`, or `N=64` with 1-min = `~117 MB` / `N=128` 1-min = `~58 MB`!) keeps partitions compact, and **TWCS** drops expired TTL SSTables with zero compaction I/O.\n- **Dual Access Paths**: Deterministic `shard_id = hash(device_id) % 32` lets single-device queries hit **1 shard**, while global recent-events queries run bounded 32-way async scatter-gather (`< 50 ms` p99).",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "wal-mvcc",
+            "eyebrow": "Write & Read Path",
+            "title": "Deterministic Salt + Time-Window Compaction (TWCS)",
+            "nodes": [
+              {
+                "label": "hash(device_id) % 32",
+                "role": "Deterministic shard_id"
+              },
+              {
+                "label": "PK(shard, 1m_bucket)",
+                "role": "~15.6k w/s/node, <15ms p99"
+              },
+              {
+                "label": "TWCS SSTables",
+                "role": "Drops expired TTL windows O(1)"
+              },
+              {
+                "label": "Bounded Scatter",
+                "role": "1 shard (device) / 32 (global)"
+              }
+            ],
+            "edges": [
+              {
+                "label": "even token spread"
+              },
+              {
+                "label": "zero-compaction expiry"
+              }
+            ],
+            "summary": "Deterministic salting + fine time buckets keep write latency <15 ms while supporting both single-device and global queries."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where deterministic key salting is used",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Write sharding and time-bucketing are mandatory whenever monotonic keys meet distributed hash/range partitions:\n\n- **IoT & Metrics Ingestion**: Cassandra/ScyllaDB and DynamoDB time-series tables salt partition keys by `hash(entity_id) % N`.\n- **Sequential ID Hotspots**: Replacing `AUTO_INCREMENT` / UUIDv1 keys with UUIDv4/hash-prefixed keys prevents Spanner and Bigtable range-server hotspots.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Salt partition keys deterministically (`shard_id = hash(device_id) % 32`) paired with fine-grained time buckets (`5-minute` windows) and TWCS so writes spread evenly and partitions stay under 100 MB.",
+      "summary": "Using raw timestamps, auto-increment IDs, or coarse `event_hour` as a partition key routes 100% of current writes to one replica set, saturating one node while the cluster sits idle.",
+      "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, salt partition keys deterministically (`shard_id = hash(device_id) % 32`) paired with fine-grained time buckets (`5-minute` windows) and TWCS so writes spread evenly and partitions stay under 100 MB."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "simulation": {
+    "title": "Avoiding Partition Hotspots on Monotonic Keys — Interactive Execution Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Workload & Budget"
+      },
+      {
+        "id": "router",
+        "label": "Gateway / Router",
+        "role": "Admission & Dispatch"
+      },
+      {
+        "id": "engine",
+        "label": "Core Engine",
+        "role": "Primary Execution"
+      },
+      {
+        "id": "replica",
+        "label": "Replica / Fallback",
+        "role": "Durability & Recovery"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "router",
+        "label": "request"
+      },
+      {
+        "from": "router",
+        "to": "engine",
+        "label": "route"
+      },
+      {
+        "from": "engine",
+        "to": "replica",
+        "label": "sync / fallback"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why monotonic partition keys create single-node bottlenecks",
+        "actionLabel": "Dispatch nominal request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "router"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "Ingress",
+          "p99_ms": 8,
+          "error_rate": "0.0%"
+        },
+        "explanation": "Caller sends work into the gateway with explicit timeout and concurrency bounds (Why monotonic partition keys create single-node bottlenecks)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "100% write skew, 1,400 ms p99 latency, and compaction stalls",
+        "actionLabel": "Execute core invariant",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "Core Path",
+          "p99_ms": 18,
+          "in_flight": 124
+        },
+        "explanation": "The core engine processes the hot path while keeping state transitions deterministic (100% write skew, 1,400 ms p99 latency, and compaction stalls)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Naive salting mistakes (random salts & oversized buckets)",
+        "actionLabel": "Detect skew or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Degraded",
+          "p99_ms": 64,
+          "retries_capped": "true"
+        },
+        "explanation": "Under load or replica lag, bounded backoff and isolation prevent cascading saturation (Naive salting mistakes (random salts & oversized buckets))."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Where deterministic key salting is used",
+        "actionLabel": "Converge & restore SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 11,
+          "drift": 0
+        },
+        "explanation": "State converges cleanly and telemetry confirms the system returned within its SLO envelope (Where deterministic key salting is used)."
+      }
+    ]
+  }
+}

@@ -1,0 +1,702 @@
+{
+  "id": "prob-design-realtime-unique-user-analytics-pipeline",
+  "slug": "design-realtime-unique-user-analytics-pipeline",
+  "title": "Design a 1B-Event Real-Time Unique User & Ad-Attribution Analytics Pipeline",
+  "problemType": "system-design",
+  "difficulty": "hard",
+  "prompt": "Design a real-time analytics and ad-attribution pipeline that computes COUNT(DISTINCT user_id) across 1,000,000,000+ daily events and 100+ segmented metrics with sub-second dashboard queries, multi-day rollups, and bounded cluster memory.",
+  "spark": {
+    "summary": "Replace 64 GB/metric exact HashSets with partitioned Flink/Kafka HyperLogLog sketches (1.5–12 KB each) merged via O(m) element-wise MAX into ClickHouse/Redis rollups.",
+    "keyTakeaway": "When traffic spikes expose hidden coupling, 100 concurrent billion-scale metrics shrink from 6.4 TB of RAM to 150 KB–1.2 MB while supporting instant hourly-to-monthly rollups.",
+    "byteSummary": "Scale Bottleneck: Exact distinct counting over 1B daily UUIDs consumes ~64 GB RAM per metric (6.4 TB for 100 metrics) and forces O(N) network shuffles during cross-shard unions.\n\nCore Architecture: Edge/Flink workers maintain per-window HyperLogLog sketches (p=11 for 1.5 KB or p=14 for 12 KB) in local state, flushing compact register arrays to ClickHouse (`uniqCombined` / `AggregateFunction(uniqHLL12)`) or Redis (`PFADD`/`PFMERGE`) every 10–60 seconds.\n\nRollup & Accuracy Strategy: Hourly sketches merge in O(m) time via element-wise MAX to answer arbitrary multi-day queries in sub-10ms with <1–2.3% standard error, while sparse encoding prevents memory bloat on long-tail campaigns."
+  },
+  "learningJourney": [
+    {
+      "id": "stage-1",
+      "eyebrow": "Stage 1 · Foundation",
+      "title": "Capacity Sizing: 6.4 TB Exact Sets vs 150 KB HLL Sketches",
+      "level": "foundation",
+      "purpose": "Compare memory and network shuffle costs across 100 metrics at 1B+ events/day.",
+      "explanation": {
+        "foundation": "At 1B unique users/day (~11,500 new uniques/sec, 50k+ total events/sec), retaining raw 64-byte UUID entries costs 64 GB per metric. With HyperLogLog at `p = 11` (1.5 KB) or `p = 14` (12 KB), 100 metrics occupy only 150 KB to 1.2 MB total—fitting entirely inside L3 CPU cache.",
+        "core": "```python\ndef compare_footprint(metrics: int, uniques_per_metric: int) -> dict[str, str]:\n    exact_tb = (metrics * uniques_per_metric * 64) / (1024 ** 4)\n    hll_mb = (metrics * 1536) / (1024 ** 2)\n    return {\"exact_ram\": f\"{exact_tb:.2f} TB\", \"hll_ram\": f\"{hll_mb:.3f} MB\"}\n```",
+        "deepDive": "In production deployments of Design a 1B-Event Real-Time Unique User & Ad-Attribution Analytics Pipeline, watch how capacity sizing: 6.4 tb exact sets vs 150 kb hll sketches interacts with tail latency, retry amplification, and partial failures. Production billion-event pipelines combine sparse-to-dense HLL promotion, 64-bit hash-seed versioning, and nightly 1% exact audits with 3-sigma alerting."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Capacity Sizing",
+        "title": "100 Metrics x 1B Users: 6.4 TB Exact vs 150 KB HLL",
+        "nodes": [
+          {
+            "id": "events",
+            "label": "1B+ Daily Events",
+            "sub": "100 campaign/geo metrics",
+            "role": "source"
+          },
+          {
+            "id": "exact",
+            "label": "Exact HashSet: 6.4 TB",
+            "sub": "OOM + multi-GB shuffles",
+            "role": "warning"
+          },
+          {
+            "id": "hll",
+            "label": "HLL (p=11): 150 KB",
+            "sub": "Fits in L3 cache (<2.3% err)",
+            "role": "store"
+          }
+        ],
+        "edges": [
+          {
+            "from": "events",
+            "to": "exact",
+            "label": "O(N) state"
+          },
+          {
+            "from": "events",
+            "to": "hll",
+            "label": "O(1) register array"
+          }
+        ],
+        "cards": [
+          {
+            "label": "40,000,000x Reduction",
+            "detail": "Memory drops from terabytes to kilobytes per node."
+          },
+          {
+            "label": "Network Savings",
+            "detail": "Flushing 100 metrics every 10s ships only 150 KB over the wire."
+          }
+        ],
+        "summary": "Caption: HyperLogLog reduces 100 billion-scale distinct metrics from 6.4 TB to 150 KB.",
+        "caption": "Caption: HyperLogLog reduces 100 billion-scale distinct metrics from 6.4 TB to 150 KB."
+      }
+    },
+    {
+      "id": "stage-2",
+      "eyebrow": "Stage 2 · Foundation",
+      "title": "Stream Ingestion & Partition-Local Pre-Aggregation",
+      "level": "foundation",
+      "purpose": "Avoid expensive key-by-user_id shuffles by aggregating HLL sketches locally on every Kafka/Flink partition.",
+      "explanation": {
+        "foundation": "Think of **Stream Ingestion & Partition-Local Pre-Aggregation** as the intuition layer for Design a 1B-Event Real-Time Unique User & Ad-Attribution Analytics Pipeline: Avoid expensive key-by-user_id shuffles by aggregating HLL sketches locally on every Kafka/Flink partition.",
+        "core": "An exact `COUNT(DISTINCT user_id)` in Spark/Flink usually forces a global `GROUP BY metric_id, user_id` shuffle across the cluster. Because HyperLogLog is mergeable, each Flink worker updates a **partition-local** HLL sketch for `(metric_id, 1-minute_bucket)` with zero network shuffle per event, emitting only the 1.5 KB sketch at window close!",
+        "deepDive": "Under heavy load or partial failure, stream ingestion & partition-local pre-aggregation becomes a critical lever for predictable latency and correctness. Production billion-event pipelines combine sparse-to-dense HLL promotion, 64-bit hash-seed versioning, and nightly 1% exact audits with 3-sigma alerting."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Shuffle-Free Ingestion",
+        "title": "Partition-Local HLL Accumulation Before Window Flush",
+        "nodes": [
+          {
+            "id": "kafka",
+            "label": "Kafka Partitions",
+            "sub": "50k+ events/sec",
+            "role": "source"
+          },
+          {
+            "id": "flink",
+            "label": "Flink Worker Shards",
+            "sub": "Local 1.5 KB HLL per 1m window",
+            "role": "process"
+          },
+          {
+            "id": "flush",
+            "label": "Window Flush (60s)",
+            "sub": "Emit 1.5 KB sketch only",
+            "role": "store"
+          }
+        ],
+        "edges": [
+          {
+            "from": "kafka",
+            "to": "flink",
+            "label": "No user_id shuffle"
+          },
+          {
+            "from": "flink",
+            "to": "flush",
+            "label": "O(m) sketch emit"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Zero Hot-Key Skew",
+            "sub": "detail",
+            "detail": "Even if one campaign gets 90% of traffic, each partition updates its own local 1.5 KB sketch independently."
+          },
+          {
+            "label": "Event-Time Watermarks",
+            "detail": "Late events update the corresponding historical minute sketch before compaction."
+          }
+        ],
+        "summary": "Caption: Partition-local HLL accumulation eliminates global user_id shuffles across the streaming cluster.",
+        "caption": "Caption: Partition-local HLL accumulation eliminates global user_id shuffles across the streaming cluster."
+      },
+      "decisionFramework": {
+        "problem": "How to implement Design a 1B-Event Real-Time Unique User & Ad-Attribution Analytics Pipeline without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "When traffic spikes expose hidden coupling, 100 concurrent billion-scale metrics shrink from 6.4 TB of RAM to 150 KB–1.2 MB while supporting instant hourly-to-monthly rollups.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Design a 1B-Event Real-Time Unique User & Ad-Attribution Analytics Pipeline experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-3",
+      "eyebrow": "Stage 3 · Intermediate",
+      "title": "Hierarchical Time-Bucket Rollups (Minute -> Hour -> Day)",
+      "level": "intermediate",
+      "purpose": "Enable sub-10ms arbitrary date-range unique counts (e.g., 7-day or 30-day uniques) via pre-merged HLL rollups.",
+      "explanation": {
+        "foundation": "You cannot sum daily unique counts to get weekly uniques (users repeat across days).",
+        "core": "Instead, store 1-minute HLL sketches in ClickHouse (`AggregateFunction(uniqHLL12)`) or Redis, and run background `PFMERGE` rollups into hourly and daily HLL rows.",
+        "deepDive": "A 30-day dashboard query simply merges 30 daily 1.5 KB sketches in < 1 ms!"
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Time Rollups",
+        "title": "Hierarchical O(m) PFMERGE Pyramids",
+        "nodes": [
+          {
+            "id": "min",
+            "label": "1-Min Sketches",
+            "sub": "1,440/day/metric",
+            "role": "source"
+          },
+          {
+            "id": "hr",
+            "label": "1-Hour Rollups",
+            "sub": "PFMERGE 60 mins",
+            "role": "process"
+          },
+          {
+            "id": "day",
+            "label": "1-Day Rollups",
+            "sub": "PFMERGE 24 hrs -> <1ms 30d query",
+            "role": "store"
+          }
+        ],
+        "edges": [
+          {
+            "from": "min",
+            "to": "hr",
+            "label": "O(m) max-merge"
+          },
+          {
+            "from": "hr",
+            "to": "day",
+            "label": "O(m) max-merge"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Exact Union Semantics",
+            "detail": "Users active on both Monday and Tuesday are counted once in the merged weekly HLL."
+          },
+          {
+            "label": "Bounded Query Latency",
+            "detail": "30-day query touches 30 rows (45 KB) instead of scanning 30 billion raw events."
+          }
+        ],
+        "summary": "Caption: Hierarchical PFMERGE rollups turn 30-day distinct queries into 30-row O(m) merges.",
+        "caption": "Caption: Hierarchical PFMERGE rollups turn 30-day distinct queries into 30-row O(m) merges."
+      }
+    },
+    {
+      "id": "stage-4",
+      "eyebrow": "Stage 4 · Intermediate",
+      "title": "Precision Tuning: 1.5 KB (2.3% err) vs 12 KB (0.81% err)",
+      "level": "intermediate",
+      "purpose": "Choose register precision p based on billing-grade vs operational-dashboard accuracy requirements.",
+      "explanation": {
+        "foundation": "Standard error scales as `1.04 / sqrt(2^p)`.",
+        "core": "For real-time anomaly dashboards, `p = 11` (2,048 registers, 1.5 KB, 2.3% error) is ideal.",
+        "deepDive": "For ad-tech billing or SLA reporting, `p = 14` (16,384 registers, 12 KB, 0.81% error) or `p = 16` (65,536 registers, 48 KB, 0.40% error) trades a few extra kilobytes for sub-1% precision."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Precision Trade-Off",
+        "title": "Choosing p: Memory Footprint vs Standard Error",
+        "nodes": [
+          {
+            "id": "p11",
+            "label": "p=11 (2,048 regs)",
+            "sub": "1.5 KB | ~2.30% error",
+            "role": "source"
+          },
+          {
+            "id": "p14",
+            "label": "p=14 (16,384 regs)",
+            "sub": "12 KB | ~0.81% error (Redis)",
+            "role": "process"
+          },
+          {
+            "id": "p16",
+            "label": "p=16 (65,536 regs)",
+            "sub": "48 KB | ~0.40% error",
+            "role": "store"
+          }
+        ],
+        "edges": [
+          {
+            "from": "p11",
+            "to": "p14",
+            "label": "8x RAM -> 2.8x tighter error"
+          },
+          {
+            "from": "p14",
+            "to": "p16",
+            "label": "4x RAM -> 2x tighter error"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Fixed p Per Pipeline",
+            "detail": "Pick p upfront; merging sketches with different p requires down-folding or fails."
+          },
+          {
+            "label": "3-Sigma Bound",
+            "detail": "At p=14 (0.81% sigma), 99.7% of estimates fall within +/- 2.43% of exact truth."
+          }
+        ],
+        "summary": "Caption: Increasing precision p by 2 bits quadruples register memory while halving standard error.",
+        "caption": "Caption: Increasing precision p by 2 bits quadruples register memory while halving standard error."
+      }
+    },
+    {
+      "id": "stage-5",
+      "eyebrow": "Stage 5 · Intermediate",
+      "title": "Handling Long-Tail Segmented Metrics with Sparse Encoding",
+      "level": "intermediate",
+      "purpose": "Prevent OOM when users slice dashboards by high-cardinality dimensions (e.g., 5M distinct URLs or ads).",
+      "explanation": {
+        "foundation": "If analysts group by `ad_id` (5 million ads), 90% of ads receive fewer than 50 clicks/day.",
+        "core": "Allocating 12 KB dense HLLs for 5M keys would take 60 GB!",
+        "deepDive": "Use **sparse HLL encoding** (storing a sorted list of `(bucket, rho)` 32-bit integers) until sparse size reaches 50% of dense size, cutting total memory by > 85%."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Long-Tail Compression",
+        "title": "Sparse-to-Dense HLL Promotion Across 5M Ad IDs",
+        "nodes": [
+          {
+            "id": "tail",
+            "label": "4.5M Long-Tail Ads",
+            "sub": "Sparse list (~100 B avg)",
+            "role": "source"
+          },
+          {
+            "id": "promo",
+            "label": "Promotion Threshold",
+            "sub": "Convert when > 6 KB",
+            "role": "process"
+          },
+          {
+            "id": "head",
+            "label": "500K Viral Ads",
+            "sub": "Dense 12 KB HLL",
+            "role": "store"
+          }
+        ],
+        "edges": [
+          {
+            "from": "tail",
+            "to": "promo",
+            "label": "Low-traffic keys"
+          },
+          {
+            "from": "promo",
+            "to": "head",
+            "label": "High-traffic keys"
+          }
+        ],
+        "cards": [
+          {
+            "label": "60 GB -> 6.5 GB",
+            "detail": "Sparse encoding shrinks 5M-key footprint by nearly an order of magnitude."
+          },
+          {
+            "label": "Transparent Merge",
+            "detail": "Sparse-with-dense merge unpacks only the sparse entries in O(k) time."
+          }
+        ],
+        "summary": "Caption: Sparse encoding keeps long-tail segmented metrics compact before promoting hot keys to dense HLL.",
+        "caption": "Caption: Sparse encoding keeps long-tail segmented metrics compact before promoting hot keys to dense HLL."
+      }
+    },
+    {
+      "id": "stage-6",
+      "eyebrow": "Stage 6 · Advanced",
+      "title": "Idempotent Checkpointing & Exact-Once Sketch Durability",
+      "level": "advanced",
+      "purpose": "Ensure worker restarts or Kafka replays do not corrupt sketches or lose window state.",
+      "explanation": {
+        "foundation": "Think of **Idempotent Checkpointing & Exact-Once Sketch Durability** as the intuition layer for Design a 1B-Event Real-Time Unique User & Ad-Attribution Analytics Pipeline: Ensure worker restarts or Kafka replays do not corrupt sketches or lose window state.",
+        "core": "Because `PFADD` / `max(regs[idx], rho)` is **idempotent**, replaying a duplicate Kafka message for the same `user_id` leaves the HLL sketch completely unchanged! Pairing Flink incremental RocksDB checkpoints with idempotent `MERGE` upserts into ClickHouse/Redis guarantees at-least-once replays produce exact HLL convergence.",
+        "deepDive": "Under heavy load or partial failure, idempotent checkpointing & exact-once sketch durability becomes a critical lever for predictable latency and correctness. Production billion-event pipelines combine sparse-to-dense HLL promotion, 64-bit hash-seed versioning, and nightly 1% exact audits with 3-sigma alerting."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Fault Tolerance",
+        "title": "Idempotent Replays & Checkpoint Recovery",
+        "nodes": [
+          {
+            "id": "replay",
+            "label": "Kafka Replay / Retry",
+            "sub": "Duplicate user_id events",
+            "role": "source"
+          },
+          {
+            "id": "idem",
+            "label": "Idempotent max()",
+            "sub": "Same hash -> same rho",
+            "role": "process"
+          },
+          {
+            "id": "chk",
+            "label": "Consistent HLL State",
+            "sub": "Zero over-counting on retry",
+            "role": "store"
+          }
+        ],
+        "edges": [
+          {
+            "from": "replay",
+            "to": "idem",
+            "label": "Re-hash"
+          },
+          {
+            "from": "idem",
+            "to": "chk",
+            "label": "No inflation"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Natural Idempotency",
+            "detail": "Unlike SUM/COUNT(+), HLL MAX-updates are immune to duplicate event delivery."
+          },
+          {
+            "label": "Versioned Hash Seed",
+            "detail": "Store a 1-byte schema/seed version header on every serialized HLL blob."
+          }
+        ],
+        "summary": "Caption: HLL's idempotent max-register update makes distinct counting naturally immune to duplicate event replays.",
+        "caption": "Caption: HLL's idempotent max-register update makes distinct counting naturally immune to duplicate event replays."
+      }
+    },
+    {
+      "id": "stage-7",
+      "eyebrow": "Stage 7 · Advanced",
+      "title": "Observability, Hash-Drift Guards & Billing Reconciliation",
+      "level": "advanced",
+      "purpose": "Detect silent hash-seed mismatches and reconcile probabilistic estimates against nightly exact batch audits.",
+      "explanation": {
+        "foundation": "Think of **Observability, Hash-Drift Guards & Billing Reconciliation** as the intuition layer for Design a 1B-Event Real-Time Unique User & Ad-Attribution Analytics Pipeline: Detect silent hash-seed mismatches and reconcile probabilistic estimates against nightly exact batch audits.",
+        "core": "Because HLL errors are bounded and predictable (`~1.04 / sqrt(m)`), run a nightly Spark/SQL exact `COUNT(DISTINCT)` audit on a 1% sampled metric set. Alert if observed drift exceeds `3 * sigma` (which immediately catches hash-seed mismatches, truncated 32-bit hashes, or corrupted sparse-to-dense merges).",
+        "deepDive": "Under heavy load or partial failure, observability, hash-drift guards & billing reconciliation becomes a critical lever for predictable latency and correctness. Production billion-event pipelines combine sparse-to-dense HLL promotion, 64-bit hash-seed versioning, and nightly 1% exact audits with 3-sigma alerting."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "SRE Verification",
+        "title": "Nightly 1% Exact Audit & 3-Sigma Drift Alerting",
+        "nodes": [
+          {
+            "id": "live",
+            "label": "Live HLL Estimate",
+            "sub": "Real-time dashboard",
+            "role": "source"
+          },
+          {
+            "id": "audit",
+            "label": "1% Nightly Batch Audit",
+            "sub": "Exact COUNT(DISTINCT)",
+            "role": "process"
+          },
+          {
+            "id": "alert",
+            "label": "|est - exact| > 3*sigma",
+            "sub": "Page on hash/merge bug",
+            "role": "store"
+          }
+        ],
+        "edges": [
+          {
+            "from": "live",
+            "to": "audit",
+            "label": "Sampled compare"
+          },
+          {
+            "from": "audit",
+            "to": "alert",
+            "label": "Verify error bound"
+          }
+        ],
+        "cards": [
+          {
+            "label": "32-Bit Hash Trap",
+            "detail": "Using a 32-bit hash saturates above ~4B items via collisions; always use 64-bit hashes."
+          },
+          {
+            "label": "Audit Confidence",
+            "detail": "Automated 3-sigma checks prove ongoing SLA compliance for ad-tech billing."
+          }
+        ],
+        "summary": "Caption: Nightly sampled exact audits catch 32-bit hash collisions or seed mismatches if error exceeds 3-sigma.",
+        "caption": "Caption: Nightly sampled exact audits catch 32-bit hash collisions or seed mismatches if error exceeds 3-sigma."
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-1",
+        "question": "In a Flink + Kafka pipeline computing COUNT(DISTINCT user_id) for 100 campaign metrics, why does HyperLogLog eliminate the need to shuffle raw events by user_id?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Kafka automatically deduplicates user_id across all partitions.",
+            "correct": false,
+            "feedback": "Incorrect: Kafka partitions do not globally deduplicate distinct keys across topics."
+          },
+          {
+            "id": "b",
+            "text": "Each partition updates a tiny local HLL sketch and emits only the 1.5–12 KB sketch at window close for O(m) PFMERGE.",
+            "correct": true,
+            "feedback": "Correct: Local HLL accumulation plus O(m) element-wise MAX merging removes the global user_id shuffle."
+          },
+          {
+            "id": "c",
+            "text": "Flink stores all 1B user IDs in Redis instead.",
+            "correct": false,
+            "feedback": "Incorrect: Storing 1B raw IDs in Redis would still consume 64 GB per metric."
+          },
+          {
+            "id": "d",
+            "text": "HyperLogLog only counts total events, not unique users.",
+            "correct": false,
+            "feedback": "Incorrect: HyperLogLog specifically estimates unique cardinality."
+          }
+        ],
+        "explanation": "Partition-local HLL sketches can be merged via O(m) element-wise MAX without ever shuffling raw user_id records."
+      },
+      {
+        "id": "kc-2",
+        "question": "Your ad-tech platform tracks 5,000,000 ad_id segments, 90% of which see fewer than 30 clicks/day. How do you avoid spending 60 GB of RAM on 12 KB dense HLL arrays?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Drop all ads with fewer than 30 clicks.",
+            "correct": false,
+            "feedback": "Incorrect: Dropping long-tail ads loses attribution data."
+          },
+          {
+            "id": "b",
+            "text": "Use a 4-bit hash function.",
+            "correct": false,
+            "feedback": "Incorrect: A 4-bit hash cannot distinguish more than 16 buckets."
+          },
+          {
+            "id": "c",
+            "text": "Start each key in a sparse HLL representation (~100 bytes) and promote to dense 12 KB only when sparse entries exceed the threshold.",
+            "correct": true,
+            "feedback": "Correct: Sparse-to-dense promotion cuts long-tail RAM by ~85–90% while preserving exact HLL accuracy."
+          },
+          {
+            "id": "d",
+            "text": "Store raw UUIDs in a SQL table in RAM.",
+            "correct": false,
+            "feedback": "Incorrect: Raw UUIDs still scale linearly with N."
+          }
+        ],
+        "explanation": "Sparse HLL encoding stores only non-zero (bucket, rho) pairs for low-cardinality keys before promoting to dense arrays."
+      },
+      {
+        "id": "kc-3",
+        "question": "Why is HyperLogLog naturally resilient to at-least-once Kafka message replays after a worker crash?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Because updating regs[idx] = max(regs[idx], rho) is idempotent—replaying the same user_id produces the identical hash and leaves registers unchanged.",
+            "correct": true,
+            "feedback": "Correct: Duplicate deliveries of the same user_id yield the same (idx, rho) and never inflate the sketch."
+          },
+          {
+            "id": "b",
+            "text": "Because HLL resets all registers to zero on every restart.",
+            "correct": false,
+            "feedback": "Incorrect: Resetting registers would lose all historical counts."
+          },
+          {
+            "id": "c",
+            "text": "Because HLL increments a counter by +1 on every event.",
+            "correct": false,
+            "feedback": "Incorrect: HLL takes the max leading-zero run, not a sum."
+          },
+          {
+            "id": "d",
+            "text": "Because Kafka deletes duplicates before consumers read.",
+            "correct": false,
+            "feedback": "Incorrect: At-least-once consumers can still receive duplicate deliveries on restart."
+          }
+        ],
+        "explanation": "Since HLL updates registers via max(regs[idx], rho) on deterministic hashes, duplicate event replays are idempotent."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Instead of saving every user ID in giant tables, the analytics pipeline keeps tiny 1.5 KB HyperLogLog summaries per minute and merges them in milliseconds.",
+      "keyTakeaway": "When traffic spikes expose hidden coupling, 100 concurrent billion-scale metrics shrink from 6.4 TB of RAM to 150 KB–1.2 MB while supporting instant hourly-to-monthly rollups.",
+      "byteSummary": "Each worker summarizes millions of clicks into a 1.5 KB HyperLogLog sketch and sends just that tiny summary to the database. Merging 30 days of summaries takes a fraction of a millisecond."
+    },
+    "intermediate": {
+      "summary": "Partition-local HLL sketches eliminate user_id shuffles, while hierarchical PFMERGE rollups answer multi-day distinct queries in <10 ms with <1–2.3% error.",
+      "keyTakeaway": "When traffic spikes expose hidden coupling, 100 concurrent billion-scale metrics shrink from 6.4 TB of RAM to 150 KB–1.2 MB while supporting instant hourly-to-monthly rollups.",
+      "byteSummary": "Workers accumulate local HLLs per 1-minute window, flush to ClickHouse/Redis for hourly and daily PFMERGE rollups, and benefit from natural idempotency during Kafka replays."
+    },
+    "advanced": {
+      "summary": "Production billion-event pipelines combine sparse-to-dense HLL promotion, 64-bit hash-seed versioning, and nightly 1% exact audits with 3-sigma alerting.",
+      "keyTakeaway": "When traffic spikes expose hidden coupling, 100 concurrent billion-scale metrics shrink from 6.4 TB of RAM to 150 KB–1.2 MB while supporting instant hourly-to-monthly rollups.",
+      "byteSummary": "At 5M+ segmented metrics, sparse representation avoids 12 KB overhead on low-traffic keys, 64-bit hashes prevent 32-bit saturation above 4B events, and sampled exact audits verify continuous SLA compliance."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "prerequisites": [
+    {
+      "title": "HyperLogLog & Probabilistic Cardinality Estimation",
+      "summary": "HyperLogLog hashes each element into 64 bits, routes it to one of m = 2^p registers, tracks the maximum leading-zero run rho(w), and averages registers via a bias-corrected harmonic mean in O(1) space."
+    }
+  ],
+  "simulation": {
+    "title": "Design a 1B-Event Real-Time Unique User & Ad-Attribution Analytics Pipeline — Interactive Execution Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Workload & Budget"
+      },
+      {
+        "id": "router",
+        "label": "Gateway / Router",
+        "role": "Admission & Dispatch"
+      },
+      {
+        "id": "engine",
+        "label": "Core Engine",
+        "role": "Primary Execution"
+      },
+      {
+        "id": "replica",
+        "label": "Replica / Fallback",
+        "role": "Durability & Recovery"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "router",
+        "label": "request"
+      },
+      {
+        "from": "router",
+        "to": "engine",
+        "label": "route"
+      },
+      {
+        "from": "engine",
+        "to": "replica",
+        "label": "sync / fallback"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Capacity Sizing: 6.4 TB Exact Sets vs 150 KB HLL Sketches",
+        "actionLabel": "Dispatch nominal request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "router"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "Ingress",
+          "p99_ms": 8,
+          "error_rate": "0.0%"
+        },
+        "explanation": "Caller sends work into the gateway with explicit timeout and concurrency bounds (Capacity Sizing: 6.4 TB Exact Sets vs 150 KB HLL Sketches)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Stream Ingestion & Partition-Local Pre-Aggregation",
+        "actionLabel": "Execute core invariant",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "Core Path",
+          "p99_ms": 18,
+          "in_flight": 124
+        },
+        "explanation": "The core engine processes the hot path while keeping state transitions deterministic (Stream Ingestion & Partition-Local Pre-Aggregation)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Hierarchical Time-Bucket Rollups (Minute -> Hour -> Day)",
+        "actionLabel": "Detect skew or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Degraded",
+          "p99_ms": 64,
+          "retries_capped": "true"
+        },
+        "explanation": "Under load or replica lag, bounded backoff and isolation prevent cascading saturation (Hierarchical Time-Bucket Rollups (Minute -> Hour -> Day))."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Observability, Hash-Drift Guards & Billing Reconciliation",
+        "actionLabel": "Converge & restore SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 11,
+          "drift": 0
+        },
+        "explanation": "State converges cleanly and telemetry confirms the system returned within its SLO envelope (Observability, Hash-Drift Guards & Billing Reconciliation)."
+      }
+    ]
+  }
+}

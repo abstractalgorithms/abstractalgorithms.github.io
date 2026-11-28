@@ -1,0 +1,823 @@
+{
+  "id": "littles-law-thread",
+  "slug": "littles-law-thread",
+  "title": "Sizing Thread Pools with Little's Law",
+  "problemType": "system-design",
+  "difficulty": "medium",
+  "prompt": "Your monolith/gateway runs a shared 200-thread Tomcat pool handling 1,000 RPS total: 600 RPS of fast `/catalog` queries (10 ms) and 400 RPS of `/checkout` calls hitting a third-party fraud API (normally 50 ms). When the fraud API browns out to 2,500 ms (not failing fast, just slow), `/catalog` and `/health` also go down with 504s, and Kubernetes restarts the pod. Apply Little's Law and bulkhead isolation to keep `/catalog` and `/health` 100% healthy.",
+  "spark": {
+    "summary": "By Little's Law (`L = lambda * W`), when a downstream payment API browns out from 50 ms to 2,500 ms at 400 RPS, required in-flight threads jump from 20 to 1,000—instantly saturating a 200-thread server pool and starving unrelated health/fast endpoints.",
+    "keyTakeaway": "If latency budgets leave no room for synchronous retries, isolate each downstream dependency behind its own bounded bulkhead + strict timeout, apply Little's Law (`threads = RPS * p99_latency`) for sizing, and shed load early via adaptive concurrency limits.",
+    "byteSummary": "**Core Mechanics:** A shared **200-thread Tomcat pool** serves **1,000 RPS**: **600 RPS** of fast `/catalog` (`10 ms`) and **400 RPS** of `/checkout` calling a fraud API (`50 ms`).\n\n**Visual & Structural Flow:** Depicts Shared 200-Thread Freeze vs. Per-Dependency Bulkhead (/catalog (600 RPS) -> /checkout (400 RPS) -> Tomcat (200) -> Fraud API (2.5s)); Dedicated Bounded Executors Sized via L = λW (Tomcat Ingress -> /catalog Pool -> /checkout Bulkhead -> Fraud Client).\n\n**Trade-Offs & Production:** Raising Tomcat `maxThreads` from 200 to 2,000 causes massive JVM context-switching, 2 GB of thread stack RAM, and still saturates during a 2.5s brownout. Size each dependency's pool via $L = \\lambda W$ and isolate failure domains: **Calculate Pool Size**: For 400 RPS `/checkout` at 50 ms normal (150 ms p99 timeout), $L = 400 \\times.\n\n**Failure Modes & Application:** Little's Law governs capacity planning across every queuing tier: **Microservice Thread & Connection Pools**: Sizing HikariCP (`connections = RPS * query_time`) and HTTP client pools."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why Little's Law Thread Pool Sizing Matters",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "A shared **200-thread Tomcat pool** serves **1,000 RPS**: **600 RPS** of fast `/catalog` (`10 ms`) and **400 RPS** of `/checkout` calling a fraud API (`50 ms`).",
+        "core": "By **Little's Law ($L = \\lambda W$)**, normal concurrency is $600 \\times 0.01 + 400 \\times 0.05 = 26$ threads.",
+        "deepDive": "When the fraud API browns out to **2,500 ms**, `/checkout` alone demands $400 \\times 2.5 = 1,000$ threads—instantly saturating all 200 Tomcat threads and taking down `/catalog` (`< 25 ms` SLA) and `/health`."
+      },
+      "purpose": "The mechanism: understand how Why Little's Law Thread Pool Sizing Matters works from first principles."
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "Real-World Impact of Shared-Pool Brownouts",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Without bulkhead isolation and bounded queues:",
+        "core": "1. **100% Blast Radius**: A slow third-party fraud API starves fast, healthy `/catalog` and `/health` endpoints.\n2. **Queueing Delay Explosion**: Unbounded `LinkedBlockingQueue`s hide saturation while p99 latency climbs to tens of seconds.\n3. **Kubernetes Probe Cascade**: Failed `/health` checks trigger pod restarts, shrinking total capacity during the incident.",
+        "deepDive": "In production deployments of Sizing Thread Pools with Little's Law, watch how real-world impact of shared-pool brownouts interacts with tail latency, retry amplification, and partial failures. By Little's Law (`L = lambda * W`), when a downstream payment API browns out from 50 ms to 2,500 ms at 400 RPS, required in-flight threads jump from 20 to 1,000—instantly saturating a 200-thread server pool and starving unrelated health/fast endpoints."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Little's Law Saturation vs. Bulkhead",
+        "title": "Shared 200-Thread Freeze vs. Per-Dependency Bulkhead",
+        "actors": [
+          {
+            "id": "cat",
+            "label": "/catalog (600 RPS)"
+          },
+          {
+            "id": "chk",
+            "label": "/checkout (400 RPS)"
+          },
+          {
+            "id": "pool",
+            "label": "Tomcat (200)"
+          },
+          {
+            "id": "fraud",
+            "label": "Fraud API (2.5s)"
+          }
+        ],
+        "events": [
+          {
+            "from": "chk",
+            "to": "pool",
+            "label": "Naive: 400 * 2.5s = 1000 threads needed",
+            "status": "fail"
+          },
+          {
+            "from": "cat",
+            "to": "pool",
+            "label": "/catalog starved -> 503 outage",
+            "status": "fail"
+          },
+          {
+            "from": "chk",
+            "to": "fraud",
+            "label": "Fixed: Bulkhead(40) + 150ms timeout",
+            "status": "ok"
+          },
+          {
+            "from": "cat",
+            "to": "pool",
+            "label": "/catalog uses 6 threads (<25ms p99)",
+            "status": "ok"
+          }
+        ],
+        "summary": "Isolating /checkout behind a 40-thread bulkhead and 150 ms timeout keeps /catalog p99 under 25 ms even during 100% fraud brownout."
+      },
+      "purpose": "The problem: see what breaks without Real-World Impact of Shared-Pool Brownouts under real concurrency or scale.",
+      "decisionFramework": {
+        "problem": "How to implement Sizing Thread Pools with Little's Law without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "If latency budgets leave no room for synchronous retries, isolate each downstream dependency behind its own bounded bulkhead + strict timeout, apply Little's Law (`threads = RPS * p99_latency`) for sizing, and shed load early via adaptive concurrency limits.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Sizing Thread Pools with Little's Law experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Naive Solution (and Why It Breaks)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Think of **Naive Solution (and Why It Breaks)** as the intuition layer for Sizing Thread Pools with Little's Law: The problem: see what breaks without Naive Solution under real concurrency or scale.",
+        "core": "Raising Tomcat `maxThreads` from 200 to 2,000 causes massive JVM context-switching, 2 GB of thread stack RAM, and still saturates during a 2.5s brownout. Using an unbounded `LinkedBlockingQueue` queues requests indefinitely until callers time out or OOM.",
+        "deepDive": "Under heavy load or partial failure, naive solution (and why it breaks) becomes a critical lever for predictable latency and correctness. By Little's Law (`L = lambda * W`), when a downstream payment API browns out from 50 ms to 2,500 ms at 400 RPS, required in-flight threads jump from 20 to 1,000—instantly saturating a 200-thread server pool and starving unrelated health/fast endpoints."
+      },
+      "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Request & State Flow",
+        "title": "Naive Solution (and Why It Breaks)",
+        "actors": [
+          {
+            "id": "prod",
+            "label": "Producer Thread"
+          },
+          {
+            "id": "queue",
+            "label": "Bounded Queue / Ring"
+          },
+          {
+            "id": "pool",
+            "label": "Worker Pool"
+          },
+          {
+            "id": "sink",
+            "label": "Shared State"
+          }
+        ],
+        "events": [
+          {
+            "from": "prod",
+            "to": "queue",
+            "label": "Try non-blocking offer / CAS"
+          },
+          {
+            "from": "queue",
+            "to": "pool",
+            "label": "Dispatch to idle worker thread"
+          },
+          {
+            "from": "pool",
+            "to": "sink",
+            "label": "Execute without holding outer locks"
+          },
+          {
+            "from": "pool",
+            "to": "prod",
+            "label": "Release permit / signal completion"
+          }
+        ]
+      }
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise Solution: Little's Law Bulkheads + Strict Timeouts + Load Shedding",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": {
+        "foundation": "Size each dependency's pool via $L = \\lambda W$ and isolate failure domains:",
+        "core": "- **Calculate Pool Size**: For 400 RPS `/checkout` at 50 ms normal (150 ms p99 timeout), $L = 400 \\times 0.10\\text{s} = 40$ threads (or `Semaphore(40)`).\n- **Bounded Queue (`ArrayBlockingQueue(20)`) + `AbortPolicy`**: Reject excess `/checkout` calls immediately with `503` / fallback rather than queuing for seconds.\n- **Adaptive Concurrency / Timeout**: Enforce a strict 150 ms socket timeout on the fraud client so hung connections release threads fast, leaving 160+ Tomcat threads free for `/catalog` (`6` threads needed).",
+        "deepDive": "In production deployments of Sizing Thread Pools with Little's Law, watch how enterprise solution: little's law bulkheads + strict timeouts + load shedding interacts with tail latency, retry amplification, and partial failures. By Little's Law (`L = lambda * W`), when a downstream payment API browns out from 50 ms to 2,500 ms at 400 RPS, required in-flight threads jump from 20 to 1,000—instantly saturating a 200-thread server pool and starving unrelated health/fast endpoints."
+      },
+      "sectionDiagram": {
+        "kind": "cache-tier",
+        "eyebrow": "Bulkhead Thread Pool Topology",
+        "title": "Dedicated Bounded Executors Sized via L = λW",
+        "nodes": [
+          {
+            "label": "Tomcat Ingress",
+            "role": "200 threads (non-blocking)"
+          },
+          {
+            "label": "/catalog Pool",
+            "role": "L = 600 * 0.01s = 6"
+          },
+          {
+            "label": "/checkout Bulkhead",
+            "role": "40 threads + Q(20)"
+          },
+          {
+            "label": "Fraud Client",
+            "role": "150ms timeout + 503 shed"
+          }
+        ],
+        "edges": [
+          {
+            "label": "p99 < 25ms"
+          },
+          {
+            "label": "AbortPolicy -> 503"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Little's Law",
+            "detail": "Concurrency L = Arrival Rate (λ) × Latency (W)."
+          },
+          {
+            "label": "Bounded Queue",
+            "detail": "Small ArrayBlockingQueue(20) absorbs micro-bursts without latency bloat."
+          },
+          {
+            "label": "AbortPolicy",
+            "detail": "Sheds excess load with 503 instead of starving /catalog."
+          },
+          {
+            "label": "Fast Timeouts",
+            "detail": "150 ms fraud timeout caps worst-case thread hold time."
+          }
+        ],
+        "summary": "Per-dependency bulkheads sized with Little's Law contain brownouts to the degraded endpoint."
+      },
+      "markdownContent": "```java\nimport java.net.http.*;\nimport java.time.Duration;\nimport java.util.concurrent.*;\nimport java.util.concurrent.atomic.AtomicLong;\n\npublic class FraudBulkheadClient {\n    private final Semaphore bulkhead = new Semaphore(40);\n    private final HttpClient http = HttpClient.newBuilder()\n            .connectTimeout(Duration.ofMillis(100)).build();\n    private final ConcurrentLinkedDeque<Boolean> slowWindow = new ConcurrentLinkedDeque<>();\n    private final AtomicLong openUntilNano = new AtomicLong(0);\n\n    public String checkFraud(HttpRequest req) throws Exception {\n        if (System.nanoTime() < openUntilNano.get()) {\n            throw new RejectedExecutionException(\"Fraud circuit OPEN\");\n        }\n        if (!bulkhead.tryAcquire()) {\n            throw new RejectedExecutionException(\"Fraud bulkhead FULL (40/40)\");\n        }\n        long start = System.nanoTime();\n        boolean slowOrFailed = false;\n        try {\n            HttpRequest timed = HttpRequest.newBuilder(req, (k, v) -> true)\n                    .timeout(Duration.ofMillis(250)).build();\n            HttpResponse<String> res = http.send(timed, HttpResponse.BodyHandlers.ofString());\n            if (System.nanoTime() - start > 200_000_000L || res.statusCode() >= 500) {\n                slowOrFailed = true;\n            }\n            return res.body();\n        } catch (Exception e) {\n            slowOrFailed = true;\n            throw e;\n        } finally {\n            bulkhead.release();\n            recordOutcome(slowOrFailed);\n        }\n    }\n\n    private synchronized void recordOutcome(boolean slowOrFailed) {\n        slowWindow.addLast(slowOrFailed);\n        if (slowWindow.size() > 50) slowWindow.removeFirst();\n        if (slowWindow.size() == 50 && slowWindow.stream().filter(b -> b).count() >= 25) {\n            openUntilNano.set(System.nanoTime() + 10_000_000_000L); // Open 10s\n            slowWindow.clear();\n        }\n    }\n}\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where Little's Law Sizing Applies in System Design",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Little's Law governs capacity planning across every queuing tier:",
+        "core": "- **Microservice Thread & Connection Pools**: Sizing HikariCP (`connections = RPS * query_time`) and HTTP client pools.\n- **API Gateways & BFFs**: Isolating slow third-party payment/shipping APIs from core catalog reads.\n- **Autoscaling & Capacity Forecasting**: Predicting pod count from target p99 latency and peak RPS.",
+        "deepDive": "In production deployments of Sizing Thread Pools with Little's Law, watch how where little's law sizing applies in system design interacts with tail latency, retry amplification, and partial failures. By Little's Law (`L = lambda * W`), when a downstream payment API browns out from 50 ms to 2,500 ms at 400 RPS, required in-flight threads jump from 20 to 1,000—instantly saturating a 200-thread server pool and starving unrelated health/fast endpoints."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "bulkhead-fault-isolation",
+          "title": "Concept: Bulkhead & Fault Isolation",
+          "kind": "concept"
+        },
+        {
+          "slug": "thread-pool-design",
+          "title": "Concept: Thread Pool Design",
+          "kind": "concept"
+        },
+        {
+          "slug": "capacity-planning-forecasting",
+          "title": "Concept: Capacity Planning & Forecasting",
+          "kind": "concept"
+        },
+        {
+          "slug": "circuit-breaker-pattern",
+          "title": "System Design: Circuit Breaker Pattern",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Using Little's Law ($L = \\lambda W$), how many concurrent threads are needed for 400 RPS at 50 ms average latency (or 100 ms p99)?",
+      "options": [
+        {
+          "id": "a",
+          "text": "20 threads at average (400 × 0.05s), or 40 threads at p99 (400 × 0.10s)",
+          "correct": true,
+          "feedback": "Correct: $L = \\lambda W$ directly relates arrival rate, latency, and required concurrency."
+        },
+        {
+          "id": "b",
+          "text": "400 threads regardless of latency",
+          "correct": false,
+          "feedback": "Arrival rate alone does not determine concurrency; latency $W$ scales it linearly."
+        },
+        {
+          "id": "c",
+          "text": "8,000 threads (400 / 0.05s)",
+          "correct": false,
+          "feedback": "Concurrency is $\\lambda \\times W$, not $\\lambda / W$."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Using Little's Law ($L = \\lambda W$), how many concurrent threads are needed for 400 RPS at 50 ms average latency (or 100 ms p99)?",
+        "options": [
+          {
+            "id": "a",
+            "text": "20 threads at average (400 × 0.05s), or 40 threads at p99 (400 × 0.10s)",
+            "correct": true,
+            "feedback": "Correct: $L = \\lambda W$ directly relates arrival rate, latency, and required concurrency."
+          },
+          {
+            "id": "b",
+            "text": "400 threads regardless of latency",
+            "correct": false,
+            "feedback": "Arrival rate alone does not determine concurrency; latency $W$ scales it linearly."
+          },
+          {
+            "id": "c",
+            "text": "8,000 threads (400 / 0.05s)",
+            "correct": false,
+            "feedback": "Concurrency is $\\lambda \\times W$, not $\\lambda / W$."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why Little's Law Thread Pool Sizing Matters', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "b",
+            "text": "A shared **200-thread Tomcat pool** serves **1,000 RPS**: **600 RPS** of fast /catalog (10 ms) and **400 RPS** of /checkout calling a fraud API (50 ms).",
+            "correct": true,
+            "feedback": "Correct: A shared **200-thread Tomcat pool** serves **1,000 RPS**: **600 RPS** of fast /catalog (10 ms) and **400 RPS** of /checkout calling a fraud API (50 ms)."
+          },
+          {
+            "id": "c",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Real-World Impact of Shared-Pool Brownouts', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "b",
+            "text": "Without bulkhead isolation and bounded queues: 1.",
+            "correct": true,
+            "feedback": "Correct: Without bulkhead isolation and bounded queues: 1."
+          },
+          {
+            "id": "c",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** A shared **200-thread Tomcat pool** serves **1,000 RPS**: **600 RPS** of fast `/catalog` (`10 ms`) and **400 RPS** of `/checkout` calling a fraud API (`50 ms`).\n\n**How It Flows:** Think of Sizing Thread Pools with Little's Law as a clear step-by-step chain: /catalog (600 RPS) -> /checkout (400 RPS) -> Tomcat (200) -> Fraud API (2.5s) -> Tomcat Ingress.\n\n**Why Beginners Should Care:** Isolate each downstream dependency behind its own bounded bulkhead + strict timeout, apply Little's Law (`threads = RPS * p99_latency`) for sizing, and shed load early via adaptive concurrency limits.",
+      "spark": {
+        "summary": "A shared **200-thread Tomcat pool** serves **1,000 RPS**: **600 RPS** of fast `/catalog` (`10 ms`) and **400 RPS** of `/checkout` calling a fraud API (`50 ms`).",
+        "keyTakeaway": "Isolate each downstream dependency behind its own bounded bulkhead + strict timeout, apply Little's Law (`threads = RPS * p99_latency`) for sizing, and shed load early via adaptive concurrency limits."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why Little's Law Thread Pool Sizing Matters",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why Little's Law Thread Pool Sizing Matters works from first principles.",
+          "explanation": "A shared **200-thread Tomcat pool** serves **1,000 RPS**: **600 RPS** of fast `/catalog` (`10 ms`) and **400 RPS** of `/checkout` calling a fraud API (`50 ms`). By **Little's Law ($L = \\lambda W$)**, normal concurrency is $600 \\times 0.01 + 400 \\times 0.05 = 26$ threads.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Real-World Impact of Shared-Pool Brownouts",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without Real-World Impact of Shared-Pool Brownouts under real concurrency or scale.",
+          "explanation": "Without bulkhead isolation and bounded queues: 1. **100% Blast Radius**: A slow third-party fraud API starves fast, healthy `/catalog` and `/health` endpoints. 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Little's Law Saturation vs. Bulkhead",
+            "title": "Shared 200-Thread Freeze vs. Per-Dependency Bulkhead",
+            "actors": [
+              {
+                "id": "cat",
+                "label": "/catalog (600 RPS)"
+              },
+              {
+                "id": "chk",
+                "label": "/checkout (400 RPS)"
+              },
+              {
+                "id": "pool",
+                "label": "Tomcat (200)"
+              },
+              {
+                "id": "fraud",
+                "label": "Fraud API (2.5s)"
+              }
+            ],
+            "events": [
+              {
+                "from": "chk",
+                "to": "pool",
+                "label": "Naive: 400 * 2.5s = 1000 threads needed",
+                "status": "fail"
+              },
+              {
+                "from": "cat",
+                "to": "pool",
+                "label": "/catalog starved -> 503 outage",
+                "status": "fail"
+              },
+              {
+                "from": "chk",
+                "to": "fraud",
+                "label": "Fixed: Bulkhead(40) + 150ms timeout",
+                "status": "ok"
+              },
+              {
+                "from": "cat",
+                "to": "pool",
+                "label": "/catalog uses 6 threads (<25ms p99)",
+                "status": "ok"
+              }
+            ],
+            "summary": "Isolating /checkout behind a 40-thread bulkhead and 150 ms timeout keeps /catalog p99 under 25 ms even during 100% fraud brownout."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive Solution (and Why It Breaks)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+          "explanation": "Raising Tomcat `maxThreads` from 200 to 2,000 causes massive JVM context-switching, 2 GB of thread stack RAM, and still saturates during a 2.5s brownout. Using an unbounded `LinkedBlockingQueue` queues requests indefinitely until callers time out or OOM.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise Solution: Little's Law Bulkheads + Strict Timeouts + Load Shedding",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Size each dependency's pool via $L = \\lambda W$ and isolate failure domains: **Calculate Pool Size**: For 400 RPS `/checkout` at 50 ms normal (150 ms p99 timeout), $L = 400 \\times 0.10\\text{s} = 40$ threads (or `Semaphore(40)`). **Bounded Queue (`ArrayBlockingQueue(20)`) + `AbortPolicy`**: Reject excess `/checkout` calls immediately with `503` / fallback rather than queuing for seconds.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Bulkhead Thread Pool Topology",
+            "title": "Dedicated Bounded Executors Sized via L = λW",
+            "nodes": [
+              {
+                "label": "Tomcat Ingress",
+                "role": "200 threads (non-blocking)"
+              },
+              {
+                "label": "/catalog Pool",
+                "role": "L = 600 * 0.01s = 6"
+              },
+              {
+                "label": "/checkout Bulkhead",
+                "role": "40 threads + Q(20)"
+              },
+              {
+                "label": "Fraud Client",
+                "role": "150ms timeout + 503 shed"
+              }
+            ],
+            "edges": [
+              {
+                "label": "p99 < 25ms"
+              },
+              {
+                "label": "AbortPolicy -> 503"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Little's Law",
+                "detail": "Concurrency L = Arrival Rate (λ) × Latency (W)."
+              },
+              {
+                "label": "Bounded Queue",
+                "detail": "Small ArrayBlockingQueue(20) absorbs micro-bursts without latency bloat."
+              },
+              {
+                "label": "AbortPolicy",
+                "detail": "Sheds excess load with 503 instead of starving /catalog."
+              },
+              {
+                "label": "Fast Timeouts",
+                "detail": "150 ms fraud timeout caps worst-case thread hold time."
+              }
+            ],
+            "summary": "Per-dependency bulkheads sized with Little's Law contain brownouts to the degraded endpoint."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Isolate each downstream dependency behind its own bounded bulkhead + strict timeout, apply Little's Law (`threads = RPS * p99_latency`) for sizing, and shed load early via adaptive concurrency limits.",
+      "summary": "By Little's Law (`L = lambda * W`), when a downstream payment API browns out from 50 ms to 2,500 ms at 400 RPS, required in-flight threads jump from 20 to 1,000—instantly saturating a 200-thread server pool and starving unrelated health/fast endpoints.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, isolate each downstream dependency behind its own bounded bulkhead + strict timeout, apply Little's Law (`threads = RPS * p99_latency`) for sizing, and shed load early via adaptive concurrency limits."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** A shared **200-thread Tomcat pool** serves **1,000 RPS**: **600 RPS** of fast `/catalog` (`10 ms`) and **400 RPS** of `/checkout` calling a fraud API (`50 ms`).\n\n**Visual & Structural Flow:** Depicts Shared 200-Thread Freeze vs. Per-Dependency Bulkhead (/catalog (600 RPS) -> /checkout (400 RPS) -> Tomcat (200) -> Fraud API (2.5s)); Dedicated Bounded Executors Sized via L = λW (Tomcat Ingress -> /catalog Pool -> /checkout Bulkhead -> Fraud Client).\n\n**Trade-Offs & Production:** Raising Tomcat `maxThreads` from 200 to 2,000 causes massive JVM context-switching, 2 GB of thread stack RAM, and still saturates during a 2.5s brownout. Size each dependency's pool via $L = \\lambda W$ and isolate failure domains: **Calculate Pool Size**: For 400 RPS `/checkout` at 50 ms normal (150 ms p99 timeout), $L = 400 \\times.\n\n**Failure Modes & Application:** Little's Law governs capacity planning across every queuing tier: **Microservice Thread & Connection Pools**: Sizing HikariCP (`connections = RPS * query_time`) and HTTP client pools.",
+      "spark": {
+        "summary": "By Little's Law (`L = lambda * W`), when a downstream payment API browns out from 50 ms to 2,500 ms at 400 RPS, required in-flight threads jump from 20 to 1,000—instantly saturating a 200-thread server pool and starving unrelated health/fast endpoints.",
+        "keyTakeaway": "Isolate each downstream dependency behind its own bounded bulkhead + strict timeout, apply Little's Law (`threads = RPS * p99_latency`) for sizing, and shed load early via adaptive concurrency limits."
+      },
+      "summary": "By Little's Law (`L = lambda * W`), when a downstream payment API browns out from 50 ms to 2,500 ms at 400 RPS, required in-flight threads jump from 20 to 1,000—instantly saturating a 200-thread server pool and starving unrelated health/fast endpoints.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, isolate each downstream dependency behind its own bounded bulkhead + strict timeout, apply Little's Law (`threads = RPS * p99_latency`) for sizing, and shed load early via adaptive concurrency limits."
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** By Little's Law (`L = lambda * W`), when a downstream payment API browns out from 50 ms to 2,500 ms at 400 RPS, required in-flight threads jump from 20 to 1,000—instantly saturating a 200-thread server pool and starving unrelated health/fast endpoints.\n\n**Production Trade-Offs:** Raising Tomcat `maxThreads` from 200 to 2,000 causes massive JVM context-switching, 2 GB of thread stack RAM, and still saturates during a 2.5s brownout.\n\n**Failure Modes & Edge Cases:** Little's Law governs capacity planning across every queuing tier: **Microservice Thread & Connection Pools**: Sizing HikariCP (`connections = RPS * query_time`) and HTTP client pools.\n\n**Principal Takeaway:** Isolate each downstream dependency behind its own bounded bulkhead + strict timeout, apply Little's Law (`threads = RPS * p99_latency`) for sizing, and shed load early via adaptive concurrency limits.",
+      "spark": {
+        "summary": "By Little's Law (`L = lambda * W`), when a downstream payment API browns out from 50 ms to 2,500 ms at 400 RPS, required in-flight threads jump from 20 to 1,000—instantly saturating a 200-thread server pool and starving unrelated health/fast endpoints.",
+        "keyTakeaway": "Isolate each downstream dependency behind its own bounded bulkhead + strict timeout, apply Little's Law (`threads = RPS * p99_latency`) for sizing, and shed load early via adaptive concurrency limits."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why Little's Law Thread Pool Sizing Matters",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why Little's Law Thread Pool Sizing Matters works from first principles.",
+          "explanation": "A shared **200-thread Tomcat pool** serves **1,000 RPS**: **600 RPS** of fast `/catalog` (`10 ms`) and **400 RPS** of `/checkout` calling a fraud API (`50 ms`). By **Little's Law ($L = \\lambda W$)**, normal concurrency is $600 \\times 0.01 + 400 \\times 0.05 = 26$ threads. When the fraud API browns out to **2,500 ms**, `/checkout` alone demands $400 \\times 2.5 = 1,000$ threads—instantly saturating all 200 Tomcat threads and taking down `/catalog` (`< 25 ms` SLA) and `/health`.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Real-World Impact of Shared-Pool Brownouts",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without Real-World Impact of Shared-Pool Brownouts under real concurrency or scale.",
+          "explanation": "Without bulkhead isolation and bounded queues:\n\n1. **100% Blast Radius**: A slow third-party fraud API starves fast, healthy `/catalog` and `/health` endpoints.\n2. **Queueing Delay Explosion**: Unbounded `LinkedBlockingQueue`s hide saturation while p99 latency climbs to tens of seconds.\n3. **Kubernetes Probe Cascade**: Failed `/health` checks trigger pod restarts, shrinking total capacity during the incident.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Little's Law Saturation vs. Bulkhead",
+            "title": "Shared 200-Thread Freeze vs. Per-Dependency Bulkhead",
+            "actors": [
+              {
+                "id": "cat",
+                "label": "/catalog (600 RPS)"
+              },
+              {
+                "id": "chk",
+                "label": "/checkout (400 RPS)"
+              },
+              {
+                "id": "pool",
+                "label": "Tomcat (200)"
+              },
+              {
+                "id": "fraud",
+                "label": "Fraud API (2.5s)"
+              }
+            ],
+            "events": [
+              {
+                "from": "chk",
+                "to": "pool",
+                "label": "Naive: 400 * 2.5s = 1000 threads needed",
+                "status": "fail"
+              },
+              {
+                "from": "cat",
+                "to": "pool",
+                "label": "/catalog starved -> 503 outage",
+                "status": "fail"
+              },
+              {
+                "from": "chk",
+                "to": "fraud",
+                "label": "Fixed: Bulkhead(40) + 150ms timeout",
+                "status": "ok"
+              },
+              {
+                "from": "cat",
+                "to": "pool",
+                "label": "/catalog uses 6 threads (<25ms p99)",
+                "status": "ok"
+              }
+            ],
+            "summary": "Isolating /checkout behind a 40-thread bulkhead and 150 ms timeout keeps /catalog p99 under 25 ms even during 100% fraud brownout."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive Solution (and Why It Breaks)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+          "explanation": "Raising Tomcat `maxThreads` from 200 to 2,000 causes massive JVM context-switching, 2 GB of thread stack RAM, and still saturates during a 2.5s brownout. Using an unbounded `LinkedBlockingQueue` queues requests indefinitely until callers time out or OOM.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise Solution: Little's Law Bulkheads + Strict Timeouts + Load Shedding",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Size each dependency's pool via $L = \\lambda W$ and isolate failure domains:\n\n- **Calculate Pool Size**: For 400 RPS `/checkout` at 50 ms normal (150 ms p99 timeout), $L = 400 \\times 0.10\\text{s} = 40$ threads (or `Semaphore(40)`).\n- **Bounded Queue (`ArrayBlockingQueue(20)`) + `AbortPolicy`**: Reject excess `/checkout` calls immediately with `503` / fallback rather than queuing for seconds.\n- **Adaptive Concurrency / Timeout**: Enforce a strict 150 ms socket timeout on the fraud client so hung connections release threads fast, leaving 160+ Tomcat threads free for `/catalog` (`6` threads needed).",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Bulkhead Thread Pool Topology",
+            "title": "Dedicated Bounded Executors Sized via L = λW",
+            "nodes": [
+              {
+                "label": "Tomcat Ingress",
+                "role": "200 threads (non-blocking)"
+              },
+              {
+                "label": "/catalog Pool",
+                "role": "L = 600 * 0.01s = 6"
+              },
+              {
+                "label": "/checkout Bulkhead",
+                "role": "40 threads + Q(20)"
+              },
+              {
+                "label": "Fraud Client",
+                "role": "150ms timeout + 503 shed"
+              }
+            ],
+            "edges": [
+              {
+                "label": "p99 < 25ms"
+              },
+              {
+                "label": "AbortPolicy -> 503"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Little's Law",
+                "detail": "Concurrency L = Arrival Rate (λ) × Latency (W)."
+              },
+              {
+                "label": "Bounded Queue",
+                "detail": "Small ArrayBlockingQueue(20) absorbs micro-bursts without latency bloat."
+              },
+              {
+                "label": "AbortPolicy",
+                "detail": "Sheds excess load with 503 instead of starving /catalog."
+              },
+              {
+                "label": "Fast Timeouts",
+                "detail": "150 ms fraud timeout caps worst-case thread hold time."
+              }
+            ],
+            "summary": "Per-dependency bulkheads sized with Little's Law contain brownouts to the degraded endpoint."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where Little's Law Sizing Applies in System Design",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Little's Law governs capacity planning across every queuing tier:\n\n- **Microservice Thread & Connection Pools**: Sizing HikariCP (`connections = RPS * query_time`) and HTTP client pools.\n- **API Gateways & BFFs**: Isolating slow third-party payment/shipping APIs from core catalog reads.\n- **Autoscaling & Capacity Forecasting**: Predicting pod count from target p99 latency and peak RPS.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Isolate each downstream dependency behind its own bounded bulkhead + strict timeout, apply Little's Law (`threads = RPS * p99_latency`) for sizing, and shed load early via adaptive concurrency limits.",
+      "summary": "By Little's Law (`L = lambda * W`), when a downstream payment API browns out from 50 ms to 2,500 ms at 400 RPS, required in-flight threads jump from 20 to 1,000—instantly saturating a 200-thread server pool and starving unrelated health/fast endpoints.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, isolate each downstream dependency behind its own bounded bulkhead + strict timeout, apply Little's Law (`threads = RPS * p99_latency`) for sizing, and shed load early via adaptive concurrency limits."
+    }
+  },
+  "pedagogicalFramework": "CLASSE",
+  "simulation": {
+    "title": "Sizing Thread Pools with Little's Law — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "prod",
+        "label": "Producers",
+        "role": "Concurrent Tasks"
+      },
+      {
+        "id": "queue",
+        "label": "Bounded Queue",
+        "role": "Backpressure Gate"
+      },
+      {
+        "id": "pool",
+        "label": "Worker Pool",
+        "role": "Isolated Threads"
+      },
+      {
+        "id": "sink",
+        "label": "Shared Memory",
+        "role": "CAS / Padded State"
+      }
+    ],
+    "edges": [
+      {
+        "from": "prod",
+        "to": "queue",
+        "label": "offer(task)"
+      },
+      {
+        "from": "queue",
+        "to": "pool",
+        "label": "dispatch"
+      },
+      {
+        "from": "pool",
+        "to": "sink",
+        "label": "CAS update"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why Little's Law Thread Pool Sizing Matters",
+        "actionLabel": "offer(task)",
+        "status": "healthy",
+        "activeNodeIds": [
+          "prod",
+          "queue"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "offer(task)",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Producers sends work to Bounded Queue (Why Little's Law Thread Pool Sizing Matters)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Real-World Impact of Shared-Pool Brownouts",
+        "actionLabel": "dispatch",
+        "status": "healthy",
+        "activeNodeIds": [
+          "queue",
+          "pool"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "dispatch",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Bounded Queue coordinates with Worker Pool while preserving the core invariant (Real-World Impact of Shared-Pool Brownouts)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Naive Solution (and Why It Breaks)",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "pool",
+          "sink"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, Shared Memory absorbs pressure without cascading (Naive Solution (and Why It Breaks))."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Where Little's Law Sizing Applies in System Design",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "prod",
+          "queue",
+          "pool",
+          "sink"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Where Little's Law Sizing Applies in System Design)."
+      }
+    ]
+  }
+}

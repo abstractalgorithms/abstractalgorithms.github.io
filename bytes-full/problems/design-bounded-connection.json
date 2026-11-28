@@ -1,0 +1,702 @@
+{
+  "id": "design-bounded-connection",
+  "slug": "design-bounded-connection",
+  "title": "Low-Level Design: Thread-Safe Bounded Connection Pool for 500+ Workers",
+  "problemType": "system-design",
+  "difficulty": "medium",
+  "prompt": "Design and implement a thread-safe, bounded connection pool in Java/Python that lets 500+ concurrent worker threads share at most C = 32 database connections with O(1) borrow/return, fast-fail borrow(timeoutMs) backpressure, leak-proof AutoCloseable returns, and automatic stale-socket eviction.",
+  "spark": {
+    "summary": "Architect a BoundedConnectionPool using ArrayBlockingQueue(C), CAS totalCreated slot caps, monotonic nanoTime deadlines, idempotent AutoCloseable handles, and a jittered Health Sweeper.",
+    "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, bounding physical sockets at C = 32 with fast-fail timeouts protects PostgreSQL from max_connections crashes while keeping borrow/return O(1).",
+    "byteSummary": "Production Problem: 500 worker threads handling 2,000 req/s must share C = 32 PostgreSQL TCP+TLS sockets without exceeding DB max_connections = 100, leaking slots on exceptions, or hanging on dead NAT-dropped sockets.\n\nCore LLD Architecture: Back the pool with ArrayBlockingQueue<PooledConn>(32), reserve lazy creation slots atomically via AtomicInteger CAS, bound wait times with System.nanoTime() deadlines, and wrap handles in an idempotent AutoCloseable.\n\nOperational Resilience: Validate isAlive() and jittered maxLifetimeMs on borrow/sweep, decrement totalCreated on any dial failure, and drain idle sockets cleanly on shutdown."
+  },
+  "learningJourney": [
+    {
+      "id": "stage-1",
+      "eyebrow": "Stage 1 · Foundation",
+      "title": "API Contract & Core Pool Invariants",
+      "level": "foundation",
+      "purpose": "Define the public LLD interface (borrow, release, close) and the strict O(C) capacity invariant.",
+      "explanation": {
+        "foundation": "Think of **API Contract & Core Pool Invariants** as the intuition layer for Low-Level Design: Thread-Safe Bounded Connection Pool for 500+ Workers: Define the public LLD interface (borrow, release, close) and the strict O(C) capacity invariant.",
+        "core": "A clean LLD separates pool management (`BoundedConnectionPool`) from the caller-facing handle (`PooledConn implements AutoCloseable`). The central invariant: `activeSockets + idle.size() <= maxSize` must hold under any interleaving of 500 threads.",
+        "deepDive": "Under heavy load or partial failure, api contract & core pool invariants becomes a critical lever for predictable latency and correctness. Harden the pool with transaction rollback on release, jittered maxLifetime sweeping, LIFO/FIFO contention tuning, and interrupt-safe shutdown draining."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "LLD Contract",
+        "title": "BoundedConnectionPool & AutoCloseable Handle API",
+        "nodes": [
+          {
+            "id": "api",
+            "label": "borrow(timeoutMs)",
+            "sub": "Returns PooledConn or throws",
+            "role": "source"
+          },
+          {
+            "id": "inv",
+            "label": "totalCreated <= C (32)",
+            "sub": "Hard physical socket cap",
+            "role": "process"
+          },
+          {
+            "id": "rel",
+            "label": "PooledConn.close()",
+            "sub": "Idempotent O(1) return",
+            "role": "store"
+          }
+        ],
+        "edges": [
+          {
+            "from": "api",
+            "to": "inv",
+            "label": "Acquire or dial"
+          },
+          {
+            "from": "inv",
+            "to": "rel",
+            "label": "try-with-resources"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Package-Private Release",
+            "detail": "Callers only call conn.close(); pool.release(conn) stays internal."
+          },
+          {
+            "label": "Explicit Timeout",
+            "detail": "Never offer an unbounded borrow() without a timeout default."
+          }
+        ],
+        "summary": "Caption: Separating pool orchestration from an AutoCloseable handle enforces clean, leak-proof resource ownership.",
+        "caption": "Caption: Separating pool orchestration from an AutoCloseable handle enforces clean, leak-proof resource ownership."
+      }
+    },
+    {
+      "id": "stage-2",
+      "eyebrow": "Stage 2 · Foundation",
+      "title": "Non-Blocking Fast Path & CAS Lazy Initialization",
+      "level": "foundation",
+      "purpose": "Serve warm idle connections in O(1) without blocking, and dial new sockets lazily up to C = 32.",
+      "explanation": {
+        "foundation": "Think of **Non-Blocking Fast Path & CAS Lazy Initialization** as the intuition layer for Low-Level Design: Thread-Safe Bounded Connection Pool for 500+ Workers: Serve warm idle connections in O(1) without blocking, and dial new sockets lazily up to C = 32.",
+        "core": "In `borrow(timeoutMs)`, first call `idle.poll()` (non-blocking). If `null`, check `totalCreated.get() < maxSize` and race cleanly with `compareAndSet(cur, cur + 1)` so only the winning thread dials a new socket.",
+        "deepDive": "Under heavy load or partial failure, non-blocking fast path & cas lazy initialization becomes a critical lever for predictable latency and correctness. Harden the pool with transaction rollback on release, jittered maxLifetime sweeping, LIFO/FIFO contention tuning, and interrupt-safe shutdown draining."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Acquire Fast Path",
+        "title": "Poll Idle -> CAS Reserve -> Bounded Wait",
+        "nodes": [
+          {
+            "id": "fast",
+            "label": "1. idle.poll()",
+            "sub": "Zero wait if warm socket ready",
+            "role": "source"
+          },
+          {
+            "id": "cas",
+            "label": "2. CAS totalCreated < 32",
+            "sub": "Lazy dial on win",
+            "role": "process"
+          },
+          {
+            "id": "block",
+            "label": "3. idle.poll(rem, NS)",
+            "sub": "Wait up to deadline",
+            "role": "store"
+          }
+        ],
+        "edges": [
+          {
+            "from": "fast",
+            "to": "cas",
+            "label": "If null"
+          },
+          {
+            "from": "cas",
+            "to": "block",
+            "label": "If pool at C=32"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Loop After Stale",
+            "detail": "If an idle socket fails isAlive(), destroy it, decrement totalCreated, and loop."
+          },
+          {
+            "label": "Zero Busy-Spin",
+            "detail": "ArrayBlockingQueue.poll(rem, NS) parks the waiting thread via LockSupport."
+          }
+        ],
+        "summary": "Caption: The three-step borrow path prioritizes warm idle sockets, lazily scales to C, and parks cleanly when full.",
+        "caption": "Caption: The three-step borrow path prioritizes warm idle sockets, lazily scales to C, and parks cleanly when full."
+      },
+      "decisionFramework": {
+        "problem": "How to implement Low-Level Design: Thread-Safe Bounded Connection Pool for 500+ Workers without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "To keep the architecture evolvable without sacrificing reliability, bounding physical sockets at C = 32 with fast-fail timeouts protects PostgreSQL from max_connections crashes while keeping borrow/return O(1).",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Low-Level Design: Thread-Safe Bounded Connection Pool for 500+ Workers experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-3",
+      "eyebrow": "Stage 3 · Intermediate",
+      "title": "Full Thread-Safe Java Implementation",
+      "level": "intermediate",
+      "purpose": "Assemble the complete, deadlock-free Java pool with dial-failure rollback and validation.",
+      "explanation": {
+        "foundation": "Notice how every failure path (`!isAlive()`, `isExpired()`, dial exception, or `!idle.offer(conn)`) decrements `totalCreated` and closes the underlying socket cleanly.",
+        "core": "```java\nimport java.util.concurrent.*;\nimport java.util.concurrent.atomic.AtomicInteger;\n\npublic class BoundedConnectionPool implements AutoCloseable {\n    private final BlockingQueue<PooledConn> idle;\n    private final AtomicInteger totalCreated = new AtomicInteger(0);\n    private final int maxSize;\n    private final long maxLifetimeMs;\n\npublic BoundedConnectionPool(int maxSize, long maxLifetimeMs) {\n        this.maxSize = maxSize;\n        this.maxLifetimeMs = maxLifetimeMs;\n        this.idle = new ArrayBlockingQueue<>(maxSize);\n    }",
+        "deepDive": "public PooledConn borrow(long timeoutMs) throws InterruptedException, TimeoutException {\n        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);\n        while (true) {\n            PooledConn conn = idle.poll();\n            if (conn != null) {\n                if (conn.isAlive() && !conn.isExpired(maxLifetimeMs)) return conn;\n                totalCreated.decrementAndGet();\n                conn.destroyQuietly();\n                continue;\n            }\n            int cur = totalCreated.get();\n            if (cur < maxSize && totalCreated.compareAndSet(cur, cur + 1)) {\n                try { return new PooledConn(this); }\n                catch (RuntimeException e) { totalCreated.decrementAndGet(); throw e; }\n            }\n            long rem = deadline - System.nanoTime();\n            if (rem <= 0) throw new TimeoutException(\"Pool exhausted after \" + timeoutMs + \"ms\");\n            conn = idle.poll(rem, TimeUnit.NANOSECONDS);\n            if (conn != null && conn.isAlive() && !conn.isExpired(maxLifetimeMs)) return conn;\n            if (conn != null) { totalCreated.decrementAndGet(); conn.destroyQuietly(); }\n        }\n    }\n}\n```"
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Reference Code",
+        "title": "Leak-Free Slot Accounting Across All Branches",
+        "nodes": [
+          {
+            "id": "inc",
+            "label": "CAS +1 on Dial",
+            "sub": "Slot reserved",
+            "role": "source"
+          },
+          {
+            "id": "use",
+            "label": "Valid Borrow / Release",
+            "sub": "Slot stays accounted",
+            "role": "process"
+          },
+          {
+            "id": "dec",
+            "label": "CAS -1 on Destroy",
+            "sub": "Dead, expired, or dial error",
+            "role": "store"
+          }
+        ],
+        "edges": [
+          {
+            "from": "inc",
+            "to": "use",
+            "label": "Healthy"
+          },
+          {
+            "from": "use",
+            "to": "dec",
+            "label": "Evict / fail"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Accounting Invariant",
+            "detail": "Every +1 in totalCreated has a matching -1 on destroyQuietly() or dial failure."
+          },
+          {
+            "label": "No Nested Locks",
+            "detail": "Dialing happens outside any pool lock so slow DB handshakes never block other threads."
+          }
+        ],
+        "summary": "Caption: Dialing outside locks and balancing every CAS +1 with a -1 on destruction prevents both contention and slot leaks.",
+        "caption": "Caption: Dialing outside locks and balancing every CAS +1 with a -1 on destruction prevents both contention and slot leaks."
+      }
+    },
+    {
+      "id": "stage-4",
+      "eyebrow": "Stage 4 · Intermediate",
+      "title": "Handling Uncommitted Transactions & Double-Close Bugs",
+      "level": "intermediate",
+      "purpose": "Prevent dirty transaction state or duplicate queue entries when callers misbehave.",
+      "explanation": {
+        "foundation": "Think of **Handling Uncommitted Transactions & Double-Close Bugs** as the intuition layer for Low-Level Design: Thread-Safe Bounded Connection Pool for 500+ Workers: Prevent dirty transaction state or duplicate queue entries when callers misbehave.",
+        "core": "If a caller starts a SQL transaction, hits an application exception, and exits `try-with-resources`, returning that dirty socket to `idle` would poison the next thread! `release(conn)` must reset `autoCommit = true` / rollback pending work, and `PooledConn.close()` must guard with `AtomicBoolean` so double-close is a safe no-op.",
+        "deepDive": "Under heavy load or partial failure, handling uncommitted transactions & double-close bugs becomes a critical lever for predictable latency and correctness. Harden the pool with transaction rollback on release, jittered maxLifetime sweeping, LIFO/FIFO contention tuning, and interrupt-safe shutdown draining."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "State Hygiene",
+        "title": "Sanitizing Handles Before Re-Queueing",
+        "nodes": [
+          {
+            "id": "close",
+            "label": "PooledConn.close()",
+            "sub": "AtomicBoolean once-guard",
+            "role": "source"
+          },
+          {
+            "id": "reset",
+            "label": "Rollback Dirty Tx",
+            "sub": "Reset session state",
+            "role": "process"
+          },
+          {
+            "id": "offer",
+            "label": "idle.offer(conn)",
+            "sub": "Ready for next worker",
+            "role": "store"
+          }
+        ],
+        "edges": [
+          {
+            "from": "close",
+            "to": "reset",
+            "label": "First close only"
+          },
+          {
+            "from": "reset",
+            "to": "offer",
+            "label": "If clean & alive"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Session Isolation",
+            "detail": "Never return a connection with an open transaction or altered session variable."
+          },
+          {
+            "label": "Destroy on Reset Fail",
+            "detail": "If rollback() throws an IOException, destroy the socket instead of re-queueing."
+          }
+        ],
+        "summary": "Caption: Idempotent close guards and session rollbacks prevent dirty state from leaking between worker threads.",
+        "caption": "Caption: Idempotent close guards and session rollbacks prevent dirty state from leaking between worker threads."
+      }
+    },
+    {
+      "id": "stage-5",
+      "eyebrow": "Stage 5 · Intermediate",
+      "title": "Background Health Sweeper & Jittered maxLifetime",
+      "level": "intermediate",
+      "purpose": "Proactively evict idle stale sockets and stagger connection recycling to avoid synchronized re-dial spikes.",
+      "explanation": {
+        "foundation": "Think of **Background Health Sweeper & Jittered maxLifetime** as the intuition layer for Low-Level Design: Thread-Safe Bounded Connection Pool for 500+ Workers: Proactively evict idle stale sockets and stagger connection recycling to avoid synchronized re-dial spikes.",
+        "core": "A scheduled daemon thread (`ScheduledExecutorService`) wakes every 30s, drains or inspects idle connections, and destroys any socket exceeding `maxLifetimeMs` (e.g., 30 min +/- 10% random jitter) or failing a lightweight liveness probe.",
+        "deepDive": "Under heavy load or partial failure, background health sweeper & jittered maxlifetime becomes a critical lever for predictable latency and correctness. Harden the pool with transaction rollback on release, jittered maxLifetime sweeping, LIFO/FIFO contention tuning, and interrupt-safe shutdown draining."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Health Sweeper",
+        "title": "Periodic Idle Eviction with Jittered TTL",
+        "nodes": [
+          {
+            "id": "sched",
+            "label": "30s Daemon Sweeper",
+            "sub": "Non-blocking idle scan",
+            "role": "source"
+          },
+          {
+            "id": "jit",
+            "label": "maxLifetime +/- 10%",
+            "sub": "Prevents mass expiry",
+            "role": "process"
+          },
+          {
+            "id": "clean",
+            "label": "Evict Stale Sockets",
+            "sub": "Zero 500s on NAT drops",
+            "role": "store"
+          }
+        ],
+        "edges": [
+          {
+            "from": "sched",
+            "to": "jit",
+            "label": "Check age & liveness"
+          },
+          {
+            "from": "jit",
+            "to": "clean",
+            "label": "Recycle smoothly"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Staggered Recycling",
+            "detail": "Randomizing per-connection maxLifetime avoids all 32 sockets re-handshaking at the exact same second."
+          },
+          {
+            "label": "Daemon Thread",
+            "detail": "Mark the sweeper thread as daemon and cancel its future in pool.close()."
+          }
+        ],
+        "summary": "Caption: Jittered maxLifetime and periodic sweeping keep idle connections fresh without synchronized re-dial spikes.",
+        "caption": "Caption: Jittered maxLifetime and periodic sweeping keep idle connections fresh without synchronized re-dial spikes."
+      }
+    },
+    {
+      "id": "stage-6",
+      "eyebrow": "Stage 6 · Advanced",
+      "title": "Starvation & Fairness: FIFO vs LIFO Under Heavy Contention",
+      "level": "advanced",
+      "purpose": "Choose between fair wait queues (`ArrayBlockingQueue(C, true)`) and LIFO socket reuse.",
+      "explanation": {
+        "foundation": "Think of **Starvation & Fairness: FIFO vs LIFO Under Heavy Contention** as the intuition layer for Low-Level Design: Thread-Safe Bounded Connection Pool for 500+ Workers: Choose between fair wait queues (`ArrayBlockingQueue(C, true)`) and LIFO socket reuse.",
+        "core": "`ArrayBlockingQueue(C, true)` enforces FIFO waiter wakeup (preventing thread starvation under 500-thread contention at a minor throughput cost), whereas unfair mode (`false`) maximizes throughput via thread-local cache warmth.",
+        "deepDive": "Under heavy load or partial failure, starvation & fairness: fifo vs lifo under heavy contention becomes a critical lever for predictable latency and correctness. Harden the pool with transaction rollback on release, jittered maxLifetime sweeping, LIFO/FIFO contention tuning, and interrupt-safe shutdown draining."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Contention Tuning",
+        "title": "Fair FIFO Waiters vs High-Throughput Unfair Mode",
+        "nodes": [
+          {
+            "id": "w500",
+            "label": "500 Contending Threads",
+            "sub": "Waiting on C=32",
+            "role": "source"
+          },
+          {
+            "id": "fifo",
+            "label": "fair = true (FIFO)",
+            "sub": "Zero thread starvation",
+            "role": "process"
+          },
+          {
+            "id": "unfair",
+            "label": "fair = false (Default)",
+            "sub": "Higher peak QPS",
+            "role": "store"
+          }
+        ],
+        "edges": [
+          {
+            "from": "w500",
+            "to": "fifo",
+            "label": "Strict p99 tail"
+          },
+          {
+            "from": "w500",
+            "to": "unfair",
+            "label": "Max throughput"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Tail Latency vs QPS",
+            "detail": "Fair mode bounds worst-case wait variance; unfair mode avoids extra park/unpark context switches."
+          },
+          {
+            "label": "Pool Size Formula",
+            "detail": "Keep C close to (2 * DB_cores + effective_spindle_count) rather than matching 500 app threads."
+          }
+        ],
+        "summary": "Caption: Selecting queue fairness trades peak throughput against worst-case waiter tail latency.",
+        "caption": "Caption: Selecting queue fairness trades peak throughput against worst-case waiter tail latency."
+      }
+    },
+    {
+      "id": "stage-7",
+      "eyebrow": "Stage 7 · Advanced",
+      "title": "Graceful Pool Shutdown & Chaos Testing Checklist",
+      "level": "advanced",
+      "purpose": "Verify pool invariants under simulated DB restarts, slow handshakes, and thread interrupts.",
+      "explanation": {
+        "foundation": "Think of **Graceful Pool Shutdown & Chaos Testing Checklist** as the intuition layer for Low-Level Design: Thread-Safe Bounded Connection Pool for 500+ Workers: Verify pool invariants under simulated DB restarts, slow handshakes, and thread interrupts.",
+        "core": "Before shipping a custom pool, stress-test with 500 threads for 60s under: (1) injected 200ms dial latency, (2) random query exceptions, (3) `Thread.interrupt()` while waiting in `poll()`, and (4) `pool.close()` mid-load—asserting `totalCreated == 0` after all threads exit.",
+        "deepDive": "Under heavy load or partial failure, graceful pool shutdown & chaos testing checklist becomes a critical lever for predictable latency and correctness. Harden the pool with transaction rollback on release, jittered maxLifetime sweeping, LIFO/FIFO contention tuning, and interrupt-safe shutdown draining."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Verification",
+        "title": "Chaos Test Assertions & Zero-Leak Shutdown",
+        "nodes": [
+          {
+            "id": "chaos",
+            "label": "500-Thread Chaos Run",
+            "sub": "Exceptions + interrupts + lag",
+            "role": "source"
+          },
+          {
+            "id": "shut",
+            "label": "pool.close()",
+            "sub": "Drains idle & returned conns",
+            "role": "process"
+          },
+          {
+            "id": "assert",
+            "label": "totalCreated == 0",
+            "sub": "Zero leaked sockets proven",
+            "role": "store"
+          }
+        ],
+        "edges": [
+          {
+            "from": "chaos",
+            "to": "shut",
+            "label": "Trigger shutdown"
+          },
+          {
+            "from": "shut",
+            "to": "assert",
+            "label": "Verify invariant"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Interrupt Handling",
+            "detail": "Preserve InterruptedException in borrow() so shutdown signals wake blocked threads immediately."
+          },
+          {
+            "label": "Zero-Leak Proof",
+            "detail": "Asserting totalCreated == 0 post-shutdown catches every subtle accounting bug."
+          }
+        ],
+        "summary": "Caption: Stress testing with injected dial failures and interrupts proves zero socket leaks on shutdown.",
+        "caption": "Caption: Stress testing with injected dial failures and interrupts proves zero socket leaks on shutdown."
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-1",
+        "question": "Why is `ArrayBlockingQueue<PooledConn>` preferred over `LinkedBlockingQueue` for a bounded connection pool?",
+        "options": [
+          {
+            "id": "a",
+            "text": "LinkedBlockingQueue does not support poll(timeout).",
+            "correct": false,
+            "feedback": "Incorrect: LinkedBlockingQueue supports timed poll()."
+          },
+          {
+            "id": "b",
+            "text": "ArrayBlockingQueue uses a pre-allocated circular array with zero per-enqueue node allocations, eliminating GC pressure on hot borrow/return.",
+            "correct": true,
+            "feedback": "Correct: Pre-allocated ring buffers avoid creating and collecting LinkedBlockingQueue.Node objects on every query."
+          },
+          {
+            "id": "c",
+            "text": "ArrayBlockingQueue automatically dials TCP sockets.",
+            "correct": false,
+            "feedback": "Incorrect: Queue data structures only store object references."
+          },
+          {
+            "id": "d",
+            "text": "LinkedBlockingQueue cannot be bounded.",
+            "correct": false,
+            "feedback": "Incorrect: LinkedBlockingQueue has a bounded constructor, though it still allocates node objects."
+          }
+        ],
+        "explanation": "ArrayBlockingQueue avoids per-operation heap node allocations, reducing GC pressure at thousands of borrows/sec."
+      },
+      {
+        "id": "kc-2",
+        "question": "In `borrow(timeoutMs)`, why is `System.nanoTime()` used to compute the remaining deadline instead of `System.currentTimeMillis()`?",
+        "options": [
+          {
+            "id": "a",
+            "text": "System.currentTimeMillis() always returns 0 on Linux.",
+            "correct": false,
+            "feedback": "Incorrect: currentTimeMillis() returns wall-clock epoch milliseconds."
+          },
+          {
+            "id": "b",
+            "text": "System.nanoTime() only works inside synchronized blocks.",
+            "correct": false,
+            "feedback": "Incorrect: nanoTime() works anywhere."
+          },
+          {
+            "id": "c",
+            "text": "System.nanoTime() is monotonic and immune to NTP wall-clock adjustments that could make timeouts fire early or hang.",
+            "correct": true,
+            "feedback": "Correct: Elapsed time calculations must always use monotonic nanoTime() rather than wall-clock time."
+          },
+          {
+            "id": "d",
+            "text": "System.nanoTime() measures database query cost.",
+            "correct": false,
+            "feedback": "Incorrect: nanoTime() measures elapsed monotonic time."
+          }
+        ],
+        "explanation": "Monotonic System.nanoTime() guarantees elapsed deadline math cannot be corrupted by NTP wall-clock jumps."
+      },
+      {
+        "id": "kc-3",
+        "question": "Why should `maxLifetimeMs` include +/- 10% random jitter per connection?",
+        "options": [
+          {
+            "id": "a",
+            "text": "To prevent all C = 32 connections created at startup from expiring and re-dialing TCP+TLS handshakes simultaneously.",
+            "correct": true,
+            "feedback": "Correct: Jitter spreads connection recycling smoothly over time instead of causing periodic latency spikes."
+          },
+          {
+            "id": "b",
+            "text": "To allow connections to stay open forever.",
+            "correct": false,
+            "feedback": "Incorrect: Jittered maxLifetime still bounds maximum socket age."
+          },
+          {
+            "id": "c",
+            "text": "To bypass the Health Sweeper.",
+            "correct": false,
+            "feedback": "Incorrect: The Health Sweeper enforces each connection's jittered expiration timestamp."
+          },
+          {
+            "id": "d",
+            "text": "To increase DB max_connections.",
+            "correct": false,
+            "feedback": "Incorrect: maxLifetimeMs does not change database server settings."
+          }
+        ],
+        "explanation": "Adding +/- 10% jitter prevents synchronized mass expiration and re-handshaking across all pooled sockets."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Build a thread-safe pool that shares 32 database connections across 500 workers using a bounded queue, a timeout, and AutoCloseable.",
+      "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, bounding physical sockets at C = 32 with fast-fail timeouts protects PostgreSQL from max_connections crashes while keeping borrow/return O(1).",
+      "byteSummary": "Instead of opening 500 separate database connections, workers borrow from a 32-slot ArrayBlockingQueue and automatically return handles when done."
+    },
+    "intermediate": {
+      "summary": "Combine ArrayBlockingQueue(32), CAS totalCreated slot reservation, monotonic nanoTime() deadlines, and idempotent AutoCloseable returns.",
+      "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, bounding physical sockets at C = 32 with fast-fail timeouts protects PostgreSQL from max_connections crashes while keeping borrow/return O(1).",
+      "byteSummary": "This LLD guarantees O(1) borrow/return, strict O(C) socket caps, dial-outside-lock concurrency, and zero slot leaks under exceptions."
+    },
+    "advanced": {
+      "summary": "Harden the pool with transaction rollback on release, jittered maxLifetime sweeping, LIFO/FIFO contention tuning, and interrupt-safe shutdown draining.",
+      "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, bounding physical sockets at C = 32 with fast-fail timeouts protects PostgreSQL from max_connections crashes while keeping borrow/return O(1).",
+      "byteSummary": "Production readiness requires sanitizing dirty SQL sessions on close(), staggering socket expirations with +/- 10% jitter, and exposing wait-queue/timeout telemetry for fast-fail shedding."
+    }
+  },
+  "pedagogicalFramework": "CLASSE",
+  "prerequisites": [
+    {
+      "title": "Thread-Safe Bounded Connection Pool & Health Sweeper",
+      "summary": "A thread-safe bounded connection pool pairs a fixed-capacity ArrayBlockingQueue with an AtomicInteger CAS slot counter, deadline-bounded poll(timeout), AutoCloseable handle return, and maxLifetime health sweeping."
+    }
+  ],
+  "simulation": {
+    "title": "Low-Level Design: Thread-Safe Bounded Connection Pool for 500+ Workers — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "prod",
+        "label": "Producers",
+        "role": "Concurrent Tasks"
+      },
+      {
+        "id": "queue",
+        "label": "Bounded Queue",
+        "role": "Backpressure Gate"
+      },
+      {
+        "id": "pool",
+        "label": "Worker Pool",
+        "role": "Isolated Threads"
+      },
+      {
+        "id": "sink",
+        "label": "Shared Memory",
+        "role": "CAS / Padded State"
+      }
+    ],
+    "edges": [
+      {
+        "from": "prod",
+        "to": "queue",
+        "label": "offer(task)"
+      },
+      {
+        "from": "queue",
+        "to": "pool",
+        "label": "dispatch"
+      },
+      {
+        "from": "pool",
+        "to": "sink",
+        "label": "CAS update"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "API Contract & Core Pool Invariants",
+        "actionLabel": "offer(task)",
+        "status": "healthy",
+        "activeNodeIds": [
+          "prod",
+          "queue"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "offer(task)",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Producers sends work to Bounded Queue (API Contract & Core Pool Invariants)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Non-Blocking Fast Path & CAS Lazy Initialization",
+        "actionLabel": "dispatch",
+        "status": "healthy",
+        "activeNodeIds": [
+          "queue",
+          "pool"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "dispatch",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Bounded Queue coordinates with Worker Pool while preserving the core invariant (Non-Blocking Fast Path & CAS Lazy Initialization)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Full Thread-Safe Java Implementation",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "pool",
+          "sink"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, Shared Memory absorbs pressure without cascading (Full Thread-Safe Java Implementation)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Graceful Pool Shutdown & Chaos Testing Checklist",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "prod",
+          "queue",
+          "pool",
+          "sink"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Graceful Pool Shutdown & Chaos Testing Checklist)."
+      }
+    ]
+  }
+}

@@ -1,0 +1,512 @@
+{
+  "id": "design-zero-trust-edge-delegated-auth",
+  "slug": "design-zero-trust-edge-delegated-auth",
+  "title": "Design a Zero-Trust Multi-Service Delegated Authorization Gateway with Offline Token Attenuation",
+  "domain": "Security",
+  "pedagogicalFramework": "RESHADED",
+  "tagline": "Authorize 100K RPS across 4-hop microservices and AI agents with zero IdP round-trips using Biscuit offline attenuation and local revocation sets.",
+  "purpose": "When multi-hop microservices or AI agents need scoped least-privilege tokens without hitting a central IdP on every hop, design a local-verify Biscuit gateway.",
+  "prerequisites": [
+    {
+      "title": "Decentralized Capability Tokens",
+      "summary": "Macaroons and Biscuit let holders append restrictions offline without being able to remove earlier ones."
+    },
+    {
+      "title": "SPIFFE / mTLS Workload Identity",
+      "summary": "Workload identity proves which service is calling, while capability tokens prove what user permissions it carries."
+    }
+  ],
+  "spark": {
+    "summary": "Replace 4-hop OAuth2 token-exchange calls with Biscuit Ed25519 capability tokens, 5s verification caches, bounded Datalog evaluators, and 3.2 MB Pub/Sub revocation sets.",
+    "keyTakeaway": "When multi-hop microservices or AI agents must narrow user permissions at 100K RPS without bottlenecking a central Identity Provider, issue Biscuit root tokens at the edge, attenuate caveats offline per hop, and verify locally with a 5-second cache and bounded revocation set.",
+    "byteSummary": "In a 100K RPS microservice and AI-agent platform where requests fan out across 4–6 internal hops, calling a central Authorization / IdP service on every hop to exchange narrowed JWTs adds 4–6x load to the IdP and turns it into a latency bottleneck.\n\nA **Zero-Trust Delegated Authorization Gateway** issues root **Biscuit** capability tokens at the edge, lets intermediate services and AI agents attenuate tokens offline with narrow Datalog caveats (`op=read`, `resource=...`, `exp < now + 60s`), and verifies tokens locally at every downstream service using the edge public key + a 5-second cached Datalog evaluation.\n\nEmergency revocations propagate via compact `revocation_id` push streams (Redis Pub/Sub -> local in-memory Bloom/HashSet), bounded by Datalog execution step limits to prevent adversarial token CPU DoS."
+  },
+  "learningJourney": [
+    {
+      "id": "01-r-requirements",
+      "eyebrow": "R · REQUIREMENTS & SCENARIO",
+      "title": "Eliminating 5-Hop IdP Bottlenecks & Confused Deputies at 100K RPS",
+      "level": "foundation",
+      "purpose": "Establish the multi-hop delegation scenario, zero-IdP-hop latency goal, and emergency revocation requirements.",
+      "explanation": {
+        "foundation": "Suppose a user asks your platform's AI orchestrator to summarize a private Drive folder. The request traverses `API Gateway -> Agent Planner -> Document Fetcher -> Storage Service`. Forwarding a broad OAuth2 JWT lets a prompt-injected Document Fetcher delete files; calling OAuth2 Token Exchange on every hop adds 40–80 ms and crashes the IdP during traffic spikes.",
+        "core": "**Functional & Non-Functional Targets**:\n- **100K edge RPS** (~400K internal downstream verifications/sec across 4 hops).\n- **Offline attenuation** at every hop with **zero synchronous IdP calls** on the hot path.\n- **<2 ms p99** local token verification + Datalog check.\n- **<5s emergency revocation** propagation for compromised root sessions.",
+        "deepDive": "Separate **workload identity** (mTLS / SPIFFE SVIDs proving *which service* is calling) from **delegated user authority** (Biscuit capability token proving *what narrow slice of user data* is permitted)."
+      },
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "R · DELEGATED AUTH TOPOLOGY",
+        "title": "Public-Key Edge Verification + Offline Multi-Hop Attenuation",
+        "graphNodes": [
+          {
+            "id": "idp",
+            "label": "Root Auth Issuer",
+            "role": "Mints Block 0 (Ed25519)",
+            "col": 0,
+            "row": 0,
+            "tone": "primary"
+          },
+          {
+            "id": "gw",
+            "label": "Edge Gateway",
+            "role": "Revocation + Verify",
+            "col": 1,
+            "row": 0,
+            "tone": "tint"
+          },
+          {
+            "id": "ag",
+            "label": "Agent / Worker",
+            "role": "Appends Offline Caveat",
+            "col": 2,
+            "row": 0,
+            "tone": "amber"
+          },
+          {
+            "id": "st",
+            "label": "Storage Service",
+            "role": "Datalog + PubKey Check",
+            "col": 3,
+            "row": 0,
+            "tone": "neutral"
+          }
+        ],
+        "graphEdges": [
+          {
+            "from": "idp",
+            "to": "gw",
+            "label": "Root PubKey + Revoke Stream",
+            "style": "dashed",
+            "tone": "amber"
+          },
+          {
+            "from": "gw",
+            "to": "ag",
+            "label": "Root Biscuit",
+            "style": "solid",
+            "tone": "green"
+          },
+          {
+            "from": "ag",
+            "to": "st",
+            "label": "Attenuated Biscuit (0 IdP calls)",
+            "style": "solid",
+            "tone": "green"
+          }
+        ],
+        "summary": "Services attenuate Biscuit tokens offline and verify downstream using only the issuer's public key."
+      }
+    },
+    {
+      "id": "02-e-estimations",
+      "eyebrow": "E · ESTIMATIONS & CPU PHYSICS",
+      "title": "Sizing Ed25519 Verification CPU & Revocation Set Memory",
+      "level": "foundation",
+      "purpose": "Calculate exact CPU cores needed for 400K Ed25519 verifications/sec and how a 5s local verification cache cuts CPU by 10x.",
+      "explanation": {
+        "foundation": "**Illustrative CPU Math**: At 100K edge RPS × 4 hops = **400,000 token verifications/sec** cluster-wide. A 3-block Biscuit Ed25519 verification takes ~150–200 us on one core (~5,000–6,500 verifications/sec/core). Without caching, 400K/s requires ~65–80 dedicated CPU cores just for signature math!",
+        "core": "Caching verified `(sha256(raw_token), policy_hash) -> allow/deny` in a 5-second process-local LRU (bounded to `min(5s, token_ttl_remaining)`) absorbs repeated multi-call bursts from the same agent session—cutting CPU by ~5–10x in fan-out workloads (exact hit rate depends on per-request token reuse).",
+        "deepDive": "**Revocation Memory Math**: Assuming 100,000 active revocations within a 1-hour root TTL, storing 32-byte `revocation_id`s takes 100,000 × 32 B ≈ **3.2 MB RAM** per service pod—easily replicated over Redis Pub/Sub."
+      },
+      "sectionDiagram": {
+        "kind": "behavior-transition",
+        "eyebrow": "E · CPU & MEMORY SIZING",
+        "title": "Cutting 400K/s Ed25519 Verification Overhead with 5s Local Caching",
+        "steps": [
+          {
+            "label": "400K/s Raw Verify",
+            "title": "200 us / 3-Block Token",
+            "metric": "~80 CPU Cores Burned",
+            "status": "warn"
+          },
+          {
+            "label": "5s Verify LRU",
+            "title": "Keyed by sha256(token)",
+            "metric": "<10 us Cache Hit",
+            "status": "ok"
+          },
+          {
+            "label": "Revocation Set",
+            "title": "100K Active IDs x 32B",
+            "metric": "3.2 MB RAM / Pod",
+            "status": "ok"
+          }
+        ],
+        "summary": "Short-lived local verification caching and 3.2 MB revocation sets keep p99 auth latency under 2 ms."
+      }
+    },
+    {
+      "id": "03-sh-storage-api",
+      "eyebrow": "S+H+A · SCHEMA, REVOCATION & API CONTRACTS",
+      "title": "Revocation Stream, Datalog Policy Facts & Fail-Closed HTTP 401/403",
+      "level": "intermediate",
+      "purpose": "Define the token block schema, revocation push stream, and explicit HTTP error semantics.",
+      "explanation": {
+        "foundation": "Every Biscuit block carries a unique `revocation_id` (`SHA256(block_signature)`). When a user clicks 'Sign out everywhere' or an API key is compromised, the Issuer writes `(revocation_id, expires_at)` to PostgreSQL and broadcasts it over Redis Pub/Sub.",
+        "core": "**API Contract**:\n- `401 Unauthorized`: Invalid Ed25519 signature, malformed block, expired `ttl`, or `revocation_id` hit.\n- `403 Forbidden`: Signature valid, but Datalog `check if` policy fails (e.g., `op=write` attempted on `op=read` attenuated token).\n- `400 Bad Request`: Token exceeds `max_blocks = 8` or Datalog `max_facts = 256` (anti-DoS cap).",
+        "deepDive": "On pod startup, workers hydrate active revocations from PostgreSQL (`WHERE expires_at > NOW()`) before opening readiness probes, closing cold-start revocation gaps."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "A · REVOCATION & VERIFY FLOW",
+        "title": "Hydrated Revocation Set + Fail-Closed Datalog Enforcement",
+        "actors": [
+          {
+            "id": "ag",
+            "label": "Agent Worker"
+          },
+          {
+            "id": "st",
+            "label": "Storage Guard"
+          },
+          {
+            "id": "rd",
+            "label": "Redis Revoke Stream"
+          }
+        ],
+        "events": [
+          {
+            "from": "rd",
+            "to": "st",
+            "label": "Push revocation_id (TTL 1h)",
+            "status": "ok"
+          },
+          {
+            "from": "ag",
+            "to": "st",
+            "label": "GET /reports/q4 (Attenuated Biscuit)",
+            "status": "ok"
+          },
+          {
+            "from": "st",
+            "to": "st",
+            "label": "Check Revoke Set -> Ed25519 -> Datalog",
+            "status": "ok"
+          },
+          {
+            "from": "st",
+            "to": "ag",
+            "label": "403 if write attempted; 200 on read",
+            "status": "ok"
+          }
+        ],
+        "summary": "Local revocation sets, Ed25519 verification, and Datalog policy evaluation execute in <2 ms without IdP calls."
+      },
+      "simulation": {
+        "title": "Multi-Hop Delegated Auth & Emergency Revocation",
+        "nodes": [
+          {
+            "id": "edge",
+            "label": "Edge Gateway",
+            "role": "Mints / Attenuates"
+          },
+          {
+            "id": "agent",
+            "label": "AI Agent",
+            "role": "Adds read + 60s"
+          },
+          {
+            "id": "store",
+            "label": "Storage API",
+            "role": "Revoke + Datalog"
+          }
+        ],
+        "edges": [
+          {
+            "from": "edge",
+            "to": "agent",
+            "label": "1. Root Biscuit"
+          },
+          {
+            "from": "agent",
+            "to": "store",
+            "label": "2. Attenuated Token"
+          }
+        ],
+        "steps": [
+          {
+            "stepNumber": 1,
+            "title": "Delegate Narrow Token",
+            "actionLabel": "Append Caveat",
+            "status": "healthy",
+            "activeNodeIds": [
+              "edge",
+              "agent"
+            ],
+            "activeEdgeIndex": 0,
+            "stateSnapshot": {
+              "blocks": 2,
+              "caveat": "op=read, ttl=60s",
+              "idp_calls": 0
+            },
+            "explanation": "AI Agent narrows the token offline to read-only for 60s before invoking Storage API."
+          },
+          {
+            "stepNumber": 2,
+            "title": "Enforce Datalog Policy",
+            "actionLabel": "Verify Locally",
+            "status": "healthy",
+            "activeNodeIds": [
+              "agent",
+              "store"
+            ],
+            "activeEdgeIndex": 1,
+            "stateSnapshot": {
+              "sig_ok": "true",
+              "revoked": "false",
+              "http": 200
+            },
+            "explanation": "Storage API verifies Ed25519 signature and Datalog rules locally in <1 ms."
+          },
+          {
+            "stepNumber": 3,
+            "title": "Emergency Revocation Broadcast",
+            "actionLabel": "Block Revoked ID",
+            "status": "warning",
+            "activeNodeIds": [
+              "store"
+            ],
+            "activeEdgeIndex": 1,
+            "stateSnapshot": {
+              "revoked_id_hit": "true",
+              "http": 401
+            },
+            "explanation": "User revokes session; Storage API receives revocation_id via Pub/Sub and rejects further calls with 401."
+          }
+        ]
+      }
+    },
+    {
+      "id": "04-d-detailed",
+      "eyebrow": "D · DETAILED DESIGN & DECISION",
+      "title": "Datalog DoS Bounds, Key Rotation & Safe Verifier Middleware",
+      "level": "intermediate",
+      "purpose": "Protect Datalog evaluators against CPU exhaustion bombs and handle multi-key Ed25519 rotation cleanly.",
+      "explanation": {
+        "foundation": "Because any intermediate caller can append Datalog blocks, an adversarial caller could craft a 50-block token with recursive rules designed to stall the verifier's CPU.",
+        "core": "```python\nMAX_BLOCKS = 8\nMAX_TOKEN_BYTES = 4096\n\ndef verify_biscuit_middleware(raw_token: bytes, pubkeys: dict[str, bytes], revoke_set: set[bytes], evaluator) -> dict:\n    if not raw_token or len(raw_token) > MAX_TOKEN_BYTES:\n        return {'allow': False, 'status': 400, 'reason': 'Token size exceeds 4KB cap'}\n    parsed = evaluator.parse(raw_token)\n    if len(parsed.blocks) > MAX_BLOCKS:\n        return {'allow': False, 'status': 400, 'reason': 'Block chain exceeds depth 8'}\n    if any(b.revocation_id in revoke_set for b in parsed.blocks):\n        return {'allow': False, 'status': 401, 'reason': 'Block revoked'}\n    pk = pubkeys.get(parsed.root_key_id)\n    if not pk or not evaluator.verify_signatures(parsed, pk):\n        return {'allow': False, 'status': 401, 'reason': 'Invalid signature or unknown key_id'}\n    if not evaluator.run_datalog(parsed, max_facts=256, max_iterations=100, timeout_ms=2):\n        return {'allow': False, 'status': 403, 'reason': 'Policy denied or budget exceeded'}\n    return {'allow': True, 'status': 200}\n```",
+        "deepDive": "Include `root_key_id` in Block 0 and publish a JWKS-style public-key bundle (`[k_old, k_new]`) before rotating the Issuer's active Ed25519 private key so zero valid tokens fail during rotation."
+      },
+      "decisionFramework": {
+        "problem": "Untrusted or compromised intermediate agents could craft huge Biscuit chains or need emergency revocation.",
+        "naiveSolution": "Allow unbounded Biscuit blocks and omit revocation checks to keep verification 100% stateless.",
+        "whyItFails": "Adversarial tokens trigger Datalog CPU DoS, and stolen 1-hour root tokens remain valid until expiry.",
+        "alternatives": "Pure stateless short-TTL (30s) tokens vs. 1h tokens + bounded Datalog + compact revocation stream.",
+        "decision": "Enforce 4 KB / 8-block / 2 ms Datalog caps plus a 3.2 MB Pub/Sub revocation set hydrated from DB on boot.",
+        "tradeOffs": "Adds ~3 MB RAM and a 1–5s revocation propagation window in exchange for 1h UX and DoS immunity."
+      },
+      "decisionExercise": {
+        "prompt": "A Storage pod restarts during a traffic spike and hasn't finished downloading the active `revocation_id` snapshot from PostgreSQL yet. A request arrives with a valid Ed25519 Biscuit. What should the pod do?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Serve the request immediately; revocation checks are optional.",
+            "correct": false,
+            "feedback": "Failing open lets revoked/compromised tokens bypass security during pod restarts."
+          },
+          {
+            "id": "b",
+            "text": "Keep Kubernetes readiness probes failing (fail closed) until the initial revocation snapshot is hydrated into RAM.",
+            "correct": true,
+            "feedback": "Correct! Failing readiness until revocation state is loaded guarantees no revoked token is ever accepted."
+          },
+          {
+            "id": "c",
+            "text": "Forward the request to the IdP without checking signatures.",
+            "correct": false,
+            "feedback": "Skipping signature checks opens an immediate auth bypass."
+          }
+        ]
+      }
+    },
+    {
+      "id": "05-ed-evaluation-durability",
+      "eyebrow": "E+D · EVALUATION, DURABILITY & GLOSSARY",
+      "title": "Trade-Offs, Assumptions, Limitations & Glossary",
+      "level": "advanced",
+      "purpose": "Evaluate when capability tokens beat OAuth2 JWTs, document revocation propagation bounds, and define core terms.",
+      "explanation": {
+        "foundation": "### Assumptions & Limitations\n- **Propagation Lag**: Pub/Sub revocation updates propagate in ~1–5s; if a Redis Pub/Sub disconnect occurs, pods fall back to periodic 10s DB delta polls and fail closed if stale beyond `max_revoke_staleness`.\n- **Clock Skew**: Time-bounded caveats (`ttl=60s`) assume NTP clock skew under 1–2s across services.\n- **When NOT to Use**: Simple single-hop APIs without delegation are simpler with standard OAuth2 JWTs.",
+        "core": "### Concise Glossary\n- **Offline Attenuation**: Appending restrictive caveats locally without contacting the issuer.\n- **Biscuit**: Asymmetric Ed25519 capability token with an embedded bounded Datalog policy engine.\n- **Revocation ID**: Deterministic per-block identifier (`SHA256(sig)`) used to blacklist compromised tokens.\n- **SPIFFE SVID**: Short-lived mTLS workload identity certificate authenticating service-to-service callers.\n- **Fail Closed**: Rejecting requests (401/503) whenever policy, key, or revocation state is unknown or unavailable.",
+        "deepDive": "Monitor `auth_verify_duration_p99_ms`, `auth_cache_hit_ratio`, `revocation_stream_lag_ms`, and `datalog_budget_exceeded_total`."
+      },
+      "sectionDiagram": {
+        "kind": "quorum-cluster",
+        "eyebrow": "D · RESILIENCE & GUARDRAILS",
+        "title": "Readiness Hydration, Pub/Sub Fallback & Datalog DoS Caps",
+        "nodes": [
+          {
+            "id": "boot",
+            "label": "Boot Hydration",
+            "role": "Load Revokes Before Ready",
+            "status": "ok"
+          },
+          {
+            "id": "ps",
+            "label": "Pub/Sub + 10s Poll",
+            "role": "Bounded Revoke Lag",
+            "status": "ok"
+          },
+          {
+            "id": "dos",
+            "label": "4KB / 8-Block Cap",
+            "role": "Block Datalog CPU DoS",
+            "status": "ok"
+          },
+          {
+            "id": "fc",
+            "label": "Fail-Closed Guard",
+            "role": "503 if Revokes Stale",
+            "status": "warn"
+          }
+        ],
+        "summary": "Boot-time revocation hydration, 10s DB poll fallbacks, and 4 KB/8-block caps harden delegated auth at 100K RPS."
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-ztd-1",
+        "question": "Why does caching verified Biscuit evaluations for 5 seconds (`sha256(raw_token)`) cut CPU from ~80 cores to ~8–16 cores in a 400K/s fan-out?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Repeated calls carrying the same attenuated token skip ~200 us Ed25519 signature math and resolve in <10 us from local RAM.",
+            "correct": true,
+            "feedback": "Correct! Caching bounded by min(5s, remaining_ttl) amortizes Ed25519 verification across bursty agent calls."
+          },
+          {
+            "id": "b",
+            "text": "It disables Ed25519 cryptography globally.",
+            "correct": false,
+            "feedback": "First-seen tokens are still fully verified with Ed25519."
+          },
+          {
+            "id": "c",
+            "text": "It lets clients forge tokens for 5 seconds.",
+            "correct": false,
+            "feedback": "Only tokens that already passed Ed25519 verification are cached."
+          },
+          {
+            "id": "d",
+            "text": "It stores tokens in PostgreSQL.",
+            "correct": false,
+            "feedback": "Verification caches live in process-local RAM."
+          }
+        ],
+        "explanation": "Short-lived local caching keyed by token SHA-256 eliminates redundant Ed25519 verifications on bursty fan-outs."
+      },
+      {
+        "id": "kc-ztd-2",
+        "question": "Why must `verify_biscuit_middleware` enforce `MAX_TOKEN_BYTES = 4096`, `MAX_BLOCKS = 8`, and `max_iterations = 100` before running Datalog?",
+        "options": [
+          {
+            "id": "a",
+            "text": "To prevent untrusted callers from sending huge or deeply recursive caveat chains that exhaust verifier CPU (DoS).",
+            "correct": true,
+            "feedback": "Correct! Bounding token size, block depth, and Datalog iterations prevents CPU exhaustion."
+          },
+          {
+            "id": "b",
+            "text": "Because Ed25519 keys cannot verify tokens over 4 KB.",
+            "correct": false,
+            "feedback": "Ed25519 signs arbitrary hashes; the cap protects the Datalog policy evaluator."
+          },
+          {
+            "id": "c",
+            "text": "To force all requests to call the IdP.",
+            "correct": false,
+            "feedback": "Verification remains 100% local."
+          },
+          {
+            "id": "d",
+            "text": "Because Redis Pub/Sub drops messages under 4 KB.",
+            "correct": false,
+            "feedback": "Pub/Sub carries 32-byte revocation IDs, not full tokens."
+          }
+        ],
+        "explanation": "Resource caps on Datalog evaluation prevent adversarial capability chains from causing CPU DoS."
+      },
+      {
+        "id": "kc-ztd-3",
+        "question": "How does the gateway prevent a freshly restarted Storage pod from accepting a revoked Biscuit token before its Pub/Sub listener catches up?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Fail Kubernetes readiness probes until the pod hydrates active revocations from PostgreSQL into RAM.",
+            "correct": true,
+            "feedback": "Correct! Boot-time DB hydration before serving traffic closes cold-start revocation windows."
+          },
+          {
+            "id": "b",
+            "text": "Allow all tokens for the first 60 seconds after boot.",
+            "correct": false,
+            "feedback": "Failing open during boot creates an instant security bypass."
+          },
+          {
+            "id": "c",
+            "text": "Delete all active user sessions on every pod restart.",
+            "correct": false,
+            "feedback": "Revoking all users on autoscaling would cause an outage."
+          },
+          {
+            "id": "d",
+            "text": "Store all historical expired tokens from the past 5 years in RAM.",
+            "correct": false,
+            "feedback": "Only unexpired revocations (WHERE expires_at > NOW()) need to be kept."
+          }
+        ],
+        "explanation": "Hydrating unexpired revocations from DB before marking the pod ready ensures zero cold-start revocation gaps."
+      },
+      {
+        "id": "kc-ztd-4",
+        "question": "What HTTP status code should the Storage Guard return when a Biscuit token's Ed25519 signatures are valid, but its Datalog caveat (`op=read`) forbids the requested `DELETE` operation?",
+        "options": [
+          {
+            "id": "a",
+            "text": "403 Forbidden (authenticated, but attenuated policy forbids the operation).",
+            "correct": true,
+            "feedback": "Correct! 401 is for invalid/expired/revoked credentials; 403 is for valid credentials denied by policy."
+          },
+          {
+            "id": "b",
+            "text": "200 OK with empty body.",
+            "correct": false,
+            "feedback": "Returning 200 masks an authorization failure."
+          },
+          {
+            "id": "c",
+            "text": "302 Redirect to login.",
+            "correct": false,
+            "feedback": "API services return explicit 401/403 status codes."
+          },
+          {
+            "id": "d",
+            "text": "500 Internal Server Error.",
+            "correct": false,
+            "feedback": "Policy denial is a client authorization rejection (403), not a server crash."
+          }
+        ],
+        "explanation": "Use 401 for invalid/revoked/expired signatures and 403 when a valid token's Datalog caveats deny the action."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Issue Biscuit tokens at the edge so services and AI agents can narrow permissions locally without calling the login server on every hop.",
+      "keyTakeaway": "When multi-hop microservices or AI agents must narrow user permissions at 100K RPS without bottlenecking a central Identity Provider, issue Biscuit root tokens at the edge, attenuate caveats offline per hop, and verify locally with a 5-second cache and bounded revocation set.",
+      "byteSummary": "In a 100K RPS microservice and AI-agent platform where requests fan out across 4–6 internal hops, calling a central Authorization / IdP service on every hop to exchange narrowed JWTs adds 4–6x load to the IdP and turns it into a latency bottleneck.\n\nA **Zero-Trust Delegated Authorization Gateway** issues root **Biscuit** capability tokens at the edge, lets intermediate services and AI agents attenuate tokens offline with narrow Datalog caveats (`op=read`, `resource=...`, `exp < now + 60s`), and verifies tokens locally at every downstream service using the edge public key + a 5-second cached Datalog evaluation.\n\nEmergency revocations propagate via compact `revocation_id` push streams (Redis Pub/Sub -> local in-memory Bloom/HashSet), bounded by Datalog execution step limits to prevent adversarial token CPU DoS."
+    },
+    "intermediate": {
+      "summary": "Combine Biscuit Ed25519 verification, 5s token-hash caching, 4 KB / 8-block Datalog caps, and a 3.2 MB Pub/Sub revocation set.",
+      "keyTakeaway": "When multi-hop microservices or AI agents must narrow user permissions at 100K RPS without bottlenecking a central Identity Provider, issue Biscuit root tokens at the edge, attenuate caveats offline per hop, and verify locally with a 5-second cache and bounded revocation set.",
+      "byteSummary": "In a 100K RPS microservice and AI-agent platform where requests fan out across 4–6 internal hops, calling a central Authorization / IdP service on every hop to exchange narrowed JWTs adds 4–6x load to the IdP and turns it into a latency bottleneck.\n\nA **Zero-Trust Delegated Authorization Gateway** issues root **Biscuit** capability tokens at the edge, lets intermediate services and AI agents attenuate tokens offline with narrow Datalog caveats (`op=read`, `resource=...`, `exp < now + 60s`), and verifies tokens locally at every downstream service using the edge public key + a 5-second cached Datalog evaluation.\n\nEmergency revocations propagate via compact `revocation_id` push streams (Redis Pub/Sub -> local in-memory Bloom/HashSet), bounded by Datalog execution step limits to prevent adversarial token CPU DoS."
+    },
+    "advanced": {
+      "summary": "Harden delegated auth at 400K verifications/sec with boot-time DB revocation hydration, fail-closed staleness guards, JWKS key rotation, and Datalog step caps.",
+      "keyTakeaway": "When multi-hop microservices or AI agents must narrow user permissions at 100K RPS without bottlenecking a central Identity Provider, issue Biscuit root tokens at the edge, attenuate caveats offline per hop, and verify locally with a 5-second cache and bounded revocation set.",
+      "byteSummary": "In a 100K RPS microservice and AI-agent platform where requests fan out across 4–6 internal hops, calling a central Authorization / IdP service on every hop to exchange narrowed JWTs adds 4–6x load to the IdP and turns it into a latency bottleneck.\n\nA **Zero-Trust Delegated Authorization Gateway** issues root **Biscuit** capability tokens at the edge, lets intermediate services and AI agents attenuate tokens offline with narrow Datalog caveats (`op=read`, `resource=...`, `exp < now + 60s`), and verifies tokens locally at every downstream service using the edge public key + a 5-second cached Datalog evaluation.\n\nEmergency revocations propagate via compact `revocation_id` push streams (Redis Pub/Sub -> local in-memory Bloom/HashSet), bounded by Datalog execution step limits to prevent adversarial token CPU DoS."
+    }
+  }
+}

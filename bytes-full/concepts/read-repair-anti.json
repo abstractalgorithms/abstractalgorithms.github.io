@@ -1,0 +1,1038 @@
+{
+  "id": "read-repair-anti",
+  "slug": "read-repair-anti",
+  "name": "Read Repair & Anti-Entropy",
+  "domain": "Distributed Systems & Storage",
+  "tagline": "Healing divergent replicas in leaderless quorum stores using hot-path digest read repair and offline Merkle-tree anti-entropy.",
+  "purpose": "Build a progressive mental model of replica convergence—from blocking vs. async read repair and hinted handoff limits to Merkle-tree repairs and preventing tombstone resurrection.",
+  "spark": {
+    "summary": "Read repair and anti-entropy background repair heal divergent replicas in eventually consistent distributed stores—read repair fixes stale keys on the hot read path, while anti-entropy reconciles entire key ranges offline using Merkle trees.",
+    "keyTakeaway": "When durability and read throughput pull in opposite directions, use read repair for fast, opportunistic healing of hot keys during `QUORUM` reads, and schedule periodic Merkle-tree anti-entropy repairs (`nodetool repair`) faster than `gc_grace_seconds` (e.g., < 10 days) to prevent deleted tombstones from resurrecting.",
+    "byteSummary": "**Core Mechanics:** In leaderless Dynamo-style stores (Cassandra, ScyllaDB, Riak), there is no single primary log ordering every write. When a replica misses a write during an outage, two mechanisms restore convergence: 1.\n\n**Visual & Structural Flow:** Depicts Blocking Read Repair on `LOCAL_QUORUM` (R=2 of RF=3) (Coordinator -> Replica A (v2) -> Replica B (v2) -> Replica C (v1)); Token-Range Merkle Tree Hash Comparison Across Replicas (Range Root Hash -> Left Subtree (Match) -> Right Subtree (Diff) -> Bucket #42 Stream).\n\n**Trade-Offs & Production:** Balance monotonic read guarantees against repair I/O and compaction overhead. A 12-node Cassandra ring (`RF=3`, `gc_grace_seconds=864000`) runs **Cassandra Reaper** to divide the token ring into small sub-ranges, builds depth-15 Merkle trees per range.\n\n**Failure Modes & Application:** Explore tombstone scans, hinted handoff, and quorum tuning."
+  },
+  "learningJourney": [
+    {
+      "id": "01-what-it-is",
+      "eyebrow": "STAGE 01 · WHAT IT IS",
+      "title": "What are Read Repair & Anti-Entropy",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "In leaderless Dynamo-style stores (Cassandra, ScyllaDB, Riak), there is no single primary log ordering every write. When a replica misses a write during an outage, two mechanisms restore convergence:",
+        "core": "1. **Read Repair** (hot path): On a `QUORUM` read, the coordinator fetches full data from 1 replica and cryptographic **digests** from `R - 1` replicas. If digests mismatch, it fetches full values, picks the winner, and writes it back to stale replicas.\n2. **Anti-Entropy** (background): Nodes exchange **Merkle trees** (hash trees over token ranges) via `nodetool repair` to pinpoint and stream divergent cold keys in $O(\\log N)$ network traffic.",
+        "deepDive": "In production deployments of Read Repair & Anti-Entropy, watch how what are read repair & anti-entropy interacts with tail latency, retry amplification, and partial failures. Read repair and anti-entropy background repair heal divergent replicas in eventually consistent distributed stores—read repair fixes stale keys on the hot read path, while anti-entropy reconciles entire key ranges offline using Merkle trees."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Hot-Path Digest Check",
+        "title": "Blocking Read Repair on `LOCAL_QUORUM` (R=2 of RF=3)",
+        "actors": [
+          {
+            "id": "coord",
+            "label": "Coordinator"
+          },
+          {
+            "id": "ra",
+            "label": "Replica A (v2)"
+          },
+          {
+            "id": "rb",
+            "label": "Replica B (v2)"
+          },
+          {
+            "id": "rc",
+            "label": "Replica C (v1)"
+          }
+        ],
+        "events": [
+          {
+            "from": "coord",
+            "to": "ra",
+            "label": "Full data read -> v2 (ts=200)",
+            "status": "ok"
+          },
+          {
+            "from": "coord",
+            "to": "rc",
+            "label": "Digest read -> hash(v1) MISMATCH",
+            "status": "fail"
+          },
+          {
+            "from": "coord",
+            "to": "rc",
+            "label": "Fetch full v1 -> resolve v2 wins",
+            "status": "warn"
+          },
+          {
+            "from": "coord",
+            "to": "rc",
+            "label": "Write v2 repair -> return v2",
+            "status": "ok"
+          }
+        ],
+        "summary": "Blocking read repair guarantees monotonic reads at QUORUM before returning to the client."
+      },
+      "purpose": "The mechanism: understand how Read Repair & Anti-Entropy works from first principles."
+    },
+    {
+      "id": "02-why-we-need-it",
+      "eyebrow": "STAGE 02 · WHY WE NEED IT",
+      "title": "Why we need Anti-Entropy (Cold Keys & Zombie Tombstones)",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "Think of **Why we need Anti-Entropy (Cold Keys & Zombie Tombstones)** as the intuition layer for Read Repair & Anti-Entropy: The problem: see what breaks without Anti-Entropy under real concurrency or scale.",
+        "core": "Read repair only heals *active* keys; cold keys that are rarely read rot silently. Worse, if Replica C misses a `DELETE`, and peers purge the deletion **tombstone** after `gc_grace_seconds` (default 10 days / 864,000s), a subsequent read repair sees Replica C's old live row and **resurrects the deleted record ('zombie data')** across the cluster.",
+        "deepDive": "Under heavy load or partial failure, why we need anti-entropy (cold keys & zombie tombstones) becomes a critical lever for predictable latency and correctness. Read repair and anti-entropy background repair heal divergent replicas in eventually consistent distributed stores—read repair fixes stale keys on the hot read path, while anti-entropy reconciles entire key ranges offline using Merkle trees."
+      },
+      "ideas": [
+        {
+          "title": "Hinted Handoff Is Best-Effort Only",
+          "description": "Coordinators buffer hints for brief outages (`max_hint_window = 3h`), but hints drop if the outage exceeds 3 hours or the coordinator crashes."
+        },
+        {
+          "title": "NTP Clock Skew Breaks LWW Repairs",
+          "description": "Under Last-Write-Wins (LWW), a coordinator 2 seconds ahead stamps older writes with higher timestamps—keep chrony drift <10 ms or use version vectors."
+        }
+      ],
+      "purpose": "The problem: see what breaks without Anti-Entropy under real concurrency or scale.",
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "Lifecycle & Failure Recovery",
+        "title": "Why we need Anti-Entropy (Cold Keys & Zombie Tombstones)",
+        "states": [
+          {
+            "id": "follower",
+            "label": "Follower",
+            "tone": "neutral"
+          },
+          {
+            "id": "candidate",
+            "label": "Candidate Election",
+            "tone": "info"
+          },
+          {
+            "id": "leader",
+            "label": "Elected Leader",
+            "tone": "good"
+          },
+          {
+            "id": "partition",
+            "label": "Minority Isolated",
+            "tone": "warn"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "follower",
+            "to": "candidate",
+            "label": "election timeout"
+          },
+          {
+            "from": "candidate",
+            "to": "leader",
+            "label": "majority votes"
+          },
+          {
+            "from": "leader",
+            "to": "partition",
+            "label": "higher term seen"
+          }
+        ]
+      },
+      "decisionFramework": {
+        "problem": "How to implement Read Repair & Anti-Entropy without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "When durability and read throughput pull in opposite directions, use read repair for fast, opportunistic healing of hot keys during `QUORUM` reads, and schedule periodic Merkle-tree anti-entropy repairs (`nodetool repair`) faster than `gc_grace_seconds` (e.g., < 10 days) to prevent deleted tombstones from resurrecting.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Read Repair & Anti-Entropy experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-where-it-is-used",
+      "eyebrow": "STAGE 03 · WHERE IT IS USED",
+      "title": "Where Read Repair & Anti-Entropy apply (and where WALs replace them)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Think of **Where Read Repair & Anti-Entropy apply (and where WALs replace them)** as the intuition layer for Read Repair & Anti-Entropy: Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+        "core": "Mandatory on all leaderless/multi-master quorum stores; unnecessary on single-leader WAL-replicated databases.",
+        "deepDive": "Under heavy load or partial failure, where read repair & anti-entropy apply (and where wals replace them) becomes a critical lever for predictable latency and correctness. Read repair and anti-entropy background repair heal divergent replicas in eventually consistent distributed stores—read repair fixes stale keys on the hot read path, while anti-entropy reconciles entire key ranges offline using Merkle trees."
+      },
+      "comparison": [
+        {
+          "choice": "Good Candidate: Cassandra, ScyllaDB, Riak & Dynamo Rings",
+          "benefits": [
+            "Heals hot keys opportunistically on read and guarantees full-ring convergence on cold data."
+          ],
+          "costs": [
+            "Unthrottled full Merkle repairs saturate disk compaction and streaming bandwidth."
+          ]
+        },
+        {
+          "choice": "Avoid: Single-Leader WAL/Raft Databases",
+          "benefits": [
+            "PostgreSQL, Spanner, and etcd replicate a strict ordered log; followers cannot silently diverge on writes."
+          ],
+          "costs": [
+            "Read repair has no role in single-leader consensus."
+          ]
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    },
+    {
+      "id": "04-how-it-is-managed",
+      "eyebrow": "STAGE 04 · HOW IT IS MANAGED",
+      "title": "How Sub-Range Merkle Repairs & `gc_grace_seconds` are managed",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Think of **How Sub-Range Merkle Repairs & `gc_grace_seconds` are managed** as the intuition layer for Read Repair & Anti-Entropy: Operational control: configure bounds, failure handling, and safe production defaults.",
+        "core": "Never set `gc_grace_seconds = 0` on tables with `DELETE`s or TTLs, schedule automated sub-range incremental repairs (e.g., Cassandra Reaper) every 3–5 days (< `gc_grace_seconds`), and throttle `stream_throughput_outbound`.",
+        "deepDive": "Under heavy load or partial failure, how sub-range merkle repairs & `gc_grace_seconds` are managed becomes a critical lever for predictable latency and correctness. Read repair and anti-entropy background repair heal divergent replicas in eventually consistent distributed stores—read repair fixes stale keys on the hot read path, while anti-entropy reconciles entire key ranges offline using Merkle trees."
+      },
+      "markdownContent": "```python\n# Simplified Merkle-tree range diff used by anti-entropy repair\nimport hashlib\n\ndef merkle_leaf(records: list[tuple[str, str]]) -> str:\n    h = hashlib.sha256()\n    for k, v in sorted(records):\n        h.update(f\"{k}:{v};\".encode(\"utf-8\"))\n    return h.hexdigest()\n\ndef find_divergent_buckets(local_tree: dict[int, str], remote_tree: dict[int, str]) -> list[int]:\n    \"\"\"Only stream token buckets whose Merkle hash differs.\"\"\"\n    return [bucket for bucket, h in local_tree.items() if remote_tree.get(bucket) != h]\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "Component Topology",
+        "title": "How Sub-Range Merkle Repairs & `gc_grace_seconds` are managed",
+        "graphNodes": [
+          {
+            "id": "client",
+            "label": "Client",
+            "role": "ingress",
+            "col": 0,
+            "row": 0,
+            "tone": "primary"
+          },
+          {
+            "id": "leader",
+            "label": "Quorum Leader",
+            "role": "compute",
+            "col": 1,
+            "row": 0,
+            "tone": "tint"
+          },
+          {
+            "id": "f1",
+            "label": "Replica 1",
+            "role": "storage",
+            "col": 2,
+            "row": 0,
+            "tone": "tint"
+          },
+          {
+            "id": "f2",
+            "label": "Replica 2",
+            "role": "control",
+            "col": 0,
+            "row": 1,
+            "tone": "tint"
+          }
+        ],
+        "graphEdges": [
+          {
+            "from": "client",
+            "to": "leader",
+            "label": "write(token)",
+            "style": "solid",
+            "tone": "green"
+          },
+          {
+            "from": "leader",
+            "to": "f1",
+            "label": "AppendEntries",
+            "style": "solid",
+            "tone": "green"
+          },
+          {
+            "from": "leader",
+            "to": "f2",
+            "label": "quorum sync",
+            "style": "solid",
+            "tone": "green"
+          }
+        ]
+      }
+    },
+    {
+      "id": "05-alternatives",
+      "eyebrow": "STAGE 05 · ALTERNATIVES",
+      "title": "Alternatives: Blocking vs. Async Read Repair & Incremental vs. Full Merkle Repair",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": {
+        "foundation": "Think of **Alternatives: Blocking vs. Async Read Repair & Incremental vs. Full Merkle Repair** as the intuition layer for Read Repair & Anti-Entropy: The trade-off: compare competing approaches across latency, consistency, and operational cost.",
+        "core": "Balance monotonic read guarantees against repair I/O and compaction overhead.",
+        "deepDive": "Under heavy load or partial failure, alternatives: blocking vs. async read repair & incremental vs. full merkle repair becomes a critical lever for predictable latency and correctness. Read repair and anti-entropy background repair heal divergent replicas in eventually consistent distributed stores—read repair fixes stale keys on the hot read path, while anti-entropy reconciles entire key ranges offline using Merkle trees."
+      },
+      "comparison": [
+        {
+          "choice": "Blocking Read Repair (`QUORUM`)",
+          "benefits": [
+            "Guarantees monotonic reads—subsequent `QUORUM` reads immediately see the repaired winner."
+          ],
+          "costs": [
+            "Adds 1 extra RTT on tail latency whenever a digest mismatch triggers full-row repair."
+          ]
+        },
+        {
+          "choice": "Incremental Merkle Repair",
+          "benefits": [
+            "Hashes only newly written SSTables, cutting repair CPU and disk I/O by 80–90%."
+          ],
+          "costs": [
+            "Requires SSTable anti-compaction management."
+          ]
+        },
+        {
+          "choice": "Full Sub-Range Repair (Cassandra Reaper)",
+          "benefits": [
+            "Simple, predictable token-segment orchestration that pauses automatically if compactions spike."
+          ],
+          "costs": [
+            "Re-hashes entire token range every cycle."
+          ]
+        }
+      ],
+      "purpose": "The trade-off: compare competing approaches across latency, consistency, and operational cost."
+    },
+    {
+      "id": "06-production-architecture",
+      "eyebrow": "STAGE 06 · PRODUCTION ARCHITECTURE",
+      "title": "Production example: Sub-Range Merkle Tree Anti-Entropy with Reaper",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Think of **Production example: Sub-Range Merkle Tree Anti-Entropy with Reaper** as the intuition layer for Read Repair & Anti-Entropy: Production architecture: see how the components compose end to end under real load.",
+        "core": "A 12-node Cassandra ring (`RF=3`, `gc_grace_seconds=864000`) runs **Cassandra Reaper** to divide the token ring into small sub-ranges, builds depth-15 Merkle trees per range during off-peak hours, and streams only mismatched buckets—pausing automatically if p99 read latency or pending compactions spike.",
+        "deepDive": "Under heavy load or partial failure, production example: sub-range merkle tree anti-entropy with reaper becomes a critical lever for predictable latency and correctness. Read repair and anti-entropy background repair heal divergent replicas in eventually consistent distributed stores—read repair fixes stale keys on the hot read path, while anti-entropy reconciles entire key ranges offline using Merkle trees."
+      },
+      "sectionDiagram": {
+        "kind": "tree-index",
+        "eyebrow": "Merkle Tree Anti-Entropy",
+        "title": "Token-Range Merkle Tree Hash Comparison Across Replicas",
+        "nodes": [
+          {
+            "id": "root",
+            "label": "Range Root Hash",
+            "role": "Mismatch detected"
+          },
+          {
+            "id": "l",
+            "label": "Left Subtree (Match)",
+            "role": "Skip 50% of keys"
+          },
+          {
+            "id": "r",
+            "label": "Right Subtree (Diff)",
+            "role": "Descend to leaf"
+          },
+          {
+            "id": "leaf",
+            "label": "Bucket #42 Stream",
+            "role": "Sync only stale keys"
+          }
+        ],
+        "edges": [
+          {
+            "label": "hash equal -> skip"
+          },
+          {
+            "label": "hash diff -> drill"
+          }
+        ],
+        "cards": [
+          {
+            "label": "1. O(log N) Pinpoint",
+            "detail": "Replicas exchange tree hashes and only descend branches whose hashes differ."
+          },
+          {
+            "label": "2. Sub-Range Split",
+            "detail": "Keeping token segments small limits how many keys live in a single leaf bucket."
+          },
+          {
+            "label": "3. Tombstone Safety",
+            "detail": "Completing full cycles every 4 days (< 10d grace) prevents zombie resurrection."
+          }
+        ],
+        "summary": "Merkle trees minimize network streaming to only divergent token buckets while protecting tombstone consistency."
+      },
+      "purpose": "Production architecture: see how the components compose end to end under real load."
+    },
+    {
+      "id": "07-problems-and-further-reading",
+      "eyebrow": "STAGE 07 · PROBLEMS SOLVED & FURTHER DEEP DIVE",
+      "title": "Problems solved by Read Repair & Related Distributed Concepts",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Think of **Problems solved by Read Repair & Related Distributed Concepts** as the intuition layer for Read Repair & Anti-Entropy: Applied problems: connect these internals to concrete system design and debugging scenarios.",
+        "core": "Explore tombstone scans, hinted handoff, and quorum tuning.",
+        "deepDive": "Under heavy load or partial failure, problems solved by read repair & related distributed concepts becomes a critical lever for predictable latency and correctness. Read repair and anti-entropy background repair heal divergent replicas in eventually consistent distributed stores—read repair fixes stale keys on the hot read path, while anti-entropy reconciles entire key ranges offline using Merkle trees."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "cassandra-tombstone-storms",
+          "title": "Problem: Cassandra Tombstone Accumulation Scans",
+          "kind": "problem"
+        },
+        {
+          "slug": "quorum-reads-writes",
+          "title": "Problem: Quorum Reads, Writes & Sloppy Quorums",
+          "kind": "problem"
+        },
+        {
+          "slug": "quorum-tuning",
+          "title": "Concept: Quorum Read/Write Tuning",
+          "kind": "concept"
+        },
+        {
+          "slug": "hinted-handoff-repair",
+          "title": "Concept: Hinted Handoff & Repair",
+          "kind": "concept"
+        }
+      ],
+      "purpose": "Applied problems: connect these internals to concrete system design and debugging scenarios.",
+      "sectionDiagram": {
+        "kind": "behavior-transition",
+        "eyebrow": "Design Trade-Off",
+        "title": "Problems solved by Read Repair & Related Distributed Concepts",
+        "before": {
+          "label": "Async Primary / Split-Brain",
+          "metrics": [
+            "Stale leader overwrites state",
+            "Clock skew breaks lease order",
+            "Full-table sync on reboot"
+          ]
+        },
+        "after": {
+          "label": "Quorum + Monotonic Fencing",
+          "metrics": [
+            "Majority quorum prevents split-brain",
+            "Fencing tokens reject zombies",
+            "Merkle/WAL catch-up in O(log N)"
+          ]
+        }
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why does failing to run `nodetool repair` within `gc_grace_seconds` (default 10 days) cause deleted records to reappear ('zombie data') in Cassandra?",
+      "options": [
+        {
+          "id": "a",
+          "text": "Peers purge the deletion tombstone after `gc_grace_seconds`, so a replica that missed the delete still holds the old row and read repair propagates it back as live data",
+          "correct": true,
+          "feedback": "Correct: schedule anti-entropy repairs faster than `gc_grace_seconds` so all replicas learn about tombstones before they expire."
+        },
+        {
+          "id": "b",
+          "text": "Because `gc_grace_seconds` disables hinted handoff",
+          "correct": false,
+          "feedback": "Hinted handoff expires after `max_hint_window` (3h), independent of `gc_grace_seconds`."
+        },
+        {
+          "id": "c",
+          "text": "Because Merkle trees invert delete flags after 10 days",
+          "correct": false,
+          "feedback": "Merkle trees only hash current state; the cause is tombstone expiration before repair."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why does failing to run `nodetool repair` within `gc_grace_seconds` (default 10 days) cause deleted records to reappear ('zombie data') in Cassandra?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Peers purge the deletion tombstone after `gc_grace_seconds`, so a replica that missed the delete still holds the old row and read repair propagates it back as live data",
+            "correct": true,
+            "feedback": "Correct: schedule anti-entropy repairs faster than `gc_grace_seconds` so all replicas learn about tombstones before they expire."
+          },
+          {
+            "id": "b",
+            "text": "Because `gc_grace_seconds` disables hinted handoff",
+            "correct": false,
+            "feedback": "Hinted handoff expires after `max_hint_window` (3h), independent of `gc_grace_seconds`."
+          },
+          {
+            "id": "c",
+            "text": "Because Merkle trees invert delete flags after 10 days",
+            "correct": false,
+            "feedback": "Merkle trees only hash current state; the cause is tombstone expiration before repair."
+          }
+        ]
+      },
+      {
+        "question": "What is the main benefit—and corresponding operational trade-off—of using Good Candidate: Cassandra, ScyllaDB, Riak & Dynamo Rings in Read Repair & Anti-Entropy?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Advantage: Heals hot keys opportunistically on read and guarantees full-ring convergence on cold data. Cost: Unthrottled full Merkle repairs saturate disk compaction and streaming bandwidth.",
+            "correct": true,
+            "feedback": "Correct: Good Candidate: Cassandra, ScyllaDB, Riak & Dynamo Rings delivers heals hot keys opportunistically on read and guarantees full-ring convergence on cold data. while requiring you to manage unthrottled full Merkle repairs saturate disk compaction and streaming bandwidth."
+          },
+          {
+            "id": "b",
+            "text": "Advantage: PostgreSQL, Spanner, and etcd replicate a strict ordered log; followers cannot silently diverge on writes. It has zero operational or latency overhead compared to Avoid: Single-Leader WAL/Raft Databases.",
+            "correct": false,
+            "feedback": "Not quite: that describes Avoid: Single-Leader WAL/Raft Databases, whereas Good Candidate: Cassandra, ScyllaDB, Riak & Dynamo Rings specifically trades off: Unthrottled full Merkle repairs saturate disk compaction and streaming bandwidth."
+          },
+          {
+            "id": "c",
+            "text": "Ignoring unthrottled full merkle repairs saturate disk compaction and streaming bandwidth. removes the need for any trade-off evaluation",
+            "correct": false,
+            "feedback": "Incorrect: every production option in Read Repair & Anti-Entropy carries concrete latency, consistency, or operational costs."
+          }
+        ]
+      },
+      {
+        "question": "Why is NTP Clock Skew Breaks LWW Repairs critical when operating Read Repair & Anti-Entropy in production?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Under Last-Write-Wins (LWW), a coordinator 2 seconds ahead stamps older writes with higher timestamps—keep chrony drift <10 ms or use version vectors.",
+            "correct": true,
+            "feedback": "Correct: Under Last-Write-Wins (LWW), a coordinator 2 seconds ahead stamps older writes with higher timestamps—keep chrony drift <10 ms or use version vectors."
+          },
+          {
+            "id": "b",
+            "text": "It only applies during local unit testing and can be disabled in production to save memory.",
+            "correct": false,
+            "feedback": "Incorrect: 'NTP Clock Skew Breaks LWW Repairs' directly governs production reliability and correctness under real traffic."
+          },
+          {
+            "id": "c",
+            "text": "It replaces the need for observability, timeouts, or capacity planning across Read Repair & Anti-Entropy.",
+            "correct": false,
+            "feedback": "Incorrect: 'NTP Clock Skew Breaks LWW Repairs' works alongside proper bounds, monitoring, and failure isolation."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** In leaderless Dynamo-style stores (Cassandra, ScyllaDB, Riak), there is no single primary log ordering every write.\n\n**How It Flows:** Think of Read Repair & Anti-Entropy as a clear step-by-step chain: Coordinator -> Replica A (v2) -> Replica B (v2) -> Replica C (v1) -> Range Root Hash.\n\n**Why Beginners Should Care:** Use read repair for fast, opportunistic healing of hot keys during `QUORUM` reads, and schedule periodic Merkle-tree anti-entropy repairs (`nodetool repair`) faster than.",
+      "spark": {
+        "summary": "In leaderless Dynamo-style stores (Cassandra, ScyllaDB, Riak), there is no single primary log ordering every write.",
+        "keyTakeaway": "Use read repair for fast, opportunistic healing of hot keys during `QUORUM` reads, and schedule periodic Merkle-tree anti-entropy repairs (`nodetool repair`) faster than."
+      },
+      "learningJourney": [
+        {
+          "id": "01-what-it-is",
+          "title": "What are Read Repair & Anti-Entropy",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Read Repair & Anti-Entropy works from first principles.",
+          "explanation": "In leaderless Dynamo-style stores (Cassandra, ScyllaDB, Riak), there is no single primary log ordering every write. When a replica misses a write during an outage, two mechanisms restore convergence: 1. **Read Repair** (hot path): On a `QUORUM` read, the coordinator fetches full data from 1 replica and cryptographic **digests** from `R - 1` replicas.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Hot-Path Digest Check",
+            "title": "Blocking Read Repair on `LOCAL_QUORUM` (R=2 of RF=3)",
+            "actors": [
+              {
+                "id": "coord",
+                "label": "Coordinator"
+              },
+              {
+                "id": "ra",
+                "label": "Replica A (v2)"
+              },
+              {
+                "id": "rb",
+                "label": "Replica B (v2)"
+              },
+              {
+                "id": "rc",
+                "label": "Replica C (v1)"
+              }
+            ],
+            "events": [
+              {
+                "from": "coord",
+                "to": "ra",
+                "label": "Full data read -> v2 (ts=200)",
+                "status": "ok"
+              },
+              {
+                "from": "coord",
+                "to": "rc",
+                "label": "Digest read -> hash(v1) MISMATCH",
+                "status": "fail"
+              },
+              {
+                "from": "coord",
+                "to": "rc",
+                "label": "Fetch full v1 -> resolve v2 wins",
+                "status": "warn"
+              },
+              {
+                "from": "coord",
+                "to": "rc",
+                "label": "Write v2 repair -> return v2",
+                "status": "ok"
+              }
+            ],
+            "summary": "Blocking read repair guarantees monotonic reads at QUORUM before returning to the client."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-why-we-need-it",
+          "title": "Why we need Anti-Entropy (Cold Keys & Zombie Tombstones)",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without Anti-Entropy under real concurrency or scale.",
+          "explanation": "Read repair only heals *active* keys; cold keys that are rarely read rot silently. Worse, if Replica C misses a `DELETE`, and peers purge the deletion **tombstone** after `gc_grace_seconds` (default 10 days / 864,000s), a subsequent read repair sees Replica C's old live row and **resurrects the deleted record ('zombie data')** across the cluster.",
+          "ideas": [
+            {
+              "title": "Hinted Handoff Is Best-Effort Only",
+              "description": "Coordinators buffer hints for brief outages (`max_hint_window = 3h`), but hints drop if the outage exceeds 3 hours or the coordinator crashes."
+            },
+            {
+              "title": "NTP Clock Skew Breaks LWW Repairs",
+              "description": "Under Last-Write-Wins (LWW), a coordinator 2 seconds ahead stamps older writes with higher timestamps—keep chrony drift <10 ms or use version vectors."
+            }
+          ],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-where-it-is-used",
+          "title": "Where Read Repair & Anti-Entropy apply (and where WALs replace them)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Mandatory on all leaderless/multi-master quorum stores; unnecessary on single-leader WAL-replicated databases.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "06-production-architecture",
+          "title": "Production example: Sub-Range Merkle Tree Anti-Entropy with Reaper",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Production architecture: see how the components compose end to end under real load.",
+          "explanation": "A 12-node Cassandra ring (`RF=3`, `gc_grace_seconds=864000`) runs **Cassandra Reaper** to divide the token ring into small sub-ranges, builds depth-15 Merkle trees per range during off-peak hours, and streams only mismatched buckets—pausing automatically if p99 read latency or pending compactions spike.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "tree-index",
+            "eyebrow": "Merkle Tree Anti-Entropy",
+            "title": "Token-Range Merkle Tree Hash Comparison Across Replicas",
+            "nodes": [
+              {
+                "id": "root",
+                "label": "Range Root Hash",
+                "role": "Mismatch detected"
+              },
+              {
+                "id": "l",
+                "label": "Left Subtree (Match)",
+                "role": "Skip 50% of keys"
+              },
+              {
+                "id": "r",
+                "label": "Right Subtree (Diff)",
+                "role": "Descend to leaf"
+              },
+              {
+                "id": "leaf",
+                "label": "Bucket #42 Stream",
+                "role": "Sync only stale keys"
+              }
+            ],
+            "edges": [
+              {
+                "label": "hash equal -> skip"
+              },
+              {
+                "label": "hash diff -> drill"
+              }
+            ],
+            "cards": [
+              {
+                "label": "1. O(log N) Pinpoint",
+                "detail": "Replicas exchange tree hashes and only descend branches whose hashes differ."
+              },
+              {
+                "label": "2. Sub-Range Split",
+                "detail": "Keeping token segments small limits how many keys live in a single leaf bucket."
+              },
+              {
+                "label": "3. Tombstone Safety",
+                "detail": "Completing full cycles every 4 days (< 10d grace) prevents zombie resurrection."
+              }
+            ],
+            "summary": "Merkle trees minimize network streaming to only divergent token buckets while protecting tombstone consistency."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Use read repair for fast, opportunistic healing of hot keys during `QUORUM` reads, and schedule periodic Merkle-tree anti-entropy repairs (`nodetool repair`) faster than.",
+      "summary": "Read repair and anti-entropy background repair heal divergent replicas in eventually consistent distributed stores—read repair fixes stale keys on the hot read path, while anti-entropy reconciles entire key ranges offline using Merkle trees.",
+      "keyTakeaway": "When durability and read throughput pull in opposite directions, use read repair for fast, opportunistic healing of hot keys during `QUORUM` reads, and schedule periodic Merkle-tree anti-entropy repairs (`nodetool repair`) faster than `gc_grace_seconds` (e.g., < 10 days) to prevent deleted tombstones from resurrecting."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** In leaderless Dynamo-style stores (Cassandra, ScyllaDB, Riak), there is no single primary log ordering every write. When a replica misses a write during an outage, two mechanisms restore convergence: 1.\n\n**Visual & Structural Flow:** Depicts Blocking Read Repair on `LOCAL_QUORUM` (R=2 of RF=3) (Coordinator -> Replica A (v2) -> Replica B (v2) -> Replica C (v1)); Token-Range Merkle Tree Hash Comparison Across Replicas (Range Root Hash -> Left Subtree (Match) -> Right Subtree (Diff) -> Bucket #42 Stream).\n\n**Trade-Offs & Production:** Balance monotonic read guarantees against repair I/O and compaction overhead. A 12-node Cassandra ring (`RF=3`, `gc_grace_seconds=864000`) runs **Cassandra Reaper** to divide the token ring into small sub-ranges, builds depth-15 Merkle trees per range.\n\n**Failure Modes & Application:** Explore tombstone scans, hinted handoff, and quorum tuning.",
+      "spark": {
+        "summary": "Read repair and anti-entropy background repair heal divergent replicas in eventually consistent distributed stores—read repair fixes stale keys on the hot read path, while anti-entropy reconciles entire key ranges offline using Merkle trees.",
+        "keyTakeaway": "Use read repair for fast, opportunistic healing of hot keys during `QUORUM` reads, and schedule periodic Merkle-tree anti-entropy repairs (`nodetool repair`) faster than `gc_grace_seconds` (e.g., < 10 days) to prevent deleted tombstones from resurrecting."
+      },
+      "summary": "Read repair and anti-entropy background repair heal divergent replicas in eventually consistent distributed stores—read repair fixes stale keys on the hot read path, while anti-entropy reconciles entire key ranges offline using Merkle trees.",
+      "keyTakeaway": "When durability and read throughput pull in opposite directions, use read repair for fast, opportunistic healing of hot keys during `QUORUM` reads, and schedule periodic Merkle-tree anti-entropy repairs (`nodetool repair`) faster than `gc_grace_seconds` (e.g., < 10 days) to prevent deleted tombstones from resurrecting."
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** Read repair and anti-entropy background repair heal divergent replicas in eventually consistent distributed stores—read repair fixes stale keys on the hot read path, while anti-entropy reconciles entire key ranges offline using Merkle trees.\n\n**Production Trade-Offs:** Never set `gc_grace_seconds = 0` on tables with `DELETE`s or TTLs, schedule automated sub-range incremental repairs (e.g., Cassandra Reaper) every 3–5 days (< `gc_grace_seconds`), and throttle `stream_throughput_outbound`.\n\n**Failure Modes & Edge Cases:** Explore tombstone scans, hinted handoff, and quorum tuning.\n\n**Principal Takeaway:** Use read repair for fast, opportunistic healing of hot keys during `QUORUM` reads, and schedule periodic Merkle-tree anti-entropy repairs (`nodetool repair`) faster than `gc_grace_seconds` (e.g., < 10 days) to prevent deleted tombstones from resurrecting.",
+      "spark": {
+        "summary": "Read repair and anti-entropy background repair heal divergent replicas in eventually consistent distributed stores—read repair fixes stale keys on the hot read path, while anti-entropy reconciles entire key ranges offline using Merkle trees.",
+        "keyTakeaway": "Use read repair for fast, opportunistic healing of hot keys during `QUORUM` reads, and schedule periodic Merkle-tree anti-entropy repairs (`nodetool repair`) faster than `gc_grace_seconds` (e.g., < 10 days) to prevent deleted tombstones from resurrecting."
+      },
+      "learningJourney": [
+        {
+          "id": "01-what-it-is",
+          "title": "What are Read Repair & Anti-Entropy",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Read Repair & Anti-Entropy works from first principles.",
+          "explanation": "In leaderless Dynamo-style stores (Cassandra, ScyllaDB, Riak), there is no single primary log ordering every write. When a replica misses a write during an outage, two mechanisms restore convergence:\n\n1. **Read Repair** (hot path): On a `QUORUM` read, the coordinator fetches full data from 1 replica and cryptographic **digests** from `R - 1` replicas. If digests mismatch, it fetches full values, picks the winner, and writes it back to stale replicas.\n2. **Anti-Entropy** (background): Nodes exchange **Merkle trees** (hash trees over token ranges) via `nodetool repair` to pinpoint and stream divergent cold keys in $O(\\log N)$ network traffic.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Hot-Path Digest Check",
+            "title": "Blocking Read Repair on `LOCAL_QUORUM` (R=2 of RF=3)",
+            "actors": [
+              {
+                "id": "coord",
+                "label": "Coordinator"
+              },
+              {
+                "id": "ra",
+                "label": "Replica A (v2)"
+              },
+              {
+                "id": "rb",
+                "label": "Replica B (v2)"
+              },
+              {
+                "id": "rc",
+                "label": "Replica C (v1)"
+              }
+            ],
+            "events": [
+              {
+                "from": "coord",
+                "to": "ra",
+                "label": "Full data read -> v2 (ts=200)",
+                "status": "ok"
+              },
+              {
+                "from": "coord",
+                "to": "rc",
+                "label": "Digest read -> hash(v1) MISMATCH",
+                "status": "fail"
+              },
+              {
+                "from": "coord",
+                "to": "rc",
+                "label": "Fetch full v1 -> resolve v2 wins",
+                "status": "warn"
+              },
+              {
+                "from": "coord",
+                "to": "rc",
+                "label": "Write v2 repair -> return v2",
+                "status": "ok"
+              }
+            ],
+            "summary": "Blocking read repair guarantees monotonic reads at QUORUM before returning to the client."
+          },
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-why-we-need-it",
+          "title": "Why we need Anti-Entropy (Cold Keys & Zombie Tombstones)",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without Anti-Entropy under real concurrency or scale.",
+          "explanation": "Read repair only heals *active* keys; cold keys that are rarely read rot silently. Worse, if Replica C misses a `DELETE`, and peers purge the deletion **tombstone** after `gc_grace_seconds` (default 10 days / 864,000s), a subsequent read repair sees Replica C's old live row and **resurrects the deleted record ('zombie data')** across the cluster.",
+          "caveats": null,
+          "ideas": [
+            {
+              "title": "Hinted Handoff Is Best-Effort Only",
+              "description": "Coordinators buffer hints for brief outages (`max_hint_window = 3h`), but hints drop if the outage exceeds 3 hours or the coordinator crashes."
+            },
+            {
+              "title": "NTP Clock Skew Breaks LWW Repairs",
+              "description": "Under Last-Write-Wins (LWW), a coordinator 2 seconds ahead stamps older writes with higher timestamps—keep chrony drift <10 ms or use version vectors."
+            }
+          ],
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "03-where-it-is-used",
+          "title": "Where Read Repair & Anti-Entropy apply (and where WALs replace them)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Mandatory on all leaderless/multi-master quorum stores; unnecessary on single-leader WAL-replicated databases.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-how-it-is-managed",
+          "title": "How Sub-Range Merkle Repairs & `gc_grace_seconds` are managed",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Never set `gc_grace_seconds = 0` on tables with `DELETE`s or TTLs, schedule automated sub-range incremental repairs (e.g., Cassandra Reaper) every 3–5 days (< `gc_grace_seconds`), and throttle `stream_throughput_outbound`.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "05-alternatives",
+          "title": "Alternatives: Blocking vs. Async Read Repair & Incremental vs. Full Merkle Repair",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "The trade-off: compare competing approaches across latency, consistency, and operational cost.",
+          "explanation": "Balance monotonic read guarantees against repair I/O and compaction overhead.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "06-production-architecture",
+          "title": "Production example: Sub-Range Merkle Tree Anti-Entropy with Reaper",
+          "eyebrow": "Advanced Path · Stage 06",
+          "purpose": "Production architecture: see how the components compose end to end under real load.",
+          "explanation": "A 12-node Cassandra ring (`RF=3`, `gc_grace_seconds=864000`) runs **Cassandra Reaper** to divide the token ring into small sub-ranges, builds depth-15 Merkle trees per range during off-peak hours, and streams only mismatched buckets—pausing automatically if p99 read latency or pending compactions spike.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "tree-index",
+            "eyebrow": "Merkle Tree Anti-Entropy",
+            "title": "Token-Range Merkle Tree Hash Comparison Across Replicas",
+            "nodes": [
+              {
+                "id": "root",
+                "label": "Range Root Hash",
+                "role": "Mismatch detected"
+              },
+              {
+                "id": "l",
+                "label": "Left Subtree (Match)",
+                "role": "Skip 50% of keys"
+              },
+              {
+                "id": "r",
+                "label": "Right Subtree (Diff)",
+                "role": "Descend to leaf"
+              },
+              {
+                "id": "leaf",
+                "label": "Bucket #42 Stream",
+                "role": "Sync only stale keys"
+              }
+            ],
+            "edges": [
+              {
+                "label": "hash equal -> skip"
+              },
+              {
+                "label": "hash diff -> drill"
+              }
+            ],
+            "cards": [
+              {
+                "label": "1. O(log N) Pinpoint",
+                "detail": "Replicas exchange tree hashes and only descend branches whose hashes differ."
+              },
+              {
+                "label": "2. Sub-Range Split",
+                "detail": "Keeping token segments small limits how many keys live in a single leaf bucket."
+              },
+              {
+                "label": "3. Tombstone Safety",
+                "detail": "Completing full cycles every 4 days (< 10d grace) prevents zombie resurrection."
+              }
+            ],
+            "summary": "Merkle trees minimize network streaming to only divergent token buckets while protecting tombstone consistency."
+          },
+          "level": "L7 · STAFF / PRINCIPAL"
+        },
+        {
+          "id": "07-problems-and-further-reading",
+          "title": "Problems solved by Read Repair & Related Distributed Concepts",
+          "eyebrow": "Advanced Path · Stage 07",
+          "purpose": "Applied problems: connect these internals to concrete system design and debugging scenarios.",
+          "explanation": "Explore tombstone scans, hinted handoff, and quorum tuning.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Use read repair for fast, opportunistic healing of hot keys during `QUORUM` reads, and schedule periodic Merkle-tree anti-entropy repairs (`nodetool repair`) faster than `gc_grace_seconds` (e.g., < 10 days) to prevent deleted tombstones from resurrecting.",
+      "summary": "Read repair and anti-entropy background repair heal divergent replicas in eventually consistent distributed stores—read repair fixes stale keys on the hot read path, while anti-entropy reconciles entire key ranges offline using Merkle trees.",
+      "keyTakeaway": "When durability and read throughput pull in opposite directions, use read repair for fast, opportunistic healing of hot keys during `QUORUM` reads, and schedule periodic Merkle-tree anti-entropy repairs (`nodetool repair`) faster than `gc_grace_seconds` (e.g., < 10 days) to prevent deleted tombstones from resurrecting."
+    }
+  },
+  "pedagogicalFramework": "PRIME",
+  "prerequisites": [
+    {
+      "title": "Distributed & Application Caching",
+      "summary": "Caching keeps a reusable copy of data so an application can avoid repeating a database query, calculation, or network call. It can make responses faster and reduce database load. The trade-off: the copy may be out of date."
+    }
+  ],
+  "simulation": {
+    "title": "Read Repair & Anti-Entropy — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Client",
+        "role": "Fenced Request"
+      },
+      {
+        "id": "leader",
+        "label": "Quorum Leader",
+        "role": "Term & Log Index"
+      },
+      {
+        "id": "f1",
+        "label": "Replica 1",
+        "role": "Majority Vote"
+      },
+      {
+        "id": "f2",
+        "label": "Replica 2",
+        "role": "Async Catch-Up"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "leader",
+        "label": "write(token)"
+      },
+      {
+        "from": "leader",
+        "to": "f1",
+        "label": "AppendEntries"
+      },
+      {
+        "from": "leader",
+        "to": "f2",
+        "label": "quorum sync"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "What are Read Repair & Anti-Entropy",
+        "actionLabel": "write(token)",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "leader"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "write(token)",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Client sends work to Quorum Leader (What are Read Repair & Anti-Entropy)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Why we need Anti-Entropy (Cold Keys & Zombie Tombstones)",
+        "actionLabel": "AppendEntries",
+        "status": "healthy",
+        "activeNodeIds": [
+          "leader",
+          "f1"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "AppendEntries",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Quorum Leader coordinates with Replica 1 while preserving the core invariant (Why we need Anti-Entropy (Cold Keys & Zombie Tombstones))."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Where Read Repair & Anti-Entropy apply (and where WALs replace them)",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "f1",
+          "f2"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, Replica 2 absorbs pressure without cascading (Where Read Repair & Anti-Entropy apply (and where WALs replace them))."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Problems solved by Read Repair & Related Distributed Concepts",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "leader",
+          "f1",
+          "f2"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Problems solved by Read Repair & Related Distributed Concepts)."
+      }
+    ]
+  }
+}

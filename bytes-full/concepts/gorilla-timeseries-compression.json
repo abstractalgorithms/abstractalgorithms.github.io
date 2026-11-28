@@ -1,0 +1,510 @@
+{
+  "id": "gorilla-timeseries-compression",
+  "slug": "gorilla-timeseries-compression",
+  "name": "Gorilla Time-Series Compression: Delta-of-Delta & XOR Floats",
+  "domain": "Time-Series Databases",
+  "tagline": "Compressing 16-byte (timestamp, float64) telemetry points down to ~1.37 bytes in streaming O(1) memory.",
+  "purpose": "Understand why general-purpose compression like Zstd/LZ4 fails on streaming 2-hour time-series blocks, and how Facebook Gorilla's Delta-of-Delta timestamps + IEEE-754 XOR float encoding achieve ~11x lossless compression.",
+  "pedagogicalFramework": "PRIME",
+  "prerequisites": [
+    {
+      "title": "IEEE-754 64-Bit Floating Point Layout",
+      "summary": "Know that a `float64` packs 1 sign bit, 11 exponent bits, and 52 mantissa bits—and nearby values share almost identical upper bits."
+    },
+    {
+      "title": "Bit-Level Streaming Buffers",
+      "summary": "Understand writing variable-width bitfields (1 bit, 7 bits, 9 bits) rather than byte-aligned integers."
+    }
+  ],
+  "spark": {
+    "summary": "Gorilla encodes regular-interval timestamps in 1 bit via Delta-of-Delta and compresses slowly changing IEEE-754 floats via XOR bit-windows, shrinking 16-byte samples to ~1.37 bytes.",
+    "keyTakeaway": "When storing high-frequency monitoring telemetry in RAM for fast dashboard queries, use Gorilla's Delta-of-Delta + XOR streaming compression per series chunk so you get ~11x memory savings without batching delays.",
+    "byteSummary": "An uncompressed `(int64 timestamp, float64 value)` data point takes 16 bytes. At 10M points/sec, keeping just 2 hours of hot telemetry in RAM for fast alerting would require 1.15 TB of DRAM. Running Zstd over tiny per-series arrays either adds CPU latency or requires buffering large batches that delay real-time reads.\n\nFacebook's Gorilla paper introduced two streaming bit-level tricks that compress each point on arrival in O(1) time. First, for timestamps, metrics arrive at regular intervals (e.g., every 60s). Instead of storing `t_n`, Gorilla computes the Delta-of-Delta `D = (t_n - t_{n-1}) - (t_{n-1} - t_{n-2})`. When `D == 0` (~96% of points), it writes a single `'0'` bit; small jitter fits in 7-, 9-, or 12-bit buckets.\n\nSecond, for values, consecutive `float64` readings (like CPU = 42.1% -> 42.3%) share the same sign, exponent, and upper mantissa bits. Gorilla computes `xor = v_{n-1} ^ v_n`. If `xor == 0`, it emits a single `'0'` bit. Otherwise, it reuses the previous XOR's leading/trailing zero window (2 control bits + meaningful bits) or writes a 5-bit leading-zero count + 6-bit length + meaningful bits—averaging ~1.37 bytes per `(timestamp, value)` pair."
+  },
+  "learningJourney": [
+    {
+      "id": "stage-1-problem-broken-trace",
+      "stageNumber": 1,
+      "title": "P · Problem & Why Uncompressed Telemetry Blows Up RAM",
+      "whyThisMatters": "Quantifies the 16-byte/point memory wall and why batch codecs hurt real-time alerting.",
+      "explanation": {
+        "foundation": "Every raw metric sample is 8 bytes for the Unix timestamp + 8 bytes for the `float64` value = 16 bytes.",
+        "core": "At 10M samples/sec, 2 hours (7,200 seconds) of hot operational metrics equals 72 billion points = 1.152 TB of raw DRAM before any index overhead. Compressing with gzip/Zstd across 10M separate series buffers either forces tiny 100-byte blocks (poor ratio) or delays flushing until buffers fill.",
+        "deepDive": "Gorilla compresses bit-by-bit as each sample arrives into an append-only 2-hour chunk per series, allowing readers to scan the live in-memory bitstream immediately without waiting for block finalization."
+      },
+      "sectionDiagram": {
+        "kind": "behavior-transition",
+        "eyebrow": "Memory Efficiency",
+        "title": "Raw 16-Byte Samples vs. Gorilla 1.37-Byte Bitstream",
+        "before": {
+          "label": "Uncompressed (int64 + float64)",
+          "metrics": [
+            "16 bytes per data point",
+            "1.15 TB DRAM for 2h @ 10M/s",
+            "No bit-level redundancy removal"
+          ]
+        },
+        "after": {
+          "label": "Gorilla Bit-Stream",
+          "metrics": [
+            "~1.37 bytes/point (~11.6x)",
+            "~98 GB DRAM for same 2h window",
+            "O(1) streaming append & read"
+          ]
+        }
+      }
+    },
+    {
+      "id": "stage-2-representation-delta-of-delta",
+      "stageNumber": 2,
+      "title": "R · Representation: Delta-of-Delta Timestamp Encoding",
+      "whyThisMatters": "Shows how regular scrape intervals collapse 64-bit timestamps into 1 bit.",
+      "explanation": {
+        "foundation": "Suppose a Prometheus scraper polls a node every 60 seconds: `t0=0, t1=60, t2=120, t3=181`.",
+        "core": "The first differences are `60, 60, 61`. The second differences (Delta-of-Delta `D`) are `D2 = 60 - 60 = 0` and `D3 = 61 - 60 = +1`. Gorilla uses a variable-length prefix code: `'0'` (1 bit) for `D == 0`; `'10'` + 7-bit signed `D` for `[-63, 64]`; `'110'` + 9-bit `D` for `[-255, 256]`; `'1110'` + 12-bit `D` for `[-2047, 2048]`; and `'1111'` + 32-bit `D` otherwise.",
+        "deepDive": "In Facebook's production Gorilla deployment, ~96% of timestamps had `D == 0` (1 bit!), and nearly all remaining jitter fit inside the 7-bit bucket (`9 bits` total)—making timestamps practically free."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Delta-of-Delta Pipeline",
+        "title": "t_n -> First Delta -> Delta-of-Delta -> Variable Bit Bucket",
+        "actors": [
+          {
+            "id": "in",
+            "label": "Incoming t_n"
+          },
+          {
+            "id": "d1",
+            "label": "Delta (t_n - t_{n-1})"
+          },
+          {
+            "id": "d2",
+            "label": "Delta-of-Delta D"
+          },
+          {
+            "id": "bit",
+            "label": "Bitstream Out"
+          }
+        ],
+        "steps": [
+          {
+            "from": "in",
+            "to": "d1",
+            "label": "Compute step interval"
+          },
+          {
+            "from": "d1",
+            "to": "d2",
+            "label": "Subtract previous interval"
+          },
+          {
+            "from": "d2",
+            "to": "bit",
+            "label": "D=0 -> emit single '0' bit"
+          },
+          {
+            "from": "d2",
+            "to": "bit",
+            "label": "D!=0 -> 7/9/12/32-bit bucket"
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-3-invariant-xor-floats",
+      "stageNumber": 3,
+      "title": "I · Invariant: IEEE-754 XOR Floating-Point Compression",
+      "whyThisMatters": "Explains why XORing consecutive floats beats integer delta encoding on floating-point values.",
+      "explanation": {
+        "foundation": "Subtracting two `float64` numbers (`42.3 - 42.1`) creates floating-point rounding noise across all 52 mantissa bits. Bitwise XOR (`v_{n-1} ^ v_n`) preserves exact lossless bit equality.",
+        "core": "Gorilla computes `xor = prev_bits ^ curr_bits`. Case 1: `xor == 0` -> emit `'0'` (1 bit). Case 2: `xor != 0` -> emit `'1'`. If the non-zero meaningful bits fall inside the previous XOR's `[leading_zeros, trailing_zeros]` window, emit `'0'` + just those meaningful bits! Otherwise emit `'1'` + 5 bits (leading zeros, capped at 31) + 6 bits (meaningful bit count - 1) + the meaningful bits.",
+        "deepDive": "Because monotonic counters and smooth gauges rarely change exponent or top mantissa bits, the XOR block shrinks to ~10–18 bits on average—and remains 100% bit-exact lossless upon `prev_bits ^ xor`!"
+      },
+      "codeExample": {
+        "language": "python",
+        "title": "Gorilla Delta-of-Delta + XOR Value Encoder (Conceptual)",
+        "code": "import struct\n\ndef float_to_u64(val: float) -> int:\n    return struct.unpack('>Q', struct.pack('>d', val))[0]\n\ndef encode_xor_step(prev_u64, curr_val, prev_lead, prev_trail, bitwriter):\n    curr_u64 = float_to_u64(curr_val)\n    xor = prev_u64 ^ curr_u64\n    if xor == 0:\n        bitwriter.write_bits(0, 1)\n        return curr_u64, prev_lead, prev_trail\n    bitwriter.write_bits(1, 1)\n    lead = min(31, (64 - xor.bit_length()))\n    trail = (xor & -xor).bit_length() - 1\n    if lead >= prev_lead and trail >= prev_trail:\n        bitwriter.write_bits(0, 1)  # reuse previous window\n        meaningful_len = 64 - prev_lead - prev_trail\n        bitwriter.write_bits(xor >> prev_trail, meaningful_len)\n        return curr_u64, prev_lead, prev_trail\n    meaningful_len = 64 - lead - trail\n    bitwriter.write_bits(1, 1)\n    bitwriter.write_bits(lead, 5)\n    bitwriter.write_bits(meaningful_len - 1, 6)\n    bitwriter.write_bits(xor >> trail, meaningful_len)\n    return curr_u64, lead, trail\n"
+      },
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "XOR Bit-Window",
+        "title": "64-Bit Float XOR -> Zero Check -> Window Reuse vs. New Window",
+        "nodes": [
+          {
+            "id": "xor",
+            "label": "prev_u64 ^ curr_u64",
+            "tier": "ingress"
+          },
+          {
+            "id": "zero",
+            "label": "xor == 0 -> '0' (1 bit)",
+            "tier": "compute"
+          },
+          {
+            "id": "reuse",
+            "label": "Fits Window -> '10'+bits",
+            "tier": "storage"
+          },
+          {
+            "id": "new",
+            "label": "New Window -> '11'+5b+6b",
+            "tier": "control"
+          }
+        ],
+        "edges": [
+          {
+            "from": "xor",
+            "to": "zero",
+            "label": "identical"
+          },
+          {
+            "from": "xor",
+            "to": "reuse",
+            "label": "lead/trail >= prev"
+          },
+          {
+            "from": "xor",
+            "to": "new",
+            "label": "wider span"
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-4-mechanics-2h-chunks",
+      "stageNumber": 4,
+      "title": "M · Mechanics at Scale: 2-Hour Blocks & Random-Access Limits",
+      "whyThisMatters": "Explains why Gorilla chunks reset every 2 hours instead of compressing forever.",
+      "explanation": {
+        "foundation": "Gorilla encoding is stateful and sequential: to decode point #500, you must decode points #1 through #499 from the start of the chunk.",
+        "core": "Resetting chunks every 2 hours (e.g., 120 points at 60s scrape, or 720 points at 10s scrape) bounds decode latency to microseconds and caps blast radius if a chunk is evicted or corrupted. It also aligns cleanly with Prometheus/VictoriaMetrics block compaction.",
+        "deepDive": "Notice the 5-bit `leading_zeros` field only encodes values `0..31`! If a `float64` XOR happens to have 40 leading zeros, Gorilla clamps `lead = 31` so it never overflows the 5-bit field—trading 9 extra bits for a simpler fixed-width header."
+      },
+      "decisionFramework": {
+        "problem": "How to store billions of streaming metric points in RAM with ~10x compression and sub-millisecond reads.",
+        "naiveSolution": "Store raw 16-byte structs or run Zstd on every incoming point.",
+        "whyItFails": "Raw structs blow up DRAM by 11x; Zstd requires batching or burns CPU re-compressing tiny per-series buffers.",
+        "alternatives": "Raw arrays vs. Zstd batches vs. Gorilla Delta-of-Delta + XOR 2-hour chunks.",
+        "decision": "Use Gorilla streaming bit-compression per 2-hour chunk in RAM, then optionally apply Zstd/Parquet when flushing cold blocks to S3.",
+        "tradeOffs": "Sequential decode within a 2-hour chunk (mitigated by capping chunk duration at 2h) in exchange for O(1) append and ~1.37 B/point."
+      },
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "2-Hour Chunk Lifecycle",
+        "title": "Open Chunk (Append Bits) -> 2h Seal -> Flush to Block Store",
+        "states": [
+          {
+            "id": "open",
+            "label": "Active 2h Chunk",
+            "tone": "good"
+          },
+          {
+            "id": "seal",
+            "label": "Sealed Immutable",
+            "tone": "info"
+          },
+          {
+            "id": "flush",
+            "label": "Compacted to Disk/S3",
+            "tone": "good"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "open",
+            "to": "seal",
+            "label": "t >= block_end"
+          },
+          {
+            "from": "seal",
+            "to": "flush",
+            "label": "async WAL truncate"
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-5-edge-cases-assumptions",
+      "stageNumber": 5,
+      "title": "E · Edge Cases, Assumptions & When NOT to Use Gorilla",
+      "whyThisMatters": "Identifies out-of-order ingestion, noisy high-entropy floats, and NaN/Inf traps.",
+      "explanation": {
+        "foundation": "Gorilla assumes timestamps per series arrive mostly in order at regular intervals and values change smoothly.",
+        "core": "When NOT to use Gorilla: (1) High-entropy random floats or cryptographic hashes—XOR windows stay near 64 bits wide, making Gorilla *larger* than 16 bytes due to control bits! (2) Heavy out-of-order writes—an append-only bitstream cannot insert `t_n < t_{n-1}` mid-chunk without rewriting or using an out-of-order buffer.",
+        "deepDive": "Assumptions & Limitations: The ~1.37 bytes/point benchmark from Pelkonen et al. (VLDB 2015) assumes 60s scrape intervals (~96% `D=0`) and production monitoring gauges/counters where ~50%+ of consecutive values are identical or closely correlated. Glossary: Delta-of-Delta (second difference of timestamps), IEEE-754 (standard 64-bit float representation), Chunk (time-bounded compressed array for one series)."
+      },
+      "decisionExercise": {
+        "prompt": "A team uses Gorilla XOR compression on a time series of uniformly random 64-bit UUID hashes cast to floats. Compression ratio drops to 0.96x (worse than uncompressed!). Why?",
+        "options": [
+          {
+            "id": "a",
+            "label": "Random values have zero bit correlation between consecutive samples, so XOR produces ~64 meaningful bits plus 13 control bits per point.",
+            "isCorrect": true,
+            "explanation": "Correct! Gorilla XOR relies on consecutive float64 values sharing upper bits; uncorrelated random bits expand slightly due to header bits."
+          },
+          {
+            "id": "b",
+            "label": "Gorilla only supports 32-bit integers.",
+            "isCorrect": false,
+            "explanation": "Gorilla is specifically designed for 64-bit IEEE-754 floats."
+          },
+          {
+            "id": "c",
+            "label": "2-hour chunks are too short for XOR.",
+            "isCorrect": false,
+            "explanation": "Chunk duration does not fix uncorrelated random entropy."
+          }
+        ]
+      },
+      "sectionDiagram": {
+        "kind": "quorum-cluster",
+        "eyebrow": "Workload Fit",
+        "title": "Smooth Gauges (1.37 B/pt) vs. Out-of-Order / Random Entropy",
+        "nodes": [
+          {
+            "id": "g1",
+            "label": "CPU / Mem Gauges",
+            "role": "~11x Gorilla Win"
+          },
+          {
+            "id": "g2",
+            "label": "Out-of-Order Spikes",
+            "role": "Needs OOO Buffer"
+          },
+          {
+            "id": "g3",
+            "label": "Random / Encrypted",
+            "role": "Use Raw / Zstd"
+          }
+        ]
+      }
+    }
+  ],
+  "simulation": {
+    "title": "Gorilla Streaming Encoder — Delta-of-Delta & XOR Steps",
+    "nodes": [
+      {
+        "id": "sample",
+        "label": "Metric Sample",
+        "role": "(t_n, float64)"
+      },
+      {
+        "id": "dod",
+        "label": "Delta-of-Delta",
+        "role": "Timestamp Bit Encoder"
+      },
+      {
+        "id": "xor",
+        "label": "XOR Float Unit",
+        "role": "64-Bit Window Matcher"
+      },
+      {
+        "id": "chunk",
+        "label": "2h Bitstream",
+        "role": "In-Memory Chunk"
+      }
+    ],
+    "edges": [
+      {
+        "from": "sample",
+        "to": "dod",
+        "label": "extract timestamp"
+      },
+      {
+        "from": "sample",
+        "to": "xor",
+        "label": "extract float64 bits"
+      },
+      {
+        "from": "xor",
+        "to": "chunk",
+        "label": "append compressed bits"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Regular 60s Timestamp (D = 0)",
+        "actionLabel": "Emit single '0' bit",
+        "status": "healthy",
+        "activeNodeIds": [
+          "sample",
+          "dod"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "delta_of_delta": 0,
+          "ts_bits": 1,
+          "raw_ts_bits": 64
+        },
+        "explanation": "Interval matches previous 60s scrape exactly, collapsing a 64-bit timestamp to 1 bit."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Identical Float Value (xor = 0)",
+        "actionLabel": "Emit single '0' bit",
+        "status": "healthy",
+        "activeNodeIds": [
+          "sample",
+          "xor",
+          "chunk"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "xor_val": 0,
+          "val_bits": 1,
+          "total_point_bits": 2
+        },
+        "explanation": "Gauge value unchanged; entire (timestamp, value) point takes just 2 bits!"
+      },
+      {
+        "stepNumber": 3,
+        "title": "Small Jitter + Slightly Changed Float",
+        "actionLabel": "Reuse XOR window ('10' + bits)",
+        "status": "healthy",
+        "activeNodeIds": [
+          "dod",
+          "xor",
+          "chunk"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "dod": "+1s (9 bits)",
+          "xor_window": "reused",
+          "avg_bytes_pt": 1.37
+        },
+        "explanation": "1s scrape jitter uses 9 bits and the float reuses the previous XOR leading/trailing zero window."
+      },
+      {
+        "stepNumber": 4,
+        "title": "2-Hour Boundary Reached",
+        "actionLabel": "Seal chunk & start fresh",
+        "status": "warning",
+        "activeNodeIds": [
+          "chunk"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "chunk_age": "2h00m",
+          "action": "Seal & Flush",
+          "decode_bound": "<10 us"
+        },
+        "explanation": "Chunk seals at 2 hours to bound sequential decode cost and prepare immutable block flush."
+      }
+    ]
+  },
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-1",
+        "question": "In Gorilla timestamp compression, how many bits are needed to encode a timestamp whose Delta-of-Delta `D` equals `0`?",
+        "options": [
+          {
+            "id": "a",
+            "text": "1 bit ('0')",
+            "correct": true,
+            "feedback": "Correct! When scrape intervals stay constant (D=0), Gorilla emits a single '0' bit."
+          },
+          {
+            "id": "b",
+            "text": "8 bits (1 byte)",
+            "correct": false,
+            "feedback": "Gorilla operates at bit granularity, not byte boundaries."
+          },
+          {
+            "id": "c",
+            "text": "32 bits",
+            "correct": false,
+            "feedback": "32 bits is only used as a fallback for huge Delta-of-Delta jumps > 2048."
+          },
+          {
+            "id": "d",
+            "text": "64 bits",
+            "correct": false,
+            "feedback": "64 bits is only stored once for the chunk's initial anchor timestamp."
+          }
+        ],
+        "explanation": "Regular 10s or 60s monitoring scrapes produce D=0 ~96% of the time, collapsing 64-bit timestamps to 1 bit."
+      },
+      {
+        "id": "kc-2",
+        "question": "Why does Gorilla use bitwise XOR (`prev ^ curr`) rather than arithmetic subtraction (`curr - prev`) for `float64` values?",
+        "options": [
+          {
+            "id": "a",
+            "text": "IEEE-754 subtraction introduces rounding noise across mantissa bits, whereas XOR is 100% lossless and leaves upper sign/exponent bits as zeros.",
+            "correct": true,
+            "feedback": "Correct! `prev ^ xor` recovers the exact 64-bit float bit-for-bit."
+          },
+          {
+            "id": "b",
+            "text": "CPUs cannot subtract `float64` numbers.",
+            "correct": false,
+            "feedback": "CPUs have FPU subtraction, but it is lossy for compression."
+          },
+          {
+            "id": "c",
+            "text": "XOR automatically sorts timestamps.",
+            "correct": false,
+            "feedback": "XOR is only used on values, not timestamps."
+          },
+          {
+            "id": "d",
+            "text": "Subtraction only works on negative numbers.",
+            "correct": false,
+            "feedback": "Subtraction works on all floats, just not bit-exactly."
+          }
+        ],
+        "explanation": "Bitwise XOR is self-inverse (`(a ^ b) ^ a == b`), ensuring exact lossless float64 reconstruction."
+      },
+      {
+        "id": "kc-3",
+        "question": "Why does Gorilla cap each compressed chunk at a fixed 2-hour window instead of appending indefinitely?",
+        "options": [
+          {
+            "id": "a",
+            "text": "To bound sequential bitstream decoding time and enable clean time-range eviction/compaction.",
+            "correct": true,
+            "feedback": "Correct! Because decoding point K requires scanning from the start of the chunk, 2-hour windows keep reads fast."
+          },
+          {
+            "id": "b",
+            "text": "Because 64-bit timestamps overflow after 2 hours.",
+            "correct": false,
+            "feedback": "64-bit timestamps last billions of years."
+          },
+          {
+            "id": "c",
+            "text": "Because XOR only works for 120 samples.",
+            "correct": false,
+            "feedback": "XOR works for any sample count; the 2h cap is for query/retention bounds."
+          },
+          {
+            "id": "d",
+            "text": "To force every query to scan S3.",
+            "correct": false,
+            "feedback": "2-hour chunks stay hot in RAM specifically to avoid disk/S3 scans."
+          }
+        ],
+        "explanation": "2-hour chunks balance compression ratio (~1.37 B/pt) with fast sequential decode and clean block aging."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Gorilla shrinks time-series metrics from 16 bytes per point to ~1.37 bytes by storing only timestamp changes (1 bit when steady) and XOR bit differences for floats.",
+      "keyTakeaway": "When storing regular-interval metrics in memory, compress timestamps with Delta-of-Delta and float values with XOR so you save ~90% of RAM.",
+      "byteSummary": "Instead of saving full 64-bit timestamps and floats every 60 seconds, Gorilla stores a single '0' bit when the interval stays constant and only the changed bits of each new float."
+    },
+    "intermediate": {
+      "summary": "Gorilla pairs Delta-of-Delta variable-bit timestamps (1/9/11/16/36 bits) with IEEE-754 XOR bit-windowing inside 2-hour chunks for ~1.37 B/point.",
+      "keyTakeaway": "When building an in-memory TSDB buffer, use Gorilla Delta-of-Delta + XOR per 2-hour chunk for O(1) streaming writes and ~11x lossless compression.",
+      "byteSummary": "Delta-of-Delta collapses regular scrapes to 1 bit, while XOR window reuse keeps slowly changing float64 values compact inside 2-hour chunks."
+    },
+    "advanced": {
+      "summary": "Bit-level Gorilla streaming encoder with 5-bit clamped leading-zero XOR windows, 2-hour chunk sealing, and out-of-order/high-entropy fallback awareness.",
+      "keyTakeaway": "When deploying Gorilla compression at scale, cap chunks at 2 hours to bound sequential decode and route high-entropy or out-of-order streams to dedicated buffers.",
+      "byteSummary": "Clamping leading zeros to 5 bits (`0..31`) simplifies the XOR control header while achieving ~1.37 B/point on smooth gauges; out-of-order writes and random entropy require separate handling."
+    }
+  }
+}

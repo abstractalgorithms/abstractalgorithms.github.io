@@ -1,0 +1,840 @@
+{
+  "id": "blocking-io-forkjoinpool",
+  "slug": "blocking-io-forkjoinpool",
+  "title": "Isolating Blocking I/O from ForkJoinPool",
+  "problemType": "system-design",
+  "difficulty": "medium",
+  "prompt": "A checkout microservice on an 8-vCPU container uses `orderIds.parallelStream().map(this::fetchOrderFromDb).toList()` in a reporting endpoint. Whenever that endpoint runs, unrelated `CompletableFuture.supplyAsync()` payment callbacks and reactive health checks freeze for 15+ seconds, even though CPU utilization is only 12%. Diagnose and fix the `ForkJoinPool.commonPool()` exhaustion.",
+  "spark": {
+    "summary": "Running blocking HTTP/DB calls inside `list.parallelStream()` or default `CompletableFuture.supplyAsync()` hijacks the JVM-wide `ForkJoinPool.commonPool()` (sized to `cores - 1`), starving unrelated async tasks across the entire process.",
+    "keyTakeaway": "If latency budgets leave no room for synchronous retries, never run blocking I/O on `ForkJoinPool.commonPool()`; isolate blocking work onto a dedicated bounded executor (or Java 21 Virtual Threads) and reserve `commonPool()` strictly for short CPU-bound tasks.",
+    "byteSummary": "**Core Mechanics:** On an **8-vCPU container**, `ForkJoinPool.commonPool()` has only **7 worker threads** (`cores - 1`).\n\n**Visual & Structural Flow:** Depicts 7-Thread ForkJoinPool Freeze vs. Virtual Threads + Semaphore (Report API -> commonPool (7) -> Payment CB -> VT + Sem(32)); Separating CPU commonPool from Bounded I/O Concurrency (CPU Tasks -> I/O Executor -> Semaphore(32) -> Postgres / HTTP).\n\n**Trade-Offs & Production:** Passing `-Djava.util.concurrent.ForkJoinPool.common.parallelism=200` bloats every parallel stream in the JVM and adds heavy context-switching overhead to CPU-bound tasks. Separate CPU-bound `commonPool()` work from blocking I/O with explicit concurrency and timeout bounds: **Dedicated I/O Executor**: Never call `.parallelStream()` for I/O or 1-arg `CompletableFuture.supplyAsync(fn)`.\n\n**Failure Modes & Application:** Thread-pool bulkhead isolation is fundamental in high-concurrency JVM services: **API Gateways & BFF Fan-Outs**: Prevents one slow downstream microservice from starving unrelated routes."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why Isolating Blocking I/O from ForkJoinPool Matters",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "Think of **Why Isolating Blocking I/O from ForkJoinPool Matters** as the intuition layer for Isolating Blocking I/O from ForkJoinPool: The mechanism: understand how Why Isolating Blocking I/O from ForkJoinPool Matters works from first principles.",
+        "core": "On an **8-vCPU container**, `ForkJoinPool.commonPool()` has only **7 worker threads** (`cores - 1`). When a reporting endpoint runs `orderIds.parallelStream().map(this::fetchOrderFromDb).toList()` on batches of **500 `orderIds`**, all 7 shared threads block on JDBC/HTTP I/O—freezing unrelated `CompletableFuture.supplyAsync()` payment callbacks and health checks for **15+ seconds** at just 12% CPU.",
+        "deepDive": "Under heavy load or partial failure, why isolating blocking i/o from forkjoinpool matters becomes a critical lever for predictable latency and correctness. Running blocking HTTP/DB calls inside `list.parallelStream()` or default `CompletableFuture.supplyAsync()` hijacks the JVM-wide `ForkJoinPool.commonPool()` (sized to `cores - 1`), starving unrelated async tasks across the entire process."
+      },
+      "purpose": "The mechanism: understand how Why Isolating Blocking I/O from ForkJoinPool Matters works from first principles."
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "Real-World Impact of CommonPool Exhaustion",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Hijacking `commonPool()` for blocking I/O creates a process-wide bulkhead breach:",
+        "core": "1. **Cross-Endpoint Starvation**: Healthy `/health` and payment callbacks queue behind slow reporting JDBC queries.\n2. **False Liveness Failures**: Kubernetes liveness probes time out while CPU is idle, restarting healthy pods.\n3. **Unbounded Downstream Spike**: If `ManagedBlocker` is used carelessly without a bulkhead, `commonPool()` spawns hundreds of compensation threads and overwhelms the database.",
+        "deepDive": "In production deployments of Isolating Blocking I/O from ForkJoinPool, watch how real-world impact of commonpool exhaustion interacts with tail latency, retry amplification, and partial failures. Running blocking HTTP/DB calls inside `list.parallelStream()` or default `CompletableFuture.supplyAsync()` hijacks the JVM-wide `ForkJoinPool.commonPool()` (sized to `cores - 1`), starving unrelated async tasks across the entire process."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "CommonPool Starvation vs. Dedicated I/O Bulkhead",
+        "title": "7-Thread ForkJoinPool Freeze vs. Virtual Threads + Semaphore",
+        "actors": [
+          {
+            "id": "rep",
+            "label": "Report API"
+          },
+          {
+            "id": "fjp",
+            "label": "commonPool (7)"
+          },
+          {
+            "id": "pay",
+            "label": "Payment CB"
+          },
+          {
+            "id": "io",
+            "label": "VT + Sem(32)"
+          }
+        ],
+        "events": [
+          {
+            "from": "rep",
+            "to": "fjp",
+            "label": "Naive: parallelStream() 500 JDBC calls",
+            "status": "fail"
+          },
+          {
+            "from": "pay",
+            "to": "fjp",
+            "label": "supplyAsync() queued 15s (starved!)",
+            "status": "fail"
+          },
+          {
+            "from": "rep",
+            "to": "io",
+            "label": "Fixed: VirtualThreadPerTask + Sem(32)",
+            "status": "ok"
+          },
+          {
+            "from": "pay",
+            "to": "fjp",
+            "label": "commonPool() stays 100% free for CPU",
+            "status": "ok"
+          }
+        ],
+        "summary": "Moving blocking I/O onto a dedicated bounded executor or Virtual Threads + Semaphore keeps ForkJoinPool.commonPool() unblocked."
+      },
+      "purpose": "The problem: see what breaks without Real-World Impact of CommonPool Exhaustion under real concurrency or scale.",
+      "decisionFramework": {
+        "problem": "How to implement Isolating Blocking I/O from ForkJoinPool without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "If latency budgets leave no room for synchronous retries, never run blocking I/O on `ForkJoinPool.commonPool()`; isolate blocking work onto a dedicated bounded executor (or Java 21 Virtual Threads) and reserve `commonPool()` strictly for short CPU-bound tasks.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Isolating Blocking I/O from ForkJoinPool experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Naive Solution (and Why It Breaks)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Think of **Naive Solution (and Why It Breaks)** as the intuition layer for Isolating Blocking I/O from ForkJoinPool: The problem: see what breaks without Naive Solution under real concurrency or scale.",
+        "core": "Passing `-Djava.util.concurrent.ForkJoinPool.common.parallelism=200` bloats every parallel stream in the JVM and adds heavy context-switching overhead to CPU-bound tasks. Using `ForkJoinPool.ManagedBlocker` for JDBC/HTTP still doesn't cap downstream DB concurrency and fails when drivers ignore thread interruption.",
+        "deepDive": "Under heavy load or partial failure, naive solution (and why it breaks) becomes a critical lever for predictable latency and correctness. Running blocking HTTP/DB calls inside `list.parallelStream()` or default `CompletableFuture.supplyAsync()` hijacks the JVM-wide `ForkJoinPool.commonPool()` (sized to `cores - 1`), starving unrelated async tasks across the entire process."
+      },
+      "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "Component Topology",
+        "title": "Naive Solution (and Why It Breaks)",
+        "graphNodes": [
+          {
+            "id": "tx",
+            "label": "Client Tx",
+            "role": "ingress",
+            "col": 0,
+            "row": 0,
+            "tone": "primary"
+          },
+          {
+            "id": "plan",
+            "label": "Query Planner",
+            "role": "compute",
+            "col": 1,
+            "row": 0,
+            "tone": "tint"
+          },
+          {
+            "id": "wal",
+            "label": "WAL Buffer",
+            "role": "storage",
+            "col": 2,
+            "row": 0,
+            "tone": "tint"
+          },
+          {
+            "id": "disk",
+            "label": "Storage Pages",
+            "role": "control",
+            "col": 0,
+            "row": 1,
+            "tone": "tint"
+          }
+        ],
+        "graphEdges": [
+          {
+            "from": "tx",
+            "to": "plan",
+            "label": "SQL query",
+            "style": "solid",
+            "tone": "green"
+          },
+          {
+            "from": "plan",
+            "to": "wal",
+            "label": "append redo",
+            "style": "solid",
+            "tone": "green"
+          },
+          {
+            "from": "wal",
+            "to": "disk",
+            "label": "checkpoint flush",
+            "style": "solid",
+            "tone": "green"
+          }
+        ]
+      }
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise Solution: Dedicated Bounded Executor / Virtual Threads + Semaphore",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": {
+        "foundation": "Separate CPU-bound `commonPool()` work from blocking I/O with explicit concurrency and timeout bounds:",
+        "core": "- **Dedicated I/O Executor**: Never call `.parallelStream()` for I/O or 1-arg `CompletableFuture.supplyAsync(fn)`. Always pass an explicit executor: a bounded `ThreadPoolExecutor` on Java 17, or `Executors.newVirtualThreadPerTaskExecutor()` on Java 21.\n- **Semaphore Bulkhead (`32` permits)**: Virtual threads are cheap, so cap concurrent DB/HTTP calls with a `Semaphore(32)` instead of pooling virtual threads.\n- **Per-Request Timeout (`2s`) & Monitoring**: Configure `HttpClient.timeout(Duration.ofSeconds(2))` and alert on `ForkJoinPool.commonPool().getQueuedSubmissionCount()`.",
+        "deepDive": "In production deployments of Isolating Blocking I/O from ForkJoinPool, watch how enterprise solution: dedicated bounded executor / virtual threads + semaphore interacts with tail latency, retry amplification, and partial failures. Running blocking HTTP/DB calls inside `list.parallelStream()` or default `CompletableFuture.supplyAsync()` hijacks the JVM-wide `ForkJoinPool.commonPool()` (sized to `cores - 1`), starving unrelated async tasks across the entire process."
+      },
+      "sectionDiagram": {
+        "kind": "cache-tier",
+        "eyebrow": "Bulkhead Isolation Architecture",
+        "title": "Separating CPU commonPool from Bounded I/O Concurrency",
+        "nodes": [
+          {
+            "label": "CPU Tasks",
+            "role": "commonPool (7 threads)"
+          },
+          {
+            "label": "I/O Executor",
+            "role": "Virtual Threads / Pool"
+          },
+          {
+            "label": "Semaphore(32)",
+            "role": "DB concurrency bulkhead"
+          },
+          {
+            "label": "Postgres / HTTP",
+            "role": "2s request timeout"
+          }
+        ],
+        "edges": [
+          {
+            "label": "Zero I/O on FJP"
+          },
+          {
+            "label": "Bounded fan-out"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Java 21 Pattern",
+            "detail": "VirtualThreadPerTaskExecutor + Semaphore(32) scales without OS thread bloat."
+          },
+          {
+            "label": "Java 17 Pattern",
+            "detail": "Dedicated ThreadPoolExecutor sized via Little's Law."
+          },
+          {
+            "label": "2s Timeouts",
+            "detail": "Prevents hung sockets from holding Semaphore permits forever."
+          },
+          {
+            "label": "JMX / Micrometer",
+            "detail": "Alert if jvm.fjp.common.queued > 0."
+          }
+        ],
+        "summary": "Explicit executor arguments and Semaphore bulkheads isolate slow I/O from JVM-wide async callbacks."
+      },
+      "markdownContent": "```java\nimport java.util.*;\nimport java.util.concurrent.*;\n\npublic class OrderBatchFetcher {\n    private final ExecutorService ioExecutor = Executors.newVirtualThreadPerTaskExecutor();\n    private final Semaphore dbConcurrencyLimit = new Semaphore(32);\n\n    public List<Order> fetchOrders(List<String> orderIds) {\n        List<CompletableFuture<Order>> futures = orderIds.stream()\n            .map(id -> CompletableFuture.supplyAsync(() -> fetchWithLimit(id), ioExecutor)\n                                        .orTimeout(2, TimeUnit.SECONDS))\n            .toList();\n        return futures.stream().map(CompletableFuture::join).toList();\n    }\n\n    private Order fetchWithLimit(String id) {\n        try {\n            if (!dbConcurrencyLimit.tryAcquire(2, TimeUnit.SECONDS)) {\n                throw new CompletionException(new TimeoutException(\"DB semaphore busy\"));\n            }\n            try {\n                return queryOrderDb(id); // uses socket timeout = 2s\n            } finally {\n                dbConcurrencyLimit.release();\n            }\n        } catch (InterruptedException e) {\n            Thread.currentThread().interrupt();\n            throw new CompletionException(e);\n        }\n    }\n}\n\nHttpRequest req = HttpRequest.newBuilder(uri)\n    .timeout(Duration.ofSeconds(2)) // Cancels socket I/O at 2s!\n    .GET().build();\n\n// Micrometer / JMX check for commonPool saturation\nGauge.builder(\"jvm.fjp.common.queued\",\n    () -> ForkJoinPool.commonPool().getQueuedSubmissionCount())\n    .register(meterRegistry);\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where Executor Isolation Applies in System Design",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Thread-pool bulkhead isolation is fundamental in high-concurrency JVM services:",
+        "core": "- **API Gateways & BFF Fan-Outs**: Prevents one slow downstream microservice from starving unrelated routes.\n- **Batch & Reporting Endpoints**: Bounds concurrent database queries per batch request.\n- **Reactive + Imperative Bridges**: Isolates legacy JDBC calls off Netty/Reactor event loops.",
+        "deepDive": "In production deployments of Isolating Blocking I/O from ForkJoinPool, watch how where executor isolation applies in system design interacts with tail latency, retry amplification, and partial failures. Running blocking HTTP/DB calls inside `list.parallelStream()` or default `CompletableFuture.supplyAsync()` hijacks the JVM-wide `ForkJoinPool.commonPool()` (sized to `cores - 1`), starving unrelated async tasks across the entire process."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "bulkhead-fault-isolation",
+          "title": "Concept: Bulkhead & Fault Isolation",
+          "kind": "concept"
+        },
+        {
+          "slug": "java-virtual-threads",
+          "title": "Concept: Java Virtual Threads",
+          "kind": "concept"
+        },
+        {
+          "slug": "thread-pool-design",
+          "title": "Concept: Thread Pool Design",
+          "kind": "concept"
+        },
+        {
+          "slug": "circuit-breaker-pattern",
+          "title": "System Design: Circuit Breaker Pattern",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why does `orderIds.parallelStream().map(this::fetchOrderFromDb)` freeze unrelated `CompletableFuture.supplyAsync()` callbacks?",
+      "options": [
+        {
+          "id": "a",
+          "text": "Both `parallelStream()` and 1-argument `CompletableFuture.supplyAsync()` share the JVM-wide `ForkJoinPool.commonPool()`",
+          "correct": true,
+          "feedback": "Correct: blocking all `cores - 1` commonPool threads starves every other caller using the default pool."
+        },
+        {
+          "id": "b",
+          "text": "`parallelStream()` acquires a global lock on the JVM heap during iteration",
+          "correct": false,
+          "feedback": "Streams do not lock the heap; they contend for `commonPool()` worker threads."
+        },
+        {
+          "id": "c",
+          "text": "`CompletableFuture` cannot execute concurrently with JDBC drivers",
+          "correct": false,
+          "feedback": "`CompletableFuture` works fine with JDBC when given a dedicated I/O executor."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why does `orderIds.parallelStream().map(this::fetchOrderFromDb)` freeze unrelated `CompletableFuture.supplyAsync()` callbacks?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Both `parallelStream()` and 1-argument `CompletableFuture.supplyAsync()` share the JVM-wide `ForkJoinPool.commonPool()`",
+            "correct": true,
+            "feedback": "Correct: blocking all `cores - 1` commonPool threads starves every other caller using the default pool."
+          },
+          {
+            "id": "b",
+            "text": "`parallelStream()` acquires a global lock on the JVM heap during iteration",
+            "correct": false,
+            "feedback": "Streams do not lock the heap; they contend for `commonPool()` worker threads."
+          },
+          {
+            "id": "c",
+            "text": "`CompletableFuture` cannot execute concurrently with JDBC drivers",
+            "correct": false,
+            "feedback": "`CompletableFuture` works fine with JDBC when given a dedicated I/O executor."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why Isolating Blocking I/O from ForkJoinPool Matters', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "On an **8-vCPU container**, ForkJoinPool.commonPool() has only **7 worker threads** (cores - 1).",
+            "correct": true,
+            "feedback": "Correct: On an **8-vCPU container**, ForkJoinPool.commonPool() has only **7 worker threads** (cores - 1)."
+          },
+          {
+            "id": "b",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "c",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Real-World Impact of CommonPool Exhaustion', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "b",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "c",
+            "text": "Hijacking commonPool() for blocking I/O creates a process-wide bulkhead breach: 1.",
+            "correct": true,
+            "feedback": "Correct: Hijacking commonPool() for blocking I/O creates a process-wide bulkhead breach: 1."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** On an **8-vCPU container**, `ForkJoinPool.commonPool()` has only **7 worker threads** (`cores - 1`).\n\n**How It Flows:** Think of Isolating Blocking I/O from ForkJoinPool as a clear step-by-step chain: Report API -> commonPool (7) -> Payment CB -> VT + Sem(32) -> CPU Tasks.\n\n**Why Beginners Should Care:** Never run blocking I/O on `ForkJoinPool.commonPool()`; isolate blocking work onto a dedicated bounded executor (or Java 21 Virtual Threads) and reserve `commonPool()` strictly for short CPU-bound tasks.",
+      "spark": {
+        "summary": "On an **8-vCPU container**, `ForkJoinPool.commonPool()` has only **7 worker threads** (`cores - 1`).",
+        "keyTakeaway": "Never run blocking I/O on `ForkJoinPool.commonPool()`; isolate blocking work onto a dedicated bounded executor (or Java 21 Virtual Threads) and reserve `commonPool()` strictly for short CPU-bound tasks."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why Isolating Blocking I/O from ForkJoinPool Matters",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why Isolating Blocking I/O from ForkJoinPool Matters works from first principles.",
+          "explanation": "On an **8-vCPU container**, `ForkJoinPool.commonPool()` has only **7 worker threads** (`cores - 1`). When a reporting endpoint runs `orderIds.parallelStream().map(this::fetchOrderFromDb).toList()` on batches of **500 `orderIds`**, all 7 shared threads block on JDBC/HTTP I/O—freezing unrelated `CompletableFuture.supplyAsync()` payment callbacks and health checks for **15+ seconds** at just 12% CPU.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Real-World Impact of CommonPool Exhaustion",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without Real-World Impact of CommonPool Exhaustion under real concurrency or scale.",
+          "explanation": "Hijacking `commonPool()` for blocking I/O creates a process-wide bulkhead breach: 1. **Cross-Endpoint Starvation**: Healthy `/health` and payment callbacks queue behind slow reporting JDBC queries. 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "CommonPool Starvation vs. Dedicated I/O Bulkhead",
+            "title": "7-Thread ForkJoinPool Freeze vs. Virtual Threads + Semaphore",
+            "actors": [
+              {
+                "id": "rep",
+                "label": "Report API"
+              },
+              {
+                "id": "fjp",
+                "label": "commonPool (7)"
+              },
+              {
+                "id": "pay",
+                "label": "Payment CB"
+              },
+              {
+                "id": "io",
+                "label": "VT + Sem(32)"
+              }
+            ],
+            "events": [
+              {
+                "from": "rep",
+                "to": "fjp",
+                "label": "Naive: parallelStream() 500 JDBC calls",
+                "status": "fail"
+              },
+              {
+                "from": "pay",
+                "to": "fjp",
+                "label": "supplyAsync() queued 15s (starved!)",
+                "status": "fail"
+              },
+              {
+                "from": "rep",
+                "to": "io",
+                "label": "Fixed: VirtualThreadPerTask + Sem(32)",
+                "status": "ok"
+              },
+              {
+                "from": "pay",
+                "to": "fjp",
+                "label": "commonPool() stays 100% free for CPU",
+                "status": "ok"
+              }
+            ],
+            "summary": "Moving blocking I/O onto a dedicated bounded executor or Virtual Threads + Semaphore keeps ForkJoinPool.commonPool() unblocked."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive Solution (and Why It Breaks)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+          "explanation": "Passing `-Djava.util.concurrent.ForkJoinPool.common.parallelism=200` bloats every parallel stream in the JVM and adds heavy context-switching overhead to CPU-bound tasks. Using `ForkJoinPool.ManagedBlocker` for JDBC/HTTP still doesn't cap downstream DB concurrency and fails when drivers ignore thread interruption.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise Solution: Dedicated Bounded Executor / Virtual Threads + Semaphore",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Separate CPU-bound `commonPool()` work from blocking I/O with explicit concurrency and timeout bounds: **Dedicated I/O Executor**: Never call `.parallelStream()` for I/O or 1-arg `CompletableFuture.supplyAsync(fn)`. Always pass an explicit executor: a bounded `ThreadPoolExecutor` on Java 17, or `Executors.newVirtualThreadPerTaskExecutor()` on Java 21.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Bulkhead Isolation Architecture",
+            "title": "Separating CPU commonPool from Bounded I/O Concurrency",
+            "nodes": [
+              {
+                "label": "CPU Tasks",
+                "role": "commonPool (7 threads)"
+              },
+              {
+                "label": "I/O Executor",
+                "role": "Virtual Threads / Pool"
+              },
+              {
+                "label": "Semaphore(32)",
+                "role": "DB concurrency bulkhead"
+              },
+              {
+                "label": "Postgres / HTTP",
+                "role": "2s request timeout"
+              }
+            ],
+            "edges": [
+              {
+                "label": "Zero I/O on FJP"
+              },
+              {
+                "label": "Bounded fan-out"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Java 21 Pattern",
+                "detail": "VirtualThreadPerTaskExecutor + Semaphore(32) scales without OS thread bloat."
+              },
+              {
+                "label": "Java 17 Pattern",
+                "detail": "Dedicated ThreadPoolExecutor sized via Little's Law."
+              },
+              {
+                "label": "2s Timeouts",
+                "detail": "Prevents hung sockets from holding Semaphore permits forever."
+              },
+              {
+                "label": "JMX / Micrometer",
+                "detail": "Alert if jvm.fjp.common.queued > 0."
+              }
+            ],
+            "summary": "Explicit executor arguments and Semaphore bulkheads isolate slow I/O from JVM-wide async callbacks."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Never run blocking I/O on `ForkJoinPool.commonPool()`; isolate blocking work onto a dedicated bounded executor (or Java 21 Virtual Threads) and reserve `commonPool()` strictly for short CPU-bound tasks.",
+      "summary": "Running blocking HTTP/DB calls inside `list.parallelStream()` or default `CompletableFuture.supplyAsync()` hijacks the JVM-wide `ForkJoinPool.commonPool()` (sized to `cores - 1`), starving unrelated async tasks across the entire process.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, never run blocking I/O on `ForkJoinPool.commonPool()`; isolate blocking work onto a dedicated bounded executor (or Java 21 Virtual Threads) and reserve `commonPool()` strictly for short CPU-bound tasks."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** On an **8-vCPU container**, `ForkJoinPool.commonPool()` has only **7 worker threads** (`cores - 1`).\n\n**Visual & Structural Flow:** Depicts 7-Thread ForkJoinPool Freeze vs. Virtual Threads + Semaphore (Report API -> commonPool (7) -> Payment CB -> VT + Sem(32)); Separating CPU commonPool from Bounded I/O Concurrency (CPU Tasks -> I/O Executor -> Semaphore(32) -> Postgres / HTTP).\n\n**Trade-Offs & Production:** Passing `-Djava.util.concurrent.ForkJoinPool.common.parallelism=200` bloats every parallel stream in the JVM and adds heavy context-switching overhead to CPU-bound tasks. Separate CPU-bound `commonPool()` work from blocking I/O with explicit concurrency and timeout bounds: **Dedicated I/O Executor**: Never call `.parallelStream()` for I/O or 1-arg `CompletableFuture.supplyAsync(fn)`.\n\n**Failure Modes & Application:** Thread-pool bulkhead isolation is fundamental in high-concurrency JVM services: **API Gateways & BFF Fan-Outs**: Prevents one slow downstream microservice from starving unrelated routes.",
+      "spark": {
+        "summary": "Running blocking HTTP/DB calls inside `list.parallelStream()` or default `CompletableFuture.supplyAsync()` hijacks the JVM-wide `ForkJoinPool.commonPool()` (sized to `cores - 1`), starving unrelated async tasks across the entire process.",
+        "keyTakeaway": "Never run blocking I/O on `ForkJoinPool.commonPool()`; isolate blocking work onto a dedicated bounded executor (or Java 21 Virtual Threads) and reserve `commonPool()` strictly for short CPU-bound tasks."
+      },
+      "summary": "Running blocking HTTP/DB calls inside `list.parallelStream()` or default `CompletableFuture.supplyAsync()` hijacks the JVM-wide `ForkJoinPool.commonPool()` (sized to `cores - 1`), starving unrelated async tasks across the entire process.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, never run blocking I/O on `ForkJoinPool.commonPool()`; isolate blocking work onto a dedicated bounded executor (or Java 21 Virtual Threads) and reserve `commonPool()` strictly for short CPU-bound tasks."
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** Running blocking HTTP/DB calls inside `list.parallelStream()` or default `CompletableFuture.supplyAsync()` hijacks the JVM-wide `ForkJoinPool.commonPool()` (sized to `cores - 1`), starving unrelated async tasks across the entire process.\n\n**Production Trade-Offs:** Passing `-Djava.util.concurrent.ForkJoinPool.common.parallelism=200` bloats every parallel stream in the JVM and adds heavy context-switching overhead to CPU-bound tasks.\n\n**Failure Modes & Edge Cases:** Thread-pool bulkhead isolation is fundamental in high-concurrency JVM services: **API Gateways & BFF Fan-Outs**: Prevents one slow downstream microservice from starving unrelated routes.\n\n**Principal Takeaway:** Never run blocking I/O on `ForkJoinPool.commonPool()`; isolate blocking work onto a dedicated bounded executor (or Java 21 Virtual Threads) and reserve `commonPool()` strictly for short CPU-bound tasks.",
+      "spark": {
+        "summary": "Running blocking HTTP/DB calls inside `list.parallelStream()` or default `CompletableFuture.supplyAsync()` hijacks the JVM-wide `ForkJoinPool.commonPool()` (sized to `cores - 1`), starving unrelated async tasks across the entire process.",
+        "keyTakeaway": "Never run blocking I/O on `ForkJoinPool.commonPool()`; isolate blocking work onto a dedicated bounded executor (or Java 21 Virtual Threads) and reserve `commonPool()` strictly for short CPU-bound tasks."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why Isolating Blocking I/O from ForkJoinPool Matters",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why Isolating Blocking I/O from ForkJoinPool Matters works from first principles.",
+          "explanation": "On an **8-vCPU container**, `ForkJoinPool.commonPool()` has only **7 worker threads** (`cores - 1`). When a reporting endpoint runs `orderIds.parallelStream().map(this::fetchOrderFromDb).toList()` on batches of **500 `orderIds`**, all 7 shared threads block on JDBC/HTTP I/O—freezing unrelated `CompletableFuture.supplyAsync()` payment callbacks and health checks for **15+ seconds** at just 12% CPU.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Real-World Impact of CommonPool Exhaustion",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without Real-World Impact of CommonPool Exhaustion under real concurrency or scale.",
+          "explanation": "Hijacking `commonPool()` for blocking I/O creates a process-wide bulkhead breach:\n\n1. **Cross-Endpoint Starvation**: Healthy `/health` and payment callbacks queue behind slow reporting JDBC queries.\n2. **False Liveness Failures**: Kubernetes liveness probes time out while CPU is idle, restarting healthy pods.\n3. **Unbounded Downstream Spike**: If `ManagedBlocker` is used carelessly without a bulkhead, `commonPool()` spawns hundreds of compensation threads and overwhelms the database.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "CommonPool Starvation vs. Dedicated I/O Bulkhead",
+            "title": "7-Thread ForkJoinPool Freeze vs. Virtual Threads + Semaphore",
+            "actors": [
+              {
+                "id": "rep",
+                "label": "Report API"
+              },
+              {
+                "id": "fjp",
+                "label": "commonPool (7)"
+              },
+              {
+                "id": "pay",
+                "label": "Payment CB"
+              },
+              {
+                "id": "io",
+                "label": "VT + Sem(32)"
+              }
+            ],
+            "events": [
+              {
+                "from": "rep",
+                "to": "fjp",
+                "label": "Naive: parallelStream() 500 JDBC calls",
+                "status": "fail"
+              },
+              {
+                "from": "pay",
+                "to": "fjp",
+                "label": "supplyAsync() queued 15s (starved!)",
+                "status": "fail"
+              },
+              {
+                "from": "rep",
+                "to": "io",
+                "label": "Fixed: VirtualThreadPerTask + Sem(32)",
+                "status": "ok"
+              },
+              {
+                "from": "pay",
+                "to": "fjp",
+                "label": "commonPool() stays 100% free for CPU",
+                "status": "ok"
+              }
+            ],
+            "summary": "Moving blocking I/O onto a dedicated bounded executor or Virtual Threads + Semaphore keeps ForkJoinPool.commonPool() unblocked."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive Solution (and Why It Breaks)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+          "explanation": "Passing `-Djava.util.concurrent.ForkJoinPool.common.parallelism=200` bloats every parallel stream in the JVM and adds heavy context-switching overhead to CPU-bound tasks. Using `ForkJoinPool.ManagedBlocker` for JDBC/HTTP still doesn't cap downstream DB concurrency and fails when drivers ignore thread interruption.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise Solution: Dedicated Bounded Executor / Virtual Threads + Semaphore",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Separate CPU-bound `commonPool()` work from blocking I/O with explicit concurrency and timeout bounds:\n\n- **Dedicated I/O Executor**: Never call `.parallelStream()` for I/O or 1-arg `CompletableFuture.supplyAsync(fn)`. Always pass an explicit executor: a bounded `ThreadPoolExecutor` on Java 17, or `Executors.newVirtualThreadPerTaskExecutor()` on Java 21.\n- **Semaphore Bulkhead (`32` permits)**: Virtual threads are cheap, so cap concurrent DB/HTTP calls with a `Semaphore(32)` instead of pooling virtual threads.\n- **Per-Request Timeout (`2s`) & Monitoring**: Configure `HttpClient.timeout(Duration.ofSeconds(2))` and alert on `ForkJoinPool.commonPool().getQueuedSubmissionCount()`.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Bulkhead Isolation Architecture",
+            "title": "Separating CPU commonPool from Bounded I/O Concurrency",
+            "nodes": [
+              {
+                "label": "CPU Tasks",
+                "role": "commonPool (7 threads)"
+              },
+              {
+                "label": "I/O Executor",
+                "role": "Virtual Threads / Pool"
+              },
+              {
+                "label": "Semaphore(32)",
+                "role": "DB concurrency bulkhead"
+              },
+              {
+                "label": "Postgres / HTTP",
+                "role": "2s request timeout"
+              }
+            ],
+            "edges": [
+              {
+                "label": "Zero I/O on FJP"
+              },
+              {
+                "label": "Bounded fan-out"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Java 21 Pattern",
+                "detail": "VirtualThreadPerTaskExecutor + Semaphore(32) scales without OS thread bloat."
+              },
+              {
+                "label": "Java 17 Pattern",
+                "detail": "Dedicated ThreadPoolExecutor sized via Little's Law."
+              },
+              {
+                "label": "2s Timeouts",
+                "detail": "Prevents hung sockets from holding Semaphore permits forever."
+              },
+              {
+                "label": "JMX / Micrometer",
+                "detail": "Alert if jvm.fjp.common.queued > 0."
+              }
+            ],
+            "summary": "Explicit executor arguments and Semaphore bulkheads isolate slow I/O from JVM-wide async callbacks."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where Executor Isolation Applies in System Design",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Thread-pool bulkhead isolation is fundamental in high-concurrency JVM services:\n\n- **API Gateways & BFF Fan-Outs**: Prevents one slow downstream microservice from starving unrelated routes.\n- **Batch & Reporting Endpoints**: Bounds concurrent database queries per batch request.\n- **Reactive + Imperative Bridges**: Isolates legacy JDBC calls off Netty/Reactor event loops.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Never run blocking I/O on `ForkJoinPool.commonPool()`; isolate blocking work onto a dedicated bounded executor (or Java 21 Virtual Threads) and reserve `commonPool()` strictly for short CPU-bound tasks.",
+      "summary": "Running blocking HTTP/DB calls inside `list.parallelStream()` or default `CompletableFuture.supplyAsync()` hijacks the JVM-wide `ForkJoinPool.commonPool()` (sized to `cores - 1`), starving unrelated async tasks across the entire process.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, never run blocking I/O on `ForkJoinPool.commonPool()`; isolate blocking work onto a dedicated bounded executor (or Java 21 Virtual Threads) and reserve `commonPool()` strictly for short CPU-bound tasks."
+    }
+  },
+  "pedagogicalFramework": "CLASSE",
+  "simulation": {
+    "title": "Isolating Blocking I/O from ForkJoinPool — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "tx",
+        "label": "Client Tx",
+        "role": "Snapshot Read/Write"
+      },
+      {
+        "id": "plan",
+        "label": "Query Planner",
+        "role": "Index & Lock Order"
+      },
+      {
+        "id": "wal",
+        "label": "WAL Buffer",
+        "role": "Group Commit"
+      },
+      {
+        "id": "disk",
+        "label": "Storage Pages",
+        "role": "MVCC / Vacuum"
+      }
+    ],
+    "edges": [
+      {
+        "from": "tx",
+        "to": "plan",
+        "label": "SQL query"
+      },
+      {
+        "from": "plan",
+        "to": "wal",
+        "label": "append redo"
+      },
+      {
+        "from": "wal",
+        "to": "disk",
+        "label": "checkpoint flush"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why Isolating Blocking I/O from ForkJoinPool Matters",
+        "actionLabel": "SQL query",
+        "status": "healthy",
+        "activeNodeIds": [
+          "tx",
+          "plan"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "SQL query",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Client Tx sends work to Query Planner (Why Isolating Blocking I/O from ForkJoinPool Matters)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Real-World Impact of CommonPool Exhaustion",
+        "actionLabel": "append redo",
+        "status": "healthy",
+        "activeNodeIds": [
+          "plan",
+          "wal"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "append redo",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Query Planner coordinates with WAL Buffer while preserving the core invariant (Real-World Impact of CommonPool Exhaustion)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Naive Solution (and Why It Breaks)",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "wal",
+          "disk"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, Storage Pages absorbs pressure without cascading (Naive Solution (and Why It Breaks))."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Where Executor Isolation Applies in System Design",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "tx",
+          "plan",
+          "wal",
+          "disk"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Where Executor Isolation Applies in System Design)."
+      }
+    ]
+  }
+}

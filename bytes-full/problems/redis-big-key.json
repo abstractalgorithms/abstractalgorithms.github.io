@@ -1,0 +1,792 @@
+{
+  "id": "redis-big-key",
+  "slug": "redis-big-key",
+  "title": "Preventing Redis Big-Key Event Loop Freezes",
+  "problemType": "architecture",
+  "difficulty": "medium",
+  "prompt": "Your Redis 7 primary serves 85,000 OPS at 0.8ms p99 latency. A feature-flag/catalog cache stores 2.5 million entries inside a single Redis Hash (`catalog:items`, ~480 MB RSS). Whenever a daily refresh job runs `DEL catalog:items` or its 24-hour TTL expires, all clients experience 820ms-1,200ms latency spikes, triggering 200ms SocketTimeoutExceptions and cascading application retries. Redesign the invalidation mechanism and data layout so cache refreshes and expirations never stall the Redis event loop above 2ms.",
+  "spark": {
+    "summary": "Deleting or expiring a 480 MB Redis Hash with 2.5M fields via synchronous DEL blocks Redis's single-threaded aeMain event loop for 820ms while jemalloc frees millions of allocations, causing fleet-wide client timeouts.",
+    "keyTakeaway": "When a single bottleneck threatens end-to-end availability, replace DEL with async UNLINK, enable lazyfree-lazy-expire/eviction, and shard multi-million-entry collections into 64 hash buckets (< 8 MB each) or delete in 500-field HSCAN+HDEL batches.",
+    "byteSummary": "**Core Mechanics:** Redis 7 executes all commands sequentially on a single `aeMain` event-loop thread.\n\n**Visual & Structural Flow:** Depicts Synchronous DEL on 2.5M-Field Hash Blocks 85k OPS Clients (Refresh Job -> Redis aeMain -> 85k OPS Clients); 64-Bucket Hash Sharding & bio_lazy_free Offload (redis-py Client -> aeMain (O(1) UNLINK) -> bio_lazy_free -> catalog:v2:00..63 (7.5 MB/shard)).\n\n**Trade-Offs & Production:** Replacing `DEL` with `UNLINK` in Python (`redis-py`) fixes manual deletes, **but leaves automatic TTL expiration and `maxmemory` eviction synchronous** unless. Big-key governance is essential for any single-threaded in-memory store: **Feature-Flag & Product Catalogs**: Versioned, sharded hashes prevent refresh stampedes and event-loop stalls.\n\n**Failure Modes & Application:** Big-key governance is essential for any single-threaded in-memory store: **Feature-Flag & Product Catalogs**: Versioned, sharded hashes prevent refresh stampedes and event-loop stalls."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why a single 480 MB Redis Hash freezes an 85,000 OPS primary",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "Think of **Why a single 480 MB Redis Hash freezes an 85,000 OPS primary** as the intuition layer for Preventing Redis Big-Key Event Loop Freezes: The mechanism: understand how Why a single 480 MB Redis Hash freezes an 85,000 OPS primary works from first principles.",
+        "core": "Redis 7 executes all commands sequentially on a single `aeMain` event-loop thread. Storing 2.5 million entries inside one Redis Hash (`catalog:items`, ~480 MB RSS) turns a routine `DEL catalog:items` or 24-hour TTL expiration into a synchronous traversal of 2.5M `dictEntry` allocations—blocking `aeMain` for `820–1,200 ms`.",
+        "deepDive": "Under heavy load or partial failure, why a single 480 mb redis hash freezes an 85,000 ops primary becomes a critical lever for predictable latency and correctness. Deleting or expiring a 480 MB Redis Hash with 2.5M fields via synchronous DEL blocks Redis's single-threaded aeMain event loop for 820ms while jemalloc frees millions of allocations, causing fleet-wide client timeouts."
+      },
+      "purpose": "The mechanism: understand how Why a single 480 MB Redis Hash freezes an 85,000 OPS primary works from first principles."
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "Fleet-wide 200 ms client timeouts and cache-stampede gaps",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "When `aeMain` freezes for `820 ms`, every concurrent `GET` queues behind the `DEL`:",
+        "core": "1. **85,000 OPS Timeout Storm**: Clients with `200 ms` `SocketTimeoutException` limits fail across the entire fleet.\n2. **Empty-Cache Stampede**: Deleting the entire catalog key at once leaves a window where all `catalog` reads miss and slam the origin database.",
+        "deepDive": "In production deployments of Preventing Redis Big-Key Event Loop Freezes, watch how fleet-wide 200 ms client timeouts and cache-stampede gaps interacts with tail latency, retry amplification, and partial failures. Deleting or expiring a 480 MB Redis Hash with 2.5M fields via synchronous DEL blocks Redis's single-threaded aeMain event loop for 820ms while jemalloc frees millions of allocations, causing fleet-wide client timeouts."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Single-Threaded Event Loop Freeze",
+        "title": "Synchronous DEL on 2.5M-Field Hash Blocks 85k OPS Clients",
+        "actors": [
+          {
+            "id": "job",
+            "label": "Refresh Job"
+          },
+          {
+            "id": "ae",
+            "label": "Redis aeMain"
+          },
+          {
+            "id": "cli",
+            "label": "85k OPS Clients"
+          }
+        ],
+        "events": [
+          {
+            "from": "cli",
+            "to": "ae",
+            "label": "Normal GETs (0.8ms p99)",
+            "status": "ok"
+          },
+          {
+            "from": "job",
+            "to": "ae",
+            "label": "DEL catalog:items (2.5M fields)",
+            "status": "warn"
+          },
+          {
+            "from": "ae",
+            "to": "ae",
+            "label": "jemalloc frees 2.5M nodes (820ms)",
+            "status": "fail"
+          },
+          {
+            "from": "cli",
+            "to": "ae",
+            "label": "GETs queue -> 200ms SocketTimeout",
+            "status": "fail"
+          },
+          {
+            "from": "job",
+            "to": "ae",
+            "label": "Fix: UNLINK + 64 shards (<0.1ms)",
+            "status": "ok"
+          }
+        ],
+        "summary": "UNLINK detaches the key in O(1) (~0.08ms) and offloads memory deallocation to the bio_lazy_free background thread."
+      },
+      "purpose": "The problem: see what breaks without Fleet-wide 200 ms client timeouts and cache-stampede gaps under real concurrency or scale.",
+      "decisionFramework": {
+        "problem": "How to implement Preventing Redis Big-Key Event Loop Freezes without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "When a single bottleneck threatens end-to-end availability, replace DEL with async UNLINK, enable lazyfree-lazy-expire/eviction, and shard multi-million-entry collections into 64 hash buckets (< 8 MB each) or delete in 500-field HSCAN+HDEL batches.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Preventing Redis Big-Key Event Loop Freezes experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Why calling UNLINK in code alone still freezes on TTL expiration",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Think of **Why calling UNLINK in code alone still freezes on TTL expiration** as the intuition layer for Preventing Redis Big-Key Event Loop Freezes: The problem: see what breaks without Why calling UNLINK in code alone still freezes on TTL expiration under real concurrency or scale.",
+        "core": "Replacing `DEL` with `UNLINK` in Python (`redis-py`) fixes manual deletes, **but leaves automatic TTL expiration and `maxmemory` eviction synchronous** unless `lazyfree-lazy-expire yes` and `lazyfree-lazy-eviction yes` are enabled in `redis.conf`. Worse, a single 480 MB key still causes `HGETALL` or replica full-sync stalls.",
+        "deepDive": "Under heavy load or partial failure, why calling unlink in code alone still freezes on ttl expiration becomes a critical lever for predictable latency and correctness. Deleting or expiring a 480 MB Redis Hash with 2.5M fields via synchronous DEL blocks Redis's single-threaded aeMain event loop for 820ms while jemalloc frees millions of allocations, causing fleet-wide client timeouts."
+      },
+      "purpose": "The problem: see what breaks without Why calling UNLINK in code alone still freezes on TTL expiration under real concurrency or scale.",
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Request & State Flow",
+        "title": "Why calling UNLINK in code alone still freezes on TTL expiration",
+        "actors": [
+          {
+            "id": "app",
+            "label": "App Worker"
+          },
+          {
+            "id": "sf",
+            "label": "Singleflight / L1"
+          },
+          {
+            "id": "redis",
+            "label": "Redis L2"
+          },
+          {
+            "id": "db",
+            "label": "Origin DB"
+          }
+        ],
+        "events": [
+          {
+            "from": "app",
+            "to": "sf",
+            "label": "GET key (coalesce duplicates)"
+          },
+          {
+            "from": "sf",
+            "to": "redis",
+            "label": "Check L2 distributed cache"
+          },
+          {
+            "from": "redis",
+            "to": "db",
+            "label": "Single origin query on miss"
+          },
+          {
+            "from": "redis",
+            "to": "app",
+            "label": "Populate cache with jittered TTL"
+          }
+        ]
+      }
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise solution: UNLINK, Lazy-Free Config, and 64-Bucket Sharding",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": {
+        "foundation": "Eliminate `> 2 ms` event-loop blocks and zero-cache refresh gaps with three steps:",
+        "core": "- **Async Deallocation (`UNLINK` + `lazyfree-lazy-*`)**: Use `UNLINK` (`0.08 ms` O(1) pointer detach onto `bio_lazy_free`) and enable `lazyfree-lazy-expire yes`, `lazyfree-lazy-eviction yes`, and `lazyfree-lazy-server-del yes`.\n- **64-Bucket Hash Sharding**: Partition `catalog:items` across `catalog:items:00..63` via `CRC16(item_id) % 64`, shrinking each key from `480 MB` to `7.5 MB` (`~39k` fields).\n- **Versioned Blue-Green Swap**: Write the refreshed catalog to `catalog:v2:00..63`, atomically flip a tiny `catalog:active_version` pointer, and `UNLINK` `v1` keys asynchronously (or `HSCAN`+`HDEL` in 500-field batches).",
+        "deepDive": "In production deployments of Preventing Redis Big-Key Event Loop Freezes, watch how enterprise solution: unlink, lazy-free config, and 64-bucket sharding interacts with tail latency, retry amplification, and partial failures. Deleting or expiring a 480 MB Redis Hash with 2.5M fields via synchronous DEL blocks Redis's single-threaded aeMain event loop for 820ms while jemalloc frees millions of allocations, causing fleet-wide client timeouts."
+      },
+      "sectionDiagram": {
+        "kind": "cache-tier",
+        "eyebrow": "Sharded & Lazy-Free Redis",
+        "title": "64-Bucket Hash Sharding & bio_lazy_free Offload",
+        "nodes": [
+          {
+            "label": "redis-py Client",
+            "role": "CRC16(id) % 64"
+          },
+          {
+            "label": "aeMain (O(1) UNLINK)",
+            "role": "0.08ms detach, <10MB keys"
+          },
+          {
+            "label": "bio_lazy_free",
+            "role": "Async jemalloc free"
+          },
+          {
+            "label": "catalog:v2:00..63 (7.5 MB/shard)",
+            "role": "Zero-gap versioned swap"
+          }
+        ],
+        "cards": [
+          {
+            "label": "O(1) UNLINK",
+            "detail": "Detaches key from keyspace in ~0.08ms and frees memory on bio_lazy_free."
+          },
+          {
+            "label": "Lazy-Free Config",
+            "detail": "Enable lazyfree-lazy-expire yes and lazyfree-lazy-eviction yes in redis.conf."
+          },
+          {
+            "label": "64-Bucket Sharding",
+            "detail": "Keeps every key <8 MB so even HSCAN/HDEL batches stay sub-millisecond."
+          }
+        ],
+        "summary": "Sharding big hashes below 10 MB and enabling lazy-free across deletes, expirations, and evictions keeps p99 at 0.8 ms."
+      },
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where Redis big-key mitigation applies in production",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Big-key governance is essential for any single-threaded in-memory store:",
+        "core": "- **Feature-Flag & Product Catalogs**: Versioned, sharded hashes prevent refresh stampedes and event-loop stalls.\n- **Social Feeds & Leaderboards**: Cap `ZSET` / `LIST` lengths with `ZREMRANGEBYRANK` / `LTRIM` and shard by time bucket.\n- **Cluster Migrations**: Small `< 10 MB` keys prevent `MIGRATE` slot-transfer timeouts in Redis Cluster.",
+        "deepDive": "In production deployments of Preventing Redis Big-Key Event Loop Freezes, watch how where redis big-key mitigation applies in production interacts with tail latency, retry amplification, and partial failures. Deleting or expiring a 480 MB Redis Hash with 2.5M fields via synchronous DEL blocks Redis's single-threaded aeMain event loop for 820ms while jemalloc frees millions of allocations, causing fleet-wide client timeouts."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "caching",
+          "title": "Concept: Caching",
+          "kind": "concept"
+        },
+        {
+          "slug": "memory-allocators",
+          "title": "Concept: Memory Allocators",
+          "kind": "concept"
+        },
+        {
+          "slug": "key-value-store",
+          "title": "Concept: Key-Value Store Patterns",
+          "kind": "concept"
+        },
+        {
+          "slug": "design-cache",
+          "title": "System Design: High-Concurrency Cache",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why can Redis still freeze for hundreds of milliseconds even after replacing all application `DEL` calls with `UNLINK`?",
+      "options": [
+        {
+          "id": "a",
+          "text": "Automatic TTL expiration and maxmemory eviction still free keys synchronously on aeMain unless lazyfree-lazy-expire and lazyfree-lazy-eviction are enabled",
+          "correct": true,
+          "feedback": "Correct: both explicit deletes and implicit expirations/evictions must use async lazy freeing."
+        },
+        {
+          "id": "b",
+          "text": "UNLINK blocks until all replicas acknowledge the deletion",
+          "correct": false,
+          "feedback": "UNLINK is non-blocking on the primary event loop."
+        },
+        {
+          "id": "c",
+          "text": "Redis 7 runs jemalloc on a separate network socket",
+          "correct": false,
+          "feedback": "jemalloc runs in-process; bio_lazy_free is an internal background thread."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why can Redis still freeze for hundreds of milliseconds even after replacing all application `DEL` calls with `UNLINK`?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Automatic TTL expiration and maxmemory eviction still free keys synchronously on aeMain unless lazyfree-lazy-expire and lazyfree-lazy-eviction are enabled",
+            "correct": true,
+            "feedback": "Correct: both explicit deletes and implicit expirations/evictions must use async lazy freeing."
+          },
+          {
+            "id": "b",
+            "text": "UNLINK blocks until all replicas acknowledge the deletion",
+            "correct": false,
+            "feedback": "UNLINK is non-blocking on the primary event loop."
+          },
+          {
+            "id": "c",
+            "text": "Redis 7 runs jemalloc on a separate network socket",
+            "correct": false,
+            "feedback": "jemalloc runs in-process; bio_lazy_free is an internal background thread."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why a single 480 MB Redis Hash freezes an 85,000 OPS primary', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Redis 7 executes all commands sequentially on a single aeMain event-loop thread.",
+            "correct": true,
+            "feedback": "Correct: Redis 7 executes all commands sequentially on a single aeMain event-loop thread."
+          },
+          {
+            "id": "b",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "c",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Fleet-wide 200 ms client timeouts and cache-stampede gaps', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "b",
+            "text": "When aeMain freezes for 820 ms, every concurrent GET queues behind the DEL: 1.",
+            "correct": true,
+            "feedback": "Correct: When aeMain freezes for 820 ms, every concurrent GET queues behind the DEL: 1."
+          },
+          {
+            "id": "c",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** Redis 7 executes all commands sequentially on a single `aeMain` event-loop thread.\n\n**How It Flows:** Think of Preventing Redis Big-Key Event Loop Freezes as a clear step-by-step chain: Refresh Job -> Redis aeMain -> 85k OPS Clients -> redis-py Client -> aeMain (O(1) UNLINK).\n\n**Why Beginners Should Care:** Replace DEL with async UNLINK, enable lazyfree-lazy-expire/eviction, and shard multi-million-entry collections into 64 hash buckets (< 8 MB each) or delete in 500-field HSCAN+HDEL batches.",
+      "spark": {
+        "summary": "Redis 7 executes all commands sequentially on a single `aeMain` event-loop thread.",
+        "keyTakeaway": "Replace DEL with async UNLINK, enable lazyfree-lazy-expire/eviction, and shard multi-million-entry collections into 64 hash buckets (< 8 MB each) or delete in 500-field HSCAN+HDEL batches."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why a single 480 MB Redis Hash freezes an 85,000 OPS primary",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why a single 480 MB Redis Hash freezes an 85,000 OPS primary works from first principles.",
+          "explanation": "Redis 7 executes all commands sequentially on a single `aeMain` event-loop thread. Storing 2.5 million entries inside one Redis Hash (`catalog:items`, ~480 MB RSS) turns a routine `DEL catalog:items` or 24-hour TTL expiration into a synchronous traversal of 2.5M `dictEntry` allocations—blocking `aeMain` for `820–1,200 ms`.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Fleet-wide 200 ms client timeouts and cache-stampede gaps",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without Fleet-wide 200 ms client timeouts and cache-stampede gaps under real concurrency or scale.",
+          "explanation": "When `aeMain` freezes for `820 ms`, every concurrent `GET` queues behind the `DEL`: 1. **85,000 OPS Timeout Storm**: Clients with `200 ms` `SocketTimeoutException` limits fail across the entire fleet. 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Single-Threaded Event Loop Freeze",
+            "title": "Synchronous DEL on 2.5M-Field Hash Blocks 85k OPS Clients",
+            "actors": [
+              {
+                "id": "job",
+                "label": "Refresh Job"
+              },
+              {
+                "id": "ae",
+                "label": "Redis aeMain"
+              },
+              {
+                "id": "cli",
+                "label": "85k OPS Clients"
+              }
+            ],
+            "events": [
+              {
+                "from": "cli",
+                "to": "ae",
+                "label": "Normal GETs (0.8ms p99)",
+                "status": "ok"
+              },
+              {
+                "from": "job",
+                "to": "ae",
+                "label": "DEL catalog:items (2.5M fields)",
+                "status": "warn"
+              },
+              {
+                "from": "ae",
+                "to": "ae",
+                "label": "jemalloc frees 2.5M nodes (820ms)",
+                "status": "fail"
+              },
+              {
+                "from": "cli",
+                "to": "ae",
+                "label": "GETs queue -> 200ms SocketTimeout",
+                "status": "fail"
+              },
+              {
+                "from": "job",
+                "to": "ae",
+                "label": "Fix: UNLINK + 64 shards (<0.1ms)",
+                "status": "ok"
+              }
+            ],
+            "summary": "UNLINK detaches the key in O(1) (~0.08ms) and offloads memory deallocation to the bio_lazy_free background thread."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Why calling UNLINK in code alone still freezes on TTL expiration",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "The problem: see what breaks without Why calling UNLINK in code alone still freezes on TTL expiration under real concurrency or scale.",
+          "explanation": "Replacing `DEL` with `UNLINK` in Python (`redis-py`) fixes manual deletes, **but leaves automatic TTL expiration and `maxmemory` eviction synchronous** unless `lazyfree-lazy-expire yes` and `lazyfree-lazy-eviction yes` are enabled in `redis.conf`. Worse, a single 480 MB key still causes `HGETALL` or replica full-sync stalls.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: UNLINK, Lazy-Free Config, and 64-Bucket Sharding",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Eliminate `> 2 ms` event-loop blocks and zero-cache refresh gaps with three steps: **Async Deallocation (`UNLINK` + `lazyfree-lazy-*`)**: Use `UNLINK` (`0.08 ms` O(1) pointer detach onto `bio_lazy_free`) and enable `lazyfree-lazy-expire yes`, `lazyfree-lazy-eviction yes`, and `lazyfree-lazy-server-del yes`.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Sharded & Lazy-Free Redis",
+            "title": "64-Bucket Hash Sharding & bio_lazy_free Offload",
+            "nodes": [
+              {
+                "label": "redis-py Client",
+                "role": "CRC16(id) % 64"
+              },
+              {
+                "label": "aeMain (O(1) UNLINK)",
+                "role": "0.08ms detach, <10MB keys"
+              },
+              {
+                "label": "bio_lazy_free",
+                "role": "Async jemalloc free"
+              },
+              {
+                "label": "catalog:v2:00..63 (7.5 MB/shard)",
+                "role": "Zero-gap versioned swap"
+              }
+            ],
+            "cards": [
+              {
+                "label": "O(1) UNLINK",
+                "detail": "Detaches key from keyspace in ~0.08ms and frees memory on bio_lazy_free."
+              },
+              {
+                "label": "Lazy-Free Config",
+                "detail": "Enable lazyfree-lazy-expire yes and lazyfree-lazy-eviction yes in redis.conf."
+              },
+              {
+                "label": "64-Bucket Sharding",
+                "detail": "Keeps every key <8 MB so even HSCAN/HDEL batches stay sub-millisecond."
+              }
+            ],
+            "summary": "Sharding big hashes below 10 MB and enabling lazy-free across deletes, expirations, and evictions keeps p99 at 0.8 ms."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Replace DEL with async UNLINK, enable lazyfree-lazy-expire/eviction, and shard multi-million-entry collections into 64 hash buckets (< 8 MB each) or delete in 500-field HSCAN+HDEL batches.",
+      "summary": "Deleting or expiring a 480 MB Redis Hash with 2.5M fields via synchronous DEL blocks Redis's single-threaded aeMain event loop for 820ms while jemalloc frees millions of allocations, causing fleet-wide client timeouts.",
+      "keyTakeaway": "When a single bottleneck threatens end-to-end availability, replace DEL with async UNLINK, enable lazyfree-lazy-expire/eviction, and shard multi-million-entry collections into 64 hash buckets (< 8 MB each) or delete in 500-field HSCAN+HDEL batches."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** Redis 7 executes all commands sequentially on a single `aeMain` event-loop thread.\n\n**Visual & Structural Flow:** Depicts Synchronous DEL on 2.5M-Field Hash Blocks 85k OPS Clients (Refresh Job -> Redis aeMain -> 85k OPS Clients); 64-Bucket Hash Sharding & bio_lazy_free Offload (redis-py Client -> aeMain (O(1) UNLINK) -> bio_lazy_free -> catalog:v2:00..63 (7.5 MB/shard)).\n\n**Trade-Offs & Production:** Replacing `DEL` with `UNLINK` in Python (`redis-py`) fixes manual deletes, **but leaves automatic TTL expiration and `maxmemory` eviction synchronous** unless. Big-key governance is essential for any single-threaded in-memory store: **Feature-Flag & Product Catalogs**: Versioned, sharded hashes prevent refresh stampedes and event-loop stalls.\n\n**Failure Modes & Application:** Big-key governance is essential for any single-threaded in-memory store: **Feature-Flag & Product Catalogs**: Versioned, sharded hashes prevent refresh stampedes and event-loop stalls.",
+      "spark": {
+        "summary": "Deleting or expiring a 480 MB Redis Hash with 2.5M fields via synchronous DEL blocks Redis's single-threaded aeMain event loop for 820ms while jemalloc frees millions of allocations, causing fleet-wide client timeouts.",
+        "keyTakeaway": "Replace DEL with async UNLINK, enable lazyfree-lazy-expire/eviction, and shard multi-million-entry collections into 64 hash buckets (< 8 MB each) or delete in 500-field HSCAN+HDEL batches."
+      },
+      "summary": "Deleting or expiring a 480 MB Redis Hash with 2.5M fields via synchronous DEL blocks Redis's single-threaded aeMain event loop for 820ms while jemalloc frees millions of allocations, causing fleet-wide client timeouts.",
+      "keyTakeaway": "When a single bottleneck threatens end-to-end availability, replace DEL with async UNLINK, enable lazyfree-lazy-expire/eviction, and shard multi-million-entry collections into 64 hash buckets (< 8 MB each) or delete in 500-field HSCAN+HDEL batches."
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** Deleting or expiring a 480 MB Redis Hash with 2.5M fields via synchronous DEL blocks Redis's single-threaded aeMain event loop for 820ms while jemalloc frees millions of allocations, causing fleet-wide client timeouts.\n\n**Production Trade-Offs:** Replacing `DEL` with `UNLINK` in Python (`redis-py`) fixes manual deletes, **but leaves automatic TTL expiration and `maxmemory` eviction synchronous** unless `lazyfree-lazy-expire yes` and `lazyfree-lazy-eviction yes` are enabled in `redis.conf`.\n\n**Failure Modes & Edge Cases:** Big-key governance is essential for any single-threaded in-memory store: **Feature-Flag & Product Catalogs**: Versioned, sharded hashes prevent refresh stampedes and event-loop stalls.\n\n**Principal Takeaway:** Replace DEL with async UNLINK, enable lazyfree-lazy-expire/eviction, and shard multi-million-entry collections into 64 hash buckets (< 8 MB each) or delete in 500-field HSCAN+HDEL batches.",
+      "spark": {
+        "summary": "Deleting or expiring a 480 MB Redis Hash with 2.5M fields via synchronous DEL blocks Redis's single-threaded aeMain event loop for 820ms while jemalloc frees millions of allocations, causing fleet-wide client timeouts.",
+        "keyTakeaway": "Replace DEL with async UNLINK, enable lazyfree-lazy-expire/eviction, and shard multi-million-entry collections into 64 hash buckets (< 8 MB each) or delete in 500-field HSCAN+HDEL batches."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why a single 480 MB Redis Hash freezes an 85,000 OPS primary",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why a single 480 MB Redis Hash freezes an 85,000 OPS primary works from first principles.",
+          "explanation": "Redis 7 executes all commands sequentially on a single `aeMain` event-loop thread. Storing 2.5 million entries inside one Redis Hash (`catalog:items`, ~480 MB RSS) turns a routine `DEL catalog:items` or 24-hour TTL expiration into a synchronous traversal of 2.5M `dictEntry` allocations—blocking `aeMain` for `820–1,200 ms`.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Fleet-wide 200 ms client timeouts and cache-stampede gaps",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without Fleet-wide 200 ms client timeouts and cache-stampede gaps under real concurrency or scale.",
+          "explanation": "When `aeMain` freezes for `820 ms`, every concurrent `GET` queues behind the `DEL`:\n\n1. **85,000 OPS Timeout Storm**: Clients with `200 ms` `SocketTimeoutException` limits fail across the entire fleet.\n2. **Empty-Cache Stampede**: Deleting the entire catalog key at once leaves a window where all `catalog` reads miss and slam the origin database.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Single-Threaded Event Loop Freeze",
+            "title": "Synchronous DEL on 2.5M-Field Hash Blocks 85k OPS Clients",
+            "actors": [
+              {
+                "id": "job",
+                "label": "Refresh Job"
+              },
+              {
+                "id": "ae",
+                "label": "Redis aeMain"
+              },
+              {
+                "id": "cli",
+                "label": "85k OPS Clients"
+              }
+            ],
+            "events": [
+              {
+                "from": "cli",
+                "to": "ae",
+                "label": "Normal GETs (0.8ms p99)",
+                "status": "ok"
+              },
+              {
+                "from": "job",
+                "to": "ae",
+                "label": "DEL catalog:items (2.5M fields)",
+                "status": "warn"
+              },
+              {
+                "from": "ae",
+                "to": "ae",
+                "label": "jemalloc frees 2.5M nodes (820ms)",
+                "status": "fail"
+              },
+              {
+                "from": "cli",
+                "to": "ae",
+                "label": "GETs queue -> 200ms SocketTimeout",
+                "status": "fail"
+              },
+              {
+                "from": "job",
+                "to": "ae",
+                "label": "Fix: UNLINK + 64 shards (<0.1ms)",
+                "status": "ok"
+              }
+            ],
+            "summary": "UNLINK detaches the key in O(1) (~0.08ms) and offloads memory deallocation to the bio_lazy_free background thread."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Why calling UNLINK in code alone still freezes on TTL expiration",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "The problem: see what breaks without Why calling UNLINK in code alone still freezes on TTL expiration under real concurrency or scale.",
+          "explanation": "Replacing `DEL` with `UNLINK` in Python (`redis-py`) fixes manual deletes, **but leaves automatic TTL expiration and `maxmemory` eviction synchronous** unless `lazyfree-lazy-expire yes` and `lazyfree-lazy-eviction yes` are enabled in `redis.conf`. Worse, a single 480 MB key still causes `HGETALL` or replica full-sync stalls.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: UNLINK, Lazy-Free Config, and 64-Bucket Sharding",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Eliminate `> 2 ms` event-loop blocks and zero-cache refresh gaps with three steps:\n\n- **Async Deallocation (`UNLINK` + `lazyfree-lazy-*`)**: Use `UNLINK` (`0.08 ms` O(1) pointer detach onto `bio_lazy_free`) and enable `lazyfree-lazy-expire yes`, `lazyfree-lazy-eviction yes`, and `lazyfree-lazy-server-del yes`.\n- **64-Bucket Hash Sharding**: Partition `catalog:items` across `catalog:items:00..63` via `CRC16(item_id) % 64`, shrinking each key from `480 MB` to `7.5 MB` (`~39k` fields).\n- **Versioned Blue-Green Swap**: Write the refreshed catalog to `catalog:v2:00..63`, atomically flip a tiny `catalog:active_version` pointer, and `UNLINK` `v1` keys asynchronously (or `HSCAN`+`HDEL` in 500-field batches).",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Sharded & Lazy-Free Redis",
+            "title": "64-Bucket Hash Sharding & bio_lazy_free Offload",
+            "nodes": [
+              {
+                "label": "redis-py Client",
+                "role": "CRC16(id) % 64"
+              },
+              {
+                "label": "aeMain (O(1) UNLINK)",
+                "role": "0.08ms detach, <10MB keys"
+              },
+              {
+                "label": "bio_lazy_free",
+                "role": "Async jemalloc free"
+              },
+              {
+                "label": "catalog:v2:00..63 (7.5 MB/shard)",
+                "role": "Zero-gap versioned swap"
+              }
+            ],
+            "cards": [
+              {
+                "label": "O(1) UNLINK",
+                "detail": "Detaches key from keyspace in ~0.08ms and frees memory on bio_lazy_free."
+              },
+              {
+                "label": "Lazy-Free Config",
+                "detail": "Enable lazyfree-lazy-expire yes and lazyfree-lazy-eviction yes in redis.conf."
+              },
+              {
+                "label": "64-Bucket Sharding",
+                "detail": "Keeps every key <8 MB so even HSCAN/HDEL batches stay sub-millisecond."
+              }
+            ],
+            "summary": "Sharding big hashes below 10 MB and enabling lazy-free across deletes, expirations, and evictions keeps p99 at 0.8 ms."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where Redis big-key mitigation applies in production",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Big-key governance is essential for any single-threaded in-memory store:\n\n- **Feature-Flag & Product Catalogs**: Versioned, sharded hashes prevent refresh stampedes and event-loop stalls.\n- **Social Feeds & Leaderboards**: Cap `ZSET` / `LIST` lengths with `ZREMRANGEBYRANK` / `LTRIM` and shard by time bucket.\n- **Cluster Migrations**: Small `< 10 MB` keys prevent `MIGRATE` slot-transfer timeouts in Redis Cluster.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Replace DEL with async UNLINK, enable lazyfree-lazy-expire/eviction, and shard multi-million-entry collections into 64 hash buckets (< 8 MB each) or delete in 500-field HSCAN+HDEL batches.",
+      "summary": "Deleting or expiring a 480 MB Redis Hash with 2.5M fields via synchronous DEL blocks Redis's single-threaded aeMain event loop for 820ms while jemalloc frees millions of allocations, causing fleet-wide client timeouts.",
+      "keyTakeaway": "When a single bottleneck threatens end-to-end availability, replace DEL with async UNLINK, enable lazyfree-lazy-expire/eviction, and shard multi-million-entry collections into 64 hash buckets (< 8 MB each) or delete in 500-field HSCAN+HDEL batches."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "simulation": {
+    "title": "Preventing Redis Big-Key Event Loop Freezes — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "app",
+        "label": "App Servers",
+        "role": "Concurrent Reads"
+      },
+      {
+        "id": "sf",
+        "label": "Singleflight",
+        "role": "In-Flight Coalescer"
+      },
+      {
+        "id": "redis",
+        "label": "Redis L2",
+        "role": "Hot Key Store"
+      },
+      {
+        "id": "db",
+        "label": "Primary DB",
+        "role": "Origin Source"
+      }
+    ],
+    "edges": [
+      {
+        "from": "app",
+        "to": "sf",
+        "label": "GET hot_key"
+      },
+      {
+        "from": "sf",
+        "to": "redis",
+        "label": "L2 lookup"
+      },
+      {
+        "from": "redis",
+        "to": "db",
+        "label": "1x origin fetch"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why a single 480 MB Redis Hash freezes an 85,000 OPS primary",
+        "actionLabel": "GET hot_key",
+        "status": "healthy",
+        "activeNodeIds": [
+          "app",
+          "sf"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "GET hot_key",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "App Servers sends work to Singleflight (Why a single 480 MB Redis Hash freezes an 85,000 OPS primary)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Fleet-wide 200 ms client timeouts and cache-stampede gaps",
+        "actionLabel": "L2 lookup",
+        "status": "healthy",
+        "activeNodeIds": [
+          "sf",
+          "redis"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "L2 lookup",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Singleflight coordinates with Redis L2 while preserving the core invariant (Fleet-wide 200 ms client timeouts and cache-stampede gaps)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Why calling UNLINK in code alone still freezes on TTL expiration",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "redis",
+          "db"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, Primary DB absorbs pressure without cascading (Why calling UNLINK in code alone still freezes on TTL expiration)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Where Redis big-key mitigation applies in production",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "app",
+          "sf",
+          "redis",
+          "db"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Where Redis big-key mitigation applies in production)."
+      }
+    ]
+  }
+}

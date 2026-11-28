@@ -1,0 +1,820 @@
+{
+  "slug": "design-distributed-mcp-gateway-tool-registry",
+  "title": "Design a 300K-QPS Distributed MCP Gateway & Enterprise Tool Registry",
+  "domain": "ai-machine-learning",
+  "kind": "problem",
+  "spark": {
+    "summary": "Design a multi-tenant MCP Gateway & Tool Registry supporting 100K+ MCP servers, 1M+ tool schemas, and 300K JSON-RPC 2.0 QPS within <=15ms p99 overhead.",
+    "keyTakeaway": "When batching and tail latency compete for accelerator cycles, allocate a strict 15ms p99 budget across Edge Auth (2ms), Qdrant Top-15 (5ms), Cedar/Vault (1ms), Maglev Mux (2ms), and 3-Stage Firewall (3ms), plus async ClickHouse/Iceberg audits.",
+    "byteSummary": "Designing a Distributed MCP Gateway & Enterprise Tool Registry at Cloudflare, Kong, or Anthropic MCP scale requires routing 300,000 JSON-RPC 2.0 QPS (4.8 GB/s) across 100,000+ MCP servers and 1,000,000+ tool schemas with <=15ms p99 gateway overhead.\n\nCapacity sizing allocates 162,000 burst stream slots across 120 Rust Tokio multiplexer pods, 32 Qdrant Int8 HNSW shards x 3 replicas, 64 GB Redis Cluster for 10M SSE sessions, 25,000 Firecracker stdio microVMs (3.2 TB RAM across 64 KVM hosts), and 46.6 TB/day async OTel logging.\n\nEvery call enforces Cedar ABAC (User ∩ Agent ∩ Tool), RFC 8693 60s token exchange, SHA-256 rug-pull schema pinning, and a <=3ms output prompt-injection firewall."
+  },
+  "learningJourney": [
+    {
+      "stage": 1,
+      "level": "foundation",
+      "title": "Capacity Math & Strict <=15ms p99 Latency Budget",
+      "purpose": "Derive bandwidth, Tokio mux concurrency, Firecracker fleet RAM, and the 15ms latency budget.",
+      "explanation": {
+        "foundation": "At 300,000 QPS with 4 KB request + 12 KB response payloads, gateway bandwidth reaches 4.8 GB/s (38.4 Gbps sustained).",
+        "core": "By Little's Law (W = 0.180s), active in-flight calls equal 54,000 (162,000 with 3x burst) across 120 Rust Tokio pods (1,350 streams/pod).",
+        "deepDive": "The <=15ms routing budget allocates: Edge Auth (2ms) + Qdrant Top-15 (5ms) + Cedar/Vault (1ms) + Maglev Mux (2ms) + Output Firewall (3ms) + Jitter (2ms)."
+      },
+      "assumptions": [
+        "Assumes 300K QPS, 16 KB avg round-trip payload, 180ms p99 E2E",
+        "Assumes 120 Rust Tokio multiplexer pods"
+      ],
+      "codeExample": {
+        "language": "python",
+        "code": "def size_mcp_mux_fleet(qps: int = 300_000, rtt_sec: float = 0.180, burst: int = 3, pods: int = 120) -> dict:\n    active_slots = qps * rtt_sec\n    burst_slots = int(active_slots * burst)\n    per_pod = burst_slots // pods\n    return {\"active_slots\": int(active_slots), \"burst_slots\": burst_slots, \"streams_per_pod\": per_pod}"
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 1 • Latency & Scale Math",
+        "title": "15ms p99 Budget & 162K Burst Stream Sizing",
+        "nodes": [
+          {
+            "id": "edge",
+            "label": "1. Edge AuthN/Z (2ms)",
+            "sub": "SPIFFE mTLS + OAuth 2.1",
+            "role": "ingress"
+          },
+          {
+            "id": "qdrant",
+            "label": "2. Qdrant Top-15 (5ms)",
+            "sub": "RBAC Bitmap + Int8 HNSW",
+            "role": "index"
+          },
+          {
+            "id": "vault",
+            "label": "3. Cedar + Vault (1ms)",
+            "sub": "RFC 8693 60s token mint",
+            "role": "security"
+          },
+          {
+            "id": "mux",
+            "label": "4. Maglev + FW (5ms)",
+            "sub": "2ms Mux + 3ms Firewall",
+            "role": "compute"
+          }
+        ],
+        "edges": [
+          {
+            "from": "edge",
+            "to": "qdrant",
+            "label": "2ms budget"
+          },
+          {
+            "from": "qdrant",
+            "to": "vault",
+            "label": "5ms budget"
+          },
+          {
+            "from": "vault",
+            "to": "mux",
+            "label": "1ms + 2ms + 3ms + 2ms jitter"
+          }
+        ],
+        "cards": [
+          {
+            "label": "4.8 GB/s Bandwidth",
+            "detail": "300K QPS x 16 KB round-trip requires 100 Gbps burst NICs."
+          },
+          {
+            "label": "13ms Core + 2ms Jitter",
+            "detail": "Leaves zero room for synchronous DB audit writes on the hot path."
+          }
+        ],
+        "summary": "Strict per-stage millisecond budgets and Little's Law concurrency keep 300K QPS under 15 ms p99.",
+        "caption": "Every subsystem has an explicit millisecond ceiling enforced via gRPC deadlines."
+      }
+    },
+    {
+      "stage": 2,
+      "level": "foundation",
+      "title": "Strongly-Typed Protobuf Control Plane & JSON-RPC 2.0 Data Plane",
+      "purpose": "Separate control-plane discovery/registration from high-throughput tool invocation.",
+      "explanation": {
+        "foundation": "Think of **Strongly-Typed Protobuf Control Plane & JSON-RPC 2.0 Data Plane** as the intuition layer for Design a 300K-QPS Distributed MCP Gateway & Enterprise Tool Registry: Separate control-plane discovery/registration from high-throughput tool invocation.",
+        "core": "The MCP Gateway exposes typed Protobuf RPCs (DiscoverTools, InvokeTool, RegisterMCPServer, ExchangeDelegatedToken) internally while terminating external JSON-RPC 2.0 over HTTP/2 SSE and Streamable-HTTP. Separating discovery (100K QPS) from invocation (300K QPS) lets Qdrant replicas scale independently from Firecracker execution pools.",
+        "deepDive": "Under heavy load or partial failure, strongly-typed protobuf control plane & json-rpc 2.0 data plane becomes a critical lever for predictable latency and correctness. Principal MCP Gateway blueprint: 15ms p99 budget, SHA-256 rug-pull pinning, <=3ms DeBERTa-v3 output firewall, and 46.6 TB/day ClickHouse + Iceberg OTel ledger."
+      },
+      "assumptions": [
+        "Assumes JSON-RPC 2.0 external wire format",
+        "Assumes Protobuf internal gRPC mesh"
+      ],
+      "codeExample": {
+        "language": "protobuf",
+        "code": "service MCPGatewayControlPlane {\n  rpc DiscoverTools (DiscoverToolsRequest) returns (DiscoverToolsResponse);\n  rpc InvokeTool (InvokeToolRequest) returns (InvokeToolResponse);\n  rpc RegisterMCPServer (RegisterMCPServerRequest) returns (RegisterMCPServerResponse);\n  rpc ExchangeDelegatedToken (ExchangeDelegatedTokenRequest) returns (ExchangeDelegatedTokenResponse);\n}"
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 2 • Control vs Data Plane",
+        "title": "JSON-RPC 2.0 Edge -> Protobuf gRPC Mesh",
+        "nodes": [
+          {
+            "id": "jsonrpc",
+            "label": "JSON-RPC 2.0 Edge",
+            "sub": "SSE & Streamable-HTTP",
+            "role": "ingress"
+          },
+          {
+            "id": "disc",
+            "label": "DiscoverTools (100K QPS)",
+            "sub": "Prunes 1M -> Top-15",
+            "role": "compute"
+          },
+          {
+            "id": "inv",
+            "label": "InvokeTool (300K QPS)",
+            "sub": "Routes to Firecracker/mTLS",
+            "role": "compute"
+          },
+          {
+            "id": "reg",
+            "label": "RegisterMCPServer",
+            "sub": "Pins SHA-256 schema hash",
+            "role": "storage"
+          }
+        ],
+        "edges": [
+          {
+            "from": "jsonrpc",
+            "to": "disc",
+            "label": "Handles tools/list"
+          },
+          {
+            "from": "jsonrpc",
+            "to": "inv",
+            "label": "Handles tools/call"
+          },
+          {
+            "from": "reg",
+            "to": "disc",
+            "label": "Updates Qdrant via alias"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Zero-Downtime Alias",
+            "detail": "Qdrant Collection Aliasing swaps updated schemas instantaneously."
+          },
+          {
+            "label": "Decoupled Scaling",
+            "detail": "100K discovery QPS and 300K invocation QPS scale independently."
+          }
+        ],
+        "summary": "Decoupling discovery, registration, and invocation RPCs isolates vector scaling from execution pools.",
+        "caption": "External JSON-RPC 2.0 maps cleanly onto typed internal Protobuf contracts."
+      },
+      "decisionFramework": {
+        "problem": "How to implement Design a 300K-QPS Distributed MCP Gateway & Enterprise Tool Registry without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "When batching and tail latency compete for accelerator cycles, allocate a strict 15ms p99 budget across Edge Auth (2ms), Qdrant Top-15 (5ms), Cedar/Vault (1ms), Maglev Mux (2ms), and 3-Stage Firewall (3ms), plus async ClickHouse/Iceberg audits.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Design a 300K-QPS Distributed MCP Gateway & Enterprise Tool Registry experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "stage": 3,
+      "level": "intermediate",
+      "title": "Qdrant Int8 HNSW vs Milvus vs pgvector for 1M+ Schemas",
+      "purpose": "Select the vector engine capable of single-pass RBAC pre-filtering in <=4.8 ms.",
+      "explanation": {
+        "foundation": "At 1M tool schemas, pgvector suffers 18-35 ms p99 latency and HNSW recall collapse under SQL WHERE filters.",
+        "core": "Milvus introduces Pulsar/MinIO multi-segment merge overhead (6-9 ms).",
+        "deepDive": "Qdrant's native Rust engine executes single-pass payload bitset filtering inside Int8 HNSW + sparse BM25 RRF in 3.5-4.8 ms p99 using ~1.66 GB RAM per replica (32 shards x 3 replicas = ~53.25 GB RAM)."
+      },
+      "assumptions": [
+        "Assumes efSearch=64, M=16, Int8 scalar quantization",
+        "Assumes 32 shards x 3 replicas"
+      ],
+      "codeExample": {
+        "language": "python",
+        "code": "VECTOR_BENCHMARKS = {\n    \"Qdrant_Int8\": {\"p99_ms\": 4.8, \"rbac_filter\": \"single_pass_bitset\", \"ram_per_1m_gb\": 1.664},\n    \"Milvus_Dist\": {\"p99_ms\": 9.2, \"rbac_filter\": \"partition_scalar\", \"ram_per_1m_gb\": 2.4},\n    \"pgvector\": {\"p99_ms\": 35.0, \"rbac_filter\": \"sql_where_post\", \"ram_per_1m_gb\": 4.8},\n}"
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 3 • Engine Trade-Off",
+        "title": "Qdrant Single-Pass Bitset vs Milvus & pgvector",
+        "nodes": [
+          {
+            "id": "qdrant",
+            "label": "Qdrant (Selected)",
+            "sub": "3.5-4.8ms, single-pass bitset",
+            "role": "index"
+          },
+          {
+            "id": "milvus",
+            "label": "Milvus Distributed",
+            "sub": "6-9.2ms, Pulsar/Etcd overhead",
+            "role": "compare"
+          },
+          {
+            "id": "pgvec",
+            "label": "pgvector",
+            "sub": "18-35ms, WHERE breaks recall",
+            "role": "compare"
+          },
+          {
+            "id": "alias",
+            "label": "Collection Aliasing",
+            "sub": "Zero-downtime schema swap",
+            "role": "output"
+          }
+        ],
+        "edges": [
+          {
+            "from": "qdrant",
+            "to": "alias",
+            "label": "Fits 5ms discovery budget"
+          },
+          {
+            "from": "milvus",
+            "to": "qdrant",
+            "label": "Rejected: higher p99"
+          },
+          {
+            "from": "pgvec",
+            "to": "qdrant",
+            "label": "Rejected: recall collapse"
+          }
+        ],
+        "cards": [
+          {
+            "label": "<=4.8ms p99",
+            "detail": "Single-pass Rust payload bitsets keep RBAC filtering O(1)."
+          },
+          {
+            "label": "53.25 GB Total RAM",
+            "detail": "Entire 32x3 Qdrant fabric fits in high-speed DRAM."
+          }
+        ],
+        "summary": "Qdrant Int8 HNSW meets the <=5 ms discovery SLA via single-pass RBAC bitset filtering.",
+        "caption": "Native Rust execution and collection aliasing outperform Milvus and pgvector at 1M schemas."
+      }
+    },
+    {
+      "stage": 4,
+      "level": "intermediate",
+      "title": "Firecracker stdio Pool (25K microVMs) & Session Cursor State",
+      "purpose": "Size and isolate legacy local stdio MCP servers at 3.2 TB RAM across 64 KVM hosts.",
+      "explanation": {
+        "foundation": "Enterprise deployments still rely on thousands of legacy local stdio MCP tools.",
+        "core": "Provisioning 25,000 active Firecracker microVMs at 128 MB reserved RAM requires 3.2 TB RAM across 64 bare-metal KVM hosts, booting from warm snapshots in <125ms and communicating over AF_VSOCK gRPC.",
+        "deepDive": "Redis Cluster (64 GB) stores 10M concurrent SSE session cursors (4 KB/session = 40 GB working set) for Last-Event-ID replay."
+      },
+      "assumptions": [
+        "Assumes 25,000 active stdio microVMs x 128 MB = 3.2 TB RAM",
+        "Assumes 10M concurrent SSE sessions x 4 KB = 40 GB"
+      ],
+      "codeExample": {
+        "language": "python",
+        "code": "def size_stdio_and_session_state(microvms: int = 25_000, vm_ram_mb: int = 128, sse_sessions: int = 10_000_000) -> dict:\n    vm_ram_tb = (microvms * vm_ram_mb) / (1024 * 1024)\n    session_gb = (sse_sessions * 4) / (1024 * 1024)\n    return {\"firecracker_tb\": round(vm_ram_tb, 2), \"redis_session_gb\": round(session_gb, 1)}"
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 4 • Sandbox & Session State",
+        "title": "25K Firecracker microVMs (3.2 TB) + 64 GB Redis",
+        "nodes": [
+          {
+            "id": "fc",
+            "label": "25K Firecracker VMs",
+            "sub": "128 MB each = 3.2 TB / 64 hosts",
+            "role": "sandbox"
+          },
+          {
+            "id": "vsock",
+            "label": "AF_VSOCK gRPC",
+            "sub": "Zero-TCP-overhead stdio pipe",
+            "role": "pipeline"
+          },
+          {
+            "id": "redis",
+            "label": "64 GB Redis Cluster",
+            "sub": "10M SSE sessions (40 GB set)",
+            "role": "cache"
+          },
+          {
+            "id": "replay",
+            "label": "Last-Event-ID Resume",
+            "sub": "Seamless SSE reconnects",
+            "role": "output"
+          }
+        ],
+        "edges": [
+          {
+            "from": "fc",
+            "to": "vsock",
+            "label": "Streams stdin/stdout"
+          },
+          {
+            "from": "redis",
+            "to": "replay",
+            "label": "Recovers missed SSE events"
+          }
+        ],
+        "cards": [
+          {
+            "label": "<125ms Boot",
+            "detail": "Pre-warmed KVM snapshots absorb sudden tool burst traffic."
+          },
+          {
+            "label": "40 GB Session Set",
+            "detail": "10M active SSE cursors fit comfortably in a 64 GB Redis Cluster."
+          }
+        ],
+        "summary": "A 64-host Firecracker fleet and 64 GB Redis Cluster isolate stdio execution and 10M SSE sessions.",
+        "caption": "AF_VSOCK gRPC and Redis cursor checkpoints eliminate stdio and SSE fragility."
+      }
+    },
+    {
+      "stage": 5,
+      "level": "intermediate",
+      "title": "RFC 8693 Token Exchange & Cedar ABAC Hardening",
+      "purpose": "Enforce dual SPIFFE + User JWT attestation on every downstream MCP call.",
+      "explanation": {
+        "foundation": "Think of **RFC 8693 Token Exchange & Cedar ABAC Hardening** as the intuition layer for Design a 300K-QPS Distributed MCP Gateway & Enterprise Tool Registry: Enforce dual SPIFFE + User JWT attestation on every downstream MCP call.",
+        "core": "Even if an LLM is tricked via prompt injection into requesting a sensitive tool, Cedar ABAC intersects User JWT scopes, Agent SPIFFE workload identity, and Tool requirements in <1 ms. The isolated Token Vault then exchanges the dual assertions via RFC 8693 for a 60-second, single-tool credential—preventing lateral movement and credential exfiltration.",
+        "deepDive": "Under heavy load or partial failure, rfc 8693 token exchange & cedar abac hardening becomes a critical lever for predictable latency and correctness. Principal MCP Gateway blueprint: 15ms p99 budget, SHA-256 rug-pull pinning, <=3ms DeBERTa-v3 output firewall, and 46.6 TB/day ClickHouse + Iceberg OTel ledger."
+      },
+      "assumptions": [
+        "Assumes SPIFFE/SPIRE workload identities",
+        "Assumes 60s down-scoped RFC 8693 tokens"
+      ],
+      "codeExample": {
+        "language": "python",
+        "code": "def mint_downscoped_token(vault_client, user_jwt: str, agent_svid: str, target_audience: str, scope: str) -> str:\n    if not user_jwt or not agent_svid:\n        raise PermissionError(\"Both User JWT and Agent SPIFFE SVID are required\")\n    return vault_client.rfc8693_exchange(\n        subject_token=user_jwt, actor_token=agent_svid,\n        audience=target_audience, scope=scope, ttl_sec=60\n    )"
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 5 • Zero-Trust Vault",
+        "title": "Dual Attestation -> Cedar ABAC -> 60s Token",
+        "nodes": [
+          {
+            "id": "user",
+            "label": "User OAuth 2.1 JWT",
+            "sub": "Caller identity & roles",
+            "role": "ingress"
+          },
+          {
+            "id": "agent",
+            "label": "Agent SPIFFE SVID",
+            "sub": "mTLS workload identity",
+            "role": "ingress"
+          },
+          {
+            "id": "cedar",
+            "label": "Cedar ABAC (<1ms)",
+            "sub": "Evaluates User ∩ Agent ∩ Tool",
+            "role": "guard"
+          },
+          {
+            "id": "vault",
+            "label": "RFC 8693 Vault",
+            "sub": "Mints 60s scoped credential",
+            "role": "security"
+          }
+        ],
+        "edges": [
+          {
+            "from": "user",
+            "to": "cedar",
+            "label": "Passes subject claims"
+          },
+          {
+            "from": "agent",
+            "to": "cedar",
+            "label": "Passes actor claims"
+          },
+          {
+            "from": "cedar",
+            "to": "vault",
+            "label": "Authorizes 60s exchange"
+          }
+        ],
+        "cards": [
+          {
+            "label": "60s Token TTL",
+            "detail": "Short-lived tokens limit blast radius if a downstream server is compromised."
+          },
+          {
+            "label": "Dual Attestation",
+            "detail": "Prevents agents from acting without an authorized user context."
+          }
+        ],
+        "summary": "Dual User + Agent attestation with Cedar ABAC and 60s RFC 8693 tokens blocks confused-deputy abuse.",
+        "caption": "The LLM never touches or sees downstream credentials."
+      }
+    },
+    {
+      "stage": 6,
+      "level": "advanced",
+      "title": "3-Stage Prompt-Injection Firewall & Rug-Pull Pinning",
+      "purpose": "Defend both tool-input schemas and tool-output payloads in <=3 ms.",
+      "explanation": {
+        "foundation": "Upstream MCP servers pose two threats: runtime schema tampering ('rug pulls') and malicious data payloads containing indirect prompt injections.",
+        "core": "Schema pinning verifies canonical SHA-256 digests on every tools/list sync (tripping a 30s quarantine on mismatch).",
+        "deepDive": "On tools/call responses, a <=3ms firewall enforces JSON Schema + 64 KB cap, Aho-Corasick PII redaction, and INT8 DeBERTa-v3 injection detection."
+      },
+      "assumptions": [
+        "Assumes <=3ms inline firewall latency",
+        "Assumes 30s circuit breaker on schema mismatch"
+      ],
+      "codeExample": {
+        "language": "python",
+        "code": "def enforce_firewall_pipeline(resp: dict, max_bytes: int, pii_automaton, deberta_fn) -> dict:\n    raw = str(resp).encode(\"utf-8\")[:max_bytes].decode(\"utf-8\", errors=\"ignore\")\n    scrubbed = pii_automaton.redact(raw)\n    if deberta_fn(scrubbed) > 0.85:\n        raise SecurityError(\"Prompt injection detected in tool output\")\n    return {\"sanitized_xml\": f\"<tool_data>{scrubbed}</tool_data>\"}"
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 6 • Bidirectional Defense",
+        "title": "Schema Pinning + <=3ms 3-Stage Output Firewall",
+        "nodes": [
+          {
+            "id": "pin",
+            "label": "SHA-256 Schema Pin",
+            "sub": "30s quarantine on mismatch",
+            "role": "guard"
+          },
+          {
+            "id": "cap",
+            "label": "JSON Schema + 64KB Cap",
+            "sub": "Enforces strict structure",
+            "role": "filter"
+          },
+          {
+            "id": "pii",
+            "label": "Aho-Corasick PII",
+            "sub": "Sub-ms secret/PII masking",
+            "role": "guard"
+          },
+          {
+            "id": "deb",
+            "label": "INT8 DeBERTa-v3",
+            "sub": "Blocks indirect injections",
+            "role": "guard"
+          }
+        ],
+        "edges": [
+          {
+            "from": "pin",
+            "to": "cap",
+            "label": "Allows verified tool call"
+          },
+          {
+            "from": "cap",
+            "to": "pii",
+            "label": "Scrubs bounded output"
+          },
+          {
+            "from": "pii",
+            "to": "deb",
+            "label": "Scores & XML-wraps data"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Bidirectional Guard",
+            "detail": "Protects both tool selection (pinning) and tool returns (firewall)."
+          },
+          {
+            "label": "<=3ms Budget",
+            "detail": "Automata + INT8 inference fits inside the 15ms p99 SLA."
+          }
+        ],
+        "summary": "SHA-256 schema pinning and a <=3ms 3-stage output firewall harden untrusted MCP boundaries.",
+        "caption": "Both tool-definition rug pulls and poisoned tool outputs are blocked inline."
+      }
+    },
+    {
+      "stage": 7,
+      "level": "advanced",
+      "title": "High-Throughput OTel Audit Ledger (46.6 TB/Day) & Failover",
+      "purpose": "Stream 300K OTel spans/sec asynchronously and survive Qdrant/Firecracker faults.",
+      "explanation": {
+        "foundation": "Think of **High-Throughput OTel Audit Ledger (46.6 TB/Day) & Failover** as the intuition layer for Design a 300K-QPS Distributed MCP Gateway & Enterprise Tool Registry: Stream 300K OTel spans/sec asynchronously and survive Qdrant/Firecracker faults.",
+        "core": "To preserve the <=15ms p99 SLA, 300,000 serialized OTel spans/s (~1.8 KB = 540 MB/s, 46.6 TB/day) stream asynchronously into Kafka -> ClickHouse (30-day hot SQL) + S3 Apache Iceberg WORM (7-year archive). During Qdrant shard failovers, read replicas absorb traffic seamlessly; during Firecracker OOMs, Maglev + snapshot pools respawn clean microVMs in <125 ms.",
+        "deepDive": "Under heavy load or partial failure, high-throughput otel audit ledger (46.6 tb/day) & failover becomes a critical lever for predictable latency and correctness. Principal MCP Gateway blueprint: 15ms p99 budget, SHA-256 rug-pull pinning, <=3ms DeBERTa-v3 output firewall, and 46.6 TB/day ClickHouse + Iceberg OTel ledger."
+      },
+      "assumptions": [
+        "Assumes 540 MB/s (46.6 TB/day) OTel audit ingestion",
+        "Assumes non-blocking Kafka producer"
+      ],
+      "codeExample": {
+        "language": "python",
+        "code": "def handle_sandbox_oom(session_id: str, vm_pool, max_retries: int = 1) -> str:\n    for attempt in range(max_retries + 1):\n        try:\n            return vm_pool.restore_snapshot(session_id, timeout_ms=125)\n        except TimeoutError:\n            if attempt == max_retries:\n                raise RuntimeError(f\"Firecracker respawn failed for {session_id}\")"
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 7 • Audit & Failover",
+        "title": "46.6 TB/Day OTel Ledger + <125ms VM Respawn",
+        "nodes": [
+          {
+            "id": "otel",
+            "label": "300K OTel Spans/s",
+            "sub": "540 MB/s async Kafka emit",
+            "role": "ingress"
+          },
+          {
+            "id": "ch",
+            "label": "ClickHouse (30d Hot)",
+            "sub": "Sub-second SOC SQL queries",
+            "role": "storage"
+          },
+          {
+            "id": "ice",
+            "label": "Iceberg WORM (7yr)",
+            "sub": "Immutable compliance archive",
+            "role": "archive"
+          },
+          {
+            "id": "oom",
+            "label": "Firecracker Respawn",
+            "sub": "<125ms clean snapshot boot",
+            "role": "recovery"
+          }
+        ],
+        "edges": [
+          {
+            "from": "otel",
+            "to": "ch",
+            "label": "Real-time threat forensics"
+          },
+          {
+            "from": "otel",
+            "to": "ice",
+            "label": "Long-term WORM retention"
+          },
+          {
+            "from": "oom",
+            "to": "otel",
+            "label": "Logs sandbox fault telemetry"
+          }
+        ],
+        "cards": [
+          {
+            "label": "46.6 TB/Day Scale",
+            "detail": "Async Kafka -> ClickHouse + Iceberg never blocks the 300K QPS path."
+          },
+          {
+            "label": "<125ms Recovery",
+            "detail": "Crashed stdio microVMs respawn from clean KVM snapshots."
+          }
+        ],
+        "summary": "Async 46.6 TB/day OTel auditing and <125 ms Firecracker recovery harden 300K QPS operations.",
+        "caption": "Tiered ClickHouse + Iceberg storage delivers fast forensics and 7-year compliance."
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-prob-mcp-1",
+        "question": "Why is Qdrant Int8 HNSW selected over pgvector for 1M+ MCP tool schemas under a <=5 ms discovery SLA?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Qdrant runs single-pass RBAC payload bitset filtering inside Int8 HNSW in 3.5-4.8 ms, whereas pgvector's SQL WHERE post-filtering hits 18-35 ms and degrades recall",
+            "correct": true,
+            "feedback": "Correct. Single-pass bitset filtering in Qdrant preserves both sub-5ms p99 latency and high recall."
+          },
+          {
+            "id": "b",
+            "text": "pgvector cannot store JSON schemas or metadata",
+            "correct": false,
+            "feedback": "PostgreSQL supports JSONB, but its HNSW + SQL WHERE execution cannot meet <=5ms at 100K discovery QPS."
+          },
+          {
+            "id": "c",
+            "text": "Qdrant replaces the need for Firecracker microVMs",
+            "correct": false,
+            "feedback": "Qdrant handles semantic tool discovery; Firecracker isolates stdio tool execution."
+          },
+          {
+            "id": "d",
+            "text": "Qdrant eliminates the need for Cedar ABAC on tools/call",
+            "correct": false,
+            "feedback": "Cedar ABAC still runs on every invocation."
+          }
+        ],
+        "explanation": "Qdrant's single-pass Rust bitset filtering + Int8 HNSW + BM25 RRF achieves <=4.8 ms p99 without recall collapse."
+      },
+      {
+        "id": "kc-prob-mcp-2",
+        "question": "Using Little's Law at 300,000 QPS and 0.180s p99 round-trip latency with a 3x burst multiplier, how many concurrent stream slots must the 120 Tokio multiplexer pods support?",
+        "options": [
+          {
+            "id": "a",
+            "text": "54,000 slots total (450 per pod)",
+            "correct": false,
+            "feedback": "54,000 is the baseline without the 3x burst headroom multiplier."
+          },
+          {
+            "id": "b",
+            "text": "162,000 slots total (1,350 per pod)",
+            "correct": true,
+            "feedback": "Correct. L = 300,000 x 0.180 = 54,000 baseline; x 3 burst = 162,000 slots, or 1,350 concurrent streams across 120 pods."
+          },
+          {
+            "id": "c",
+            "text": "300,000 slots total (2,500 per pod)",
+            "correct": false,
+            "feedback": "300,000 is QPS, not Little's Law concurrency L = lambda * W."
+          },
+          {
+            "id": "d",
+            "text": "10,000 slots total (83 per pod)",
+            "correct": false,
+            "feedback": "10,000 slots would saturate immediately under 300K QPS."
+          }
+        ],
+        "explanation": "Little's Law (L = 300,000 x 0.180 = 54,000) times a 3x burst factor yields 162,000 slots (1,350 per pod)."
+      },
+      {
+        "id": "kc-prob-mcp-3",
+        "question": "Why does the gateway stream 46.6 TB/day of OTel audit logs to Kafka -> ClickHouse + Iceberg asynchronously instead of writing to PostgreSQL inline?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Because PostgreSQL cannot store JSON-RPC trace IDs",
+            "correct": false,
+            "feedback": "Postgres can store trace IDs, but 300K synchronous writes/sec would destroy the <=15ms p99 SLA."
+          },
+          {
+            "id": "b",
+            "text": "Because synchronous DB writes at 300K QPS would blow the <=15ms p99 routing budget, whereas async Kafka -> ClickHouse (30d) + Iceberg (7yr) keeps hot-path overhead near zero",
+            "correct": true,
+            "feedback": "Correct. Decoupling audit ingestion via Kafka protects the 15ms p99 budget while supporting 30-day SQL forensics and 7-year WORM compliance."
+          },
+          {
+            "id": "c",
+            "text": "Because ClickHouse executes Cedar ABAC policies",
+            "correct": false,
+            "feedback": "Cedar ABAC executes inline in <1ms inside the gateway."
+          },
+          {
+            "id": "d",
+            "text": "Because Iceberg performs Maglev consistent hashing",
+            "correct": false,
+            "feedback": "Maglev runs in the Rust Tokio multiplexer pods."
+          }
+        ],
+        "explanation": "Async Kafka -> ClickHouse + Iceberg decouples 540 MB/s audit ingestion from the 15ms p99 hot path."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Design a fast, secure gateway that lets AI agents safely call 100,000+ tools at 300,000 requests per second.",
+      "keyTakeaway": "When batching and tail latency compete for accelerator cycles, allocate a strict 15ms p99 budget across Edge Auth (2ms), Qdrant Top-15 (5ms), Cedar/Vault (1ms), Maglev Mux (2ms), and 3-Stage Firewall (3ms), plus async ClickHouse/Iceberg audits.",
+      "byteSummary": "An enterprise MCP Gateway handles hundreds of thousands of tool calls every second. To stay fast, it gives each step—login checks, searching for the right 15 tools, routing to a sandbox, and scanning the reply—a strict millisecond budget.\n\nAudit logs are sent to a background queue so saving compliance history never slows down the user."
+    },
+    "intermediate": {
+      "summary": "Size a 300K-QPS MCP Gateway: 120 Tokio mux pods, 32x3 Qdrant Int8 shards, 25K Firecracker microVMs (3.2 TB RAM), and 64 GB Redis SSE state.",
+      "keyTakeaway": "When batching and tail latency compete for accelerator cycles, allocate a strict 15ms p99 budget across Edge Auth (2ms), Qdrant Top-15 (5ms), Cedar/Vault (1ms), Maglev Mux (2ms), and 3-Stage Firewall (3ms), plus async ClickHouse/Iceberg audits.",
+      "byteSummary": "Capacity math at 300K QPS (4.8 GB/s) sizes 162,000 burst slots across 120 Tokio pods, 25,000 Firecracker stdio VMs (3.2 TB RAM across 64 KVM hosts), and 64 GB Redis for 10M SSE sessions.\n\nQdrant Int8 HNSW + BM25 RRF prunes 1M+ schemas in <=4.8ms, while Cedar ABAC + RFC 8693 Vault handles zero-trust auth in <=1ms."
+    },
+    "advanced": {
+      "summary": "Principal MCP Gateway blueprint: 15ms p99 budget, SHA-256 rug-pull pinning, <=3ms DeBERTa-v3 output firewall, and 46.6 TB/day ClickHouse + Iceberg OTel ledger.",
+      "keyTakeaway": "When batching and tail latency compete for accelerator cycles, allocate a strict 15ms p99 budget across Edge Auth (2ms), Qdrant Top-15 (5ms), Cedar/Vault (1ms), Maglev Mux (2ms), and 3-Stage Firewall (3ms), plus async ClickHouse/Iceberg audits.",
+      "byteSummary": "Meeting <=15ms p99 at 300K QPS requires 32 Qdrant Int8 shards x 3 replicas (~53.25 GB RAM), <125ms Firecracker snapshot respawns over AF_VSOCK, and 60s RFC 8693 token exchange.\n\nSHA-256 schema pinning trips 30s quarantines on rug pulls, <=3ms Aho-Corasick + DeBERTa-v3 firewalls sanitize outputs, and Kafka feeds 46.6 TB/day into 30d ClickHouse + 7yr S3 Iceberg WORM."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "prerequisites": [
+    {
+      "title": "Distributed MCP Gateway, Semantic Tool Pruning & Zero-Trust Vault",
+      "summary": "Route 300,000 JSON-RPC 2.0 tool calls/sec across 100,000+ MCP servers without overflowing 128K LLM context windows or exposing raw credentials."
+    }
+  ],
+  "simulation": {
+    "title": "Design a 300K-QPS Distributed MCP Gateway & Enterprise Tool Registry — Interactive Execution Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Workload & Budget"
+      },
+      {
+        "id": "router",
+        "label": "Gateway / Router",
+        "role": "Admission & Dispatch"
+      },
+      {
+        "id": "engine",
+        "label": "Core Engine",
+        "role": "Primary Execution"
+      },
+      {
+        "id": "replica",
+        "label": "Replica / Fallback",
+        "role": "Durability & Recovery"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "router",
+        "label": "request"
+      },
+      {
+        "from": "router",
+        "to": "engine",
+        "label": "route"
+      },
+      {
+        "from": "engine",
+        "to": "replica",
+        "label": "sync / fallback"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Capacity Math & Strict <=15ms p99 Latency Budget",
+        "actionLabel": "Dispatch nominal request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "router"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "Ingress",
+          "p99_ms": 8,
+          "error_rate": "0.0%"
+        },
+        "explanation": "Caller sends work into the gateway with explicit timeout and concurrency bounds (Capacity Math & Strict <=15ms p99 Latency Budget)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Strongly-Typed Protobuf Control Plane & JSON-RPC 2.0 Data Pl",
+        "actionLabel": "Execute core invariant",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "Core Path",
+          "p99_ms": 18,
+          "in_flight": 124
+        },
+        "explanation": "The core engine processes the hot path while keeping state transitions deterministic (Strongly-Typed Protobuf Control Plane & JSON-RPC 2.0 Data Plane)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Qdrant Int8 HNSW vs Milvus vs pgvector for 1M+ Schemas",
+        "actionLabel": "Detect skew or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Degraded",
+          "p99_ms": 64,
+          "retries_capped": "true"
+        },
+        "explanation": "Under load or replica lag, bounded backoff and isolation prevent cascading saturation (Qdrant Int8 HNSW vs Milvus vs pgvector for 1M+ Schemas)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "High-Throughput OTel Audit Ledger (46.6 TB/Day) & Failover",
+        "actionLabel": "Converge & restore SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 11,
+          "drift": 0
+        },
+        "explanation": "State converges cleanly and telemetry confirms the system returned within its SLO envelope (High-Throughput OTel Audit Ledger (46.6 TB/Day) & Failover)."
+      }
+    ]
+  }
+}

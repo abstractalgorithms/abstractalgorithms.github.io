@@ -1,0 +1,764 @@
+{
+  "slug": "design-globally-unique-username-service",
+  "title": "Design a Globally Unique Username & Identity Claim Service",
+  "domain": "distributed-systems",
+  "diagram": "diagram.png",
+  "spark": {
+    "summary": "Design a global username and identity claim service handling 500K availability checks/sec (<10ms p99), 5K linearizable claims/sec (<150ms p99), anti-spoofing normalization, and 90-day rename cooldowns.",
+    "keyTakeaway": "When nodes partition or reboot past retry windows, serve 500K/s checks from Edge Bloom Filters + Redis negative caches, and serialize 5K/s claims via CockroachDB/Spanner Raft range leases with an Idempotent Outbox and Cooldown Graveyard.",
+    "byteSummary": "Designing a Globally Unique Username & Identity Claim Service requires reconciling two opposite requirements: ultra-fast, globally distributed keystroke availability checks (500K RPS at <10ms) and ironclad linearizable uniqueness across continents for actual claims (5K RPS at <150ms).\n\nThe read path routes keystroke checks through an Edge Bloom Filter and regional Redis Taken Cache, falling back to geo-replicated read replicas only for the ~1% Bloom false positives. The write path passes through a Unicode NFKC/homoglyph Canonicalizer and Aho-Corasick Profanity/Reserved Trie before hitting a range-sharded CockroachDB/Spanner cluster where each shard's Raft leader serializes concurrent contenders.\n\nCommitted claims emit events via a Transactional Outbox with monotonic fencing tokens to update downstream services and global Edge caches in <500ms, while released handles enter a 90-day Cooldown Tombstone Graveyard."
+  },
+  "learningJourney": [
+    {
+      "stage": 1,
+      "level": "foundation",
+      "title": "Workload Asymmetry & Sizing (500K Reads vs 5K Writes)",
+      "purpose": "Quantify keystroke check QPS, claim QPS, and Bloom Filter memory footprint.",
+      "explanation": {
+        "foundation": "Think of **Workload Asymmetry & Sizing (500K Reads vs 5K Writes)** as the intuition layer for Design a Globally Unique Username & Identity Claim Service: Quantify keystroke check QPS, claim QPS, and Bloom Filter memory footprint.",
+        "core": "At 500K checks/sec and 5K claims/sec (100:1 asymmetry) over 1B total accounts: each identity row (~250 bytes) totals ~250GB raw (~750GB replicated). A 1% false-positive Bloom Filter for 1B handles requires `1B * 9.6 bits = ~1.2GB`—fitting effortlessly in RAM on every Edge POP.",
+        "deepDive": "Under heavy load or partial failure, workload asymmetry & sizing (500k reads vs 5k writes) becomes a critical lever for predictable latency and correctness. Engineer atomic rename swaps, 90-day cooldown tombstones, CP minority-partition fail-closed rules, and nightly Bloom rebuilds."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 1 - Capacity Model",
+        "title": "500K Read / 5K Write Sizing",
+        "nodes": [
+          {
+            "id": "chk",
+            "label": "500K RPS Checks",
+            "sub": "100:1 keystroke ratio",
+            "role": "source"
+          },
+          {
+            "id": "bf_sz",
+            "label": "1.2 GB Bloom Filter",
+            "sub": "1B keys @ 1% FP",
+            "role": "cache"
+          },
+          {
+            "id": "wrt",
+            "label": "5K RPS Claims",
+            "sub": "Linearizable Raft",
+            "role": "processor"
+          },
+          {
+            "id": "db_sz",
+            "label": "250 GB Raw Store",
+            "sub": "Sharded by hash(handle)",
+            "role": "storage"
+          }
+        ],
+        "edges": [
+          {
+            "from": "chk",
+            "to": "bf_sz",
+            "label": "99% absorbed in RAM"
+          },
+          {
+            "from": "wrt",
+            "to": "db_sz",
+            "label": "5K Raft txns/sec"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Hash Sharding",
+            "detail": "Shard Raft ranges by hash(canonical_handle) so 'a*' or 'the*' prefixes don't hot-spot."
+          },
+          {
+            "label": "Memory Efficiency",
+            "detail": "1.2GB Bloom filter fits inside standard Edge POP containers."
+          }
+        ],
+        "summary": "100:1 read/write asymmetry is cleanly absorbed by a 1.2GB Edge Bloom filter and hash-sharded Raft.",
+        "caption": "Hash-sharding Raft ranges prevents alphabetical prefix hot spots."
+      }
+    },
+    {
+      "stage": 2,
+      "level": "foundation",
+      "title": "Read Path: Edge Bloom Filter -> Redis -> Read Replica",
+      "purpose": "Deliver <10ms p99 availability checks globally without hitting the consensus leader.",
+      "explanation": {
+        "foundation": "Availability checks hit the nearest Edge POP.",
+        "core": "If the Edge Bloom Filter bit is 0, return `available: true` in <1ms. If 1, check regional Redis (`taken:<handle>`).",
+        "deepDive": "Only on a Redis miss (1% Bloom false positive or expired entry) does the request hit a regional read-only DB replica, which populates Redis on miss."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 2 - Global Read Path",
+        "title": "Three-Tier Availability Check",
+        "nodes": [
+          {
+            "id": "gw",
+            "label": "Edge Gateway",
+            "sub": "500K RPS checks",
+            "role": "source"
+          },
+          {
+            "id": "bf",
+            "label": "Edge Bloom Filter",
+            "sub": "0 -> Available (<1ms)",
+            "role": "router"
+          },
+          {
+            "id": "rd",
+            "label": "Redis Negative Cache",
+            "sub": "Confirms taken (<2ms)",
+            "role": "cache"
+          },
+          {
+            "id": "rr",
+            "label": "Geo Read Replica",
+            "sub": "1% FP fallback",
+            "role": "storage"
+          }
+        ],
+        "edges": [
+          {
+            "from": "gw",
+            "to": "bf",
+            "label": "Test canonical_handle"
+          },
+          {
+            "from": "bf",
+            "to": "rd",
+            "label": "On bit=1"
+          },
+          {
+            "from": "rd",
+            "to": "rr",
+            "label": "On cache miss"
+          }
+        ],
+        "cards": [
+          {
+            "label": "No Consensus on Reads",
+            "detail": "Availability checks tolerate 500ms staleness; Raft serializes the actual claim."
+          },
+          {
+            "label": "Alternative Generator",
+            "detail": "If taken, suggest 3 variants (e.g., @alice_92) batch-checked in 1 Redis pipeline."
+          }
+        ],
+        "summary": "Three-tier edge filtering serves 99% of availability checks without touching any database.",
+        "caption": "Pipelined Redis checks generate available username suggestions in a single round-trip."
+      },
+      "decisionFramework": {
+        "problem": "How to implement Design a Globally Unique Username & Identity Claim Service without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "When nodes partition or reboot past retry windows, serve 500K/s checks from Edge Bloom Filters + Redis negative caches, and serialize 5K/s claims via CockroachDB/Spanner Raft range leases with an Idempotent Outbox and Cooldown Graveyard.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Design a Globally Unique Username & Identity Claim Service experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "stage": 3,
+      "level": "intermediate",
+      "title": "Write Path: Canonicalizer, Profanity Trie & Blocklist",
+      "purpose": "Filter invalid, spoofed, and offensive handles deterministically before consensus.",
+      "explanation": {
+        "foundation": "Think of **Write Path: Canonicalizer, Profanity Trie & Blocklist** as the intuition layer for Design a Globally Unique Username & Identity Claim Service: Filter invalid, spoofed, and offensive handles deterministically before consensus.",
+        "core": "Claim requests first run NFKC + UTS #39 homoglyph folding + length/regex validation (`^[a-z0-9_]{3,20}$`). Next, an in-memory Aho-Corasick Trie (~5ms) checks 50,000+ profanity substrings and reserved system names (`admin`, `support`, `api`, `root`) in O(len(handle)) time, rejecting invalid claims with `422 Unprocessable Entity` before touching Raft.",
+        "deepDive": "Under heavy load or partial failure, write path: canonicalizer, profanity trie & blocklist becomes a critical lever for predictable latency and correctness. Engineer atomic rename swaps, 90-day cooldown tombstones, CP minority-partition fail-closed rules, and nightly Bloom rebuilds."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 3 - Pre-Write Screening",
+        "title": "Canonicalizer & Aho-Corasick Filter",
+        "nodes": [
+          {
+            "id": "req",
+            "label": "Claim Request",
+            "sub": "display_handle",
+            "role": "source"
+          },
+          {
+            "id": "can",
+            "label": "Unicode Canonicalizer",
+            "sub": "NFKC + homoglyph fold",
+            "role": "processor"
+          },
+          {
+            "id": "trie",
+            "label": "Aho-Corasick Trie",
+            "sub": "Profanity & reserved",
+            "role": "router"
+          },
+          {
+            "id": "raft_in",
+            "label": "Valid Canonical Key",
+            "sub": "Proceeds to Raft",
+            "role": "sink"
+          }
+        ],
+        "edges": [
+          {
+            "from": "req",
+            "to": "can",
+            "label": "Normalize to ASCII"
+          },
+          {
+            "from": "can",
+            "to": "trie",
+            "label": "O(N) multi-pattern scan"
+          },
+          {
+            "from": "trie",
+            "to": "raft_in",
+            "label": "Pass clean handle"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Versioned Blocklist",
+            "detail": "Push blocklist updates via config pub/sub without restarting claim services."
+          },
+          {
+            "label": "Audit Display vs Canon",
+            "detail": "Preserve user's chosen capitalization in display_handle."
+          }
+        ],
+        "summary": "O(N) Aho-Corasick screening rejects spoofed and reserved handles before consensus.",
+        "caption": "Pre-write screening protects Raft write throughput from abusive claim spam."
+      }
+    },
+    {
+      "stage": 4,
+      "level": "intermediate",
+      "title": "CockroachDB / Spanner Raft Range Leases",
+      "purpose": "Serialize concurrent global claims with linearizable single-key transactions.",
+      "explanation": {
+        "foundation": "The canonical key routes to the Raft range owning `hash(canonical_handle)`.",
+        "core": "The range's single Raft leaseholder executes `INSERT INTO handles (canonical_handle, user_id, status, lease_exp, fence_token) VALUES (...) ON CONFLICT (canonical_handle) DO NOTHING RETURNING fence_token` (or updates an expired `PENDING`/`COOLDOWN` row).",
+        "deepDive": "A quorum majority commits in ~40-80ms."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 4 - Consensus Commit",
+        "title": "CockroachDB / Spanner Raft Leaseholder",
+        "nodes": [
+          {
+            "id": "us",
+            "label": "US Claim Worker",
+            "sub": "Contender 1",
+            "role": "source"
+          },
+          {
+            "id": "eu",
+            "label": "EU Claim Worker",
+            "sub": "Contender 2",
+            "role": "source"
+          },
+          {
+            "id": "lease",
+            "label": "Raft Range Leader",
+            "sub": "Single master per range",
+            "role": "router"
+          },
+          {
+            "id": "quorum",
+            "label": "Quorum WAL Commit",
+            "sub": "1 Winner + fence_token",
+            "role": "storage"
+          }
+        ],
+        "edges": [
+          {
+            "from": "us",
+            "to": "lease",
+            "label": "Conditional INSERT"
+          },
+          {
+            "from": "eu",
+            "to": "lease",
+            "label": "Conditional INSERT"
+          },
+          {
+            "from": "lease",
+            "to": "quorum",
+            "label": "Replicate to majority"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Regional Placement",
+            "detail": "Place Raft replicas in US-East, US-Central, and EU-West for ~60ms quorum RTT."
+          },
+          {
+            "label": "Bounded Retries",
+            "detail": "On transient Raft lease-transfer errors, retry with exponential backoff + jitter."
+          }
+        ],
+        "summary": "Per-range Raft leaseholders guarantee global linearizability with ~60ms quorum latency.",
+        "caption": "Conditional INSERT/UPDATE semantics make race resolution atomic."
+      }
+    },
+    {
+      "stage": 5,
+      "level": "intermediate",
+      "title": "Idempotent Outbox & Cross-Region Cache Invalidation",
+      "purpose": "Propagate committed claims to Auth/Profile services and Edge Bloom Filters reliably.",
+      "explanation": {
+        "foundation": "Think of **Idempotent Outbox & Cross-Region Cache Invalidation** as the intuition layer for Design a Globally Unique Username & Identity Claim Service: Propagate committed claims to Auth/Profile services and Edge Bloom Filters reliably.",
+        "core": "Inside the same Raft transaction, a row inserts into `identity_outbox(event_id, canonical_handle, user_id, fence_token, type)`. A CDC relay publishes to Kafka, driving two consumers: (1) downstream Profile/Search services (idempotently checking `fence_token`), and (2) Global Cache Invalidation updating regional Redis + Edge Bloom Filters in <500ms.",
+        "deepDive": "Under heavy load or partial failure, idempotent outbox & cross-region cache invalidation becomes a critical lever for predictable latency and correctness. Engineer atomic rename swaps, 90-day cooldown tombstones, CP minority-partition fail-closed rules, and nightly Bloom rebuilds."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 5 - Outbox & Sync",
+        "title": "Transactional Outbox & Edge Invalidation",
+        "nodes": [
+          {
+            "id": "txn",
+            "label": "Raft ACID Txn",
+            "sub": "Handle + Outbox row",
+            "role": "storage"
+          },
+          {
+            "id": "cdc",
+            "label": "CDC Outbox Relay",
+            "sub": "Zero dual-write bugs",
+            "role": "processor"
+          },
+          {
+            "id": "cache_s",
+            "label": "Global Cache Sync",
+            "sub": "Updates Redis + Bloom",
+            "role": "cache"
+          },
+          {
+            "id": "svc_s",
+            "label": "Profile / Auth Sync",
+            "sub": "Checks fence_token",
+            "role": "sink"
+          }
+        ],
+        "edges": [
+          {
+            "from": "txn",
+            "to": "cdc",
+            "label": "Stream committed event"
+          },
+          {
+            "from": "cdc",
+            "to": "cache_s",
+            "label": "Set Redis/Bloom <500ms"
+          },
+          {
+            "from": "cdc",
+            "to": "svc_s",
+            "label": "Update downstream DBs"
+          }
+        ],
+        "cards": [
+          {
+            "label": "No Dual-Write Bugs",
+            "detail": "Writing handle + outbox in one ACID transaction guarantees zero lost events."
+          },
+          {
+            "label": "Idempotent Consumers",
+            "detail": "Downstream services track last_fence_token per user_id."
+          }
+        ],
+        "summary": "Transactional outboxes bridge linearizable identity commits to global eventual caches.",
+        "caption": "Monotonic fencing tokens protect downstream consumers from out-of-order delivery."
+      }
+    },
+    {
+      "stage": 6,
+      "level": "advanced",
+      "title": "Cooldown Tombstone Graveyard & Account Deletion",
+      "purpose": "Lock retired handles for 90 days on rename and permanently on account bans.",
+      "explanation": {
+        "foundation": "On rename (`@old` -> `@new`), one ACID transaction claims `@new` and updates `@old` to `status = 'COOLDOWN'`, `locked_until = now() + 90 days`, `owner_id = user_id`.",
+        "core": "Other users attempting to claim `@old` receive `409 Conflict` until `now() > locked_until`.",
+        "deepDive": "Banned accounts set `status = 'PERMA_LOCKED'`."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 6 - Cooldown Graveyard",
+        "title": "Atomic Rename & 90-Day Lock",
+        "nodes": [
+          {
+            "id": "ren",
+            "label": "Atomic Rename Txn",
+            "sub": "Claim @new + lock @old",
+            "role": "processor"
+          },
+          {
+            "id": "cool",
+            "label": "COOLDOWN (90 Days)",
+            "sub": "Only owner can revert",
+            "role": "storage"
+          },
+          {
+            "id": "ban",
+            "label": "PERMA_LOCKED",
+            "sub": "Abuse/deleted accounts",
+            "role": "cache"
+          },
+          {
+            "id": "free",
+            "label": "Released After 90d",
+            "sub": "Claimable by others",
+            "role": "sink"
+          }
+        ],
+        "edges": [
+          {
+            "from": "ren",
+            "to": "cool",
+            "label": "Set 90d lock"
+          },
+          {
+            "from": "ren",
+            "to": "ban",
+            "label": "Lock permanently if banned"
+          },
+          {
+            "from": "cool",
+            "to": "free",
+            "label": "Expire after 90 days"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Atomic Swap",
+            "detail": "Claiming @new and locking @old in one transaction ensures a user is never handle-less."
+          },
+          {
+            "label": "Rate-Limit Renames",
+            "detail": "Limit handle renames to once per 30 days to prevent churn abuse."
+          }
+        ],
+        "summary": "Single-transaction rename swaps and 90-day cooldowns prevent handle hijacking.",
+        "caption": "Permanent locks on banned accounts protect community trust."
+      }
+    },
+    {
+      "stage": 7,
+      "level": "advanced",
+      "title": "Chaos Resilience, Quorum Loss & Nightly Bloom Rebuild",
+      "purpose": "Maintain read availability during regional outages and prevent Bloom false-positive drift.",
+      "explanation": {
+        "foundation": "Think of **Chaos Resilience, Quorum Loss & Nightly Bloom Rebuild** as the intuition layer for Design a Globally Unique Username & Identity Claim Service: Maintain read availability during regional outages and prevent Bloom false-positive drift.",
+        "core": "If a continent loses connectivity to the Raft quorum majority, writes in the minority partition fail fast with `503 Service Unavailable` (CP behavior—never compromising uniqueness), while 500K RPS availability reads continue uninterrupted from local Edge Bloom Filters and Redis. Nightly Spark/Flink jobs snapshot active + cooldown handles into fresh Edge Bloom Filters.",
+        "deepDive": "Under heavy load or partial failure, chaos resilience, quorum loss & nightly bloom rebuild becomes a critical lever for predictable latency and correctness. Engineer atomic rename swaps, 90-day cooldown tombstones, CP minority-partition fail-closed rules, and nightly Bloom rebuilds."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 7 - DR & Maintenance",
+        "title": "Partition Behavior & Bloom Rebuild",
+        "nodes": [
+          {
+            "id": "part",
+            "label": "Network Partition",
+            "sub": "Minority region isolated",
+            "role": "router"
+          },
+          {
+            "id": "cp_w",
+            "label": "Writes Fail-Closed 503",
+            "sub": "Preserves uniqueness",
+            "role": "processor"
+          },
+          {
+            "id": "ap_r",
+            "label": "Reads Stay 100% Up",
+            "sub": "Edge Bloom + Redis",
+            "role": "cache"
+          },
+          {
+            "id": "reb",
+            "label": "Nightly Bloom Rebuild",
+            "sub": "Resets 1% FP target",
+            "role": "sink"
+          }
+        ],
+        "edges": [
+          {
+            "from": "part",
+            "to": "cp_w",
+            "label": "Reject minority writes"
+          },
+          {
+            "from": "part",
+            "to": "ap_r",
+            "label": "Serve local reads"
+          },
+          {
+            "from": "reb",
+            "to": "ap_r",
+            "label": "Push fresh bitset"
+          }
+        ],
+        "cards": [
+          {
+            "label": "CAP Clarity",
+            "detail": "CP on identity claims (safety), AP on availability checks (UX)."
+          },
+          {
+            "label": "Rolling Bitset Swap",
+            "detail": "Swap new Bloom filter bitsets atomically in Edge POPs with zero downtime."
+          }
+        ],
+        "summary": "Failing minority writes closed while keeping edge reads available embodies clean CAP design.",
+        "caption": "Nightly Bloom rebuilds prevent false-positive degradation over years of churn."
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-1",
+        "question": "During a transatlantic network partition isolating EU-West from the US-based Raft quorum majority, how must the Username Claim Service behave?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Accept new username claims locally in EU-West and merge them later.",
+            "correct": false,
+            "feedback": "Accepting local claims without quorum would allow duplicate usernames across regions."
+          },
+          {
+            "id": "b",
+            "text": "Fail write claims closed (503) in the minority partition to preserve global uniqueness, while continuing to serve availability reads from Edge caches.",
+            "correct": true,
+            "feedback": "Correct! Uniqueness is a CP invariant; reads stay AP via Edge Bloom filters and Redis."
+          },
+          {
+            "id": "c",
+            "text": "Disable Unicode canonicalization until the partition heals.",
+            "correct": false,
+            "feedback": "Canonicalization is local and unrelated to network partitions."
+          },
+          {
+            "id": "d",
+            "text": "Delete the Edge Bloom Filter.",
+            "correct": false,
+            "feedback": "Keeping the Edge Bloom Filter keeps reads available."
+          }
+        ],
+        "explanation": "Global uniqueness demands CP fail-closed behavior on minority-partition writes, while read-only availability checks remain available via local caches."
+      },
+      {
+        "id": "kc-2",
+        "question": "Why should Raft ranges be sharded by `hash(canonical_handle)` rather than alphabetical range (`a-z`)?",
+        "options": [
+          {
+            "id": "a",
+            "text": "To distribute traffic evenly across shards and avoid hot-spotting common prefixes like 'the_' or 'dev_'.",
+            "correct": true,
+            "feedback": "Correct! Hash sharding spreads both reads and writes uniformly across all Raft ranges."
+          },
+          {
+            "id": "b",
+            "text": "Because Raft does not support string keys.",
+            "correct": false,
+            "feedback": "Raft stores arbitrary byte keys; hash sharding is for load balancing."
+          },
+          {
+            "id": "c",
+            "text": "To make SQL LIKE 'al%' prefix searches faster.",
+            "correct": false,
+            "feedback": "Hash sharding actually prevents range scans, which are unnecessary for exact handle claims."
+          },
+          {
+            "id": "d",
+            "text": "To increase the Bloom Filter size.",
+            "correct": false,
+            "feedback": "Sharding does not change Bloom Filter size."
+          }
+        ],
+        "explanation": "Usernames skew heavily toward certain starting letters and prefixes (`the`, `alex`, `dev`). Hash-sharding distributes load evenly."
+      },
+      {
+        "id": "kc-3",
+        "question": "How does the service guarantee that a newly committed username claim updates downstream Profile services and global Edge caches without dual-write inconsistencies?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Write the handle and an event row to an `identity_outbox` table inside the same Raft ACID transaction, then stream via CDC.",
+            "correct": true,
+            "feedback": "Correct! The Transactional Outbox pattern guarantees atomic event emission without 2PC."
+          },
+          {
+            "id": "b",
+            "text": "Send a fire-and-forget HTTP POST to Profile service before committing to Raft.",
+            "correct": false,
+            "feedback": "If Raft later aborts, Profile service would hold an orphaned handle."
+          },
+          {
+            "id": "c",
+            "text": "Wait 24 hours for a batch SQL dump.",
+            "correct": false,
+            "feedback": "Downstream profile creation needs to happen in sub-second real time."
+          },
+          {
+            "id": "d",
+            "text": "Store user profiles inside the Edge Bloom Filter.",
+            "correct": false,
+            "feedback": "Bloom filters only store membership bits, not profile objects."
+          }
+        ],
+        "explanation": "Writing the claim and outbox event in one ACID transaction eliminates dual-write drift between Identity and downstream services."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Design a global username service handling 500K checks/sec and 5K signups/sec without ever allowing duplicates.",
+      "keyTakeaway": "When nodes partition or reboot past retry windows, serve 500K/s checks from Edge Bloom Filters + Redis negative caches, and serialize 5K/s claims via CockroachDB/Spanner Raft range leases with an Idempotent Outbox and Cooldown Graveyard.",
+      "byteSummary": "People type usernames fast—generating 500,000 availability checks per second—while actual signups happen 100x less often. Fast Edge Bloom filters and Redis answer checks in milliseconds.\n\nWhen someone hits 'Claim', the system normalizes lookalike characters, checks a blocklist, and uses a strongly consistent Raft database so only one person can win."
+    },
+    "intermediate": {
+      "summary": "Architect 500K RPS Bloom/Redis reads, O(N) Aho-Corasick screening, hash-sharded Raft leases, and Transactional Outboxes.",
+      "keyTakeaway": "When nodes partition or reboot past retry windows, serve 500K/s checks from Edge Bloom Filters + Redis negative caches, and serialize 5K/s claims via CockroachDB/Spanner Raft range leases with an Idempotent Outbox and Cooldown Graveyard.",
+      "byteSummary": "A 1.2GB Edge Bloom filter (1% FP for 1B keys) + regional Redis absorbs 99% of 500K RPS availability checks. Writes pass NFKC/UTS #39 canonicalization and an O(N) Aho-Corasick profanity trie before committing on hash-sharded CockroachDB/Spanner Raft leaseholders.\n\nA Transactional Outbox streams committed claims with monotonic fencing tokens to Profile services and Edge caches in <500ms."
+    },
+    "advanced": {
+      "summary": "Engineer atomic rename swaps, 90-day cooldown tombstones, CP minority-partition fail-closed rules, and nightly Bloom rebuilds.",
+      "keyTakeaway": "When nodes partition or reboot past retry windows, serve 500K/s checks from Edge Bloom Filters + Redis negative caches, and serialize 5K/s claims via CockroachDB/Spanner Raft range leases with an Idempotent Outbox and Cooldown Graveyard.",
+      "byteSummary": "Renames execute as single ACID transactions claiming the new handle while locking the old one in a 90-day `COOLDOWN` tombstone graveyard (permanent for banned accounts). During network partitions, minority regions fail writes closed (503) to preserve CP uniqueness while keeping AP edge reads online.\n\nNightly Flink/Spark jobs rebuild Edge Bloom bitsets atomically to keep false-positive rates at 1%."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "prerequisites": [
+    {
+      "title": "Globally Unique Identity Claim Consensus",
+      "summary": "Globally Unique Identity Claim Consensus guarantees that two users in different continents can never claim the same canonical username simultaneously, combining Unicode NFKC/homoglyph normalization with linearizable Raft/Paxos quorum writes."
+    }
+  ],
+  "simulation": {
+    "title": "Design a Globally Unique Username & Identity Claim Service — Interactive Execution Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Workload & Budget"
+      },
+      {
+        "id": "router",
+        "label": "Gateway / Router",
+        "role": "Admission & Dispatch"
+      },
+      {
+        "id": "engine",
+        "label": "Core Engine",
+        "role": "Primary Execution"
+      },
+      {
+        "id": "replica",
+        "label": "Replica / Fallback",
+        "role": "Durability & Recovery"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "router",
+        "label": "request"
+      },
+      {
+        "from": "router",
+        "to": "engine",
+        "label": "route"
+      },
+      {
+        "from": "engine",
+        "to": "replica",
+        "label": "sync / fallback"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Workload Asymmetry & Sizing (500K Reads vs 5K Writes)",
+        "actionLabel": "Dispatch nominal request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "router"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "Ingress",
+          "p99_ms": 8,
+          "error_rate": "0.0%"
+        },
+        "explanation": "Caller sends work into the gateway with explicit timeout and concurrency bounds (Workload Asymmetry & Sizing (500K Reads vs 5K Writes))."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Read Path: Edge Bloom Filter -> Redis -> Read Replica",
+        "actionLabel": "Execute core invariant",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "Core Path",
+          "p99_ms": 18,
+          "in_flight": 124
+        },
+        "explanation": "The core engine processes the hot path while keeping state transitions deterministic (Read Path: Edge Bloom Filter -> Redis -> Read Replica)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Write Path: Canonicalizer, Profanity Trie & Blocklist",
+        "actionLabel": "Detect skew or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Degraded",
+          "p99_ms": 64,
+          "retries_capped": "true"
+        },
+        "explanation": "Under load or replica lag, bounded backoff and isolation prevent cascading saturation (Write Path: Canonicalizer, Profanity Trie & Blocklist)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Chaos Resilience, Quorum Loss & Nightly Bloom Rebuild",
+        "actionLabel": "Converge & restore SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 11,
+          "drift": 0
+        },
+        "explanation": "State converges cleanly and telemetry confirms the system returned within its SLO envelope (Chaos Resilience, Quorum Loss & Nightly Bloom Rebuild)."
+      }
+    ]
+  }
+}

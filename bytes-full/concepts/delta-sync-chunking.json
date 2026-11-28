@@ -1,0 +1,694 @@
+{
+  "slug": "delta-sync-chunking",
+  "title": "Content-Defined Chunking (CDC) & Cross-Device Delta Sync",
+  "domain": "distributed-systems",
+  "diagram": "diagram.png",
+  "spark": {
+    "summary": "Content-Defined Chunking uses a rolling hash (Rabin fingerprint) to slice files at content-dependent boundaries so byte insertions only invalidate the modified chunk instead of shifting every downstream block.",
+    "keyTakeaway": "To bound blast radius during partial cluster failures, fixed-size chunking suffers from the boundary-shift problem; CDC with a rolling hash + SHA-256 deduplication achieves true O(delta) uploads across multi-gigabyte files.",
+    "byteSummary": "If you split a 1 GB file into fixed 4 MB blocks and insert 10 bytes at the very beginning, every single byte shifts right by 10 positions. All 250 blocks change their SHA-256 hashes, forcing a full 1 GB re-upload.\n\nContent-Defined Chunking (CDC) eliminates this boundary-shift problem. A sliding window (e.g., 48 bytes) computes a fast rolling hash such as a Rabin fingerprint or Gear hash (FastCDC) as it scans the file. Whenever the hash's lowest bits match a target mask (e.g., `hash & 0x1FFF == 0`), it places a chunk boundary.\n\nBecause boundaries depend on local byte patterns rather than absolute offsets, inserting 10 bytes at the start only alters the first chunk; all remaining 249 chunks match their existing SHA-256 hashes in S3 and are skipped during upload."
+  },
+  "learningJourney": [
+    {
+      "id": "stage-1-boundary-shift",
+      "title": "The Fixed-Chunk Boundary-Shift Problem",
+      "level": "foundation",
+      "purpose": "Observe why naive 4 MB fixed-size splitting fails on prepend or mid-file edits.",
+      "explanation": {
+        "foundation": "Fixed-size chunking slices a file at offsets `0, 4MB, 8MB, ...`.",
+        "core": "If a user prepends a 1 KB header to a 100 MB VM image or video project, every downstream 4 MB boundary shifts by 1 KB.",
+        "deepDive": "Every chunk's SHA-256 digest changes, destroying deduplication and wasting 100 MB of upload bandwidth."
+      },
+      "codeExample": "import hashlib\n\ndef fixed_chunk_hashes(data: bytes, size: int = 4096) -> list[str]:\n    return [hashlib.sha256(data[i:i+size]).hexdigest() for i in range(0, len(data), size)]",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "FOUNDATION",
+        "title": "Fixed-Size Boundary Shift",
+        "nodes": [
+          {
+            "id": "orig",
+            "label": "Original Chunks",
+            "sub": "Offsets 0, 4M, 8M",
+            "role": "state"
+          },
+          {
+            "id": "edit",
+            "label": "Prepend 10 Bytes",
+            "sub": "Shifts all offsets +10",
+            "role": "compute"
+          },
+          {
+            "id": "miss",
+            "label": "100% Hash Miss",
+            "sub": "Re-uploads entire file",
+            "role": "risk"
+          }
+        ],
+        "edges": [
+          {
+            "from": "orig",
+            "to": "edit",
+            "label": "inserts 10 bytes at start"
+          },
+          {
+            "from": "edit",
+            "to": "miss",
+            "label": "invalidates every downstream SHA-256"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Offset Fragility",
+            "detail": "Byte offsets shift globally on any insertion or deletion."
+          },
+          {
+            "label": "Zero Dedup",
+            "detail": "10 bytes edited can trigger gigabytes of redundant transfer."
+          }
+        ],
+        "summary": "Fixed-offset chunking breaks deduplication whenever bytes are inserted or deleted.",
+        "caption": "Prepending bytes shifts every fixed-size block offset, invalidating all downstream hashes."
+      }
+    },
+    {
+      "id": "stage-2-rolling-hash",
+      "title": "Rolling Hash Mechanics (Rabin Fingerprint & FastCDC)",
+      "level": "foundation",
+      "purpose": "Compute content-dependent cut points in O(1) per byte using a sliding window.",
+      "explanation": {
+        "foundation": "Think of **Rolling Hash Mechanics (Rabin Fingerprint & FastCDC)** as the intuition layer for Content-Defined Chunking (CDC) & Cross-Device Delta Sync: Compute content-dependent cut points in O(1) per byte using a sliding window.",
+        "core": "Instead of re-hashing a 48-byte window from scratch at each byte, a rolling hash updates the hash in O(1) arithmetic when the window slides by 1 byte (`out_byte` leaves, `in_byte` enters). Modern FastCDC uses a Gear hash lookup table to scan at >1 GB/sec on a single CPU core.",
+        "deepDive": "Under heavy load or partial failure, rolling hash mechanics (rabin fingerprint & fastcdc) becomes a critical lever for predictable latency and correctness. Production CDC pairs FastCDC with grace-period mark-and-sweep GC, tenant-isolated KMS keys, and optimistic revision conflict forks."
+      },
+      "codeExample": "GEAR_TABLE = [(i * 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF for i in range(256)]\n\ndef fastcdc_cut_points(data: bytes, min_sz: int = 2048, max_sz: int = 16384, mask: int = 0x1FFF) -> list[int]:\n    cuts, start, h = [], 0, 0\n    n = len(data)\n    for i, b in enumerate(data):\n        h = ((h << 1) + GEAR_TABLE[b]) & 0xFFFFFFFFFFFFFFFF\n        length = i - start + 1\n        if length >= min_sz and ((h & mask) == 0 or length >= max_sz):\n            cuts.append(i + 1)\n            start, h = i + 1, 0\n    if start < n:\n        cuts.append(n)\n    return cuts",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "FOUNDATION",
+        "title": "O(1) Sliding Rolling Hash",
+        "nodes": [
+          {
+            "id": "win",
+            "label": "48B Sliding Window",
+            "sub": "Scans 1 byte at a time",
+            "role": "ingress"
+          },
+          {
+            "id": "gear",
+            "label": "Gear / Rabin Hash",
+            "sub": "O(1) bit-shift + XOR",
+            "role": "compute"
+          },
+          {
+            "id": "mask",
+            "label": "Bitmask Trigger",
+            "sub": "(hash & mask) == 0 -> Cut",
+            "role": "gate"
+          }
+        ],
+        "edges": [
+          {
+            "from": "win",
+            "to": "gear",
+            "label": "updates rolling hash"
+          },
+          {
+            "from": "gear",
+            "to": "mask",
+            "label": "emits content-defined boundary"
+          }
+        ],
+        "cards": [
+          {
+            "label": "1+ GB/s Speed",
+            "detail": "Gear hashing avoids modular division, running near memory-copy speed."
+          },
+          {
+            "label": "Local Anchoring",
+            "detail": "Cut points depend only on the surrounding ~48 bytes."
+          }
+        ],
+        "summary": "A rolling hash finds content-anchored boundaries in a single linear O(N) pass.",
+        "caption": "FastCDC slides a Gear rolling hash across bytes to place boundaries based on local content."
+      },
+      "decisionFramework": {
+        "problem": "How to implement Content-Defined Chunking (CDC) & Cross-Device Delta Sync without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "To bound blast radius during partial cluster failures, fixed-size chunking suffers from the boundary-shift problem; CDC with a rolling hash + SHA-256 deduplication achieves true O(delta) uploads across multi-gigabyte files.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Content-Defined Chunking (CDC) & Cross-Device Delta Sync experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-3-min-max-bounds",
+      "title": "Min/Max Chunk Clamping & Normalized Chunking",
+      "level": "intermediate",
+      "purpose": "Prevent pathological tiny (1-byte) or huge (100 MB) chunks by enforcing `[min_size, max_size]` bounds.",
+      "explanation": {
+        "foundation": "Think of **Min/Max Chunk Clamping & Normalized Chunking** as the intuition layer for Content-Defined Chunking (CDC) & Cross-Device Delta Sync: Prevent pathological tiny (1-byte) or huge (100 MB) chunks by enforcing `[min_size, max_size]` bounds.",
+        "core": "A raw random bitmask follows a geometric distribution, occasionally producing 10-byte chunks (metadata explosion) or 50 MB chunks (poor dedup). Enforcing `min_size` (e.g., 2 MB) skips hash checks until `min_size` bytes are read, while `max_size` (e.g., 8 MB) forces a cut, keeping chunk counts and metadata predictable.",
+        "deepDive": "Under heavy load or partial failure, min/max chunk clamping & normalized chunking becomes a critical lever for predictable latency and correctness. Production CDC pairs FastCDC with grace-period mark-and-sweep GC, tenant-isolated KMS keys, and optimistic revision conflict forks."
+      },
+      "codeExample": "def validate_chunk_bounds(chunk_len: int, min_sz: int, max_sz: int) -> bool:\n    return min_sz <= chunk_len <= max_sz",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "INTERMEDIATE",
+        "title": "Bounded Chunk Size Distribution",
+        "nodes": [
+          {
+            "id": "min",
+            "label": "Skip < min_size",
+            "sub": "Prevents tiny metadata bloat",
+            "role": "gate"
+          },
+          {
+            "id": "norm",
+            "label": "Target Bitmask",
+            "sub": "Avg 4 MB content cuts",
+            "role": "compute"
+          },
+          {
+            "id": "max",
+            "label": "Force >= max_size",
+            "sub": "Caps worst-case upload size",
+            "role": "gate"
+          }
+        ],
+        "edges": [
+          {
+            "from": "min",
+            "to": "norm",
+            "label": "enables mask check after min_sz"
+          },
+          {
+            "from": "norm",
+            "to": "max",
+            "label": "cuts unconditionally at max_sz"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Metadata Bound",
+            "detail": "min_size guarantees at most N / min_size chunk entries."
+          },
+          {
+            "label": "FastCDC Trick",
+            "detail": "Using a stricter mask before avg_size narrows variance."
+          }
+        ],
+        "summary": "Clamping chunk sizes between `min_size` and `max_size` bounds both metadata overhead and tail upload size.",
+        "caption": "Skipping checks below min_size and forcing cuts at max_size stabilizes chunk sizes."
+      }
+    },
+    {
+      "id": "stage-4-sha256-dedup",
+      "title": "SHA-256 Content-Addressable Storage & Delta Negotiation",
+      "level": "intermediate",
+      "purpose": "Check which chunk hashes already exist on the server before uploading any binary payload.",
+      "explanation": {
+        "foundation": "Think of **SHA-256 Content-Addressable Storage & Delta Negotiation** as the intuition layer for Content-Defined Chunking (CDC) & Cross-Device Delta Sync: Check which chunk hashes already exist on the server before uploading any binary payload.",
+        "core": "After slicing a file into CDC chunks, the client computes each chunk's SHA-256 digest and sends the ordered hash list (`[h1, h2', h3, h4]`) to the Block Service. The server checks its chunk index and returns only missing hashes (`[h2']`), cutting upload traffic by >90% on incremental edits.",
+        "deepDive": "Under heavy load or partial failure, sha-256 content-addressable storage & delta negotiation becomes a critical lever for predictable latency and correctness. Production CDC pairs FastCDC with grace-period mark-and-sweep GC, tenant-isolated KMS keys, and optimistic revision conflict forks."
+      },
+      "codeExample": "def negotiate_missing_chunks(block_index, chunk_hashes: list[str]) -> list[str]:\n    existing = block_index.batch_exists(chunk_hashes)\n    return [h for h in chunk_hashes if h not in existing]",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "INTERMEDIATE",
+        "title": "Hash-First Delta Negotiation",
+        "nodes": [
+          {
+            "id": "client",
+            "label": "Client Manifest",
+            "sub": "[h1, h2', h3, h4]",
+            "role": "client"
+          },
+          {
+            "id": "check",
+            "label": "Block Index Lookup",
+            "sub": "Finds h1, h3, h4 present",
+            "role": "gate"
+          },
+          {
+            "id": "upload",
+            "label": "Delta Upload",
+            "sub": "Transfers only h2' to S3",
+            "role": "output"
+          }
+        ],
+        "edges": [
+          {
+            "from": "client",
+            "to": "check",
+            "label": "sends SHA-256 list"
+          },
+          {
+            "from": "check",
+            "to": "upload",
+            "label": "uploads only missing chunk h2'"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Content-Addressable",
+            "detail": "Chunks are stored at `blocks/{sha256}`—identical chunks across files share 1 copy."
+          },
+          {
+            "label": "Bandwidth Win",
+            "detail": "Editing 1 slide in a 500 MB deck uploads ~4 MB instead of 500 MB."
+          }
+        ],
+        "summary": "Negotiating SHA-256 manifests before uploading ensures only genuinely new chunks cross the wire.",
+        "caption": "The client sends chunk hashes first and uploads only the modified chunk h2' to S3."
+      }
+    },
+    {
+      "id": "stage-5-compression-encryption",
+      "title": "Chunk Compression, Convergent vs. Per-Tenant Encryption",
+      "level": "intermediate",
+      "purpose": "Balance storage deduplication against zero-knowledge tenant encryption.",
+      "explanation": {
+        "foundation": "Think of **Chunk Compression, Convergent vs. Per-Tenant Encryption** as the intuition layer for Content-Defined Chunking (CDC) & Cross-Device Delta Sync: Balance storage deduplication against zero-knowledge tenant encryption.",
+        "core": "Cross-user deduplication requires identical plaintext chunks to produce identical ciphertext (convergent encryption using `HMAC(chunk_hash, chunk)`), which can leak whether another user owns a known file. Enterprise systems therefore scope deduplication per `tenant_id` using per-tenant KMS keys and Zstd compression per chunk.",
+        "deepDive": "Under heavy load or partial failure, chunk compression, convergent vs. per-tenant encryption becomes a critical lever for predictable latency and correctness. Production CDC pairs FastCDC with grace-period mark-and-sweep GC, tenant-isolated KMS keys, and optimistic revision conflict forks."
+      },
+      "codeExample": "def compress_chunk(raw: bytes) -> bytes:\n    import zlib\n    compressed = zlib.compress(raw, level=3)\n    return compressed if len(compressed) < len(raw) else raw",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "INTERMEDIATE",
+        "title": "Per-Tenant Encryption & Zstd",
+        "nodes": [
+          {
+            "id": "raw",
+            "label": "Plaintext Chunk",
+            "sub": "4 MB CDC slice",
+            "role": "ingress"
+          },
+          {
+            "id": "zstd",
+            "label": "Zstd Compress",
+            "sub": "Skips if incompressible",
+            "role": "compute"
+          },
+          {
+            "id": "kms",
+            "label": "Tenant AES-GCM",
+            "sub": "Isolates dedup per org",
+            "role": "security"
+          }
+        ],
+        "edges": [
+          {
+            "from": "raw",
+            "to": "zstd",
+            "label": "compresses text/binary"
+          },
+          {
+            "from": "zstd",
+            "to": "kms",
+            "label": "encrypts with tenant DEK"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Skip Incompressible",
+            "detail": "JPEG/MP4 chunks skip compression to save CPU."
+          },
+          {
+            "label": "Privacy Boundary",
+            "detail": "Per-tenant keys prevent cross-org hash-oracle side channels."
+          }
+        ],
+        "summary": "Per-tenant encryption and conditional compression protect privacy without sacrificing org-level dedup.",
+        "caption": "Compressing and encrypting chunks with tenant-scoped keys prevents cross-tenant leakage."
+      }
+    },
+    {
+      "id": "stage-6-gc-refcounting",
+      "title": "Reference Counting & Safe Orphan Chunk Garbage Collection",
+      "level": "advanced",
+      "purpose": "Delete unreferenced S3 chunks safely without racing against concurrent uploads or file restores.",
+      "explanation": {
+        "foundation": "Because multiple file versions share chunk `h1`, deleting a file cannot immediately delete `h1` from S3.",
+        "core": "A naive `ref_count == 0` delete races with an in-flight upload that just skipped `h1` during negotiation.",
+        "deepDive": "Production systems use a two-phase mark-and-sweep GC with a 7-day grace period (`unreferenced_since`) and soft-delete locks."
+      },
+      "codeExample": "def sweep_orphan_chunks(db, s3, grace_days: int = 7):\n    candidates = db.fetch_unreferenced_older_than(days=grace_days)\n    for chunk_hash in candidates:\n        if db.try_lock_for_gc(chunk_hash):\n            s3.delete_object(Key=f'blocks/{chunk_hash}')\n            db.delete_chunk_row(chunk_hash)",
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "ADVANCED",
+        "title": "Two-Phase Grace-Period GC",
+        "cards": [
+          {
+            "label": "TOCTOU Fix",
+            "detail": "Grace window + row lock prevents deleting a chunk while a client is referencing it."
+          },
+          {
+            "label": "Version History",
+            "detail": "30-day file undo keeps chunk references alive until snapshot expiry."
+          }
+        ],
+        "summary": "Grace-period mark-and-sweep GC prevents race conditions when reclaiming unreferenced blocks.",
+        "caption": "A 7-day grace window and row lock prevent GC from deleting chunks mid-upload.",
+        "states": [
+          {
+            "id": "unref",
+            "label": "RefCount == 0",
+            "sublabel": "Sets unreferenced_since",
+            "tone": "blue"
+          },
+          {
+            "id": "grace",
+            "label": "7-Day Grace Window",
+            "sublabel": "Protects in-flight uploads",
+            "tone": "amber"
+          },
+          {
+            "id": "sweep",
+            "label": "Atomic GC Sweep",
+            "sublabel": "Deletes S3 object + row",
+            "tone": "green"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "unref",
+            "to": "grace",
+            "label": "waits 7 days"
+          },
+          {
+            "from": "grace",
+            "to": "sweep",
+            "label": "locks row before S3 delete"
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-7-cross-device-delta",
+      "title": "Version Vectors & Cross-Device Conflict Forks",
+      "level": "advanced",
+      "purpose": "Detect concurrent offline edits across devices and preserve both copies without data loss.",
+      "explanation": {
+        "foundation": "If Laptop A and Laptop B both edit `budget.xlsx` while offline, neither should silently overwrite the other.",
+        "core": "Each file carries a monotonic `revision_id` and parent pointer.",
+        "deepDive": "When Laptop B reconnects with `base_rev=5` while the server is at `rev=6`, the Metadata Service rejects the overwrite and forks `budget (Laptop B's conflicted copy).xlsx`."
+      },
+      "codeExample": "def commit_file_revision(db, file_id: str, expected_rev: int, new_chunks: list[str], device: str) -> dict:\n    current = db.get_file_head(file_id)\n    if current['rev'] != expected_rev:\n        fork_id = db.create_conflict_fork(file_id, device, new_chunks)\n        return {'status': 'CONFLICT_FORKED', 'fork_id': fork_id}\n    new_rev = db.advance_revision(file_id, expected_rev, new_chunks)\n    return {'status': 'COMMITTED', 'rev': new_rev}",
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "ADVANCED",
+        "title": "Optimistic Revision & Conflict Fork",
+        "cards": [
+          {
+            "label": "Zero Silent Loss",
+            "detail": "Conflicting offline edits are preserved as separate files."
+          },
+          {
+            "label": "Fast Sync",
+            "detail": "The forked file still reuses all unchanged CDC chunks in S3."
+          }
+        ],
+        "summary": "Optimistic revision checks detect offline edit races and create safe conflict copies.",
+        "caption": "When two devices edit offline, a revision mismatch triggers a conflict-copy fork.",
+        "states": [
+          {
+            "id": "base",
+            "label": "Device B: base_rev=5",
+            "sublabel": "Server head is rev=6",
+            "tone": "blue"
+          },
+          {
+            "id": "cmp",
+            "label": "Revision Check",
+            "sublabel": "expected_rev != head_rev",
+            "tone": "amber"
+          },
+          {
+            "id": "fork",
+            "label": "Conflict Copy Created",
+            "sublabel": "Zero data loss",
+            "tone": "green"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "base",
+            "to": "cmp",
+            "label": "submits chunk manifest"
+          },
+          {
+            "from": "cmp",
+            "to": "fork",
+            "label": "forks conflicted copy on mismatch"
+          }
+        ]
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-1",
+        "question": "Why does Content-Defined Chunking (CDC) outperform fixed 4 MB chunking when 50 bytes are inserted at the start of a 2 GB file?",
+        "options": [
+          {
+            "id": "a",
+            "text": "CDC compresses the 2 GB file into 50 bytes.",
+            "correct": false,
+            "feedback": "CDC slices files into chunks; it does not compress 2 GB into 50 bytes."
+          },
+          {
+            "id": "b",
+            "text": "CDC places boundaries using a rolling hash of local byte patterns, so only the first chunk changes while downstream chunks keep identical hashes.",
+            "correct": true,
+            "feedback": "Correct! Content-anchored boundaries re-synchronize immediately after the edit, preserving deduplication for all remaining chunks."
+          },
+          {
+            "id": "c",
+            "text": "Fixed chunking cannot use SHA-256.",
+            "correct": false,
+            "feedback": "Fixed chunking can use SHA-256, but every block's content shifts."
+          },
+          {
+            "id": "d",
+            "text": "CDC skips uploading metadata to the server.",
+            "correct": false,
+            "feedback": "The client still sends the updated chunk manifest."
+          }
+        ],
+        "explanation": "Rolling-hash boundaries depend on local byte windows, isolating insertions to the edited chunk."
+      },
+      {
+        "id": "kc-2",
+        "question": "What is the purpose of enforcing `min_size` and `max_size` bounds in FastCDC?",
+        "options": [
+          {
+            "id": "a",
+            "text": "To guarantee every chunk has the exact same byte length.",
+            "correct": false,
+            "feedback": "CDC chunks are variable-sized between min_size and max_size."
+          },
+          {
+            "id": "b",
+            "text": "To prevent tiny-chunk metadata explosion and cap worst-case chunk transfer size.",
+            "correct": true,
+            "feedback": "Correct! Clamping bounds the number of chunk records per file and caps individual block sizes."
+          },
+          {
+            "id": "c",
+            "text": "To disable SHA-256 hashing on large files.",
+            "correct": false,
+            "feedback": "Every chunk is still hashed with SHA-256."
+          },
+          {
+            "id": "d",
+            "text": "To force all files to be multiples of 4 MB.",
+            "correct": false,
+            "feedback": "Files keep their exact original length."
+          }
+        ],
+        "explanation": "Clamping `[min_size, max_size]` eliminates the extreme tails of a geometric rolling-hash distribution."
+      },
+      {
+        "id": "kc-3",
+        "question": "Why is immediate `DELETE` on `ref_count == 0` dangerous in content-addressable chunk storage?",
+        "options": [
+          {
+            "id": "a",
+            "text": "S3 charges extra for immediate deletes.",
+            "correct": false,
+            "feedback": "The issue is correctness, not delete pricing."
+          },
+          {
+            "id": "b",
+            "text": "An in-flight upload that just saw `chunk_hash` as existing may commit a new file referencing that chunk right as GC deletes it.",
+            "correct": true,
+            "feedback": "Correct! A grace window + row lock prevents TOCTOU races between GC and concurrent uploads."
+          },
+          {
+            "id": "c",
+            "text": "SHA-256 hashes expire after 24 hours.",
+            "correct": false,
+            "feedback": "SHA-256 digests are deterministic and never expire."
+          },
+          {
+            "id": "d",
+            "text": "It breaks client-side SQLite file watchers.",
+            "correct": false,
+            "feedback": "Local watchers do not manage server-side S3 GC."
+          }
+        ],
+        "explanation": "Two-phase GC with a grace period prevents deleting a block that a concurrent upload is about to reference."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Content-Defined Chunking splits large files at content patterns so editing one part only uploads the changed piece.",
+      "keyTakeaway": "To bound blast radius during partial cluster failures, fixed-size chunking suffers from the boundary-shift problem; CDC with a rolling hash + SHA-256 deduplication achieves true O(delta) uploads across multi-gigabyte files.",
+      "byteSummary": "If you cut a file every 4 MB strictly by position, adding one word at the top shifts everything and forces a full re-upload. CDC uses a sliding fingerprint to cut at natural byte patterns so unchanged pieces are recognized and skipped."
+    },
+    "intermediate": {
+      "summary": "FastCDC rolling hashes with `[min_size, max_size]` clamping, SHA-256 manifest negotiation, and per-tenant encryption.",
+      "keyTakeaway": "To bound blast radius during partial cluster failures, fixed-size chunking suffers from the boundary-shift problem; CDC with a rolling hash + SHA-256 deduplication achieves true O(delta) uploads across multi-gigabyte files.",
+      "byteSummary": "Clients slice files using Gear/Rabin rolling hashes, compute SHA-256 digests, and query the Block Service for missing hashes. Only unstored chunks are compressed, encrypted with tenant DEKs, and uploaded to S3."
+    },
+    "advanced": {
+      "summary": "Production CDC pairs FastCDC with grace-period mark-and-sweep GC, tenant-isolated KMS keys, and optimistic revision conflict forks.",
+      "keyTakeaway": "To bound blast radius during partial cluster failures, fixed-size chunking suffers from the boundary-shift problem; CDC with a rolling hash + SHA-256 deduplication achieves true O(delta) uploads across multi-gigabyte files.",
+      "byteSummary": "To eliminate cross-tenant hash-oracle leaks, deduplication is scoped per tenant. Orphaned blocks wait through a 7-day grace period before locked S3 deletion, while concurrent offline edits fork safely on `expected_rev` mismatch."
+    }
+  },
+  "pedagogicalFramework": "PRIME",
+  "simulation": {
+    "title": "Content-Defined Chunking (CDC) & Cross-Device Delta Sync — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "prod",
+        "label": "Producer",
+        "role": "Idempotent Publish"
+      },
+      {
+        "id": "broker",
+        "label": "Partition Log",
+        "role": "Ordered Append"
+      },
+      {
+        "id": "cons",
+        "label": "Consumer",
+        "role": "Deduplicated Sink"
+      },
+      {
+        "id": "dlq",
+        "label": "Dead-Letter Queue",
+        "role": "Poison Isolation"
+      }
+    ],
+    "edges": [
+      {
+        "from": "prod",
+        "to": "broker",
+        "label": "append(key)"
+      },
+      {
+        "from": "broker",
+        "to": "cons",
+        "label": "poll(offset)"
+      },
+      {
+        "from": "cons",
+        "to": "dlq",
+        "label": "dead-letter"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "The Fixed-Chunk Boundary-Shift Problem",
+        "actionLabel": "append(key)",
+        "status": "healthy",
+        "activeNodeIds": [
+          "prod",
+          "broker"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "append(key)",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Producer sends work to Partition Log (The Fixed-Chunk Boundary-Shift Problem)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Rolling Hash Mechanics (Rabin Fingerprint & FastCDC)",
+        "actionLabel": "poll(offset)",
+        "status": "healthy",
+        "activeNodeIds": [
+          "broker",
+          "cons"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "poll(offset)",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Partition Log coordinates with Consumer while preserving the core invariant (Rolling Hash Mechanics (Rabin Fingerprint & FastCDC))."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Min/Max Chunk Clamping & Normalized Chunking",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "cons",
+          "dlq"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, Dead-Letter Queue absorbs pressure without cascading (Min/Max Chunk Clamping & Normalized Chunking)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Version Vectors & Cross-Device Conflict Forks",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "prod",
+          "broker",
+          "cons",
+          "dlq"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Version Vectors & Cross-Device Conflict Forks)."
+      }
+    ]
+  }
+}

@@ -1,0 +1,811 @@
+{
+  "id": "design-tail-sampling-trace",
+  "slug": "design-tail-sampling-trace",
+  "title": "Design a 1M-Span/Sec Distributed Tail-Based Trace Sampling Pipeline",
+  "domain": "DevOps & Infrastructure",
+  "tagline": "Process 1M spans/sec and cut ClickHouse storage by 95% with two-tier trace_id routing, 30s tail buffers, and error-storm rate caps.",
+  "purpose": "Architect a high-throughput OpenTelemetry tail-sampling pipeline that captures 100% of incidents without collector OOMs or app impact.",
+  "spark": {
+    "summary": "Stateless Tier 1 trace_id routers feed 16 stateful Tier 2 collectors (30s buffer + 80% memory_limiter) and a Kafka -> ClickHouse sink, saving 95% storage while keeping errors.",
+    "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, pair trace_id consistent hashing with per-service error-storm caps, 1 KB attribute trimming, and 35s preStop draining.",
+    "byteSummary": "At 1,000,000 spans/second (~1.5 GB/s raw OTLP, ~130 TB/day), storing every span in ClickHouse or Tempo is financially prohibitive, yet 1% head-based sampling blinds on-call engineers during Sev-1 incidents. Designing a **1M-Span/Sec Distributed Tail-Based Sampling Pipeline** requires solving stateful trace assembly at scale without OOMKilling collectors or impacting live microservice latency.\n\nThe architecture splits ingestion into four stages: (1) non-blocking OTel SDKs in microservices propagating W3C `traceparent`; (2) stateless **Tier 1 Edge Collectors** that strip oversized payload attributes and route spans via consistent hashing on `trace_id`; (3) **Tier 2 Stateful Tail-Sampling Collectors** (16 pods x 4 GB RAM) holding a 30-second trace buffer with `80% memory_limiter` breakers, evaluating `100% errors + p99 > 500 ms + VIP debug tenants + 1% healthy`; and (4) a **Kafka** shock-absorber topic feeding batched 100K-row inserts into **ClickHouse**—cutting storage by 95% (~6.5 TB/day) while preserving 100% incident visibility."
+  },
+  "learningJourney": [
+    {
+      "id": "01-p-scale",
+      "eyebrow": "STAGE 01 · CAPACITY & STORAGE MATH",
+      "title": "Sizing 1M Spans/Sec, 45 GB Collector RAM & 95% Storage Savings",
+      "level": "foundation",
+      "purpose": "Size raw OTLP ingress (1.5 GB/s), 30s Tier 2 RAM buffers (~45 GB), and post-sampling ClickHouse storage.",
+      "explanation": {
+        "foundation": "1,000,000 spans/sec at ~1.5 KB/span = 1.5 GB/s raw ingress (~130 TB/day un-sampled).",
+        "core": "Buffering 30 seconds (`decision_wait`) requires 30M spans x 1.5 KB = ~45 GB active RAM across 16 Tier 2 pods (~4 GB RAM each with headroom).",
+        "deepDive": "Retaining 100% errors (~1%), 100% slow >500 ms (~2%), debug tenants (~1%), and 1% healthy baseline keeps ~5% total (~6.5 TB/day), saving 95% of ClickHouse NVMe storage and CPU."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 01 · CAPACITY & STORAGE MATH",
+        "title": "Sizing 1M Spans/Sec, 45 GB Collector RAM & 95% Storage Savings",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "1M Spans / Sec",
+            "sub": "1.5 GB/s (130 TB/day)",
+            "role": "Raw OTLP Ingress"
+          },
+          {
+            "id": "n2",
+            "label": "30s Tier 2 Buffer",
+            "sub": "45 GB Across 16 Pods",
+            "role": "Stateful RAM"
+          },
+          {
+            "id": "n3",
+            "label": "5% Policy Keep",
+            "sub": "Errors + Slow + 1% Base",
+            "role": "Sampling Funnel"
+          },
+          {
+            "id": "n4",
+            "label": "6.5 TB / Day Store",
+            "sub": "95% ClickHouse Saved",
+            "role": "Cost & Signal SLA"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "buffers"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "evaluates"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "writes"
+          }
+        ],
+        "cards": [
+          {
+            "label": "130 TB -> 6.5 TB/Day",
+            "detail": "Tail sampling cuts daily ClickHouse ingest by 20x without losing a single error trace."
+          },
+          {
+            "label": "RAM Sizing Formula",
+            "detail": "Collector RAM = (spans_per_sec * decision_wait_s * bytes_per_span) * 1.4 headroom."
+          },
+          {
+            "label": "Attribute Stripping",
+            "detail": "Dropping >2 KB stack/body tags at Tier 1 shrinks 45 GB buffer requirements further."
+          }
+        ],
+        "summary": "16 Tier 2 pods (4 GB each) buffer 30s of 1M spans/sec and reduce ClickHouse ingest from 130 TB/day to 6.5 TB/day.",
+        "caption": "16 Tier 2 pods (4 GB each) buffer 30s of 1M spans/sec and reduce ClickHouse ingest from 130 TB/day to 6.5 TB/day."
+      }
+    },
+    {
+      "id": "02-p-arch",
+      "eyebrow": "STAGE 02 · TWO-TIER PIPELINE",
+      "title": "Stateless Tier 1 Trace-ID Routers -> Stateful Tier 2 Collectors -> Kafka",
+      "level": "foundation",
+      "purpose": "Separate stateless OTLP ingestion/routing from stateful 30s trace assembly and decoupled Kafka -> ClickHouse persistence.",
+      "explanation": {
+        "foundation": "Apps export OTLP/gRPC to local node DaemonSets or Tier 1 stateless collectors, never blocking request threads.",
+        "core": "Tier 1 hashes `trace_id` onto a consistent-hash ring of Tier 2 pods. Tier 2 buffers spans, evaluates rules at `t + 30s`, and publishes kept traces to Kafka.",
+        "deepDive": "ClickHouse OTel consumers pull 100K-span batches from Kafka so ClickHouse merges never stall upstream collectors."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 02 · TWO-TIER PIPELINE",
+        "title": "Stateless Tier 1 Trace-ID Routers -> Stateful Tier 2 Collectors -> Kafka",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "Microservice SDKs",
+            "sub": "Non-Blocking Ring Buf",
+            "role": "App Export"
+          },
+          {
+            "id": "n2",
+            "label": "Tier 1 LoadBalance",
+            "sub": "hash(trace_id) Router",
+            "role": "Stateless Tier"
+          },
+          {
+            "id": "n3",
+            "label": "Tier 2 Tail Pool",
+            "sub": "30s Buffer + Policy",
+            "role": "Stateful Tier"
+          },
+          {
+            "id": "n4",
+            "label": "Kafka -> ClickHouse",
+            "sub": "100K-Row Batch Insert",
+            "role": "Durable Sink"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "gRPC OTLP"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "pins trace_id"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "publishes kept"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Zero App Coupling",
+            "detail": "Application pods never wait on Tier 2 or ClickHouse; full SDK buffers drop telemetry silently."
+          },
+          {
+            "label": "Tier 1 Stateless Scale",
+            "detail": "Autoscale Tier 1 freely on CPU without disrupting Tier 2 trace_id affinity."
+          },
+          {
+            "label": "Kafka Buffer",
+            "detail": "Absorbs ClickHouse maintenance or bursty incident error-storms cleanly."
+          }
+        ],
+        "summary": "Two-tier trace_id routing plus a Kafka buffer isolates app latency, preserves trace assembly, and protects ClickHouse.",
+        "caption": "Two-tier trace_id routing plus a Kafka buffer isolates app latency, preserves trace assembly, and protects ClickHouse."
+      },
+      "decisionFramework": {
+        "problem": "How to implement Design a 1M-Span/Sec Distributed Tail-Based Trace Sampling Pipeline without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "To keep the architecture evolvable without sacrificing reliability, pair trace_id consistent hashing with per-service error-storm caps, 1 KB attribute trimming, and 35s preStop draining.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Design a 1M-Span/Sec Distributed Tail-Based Trace Sampling Pipeline experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-p-impl",
+      "eyebrow": "STAGE 03 · SAFE IMPLEMENTATION",
+      "title": "Consistent-Hash Trace Router & Bounded Memory Tail Buffer",
+      "level": "intermediate",
+      "purpose": "Implement trace_id consistent-hash routing with unhealthy-node failover and bounded trace eviction.",
+      "explanation": {
+        "foundation": "Use Jump Consistent Hash or Ketama virtual nodes so adding/removing a Tier 2 collector remaps only `1/N` traces.",
+        "core": "```python\nimport hashlib\n\nclass TraceRingRouter:\n    def __init__(self, pods: list[str], vnodes: int = 100) -> None:\n        if not pods:\n            raise ValueError('At least one Tier 2 pod is required')\n        self.ring: list[tuple[int, str]] = []\n        for pod in pods:\n            for v in range(vnodes):\n                h = int(hashlib.md5(f'{pod}#{v}'.encode()).hexdigest()[:8], 16)\n                self.ring.append((h, pod))\n        self.ring.sort()\n\n    def route_trace(self, trace_id: str) -> str:\n        if not trace_id:\n            raise ValueError('trace_id cannot be empty')\n        h = int(hashlib.md5(trace_id.encode()).hexdigest()[:8], 16)\n        for ring_h, pod in self.ring:\n            if h <= ring_h:\n                return pod\n        return self.ring[0][1]\n```",
+        "deepDive": "In production, pair binary search (`bisect_left`) over `self.ring` with health-check filtering so dead Tier 2 pods fail over deterministically."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 03 · SAFE IMPLEMENTATION",
+        "title": "Consistent-Hash Trace Router & Bounded Memory Tail Buffer",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "Validate trace_id",
+            "sub": "Non-Empty 128-Bit ID",
+            "role": "Input Check"
+          },
+          {
+            "id": "n2",
+            "label": "100 Vnodes / Pod",
+            "sub": "Even Ring Spread",
+            "role": "Ring Topology"
+          },
+          {
+            "id": "n3",
+            "label": "bisect_left(hash)",
+            "sub": "O(log V) Pod Lookup",
+            "role": "Fast Route"
+          },
+          {
+            "id": "n4",
+            "label": "Target Tier 2 Pod",
+            "sub": "All Spans Co-Located",
+            "role": "Trace Assembly"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "hashes onto"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "searches"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "routes to"
+          }
+        ],
+        "cards": [
+          {
+            "label": "100 Virtual Nodes",
+            "detail": "100 vnodes per collector pod keep span distribution within ~5% variance across the ring."
+          },
+          {
+            "label": "1/N Remapping",
+            "detail": "Scaling from 16 to 17 pods only splits ~6% of active 30s traces instead of 94% with modulo."
+          },
+          {
+            "label": "Health-Check Skip",
+            "detail": "If a Tier 2 pod fails readiness probes, walk clockwise to the next healthy pod."
+          }
+        ],
+        "summary": "100-vnode consistent hashing keeps trace routing O(log V) and limits ring churn during autoscaling.",
+        "caption": "100-vnode consistent hashing keeps trace routing O(log V) and limits ring churn during autoscaling."
+      }
+    },
+    {
+      "id": "04-p-scaling",
+      "eyebrow": "STAGE 04 · SCALING & HOT-TRACE SHEDDING",
+      "title": "Handling 500K-Span Mega-Traces & Error-Storm Surges",
+      "level": "intermediate",
+      "purpose": "Prevent Sev-1 error storms (when kept rate jumps from 5% to 80%) from overwhelming Kafka and ClickHouse.",
+      "explanation": {
+        "foundation": "During a major database outage, error rate jumps from 1% to 80%—causing tail sampling to keep 16x more traces than normal!",
+        "core": "Apply a **per-policy rate-limiting sampler** (`rate_limiting` / `probabilistic` cap inside `and` composite policy) so error traces are capped at e.g. 50,000 spans/sec per service during a Sev-1 storm—still plenty for debugging without melting ClickHouse.",
+        "deepDive": "Cap `max_spans_per_trace = 10,000` so runaway batch-job traces don't blow up individual Tier 2 heaps."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 04 · SCALING & HOT-TRACE SHEDDING",
+        "title": "Handling 500K-Span Mega-Traces & Error-Storm Surges",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "Sev-1 Error Storm",
+            "sub": "80% Requests Fail 500",
+            "role": "16x Keep Surge"
+          },
+          {
+            "id": "n2",
+            "label": "Error Rate-Limiter",
+            "sub": "Cap 50K Error Spans/s",
+            "role": "Storm Shield"
+          },
+          {
+            "id": "n3",
+            "label": "10K Span/Trace Cap",
+            "sub": "Truncate Mega-Traces",
+            "role": "Heap Protection"
+          },
+          {
+            "id": "n4",
+            "label": "Healthy Kafka/CH",
+            "sub": "Fast Incident Queries",
+            "role": "Usable Under Fire"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "capped by"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "paired with"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "preserves"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Error-Storm Trap",
+            "detail": "Keeping 100% of errors unconditionally during a 100%-error outage turns tail sampling into 100% ingestion."
+          },
+          {
+            "label": "Per-Service Error Cap",
+            "detail": "Capping kept errors per service ensures 1 failing service doesn't crowd out other services' traces."
+          },
+          {
+            "label": "Debuggable Volume",
+            "detail": "50,000 error spans/sec still gives on-call engineers thousands of full examples per minute."
+          }
+        ],
+        "summary": "Per-service error rate caps and 10K-span trace limits keep ClickHouse queryable during Sev-1 error storms.",
+        "caption": "Per-service error rate caps and 10K-span trace limits keep ClickHouse queryable during Sev-1 error storms."
+      }
+    },
+    {
+      "id": "05-p-isolation",
+      "eyebrow": "STAGE 05 · FAULT ISOLATION",
+      "title": "Memory_Limiter Circuit Breakers & Per-Tenant Span Quotas",
+      "level": "advanced",
+      "purpose": "Enforce 80% memory_limiter breakers and Tier 1 tenant quotas so noisy services never OOM collectors.",
+      "explanation": {
+        "foundation": "A single buggy tenant logging 50 KB payloads in span attributes can exhaust Tier 2 RAM.",
+        "core": "Configure Tier 1 `transform` processor to truncate attributes >1 KB and enforce per-tenant token buckets; configure Tier 2 `memory_limiter` at 80% hard limit.",
+        "deepDive": "When `memory_limiter` trips, Tier 2 drops incoming spans cleanly and increments `otelcol_processor_refused_spans` rather than crashing."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 05 · FAULT ISOLATION",
+        "title": "Memory_Limiter Circuit Breakers & Per-Tenant Span Quotas",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "Tier 1 Attribute Trim",
+            "sub": "Truncate Tags > 1 KB",
+            "role": "Payload Guard"
+          },
+          {
+            "id": "n2",
+            "label": "Per-Tenant Quota",
+            "sub": "Token Bucket / Service",
+            "role": "Fairness Cap"
+          },
+          {
+            "id": "n3",
+            "label": "Tier 2 memory_limiter",
+            "sub": "80% RAM Shed + GC",
+            "role": "Zero OOMKill"
+          },
+          {
+            "id": "n4",
+            "label": "Isolated App Traffic",
+            "sub": "SDK Drops Overflow",
+            "role": "App Safety"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "enforces"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "protected by"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "shields"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Attribute Bloat Prevention",
+            "detail": "Truncating oversized SQL/JSON tags at Tier 1 keeps span size predictable (~1.5 KB)."
+          },
+          {
+            "label": "Noisy-Neighbor Isolation",
+            "detail": "Per-service span quotas prevent one chatty microservice from starving the entire company's traces."
+          },
+          {
+            "label": "Graceful Refusal",
+            "detail": "Refusing spans at 80% RAM preserves already-buffered traces instead of losing all 30s on OOMKill."
+          }
+        ],
+        "summary": "Tier 1 attribute truncation, per-service quotas, and 80% memory_limiter breakers prevent collector OOMKills.",
+        "caption": "Tier 1 attribute truncation, per-service quotas, and 80% memory_limiter breakers prevent collector OOMKills."
+      }
+    },
+    {
+      "id": "06-p-recovery",
+      "eyebrow": "STAGE 06 · RECOVERY & DEPLOYS",
+      "title": "Two-Phase Ring Draining & Kafka Replay Safety",
+      "level": "advanced",
+      "purpose": "Drain Tier 2 collectors cleanly over decision_wait during upgrades and replay Kafka batches idempotently.",
+      "explanation": {
+        "foundation": "Rolling updates on Tier 2 must not drop 30 seconds of in-flight traces.",
+        "core": "Remove the pod from Tier 1 service endpoints, sleep `decision_wait + 5s` (35s) in `preStop` while evaluating remaining traces, and flush to Kafka before SIGTERM.",
+        "deepDive": "ClickHouse consumers commit Kafka offsets only after `INSERT` succeeds, using `ReplacingMergeTree` or trace-level dedup if a batch replays."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 06 · RECOVERY & DEPLOYS",
+        "title": "Two-Phase Ring Draining & Kafka Replay Safety",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "Pod Unregister",
+            "sub": "Remove from Tier 1",
+            "role": "Drain Start"
+          },
+          {
+            "id": "n2",
+            "label": "35s preStop Sleep",
+            "sub": "Finish 30s Buffers",
+            "role": "Zero Split Trace"
+          },
+          {
+            "id": "n3",
+            "label": "Kafka Offset Commit",
+            "sub": "After ClickHouse Ack",
+            "role": "At-Least-Once"
+          },
+          {
+            "id": "n4",
+            "label": "Clean Rollout",
+            "sub": "Zero Blind Spots",
+            "role": "Production Safe"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "waits"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "flushes to"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "achieves"
+          }
+        ],
+        "cards": [
+          {
+            "label": "35s Graceful Drain",
+            "detail": "5s buffer over 30s decision_wait guarantees the last buffered trace evaluates and exports."
+          },
+          {
+            "label": "Kafka Retention",
+            "detail": "72-hour Kafka retention lets ClickHouse survive multi-hour schema migrations without losing traces."
+          },
+          {
+            "label": "Slow HPA Cooldown",
+            "detail": "Use 5-10 minute scale-in cooldowns on Tier 2 to avoid frequent hash-ring churn."
+          }
+        ],
+        "summary": "35s preStop ring draining and post-ACK Kafka offset commits guarantee zero trace loss during deploys.",
+        "caption": "35s preStop ring draining and post-ACK Kafka offset commits guarantee zero trace loss during deploys."
+      }
+    },
+    {
+      "id": "07-p-observability",
+      "eyebrow": "STAGE 07 · OBSERVABILITY & GUARDRAILS",
+      "title": "Synthetic Error Canaries, Rootless-Trace Alerts & FinOps Caps",
+      "level": "advanced",
+      "purpose": "Verify end-to-end pipeline health continuously with synthetic error traces and FinOps daily ingest budgets.",
+      "explanation": {
+        "foundation": "You must know immediately if tail sampling stops saving error traces or if ClickHouse storage spikes.",
+        "core": "Inject a synthetic `canary-error` trace every 60s and alert if it isn't queryable in ClickHouse within 45s. Monitor `otelcol_processor_refused_spans`, `rootless_trace_pct`, and `clickhouse_ingest_gb_per_hour`.",
+        "deepDive": "Set automated FinOps alerts if kept ratio exceeds 10% for >15 minutes (indicating accidental `debug_tenant=true` rollout)."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 07 · OBSERVABILITY & GUARDRAILS",
+        "title": "Synthetic Error Canaries, Rootless-Trace Alerts & FinOps Caps",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "60s Error Canary",
+            "sub": "Must Hit CH < 45s",
+            "role": "E2E Liveness"
+          },
+          {
+            "id": "n2",
+            "label": "refused_spans > 0",
+            "sub": "Alert RAM Pressure",
+            "role": "Capacity KPI"
+          },
+          {
+            "id": "n3",
+            "label": "rootless_trace > 5%",
+            "sub": "Detect Ring Drift",
+            "role": "Affinity KPI"
+          },
+          {
+            "id": "n4",
+            "label": "Kept Ratio > 10%",
+            "sub": "FinOps Cost Alert",
+            "role": "Budget Guardrail"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "paired with"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "correlates"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "monitored by"
+          }
+        ],
+        "cards": [
+          {
+            "label": "End-to-End Canary",
+            "detail": "Proves SDK -> Tier 1 -> Tier 2 -> Kafka -> ClickHouse works end-to-end every single minute."
+          },
+          {
+            "label": "Rootless-Trace Ratio",
+            "detail": "A jump in orphan child spans flags Tier 1 endpoint-discovery mismatches immediately."
+          },
+          {
+            "label": "Debug-Flag Guardrail",
+            "detail": "Catches accidental global debug=true flags before daily storage bills explode."
+          }
+        ],
+        "summary": "60s synthetic error canaries, rootless-trace alerts, and kept-ratio FinOps caps keep the pipeline reliable.",
+        "caption": "60s synthetic error canaries, rootless-trace alerts, and kept-ratio FinOps caps keep the pipeline reliable."
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-tailp-1",
+        "question": "During a Sev-1 database outage, 80% of all 1M spans/sec are HTTP 500 error traces. Without a safeguard, what happens to the tail-sampling pipeline?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Tail sampling tries to keep 80% of all traffic (~16x normal volume), overwhelming Kafka and ClickHouse.",
+            "correct": true,
+            "feedback": "Correct! Pair error policies with a per-service rate-limiting cap (e.g., 50K error spans/sec) to keep the store healthy during storms."
+          },
+          {
+            "id": "b",
+            "text": "Tail sampling automatically drops 100% of error traces during high CPU.",
+            "correct": false,
+            "feedback": "Without an explicit rate-limiter, the error policy matches every failing trace."
+          },
+          {
+            "id": "c",
+            "text": "Tier 1 collectors convert HTTP 500s into 200 OKs.",
+            "correct": false,
+            "feedback": "Collectors never alter status codes."
+          },
+          {
+            "id": "d",
+            "text": "ClickHouse compresses 80% error traffic to 0 bytes.",
+            "correct": false,
+            "feedback": "16x ingest volume still saturates ClickHouse write IOPS and memory."
+          }
+        ],
+        "explanation": "Unbounded error policies turn a 100%-error outage into 100% trace ingestion; per-service error rate caps protect the backend."
+      },
+      {
+        "id": "kc-tailp-2",
+        "question": "At 1,000,000 spans/sec (~1.5 KB/span), roughly how much active span data must Tier 2 collectors hold in RAM for a 30-second `decision_wait`?",
+        "options": [
+          {
+            "id": "a",
+            "text": "~1.5 GB",
+            "correct": false,
+            "feedback": "1.5 GB is only 1 second of spans—30 seconds holds 30x more."
+          },
+          {
+            "id": "b",
+            "text": "~45 GB (plus 30-40% headroom for GC and traffic bursts).",
+            "correct": true,
+            "feedback": "Correct! 1M spans/sec * 30s * 1.5 KB = 45 GB active buffer across the Tier 2 pool."
+          },
+          {
+            "id": "c",
+            "text": "~450 TB",
+            "correct": false,
+            "feedback": "450 TB is >3 days of un-sampled spans, not 30 seconds."
+          },
+          {
+            "id": "d",
+            "text": "0 bytes, because Tier 2 reads directly from ClickHouse.",
+            "correct": false,
+            "feedback": "Tier 2 must buffer spans in RAM before deciding what to write to ClickHouse."
+          }
+        ],
+        "explanation": "1M spans/sec x 30s x 1.5 KB = 45 GB of active trace state across Tier 2 collectors."
+      },
+      {
+        "id": "kc-tailp-3",
+        "question": "What does a sudden spike in `rootless_trace_ratio` (child spans without a matching root span) in Tier 2 collectors usually indicate?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Tier 1 hash-ring drift or pods shutting down without waiting `decision_wait`, splitting spans of the same trace across different collectors.",
+            "correct": true,
+            "feedback": "Correct! When root and child spans land on different Tier 2 pods, traces appear rootless and incomplete."
+          },
+          {
+            "id": "b",
+            "text": "ClickHouse NVMe disks are 100% full.",
+            "correct": false,
+            "feedback": "Disk fullness backs up Kafka/export queues, not Tier 1 trace_id routing."
+          },
+          {
+            "id": "c",
+            "text": "All microservices are returning 200 OK.",
+            "correct": false,
+            "feedback": "Healthy requests still have root spans."
+          },
+          {
+            "id": "d",
+            "text": "The 1% baseline sampler is working as intended.",
+            "correct": false,
+            "feedback": "Baseline sampling keeps or drops whole traces, never splitting root from child spans."
+          }
+        ],
+        "explanation": "Rootless traces indicate spans of the same trace_id were routed to different Tier 2 collectors or lost during ungraceful restarts."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "A 1M-span/sec tracing pipeline uses routing collectors to group each request's spans together, waits 30 seconds, and saves errors and slow traces to ClickHouse.",
+      "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, pair trace_id consistent hashing with per-service error-storm caps, 1 KB attribute trimming, and 35s preStop draining.",
+      "byteSummary": "Saving 130 TB of traces every day is too expensive. By routing all spans of a request to one collector, waiting 30 seconds, and keeping only errors, slow calls, and 1% of normal traffic, we save 95% of storage."
+    },
+    "intermediate": {
+      "summary": "Combine stateless Tier 1 trace_id consistent-hash routers, 16 Tier 2 collectors (45 GB 30s buffer + memory_limiter), and Kafka -> ClickHouse batching.",
+      "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, pair trace_id consistent hashing with per-service error-storm caps, 1 KB attribute trimming, and 35s preStop draining.",
+      "byteSummary": "At 1,000,000 spans/second (~1.5 GB/s raw OTLP, ~130 TB/day), storing every span in ClickHouse or Tempo is financially prohibitive, yet 1% head-based sampling blinds on-call engineers during Sev-1 incidents. Designing a **1M-Span/Sec Distributed Tail-Based Sampling Pipeline** requires solving stateful trace assembly at scale without OOMKilling collectors or impacting live microservice latency.\n\nThe architecture splits ingestion into four stages: (1) non-blocking OTel SDKs in microservices propagating W3C `traceparent`; (2) stateless **Tier 1 Edge Collectors** that strip oversized payload attributes and route spans via consistent hashing on `trace_id`; (3) **Tier 2 Stateful Tail-Sampling Collectors** (16 pods x 4 GB RAM) holding a 30-second trace buffer with `80% memory_limiter` breakers, evaluating `100% errors + p99 > 500 ms + VIP debug tenants + 1% healthy`; and (4) a **Kafka** shock-absorber topic feeding batched 100K-row inserts into **ClickHouse**—cutting storage by 95% (~6.5 TB/day) while preserving 100% incident visibility."
+    },
+    "advanced": {
+      "summary": "Operate 1M spans/sec with 100-vnode Jump/Ketama routing, 10K-span trace caps, 80% memory_limiter breakers, 60s synthetic error canaries, and FinOps kept-ratio alerts.",
+      "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, pair trace_id consistent hashing with per-service error-storm caps, 1 KB attribute trimming, and 35s preStop draining.",
+      "byteSummary": "At 1,000,000 spans/second (~1.5 GB/s raw OTLP, ~130 TB/day), storing every span in ClickHouse or Tempo is financially prohibitive, yet 1% head-based sampling blinds on-call engineers during Sev-1 incidents. Designing a **1M-Span/Sec Distributed Tail-Based Sampling Pipeline** requires solving stateful trace assembly at scale without OOMKilling collectors or impacting live microservice latency.\n\nThe architecture splits ingestion into four stages: (1) non-blocking OTel SDKs in microservices propagating W3C `traceparent`; (2) stateless **Tier 1 Edge Collectors** that strip oversized payload attributes and route spans via consistent hashing on `trace_id`; (3) **Tier 2 Stateful Tail-Sampling Collectors** (16 pods x 4 GB RAM) holding a 30-second trace buffer with `80% memory_limiter` breakers, evaluating `100% errors + p99 > 500 ms + VIP debug tenants + 1% healthy`; and (4) a **Kafka** shock-absorber topic feeding batched 100K-row inserts into **ClickHouse**—cutting storage by 95% (~6.5 TB/day) while preserving 100% incident visibility."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "prerequisites": [
+    {
+      "title": "OpenTelemetry Tail-Based Trace Sampling & Span Context Propagation",
+      "summary": "Tail-based sampling routes all spans of a trace by trace_id to one stateful collector, waits 30s, and keeps 100% of errors and slow traces while dropping 95%+ of healthy noise."
+    },
+    {
+      "title": "Consistent Hashing & Virtual Nodes",
+      "summary": "Consistent hashing assigns data keys to servers in a way that limits how many keys move when servers are added or removed. This helps avoid widespread cache misses and sudden load on databases."
+    }
+  ],
+  "simulation": {
+    "title": "Design a 1M-Span/Sec Distributed Tail-Based Trace Sampling Pipeline — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Input Workload"
+      },
+      {
+        "id": "entry",
+        "label": "Router / API",
+        "role": "Admission Control"
+      },
+      {
+        "id": "worker",
+        "label": "Processor",
+        "role": "Domain Logic"
+      },
+      {
+        "id": "store",
+        "label": "State Layer",
+        "role": "Durable Store"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "entry",
+        "label": "request"
+      },
+      {
+        "from": "entry",
+        "to": "worker",
+        "label": "dispatch"
+      },
+      {
+        "from": "worker",
+        "to": "store",
+        "label": "read/write"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Sizing 1M Spans/Sec, 45 GB Collector RAM & 95% Storage Savings",
+        "actionLabel": "request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "entry"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "request",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Caller sends work to Router / API (Sizing 1M Spans/Sec, 45 GB Collector RAM & 95% Storage Savings)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Stateless Tier 1 Trace-ID Routers -> Stateful Tier 2 Collectors -> Kafka",
+        "actionLabel": "dispatch",
+        "status": "healthy",
+        "activeNodeIds": [
+          "entry",
+          "worker"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "dispatch",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Router / API coordinates with Processor while preserving the core invariant (Stateless Tier 1 Trace-ID Routers -> Stateful Tier 2 Collectors -> Kafka)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Consistent-Hash Trace Router & Bounded Memory Tail Buffer",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "worker",
+          "store"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, State Layer absorbs pressure without cascading (Consistent-Hash Trace Router & Bounded Memory Tail Buffer)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Synthetic Error Canaries, Rootless-Trace Alerts & FinOps Caps",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "entry",
+          "worker",
+          "store"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Synthetic Error Canaries, Rootless-Trace Alerts & FinOps Caps)."
+      }
+    ]
+  }
+}

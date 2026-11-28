@@ -1,0 +1,603 @@
+{
+  "id": "raft-log-compaction-snapshotting",
+  "slug": "raft-log-compaction-snapshotting",
+  "title": "Raft Log Compaction, InstallSnapshot RPC & WAL Truncation",
+  "domain": "distributed-systems",
+  "spark": {
+    "summary": "Periodic Copy-on-Write snapshotting at (lastIncludedIndex, lastIncludedTerm), O(1) WAL prefix truncation, and chunked InstallSnapshot RPCs bound Raft disk growth and cut follower recovery from 4+ hours to under 45 seconds.",
+    "keyTakeaway": "Never freeze the state machine during snapshotting or stream unthrottled gigabyte snapshots; fork a Copy-on-Write checkpoint, retain a small suffix log for mildly lagging followers, and stream InstallSnapshot chunks with rate limiting.",
+    "byteSummary": "At 50,000+ mutations/sec (common in etcd, CockroachDB, or Kafka KRaft), an uncompacted Raft Write-Ahead Log (WAL) balloons to 500 GB in days. Restarting a node forces it to replay 1B+ log entries for 4+ hours while missed heartbeats trigger spurious leader election storms.\n\nRaft log compaction replaces the committed log prefix [1..lastIncludedIndex] with a point-in-time Snapshot of the state machine tagged with `(lastIncludedIndex, lastIncludedTerm)` and optional cluster membership configuration. The node atomically writes the snapshot, fsyncs it, and discards the compacted WAL prefix while retaining a small suffix log.\n\nWhen a follower lags behind `leader.firstLogIndex` (so `nextIndex < firstLogIndex`), the leader cannot catch it up with normal `AppendEntries` RPCs. Instead, the leader streams the latest snapshot in bounded chunks (`offset`, `data`, `done`) via `InstallSnapshot` RPCs, allowing the follower to atomically swap its state machine and immediately resume normal log replication."
+  },
+  "learningJourney": [
+    {
+      "level": "foundation",
+      "title": "Stage 1: Why Unbounded Raft Logs Fail at 50K Writes/Sec",
+      "purpose": "Quantify WAL growth, recovery replay latency, and election-storm risks when Raft logs are never compacted.",
+      "explanation": "Every committed mutation appends to the Raft WAL. At 50,000 writes/sec (~800 bytes/entry), a cluster generates ~3.4 TB/day of raw log history—or 500 GB in just 3.5 hours. On node restart, replaying 1B+ entries through the state machine takes 4+ hours, starving reads and risking quorum loss.",
+      "codeExample": "def estimate_wal_gb_per_hour(writes_per_sec: int, avg_entry_bytes: int = 800) -> float:\n    if writes_per_sec <= 0 or avg_entry_bytes <= 0:\n        raise ValueError('writes_per_sec and avg_entry_bytes must be positive')\n    return round((writes_per_sec * avg_entry_bytes * 3600) / 1e9, 2)\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "FOUNDATION · UNBOUNDED WAL",
+        "title": "50K Writes/Sec Uncompacted WAL Growth & 4-Hour Replay Storm",
+        "nodes": [
+          {
+            "id": "w",
+            "label": "50K Writes/sec (800 B)",
+            "sub": "~144 GB/hr WAL append",
+            "role": "Write Load"
+          },
+          {
+            "id": "wal",
+            "label": "500 GB Uncompacted WAL",
+            "sub": "1B+ historical entries",
+            "role": "Disk Bloat"
+          },
+          {
+            "id": "rep",
+            "label": "4-Hour Follower Replay",
+            "sub": "Re-apply every mutation",
+            "role": "Recovery Stall"
+          },
+          {
+            "id": "el",
+            "label": "Missed Election Timeout",
+            "sub": "Spurious leader elections",
+            "role": "Cluster Instability"
+          }
+        ],
+        "edges": [
+          {
+            "from": "w",
+            "to": "wal",
+            "label": "Append without pruning"
+          },
+          {
+            "from": "wal",
+            "to": "rep",
+            "label": "Restart replays from idx=1"
+          },
+          {
+            "from": "rep",
+            "to": "el",
+            "label": "Starve heartbeats"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Redundant History",
+            "detail": "Overwriting the same key 10,000 times stores 10,000 log entries even though only 1 current value exists."
+          },
+          {
+            "label": "Quorum Fragility",
+            "detail": "While one node spends 4 hours replaying WAL, losing a second node breaks Raft majority quorum."
+          }
+        ],
+        "summary": "Unbounded Raft logs grow to 500 GB at 50K writes/sec, causing 4-hour recovery replays and quorum fragility.",
+        "caption": "50K writes/sec without compaction produces 500 GB WALs and 4-hour follower replay stalls."
+      },
+      "id": "stage-1-stage-1-why-unbounded-raft-logs-fail-at-50k-writ"
+    },
+    {
+      "level": "foundation",
+      "title": "Stage 2: Snapshot Metadata & Atomic WAL Prefix Truncation",
+      "purpose": "Define the Snapshot header (lastIncludedIndex, lastIncludedTerm) and safe prefix truncation invariants.",
+      "explanation": "A Raft snapshot captures the deterministic state machine at a committed `lastIncludedIndex` and `lastIncludedTerm` (plus the latest cluster config). Only AFTER the snapshot file is durably fsynced and atomically renamed can the node truncate WAL segments strictly below `lastIncludedIndex`, preserving `prevLogIndex`/`prevLogTerm` continuity.",
+      "codeExample": "def can_truncate_wal_segment(segment_max_index: int, durable_snapshot_index: int, suffix_keep: int = 10000) -> bool:\n    if durable_snapshot_index < 0 or suffix_keep < 0:\n        raise ValueError('Indices must be non-negative')\n    safe_cutoff = max(0, durable_snapshot_index - suffix_keep)\n    return segment_max_index <= safe_cutoff\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "FOUNDATION · SNAPSHOT INVARIANTS",
+        "title": "Durable Snapshot Commit Before WAL Prefix Truncation",
+        "nodes": [
+          {
+            "id": "sm",
+            "label": "Committed State Machine",
+            "sub": "Applied up to index N",
+            "role": "KV State"
+          },
+          {
+            "id": "snap",
+            "label": "Snapshot + Metadata",
+            "sub": "(lastIncludedIdx, Term)",
+            "role": "Durable File"
+          },
+          {
+            "id": "fsync",
+            "label": "fsync() + Atomic Rename",
+            "sub": "Crash-safe commit point",
+            "role": "Durability Gate"
+          },
+          {
+            "id": "trunc",
+            "label": "Truncate WAL < Cutoff",
+            "sub": "Retain suffix for followers",
+            "role": "Disk Reclaim"
+          }
+        ],
+        "edges": [
+          {
+            "from": "sm",
+            "to": "snap",
+            "label": "Serialize point-in-time"
+          },
+          {
+            "from": "snap",
+            "to": "fsync",
+            "label": "Persist to disk"
+          },
+          {
+            "from": "fsync",
+            "to": "trunc",
+            "label": "Unlink old WAL segments"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Crash-Safety Ordering",
+            "detail": "Truncating WAL before fsyncing the snapshot risks losing committed state if power fails mid-compaction."
+          },
+          {
+            "label": "Suffix Retention",
+            "detail": "Keeping a small suffix (e.g. 10K entries) avoids InstallSnapshot for followers that only paused briefly."
+          }
+        ],
+        "summary": "Nodes must fsync and atomically rename the snapshot before unlinking older WAL segments while keeping a small suffix.",
+        "caption": "Snapshot metadata (lastIncludedIndex, lastIncludedTerm) is fsynced before truncating old WAL segments."
+      },
+      "id": "stage-2-stage-2-snapshot-metadata-atomic-wal-prefix-trun"
+    },
+    {
+      "level": "intermediate",
+      "title": "Stage 3: Copy-on-Write & RocksDB Checkpoint Snapshotting",
+      "purpose": "Eliminate stop-the-world state machine freezes during gigabyte snapshot serialization.",
+      "explanation": "Locking an in-memory map to serialize 20 GB of KV state stalls Raft apply threads for minutes and triggers election timeouts. Instead, in-memory engines use `fork()` Copy-on-Write (or persistent HAMT trees), while disk-backed engines (etcd/RocksDB) create an instant `hard-link` Checkpoint/MVCC read snapshot in < 1 ms and stream it asynchronously.",
+      "codeExample": "def select_snapshot_strategy(engine_type: str) -> str:\n    if engine_type == 'rocksdb_lsm':\n        return 'ROCKSDB_HARDLINK_CHECKPOINT_ZERO_COPY'\n    if engine_type == 'in_memory_map':\n        return 'COW_FORK_OR_MVCC_CLONE'\n    raise ValueError(f'Unsupported engine_type: {engine_type}')\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "INTERMEDIATE · ZERO-STALL SNAPSHOT",
+        "title": "Zero-Freeze Snapshotting via RocksDB Checkpoints & CoW",
+        "nodes": [
+          {
+            "id": "apply",
+            "label": "Raft Apply Loop",
+            "sub": "Never pauses writes",
+            "role": "Hot Path"
+          },
+          {
+            "id": "chk",
+            "label": "RocksDB Checkpoint / CoW",
+            "sub": "< 1 ms SSTable hard-links",
+            "role": "Point-in-Time"
+          },
+          {
+            "id": "bg",
+            "label": "Background Serializer",
+            "sub": "Compress + CRC32C chunks",
+            "role": "Async Worker"
+          },
+          {
+            "id": "out",
+            "label": "Immutable Snapshot Archive",
+            "sub": "Zero P99 write spike",
+            "role": "Artifact"
+          }
+        ],
+        "edges": [
+          {
+            "from": "apply",
+            "to": "chk",
+            "label": "Take O(1) MVCC/CoW handle"
+          },
+          {
+            "from": "chk",
+            "to": "bg",
+            "label": "Stream SSTables offline"
+          },
+          {
+            "from": "bg",
+            "to": "out",
+            "label": "Commit verified snapshot"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Sub-Millisecond Pause",
+            "detail": "Hard-linking immutable RocksDB SSTables takes < 1 ms regardless of whether the DB is 5 GB or 500 GB."
+          },
+          {
+            "label": "Checksumming",
+            "detail": "Always attach per-chunk CRC32C or SHA-256 checksums to detect silent bit-rot during snapshot transfer."
+          }
+        ],
+        "summary": "RocksDB hard-link checkpoints and Copy-on-Write clones decouple gigabyte snapshot I/O from the live Raft apply loop.",
+        "caption": "O(1) RocksDB checkpoints and CoW forks let background workers stream snapshots with zero apply-loop stalls."
+      },
+      "id": "stage-3-stage-3-copy-on-write-rocksdb-checkpoint-snapsho"
+    },
+    {
+      "level": "intermediate",
+      "title": "Stage 4: Detecting Lagging Followers & InstallSnapshot RPC",
+      "purpose": "Handle followers whose nextIndex falls behind the leader's compacted firstLogIndex.",
+      "explanation": "When a restarted or newly added follower has `nextIndex < leader.firstLogIndex`, the leader no longer holds the log entries needed for `AppendEntries`. The leader switches that peer's replication state to `StateSnapshot` and streams `InstallSnapshot(term, leaderId, lastIncludedIndex, lastIncludedTerm, offset, data[], done)` chunks.",
+      "codeExample": "def choose_replication_rpc(follower_next_idx: int, leader_first_log_idx: int) -> str:\n    if follower_next_idx <= 0 or leader_first_log_idx <= 0:\n        raise ValueError('Log indices must be >= 1')\n    if follower_next_idx < leader_first_log_idx:\n        return 'INSTALL_SNAPSHOT_RPC'\n    return 'APPEND_ENTRIES_RPC'\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "INTERMEDIATE · FOLLOWER CATCH-UP",
+        "title": "Switching from AppendEntries to Chunked InstallSnapshot RPC",
+        "nodes": [
+          {
+            "id": "chk",
+            "label": "Check nextIndex < firstLogIndex",
+            "sub": "Required WAL already pruned",
+            "role": "Lag Detector"
+          },
+          {
+            "id": "st",
+            "label": "Enter StateSnapshot",
+            "sub": "Pause AppendEntries for peer",
+            "role": "Replication Mode"
+          },
+          {
+            "id": "rpc",
+            "label": "Stream InstallSnapshot Chunks",
+            "sub": "offset=0..N, done=true",
+            "role": "Chunk Transfer"
+          },
+          {
+            "id": "res",
+            "label": "Set nextIndex = snapIdx + 1",
+            "sub": "Resume AppendEntries",
+            "role": "Normal Sync"
+          }
+        ],
+        "edges": [
+          {
+            "from": "chk",
+            "to": "st",
+            "label": "Gap detected"
+          },
+          {
+            "from": "st",
+            "to": "rpc",
+            "label": "Send 4 MB chunks"
+          },
+          {
+            "from": "rpc",
+            "to": "res",
+            "label": "On done=true ACK"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Idempotent Offsets",
+            "detail": "Streaming fixed-size chunks (e.g., 1-4 MB) with explicit byte offsets lets followers recover cleanly from transient network drops."
+          },
+          {
+            "label": "Term Guard",
+            "detail": "Followers reject any InstallSnapshot RPC with term < currentTerm, preserving Raft leader safety."
+          }
+        ],
+        "summary": "Leaders switch lagging followers to chunked InstallSnapshot RPCs when nextIndex < firstLogIndex, then resume AppendEntries.",
+        "caption": "When nextIndex < firstLogIndex, the leader streams InstallSnapshot chunks before resetting nextIndex to resume AppendEntries."
+      },
+      "id": "stage-4-stage-4-detecting-lagging-followers-installsnaps"
+    },
+    {
+      "level": "intermediate",
+      "title": "Stage 5: Follower Atomic State-Machine Swap & Suffix Replay",
+      "purpose": "Apply an incoming snapshot safely on a follower without corrupting local state if a crash occurs mid-transfer.",
+      "explanation": "A follower writes incoming `InstallSnapshot` chunks to a temporary staging file (`snapshot.tmp`). Only when `done == true` and checksums pass does it fsync, atomically rename the snapshot, discard any conflicting log entries up to `lastIncludedIndex`, reload its state machine from the snapshot, and ACK the leader.",
+      "codeExample": "def finalize_follower_snapshot(has_done_flag: bool, crc_valid: bool, snap_idx: int, local_last_idx: int) -> str:\n    if not has_done_flag:\n        return 'WAIT_MORE_CHUNKS'\n    if not crc_valid:\n        raise ValueError('Snapshot checksum mismatch; abort and retry')\n    if snap_idx <= local_last_idx:\n        return 'DISCARD_STALE_SNAPSHOT'\n    return 'ATOMIC_SWAP_AND_RESET_LOG'\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "INTERMEDIATE · FOLLOWER INSTALL",
+        "title": "Crash-Safe Follower Snapshot Staging & Atomic Reload",
+        "nodes": [
+          {
+            "id": "tmp",
+            "label": "Write snapshot.tmp",
+            "sub": "Verify offset & CRC32C",
+            "role": "Staging File"
+          },
+          {
+            "id": "done",
+            "label": "done == true + fsync()",
+            "sub": "Confirm full transfer",
+            "role": "Completeness Gate"
+          },
+          {
+            "id": "swap",
+            "label": "Atomic State Swap",
+            "sub": "Reload KV + prune old log",
+            "role": "State Reset"
+          },
+          {
+            "id": "ack",
+            "label": "ACK Leader (matchIndex)",
+            "sub": "Sub-45s full recovery",
+            "role": "Quorum Ready"
+          }
+        ],
+        "edges": [
+          {
+            "from": "tmp",
+            "to": "done",
+            "label": "Append all chunks"
+          },
+          {
+            "from": "done",
+            "to": "swap",
+            "label": "Rename & reload engine"
+          },
+          {
+            "from": "swap",
+            "to": "ack",
+            "label": "Report updated matchIndex"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Sub-45s Recovery",
+            "detail": "Transferring a compacted 4 GB snapshot at 1 Gbps takes ~32 seconds—vs. 4+ hours replaying 1B WAL entries."
+          },
+          {
+            "label": "Preserve Newer Suffix",
+            "detail": "If the follower's log already matches (lastIncludedIndex, lastIncludedTerm), retain entries after lastIncludedIndex."
+          }
+        ],
+        "summary": "Followers stage InstallSnapshot chunks in a temp file, verify checksums, atomically swap state on done=true, and recover in < 45 seconds.",
+        "caption": "Followers stage chunks in snapshot.tmp, verify CRC32C on done=true, and atomically swap state for < 45s recovery."
+      },
+      "id": "stage-5-stage-5-follower-atomic-state-machine-swap-suffi"
+    },
+    {
+      "level": "advanced",
+      "title": "Stage 6: Rate-Limiting Snapshot Streams & Heartbeat Isolation",
+      "purpose": "Prevent multi-gigabyte snapshot transfers from saturating NICs and causing heartbeat election timeouts.",
+      "explanation": "If a leader blasts a 20 GB snapshot to two restarting followers at full 10 Gbps line rate, NIC saturation and TCP queue bloat can delay Raft `AppendEntries` heartbeats past `electionTimeout` (e.g., 150-500 ms), triggering split-brain elections. Production clusters separate heartbeat RPCs onto a high-priority QoS/transport channel and token-bucket rate-limit `InstallSnapshot` streams.",
+      "codeExample": "def snapshot_bandwidth_cap_mbps(nic_mbps: int, max_concurrent_streams: int, reserve_pct: float = 0.5) -> float:\n    if nic_mbps <= 0 or max_concurrent_streams <= 0:\n        raise ValueError('NIC bandwidth and stream count must be positive')\n    usable = nic_mbps * (1.0 - reserve_pct)\n    return round(usable / max_concurrent_streams, 2)\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "ADVANCED · QOS & RATE LIMITING",
+        "title": "Token-Bucket Snapshot Throttling & Dedicated Heartbeat Lane",
+        "nodes": [
+          {
+            "id": "hb",
+            "label": "Priority Heartbeat Lane",
+            "sub": "DSCP / separate TCP conn",
+            "role": "Quorum Guard"
+          },
+          {
+            "id": "tb",
+            "label": "Token-Bucket Limiter",
+            "sub": "Cap snapshot <= 50% NIC",
+            "role": "Bandwidth Cap"
+          },
+          {
+            "id": "sem",
+            "label": "Max Concurrent Transfers=2",
+            "sub": "Stagger multi-node rebuilds",
+            "role": "Fanout Limit"
+          },
+          {
+            "id": "pv",
+            "label": "PreVote + Leader Lease",
+            "sub": "Block spurious term bumps",
+            "role": "Election Guard"
+          }
+        ],
+        "edges": [
+          {
+            "from": "hb",
+            "to": "pv",
+            "label": "Deliver <10ms heartbeats"
+          },
+          {
+            "from": "tb",
+            "to": "sem",
+            "label": "Throttle chunk pacing"
+          },
+          {
+            "from": "sem",
+            "to": "pv",
+            "label": "Avoid NIC congestion"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Heartbeat Priority",
+            "detail": "Dedicated connections for AppendEntries heartbeats prevent head-of-line blocking behind 4 MB snapshot chunks."
+          },
+          {
+            "label": "PreVote Extension",
+            "detail": "PreVote prevents a briefly congested node from incrementing cluster terms and disrupting the active leader."
+          }
+        ],
+        "summary": "Dedicated heartbeat connections, token-bucket snapshot throttling, and PreVote prevent election storms during follower rebuilds.",
+        "caption": "Priority heartbeat lanes, token-bucket snapshot caps, and PreVote prevent election storms during recovery."
+      },
+      "id": "stage-6-stage-6-rate-limiting-snapshot-streams-heartbeat"
+    },
+    {
+      "level": "advanced",
+      "title": "Stage 7: Compaction Triggers, ReadIndex & Quorum Safety",
+      "purpose": "Choose snapshot thresholds (entry count vs. WAL bytes) and preserve linearizable ReadIndex across compactions.",
+      "explanation": "Triggering snapshots solely by entry count (e.g., every 100K entries) can snapshot too often on tiny writes or too rarely on large 1 MB values. Dual triggers (`entries >= 100K OR wal_bytes >= 256 MB`) keep disk bounded predictably, while jittering thresholds across peers prevents all 3-5 replicas from compacting simultaneously.",
+      "codeExample": "def should_compact_log(uncompacted_entries: int, wal_bytes: int, entry_thresh: int = 100_000, byte_thresh: int = 256 * 1024 * 1024) -> bool:\n    if uncompacted_entries < 0 or wal_bytes < 0:\n        raise ValueError('Counters must be non-negative')\n    return uncompacted_entries >= entry_thresh or wal_bytes >= byte_thresh\n",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "ADVANCED · TRIGGER POLICY",
+        "title": "Jittered Dual Triggers & Concurrent Quorum Stability",
+        "nodes": [
+          {
+            "id": "ent",
+            "label": "Entry Count >= 100K",
+            "sub": "Bounds replay time",
+            "role": "Count Trigger"
+          },
+          {
+            "id": "byt",
+            "label": "WAL Size >= 256 MB",
+            "sub": "Bounds disk footprint",
+            "role": "Byte Trigger"
+          },
+          {
+            "id": "jit",
+            "label": "Per-Node +/-15% Jitter",
+            "sub": "Stagger replica snapshots",
+            "role": "Anti-Herd"
+          },
+          {
+            "id": "ri",
+            "label": "Leader ReadIndex",
+            "sub": "Linearizable reads intact",
+            "role": "Consistency"
+          }
+        ],
+        "edges": [
+          {
+            "from": "ent",
+            "to": "jit",
+            "label": "OR condition"
+          },
+          {
+            "from": "byt",
+            "to": "jit",
+            "label": "OR condition"
+          },
+          {
+            "from": "jit",
+            "to": "ri",
+            "label": "Keep quorum fast"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Anti-Herd Jitter",
+            "detail": "Jittering compaction thresholds by +/-15% ensures only one replica compacts at a time, preserving write P99."
+          },
+          {
+            "label": "ReadIndex Continuity",
+            "detail": "Snapshots never roll back commitIndex, so ReadIndex linearizability remains unbroken."
+          }
+        ],
+        "summary": "Jittered dual triggers (entries OR WAL bytes) bound both disk usage and replay time without synchronized replica pauses.",
+        "caption": "Jittered dual triggers (100K entries or 256 MB WAL) stagger replica compactions while preserving ReadIndex safety."
+      },
+      "id": "stage-7-stage-7-compaction-triggers-readindex-quorum-saf"
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-raft-1",
+        "question": "When must a Raft leader send an `InstallSnapshot` RPC instead of `AppendEntries` to a lagging follower?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Whenever the follower's `nextIndex` is strictly less than the leader's compacted `firstLogIndex`.",
+            "correct": true,
+            "feedback": "Correct. Because the leader already truncated log entries before firstLogIndex, only a snapshot can bridge the gap."
+          },
+          {
+            "id": "b",
+            "text": "Whenever a single write payload exceeds 4 KB.",
+            "correct": false,
+            "feedback": "Incorrect. Normal AppendEntries handles arbitrary entry sizes as long as they are still in the leader's WAL."
+          },
+          {
+            "id": "c",
+            "text": "On every heartbeat interval (every 50 ms).",
+            "correct": false,
+            "feedback": "Incorrect. InstallSnapshot is only for followers whose required log prefix was already compacted."
+          },
+          {
+            "id": "d",
+            "text": "Only when the cluster has an even number of nodes.",
+            "correct": false,
+            "feedback": "Incorrect. Log compaction is independent of cluster parity."
+          }
+        ],
+        "explanation": "If follower.nextIndex < leader.firstLogIndex, the needed WAL entries no longer exist on the leader, requiring InstallSnapshot."
+      },
+      {
+        "id": "kc-raft-2",
+        "question": "Why should Raft nodes use Copy-on-Write (CoW) or RocksDB hard-link checkpoints rather than locking the state machine during snapshotting?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Because locking the state machine to serialize gigabytes of data stalls the apply loop and triggers missed heartbeat election storms.",
+            "correct": true,
+            "feedback": "Correct. O(1) RocksDB checkpoints or CoW forks let background threads stream the snapshot with zero apply-loop stalls."
+          },
+          {
+            "id": "b",
+            "text": "Because RocksDB checkpoints delete the Raft WAL automatically.",
+            "correct": false,
+            "feedback": "Incorrect. WAL truncation is still explicitly gated on fsyncing the snapshot."
+          },
+          {
+            "id": "c",
+            "text": "Because CoW snapshots skip CRC32C checksums.",
+            "correct": false,
+            "feedback": "Incorrect. Checksums are still required for crash/transfer integrity."
+          },
+          {
+            "id": "d",
+            "text": "Because CoW snapshots eliminate the need for `lastIncludedIndex`.",
+            "correct": false,
+            "feedback": "Incorrect. Every snapshot must record lastIncludedIndex and lastIncludedTerm."
+          }
+        ],
+        "explanation": "Stop-the-world state-machine serialization causes multi-second/minute pauses that trigger Raft election timeouts; CoW/checkpoints avoid this."
+      },
+      {
+        "id": "kc-raft-3",
+        "question": "Why do production Raft implementations retain a small WAL suffix (e.g., 10K entries) after creating a snapshot at `lastIncludedIndex`?",
+        "options": [
+          {
+            "id": "a",
+            "text": "To allow briefly paused followers to catch up via fast `AppendEntries` instead of streaming a multi-gigabyte `InstallSnapshot`.",
+            "correct": true,
+            "feedback": "Correct. A small suffix absorbs minor network blips or GC pauses without triggering full snapshot transfers."
+          },
+          {
+            "id": "b",
+            "text": "Because Raft forbids truncating more than 50% of the WAL.",
+            "correct": false,
+            "feedback": "Incorrect. Raft allows truncating all entries up to lastIncludedIndex; keeping a suffix is a performance optimization."
+          },
+          {
+            "id": "c",
+            "text": "To store unencrypted TLS certificates.",
+            "correct": false,
+            "feedback": "Incorrect. WAL segments store Raft log entries, not certificates."
+          },
+          {
+            "id": "d",
+            "text": "To disable PreVote during leader elections.",
+            "correct": false,
+            "feedback": "Incorrect. Suffix retention is unrelated to PreVote."
+          }
+        ],
+        "explanation": "Retaining a small suffix of recent WAL entries lets slightly behind followers catch up via lightweight AppendEntries."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Raft log compaction periodically saves a compact snapshot of the current database state so nodes can delete old log history and recover in seconds instead of hours.",
+      "keyTakeaway": "Saving a snapshot and streaming it in chunks to lagging followers prevents disks from filling up and keeps restarts fast.",
+      "byteSummary": "If a Raft cluster keeps every write forever in its log, disks fill up and restarted servers take hours to replay old history.\n\nBy periodically saving a snapshot of the current state and deleting older log entries, nodes stay small and recover in under a minute."
+    },
+    "intermediate": {
+      "summary": "Pair Copy-on-Write / RocksDB checkpoints with fsync-before-truncate WAL pruning, suffix retention, and chunked `InstallSnapshot` RPCs.",
+      "keyTakeaway": "Dual compaction triggers (100K entries or 256 MB WAL) and chunked `InstallSnapshot` cut recovery from 4+ hours to < 45 seconds.",
+      "byteSummary": "At 50K writes/sec, uncompacted Raft WALs reach 500 GB and cause 4-hour replay storms. Using O(1) RocksDB checkpoints or CoW clones avoids locking the apply loop.\n\nOnce fsynced with `(lastIncludedIndex, lastIncludedTerm)`, older WAL segments are pruned (retaining a small suffix), and lagging followers catch up via chunked `InstallSnapshot` RPCs."
+    },
+    "advanced": {
+      "summary": "Production engines add token-bucket `InstallSnapshot` rate limiting, priority heartbeat lanes, PreVote guards, and jittered dual triggers for sub-10ms write P99.",
+      "keyTakeaway": "Isolating heartbeats from rate-limited snapshot streams and jittering replica compaction thresholds prevents split-brain election storms.",
+      "byteSummary": "Unthrottled multi-gigabyte `InstallSnapshot` transfers saturate NICs and starve `AppendEntries` heartbeats, causing spurious elections. Production clusters isolate heartbeats on priority connections, cap snapshot streams via token buckets, and enable PreVote.\n\nJittering dual triggers (`100K entries OR 256 MB WAL` +/-15%) prevents simultaneous replica stalls while preserving `ReadIndex` linearizability."
+    }
+  }
+}

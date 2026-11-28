@@ -1,0 +1,858 @@
+{
+  "id": "kubernetes-pdb-safe",
+  "slug": "kubernetes-pdb-safe",
+  "title": "Kubernetes Pod Disruption Budgets & Safe Node Drains",
+  "problemType": "system-design",
+  "difficulty": "medium",
+  "prompt": "During a mandatory Kubernetes 1.28 -> 1.29 EKS node-group security upgrade, the upgrade stalls for 6 hours and fails. Node drain logs show `Cannot evict pod as it would violate the pod's disruption budget` (HTTP 429 TooManyRequests from the Eviction API). Investigation reveals three broken PDBs across the cluster: (1) `redis-cache` has `replicas: 1` and `minAvailable: 1`, (2) `auth-service` has `replicas: 3`, `minAvailable: 3`, and (3) `billing-worker` has `minAvailable: 4` while its HPA scaled it down to 3 replicas during off-peak hours. Redesign the PDB standards, admission guardrails, and drain runbooks so cluster upgrades complete within SLA without risking availability.",
+  "spark": {
+    "summary": "A misconfigured PodDisruptionBudget (such as minAvailable: 100% or minAvailable == replicas) sets disruptionsAllowed=0, causing kubectl drain and Karpenter/GKE/EKS node upgrades to hang indefinitely with HTTP 429 eviction blocks.",
+    "keyTakeaway": "If latency budgets leave no room for synchronous retries, never set minAvailable equal to replicas on single- or fixed-replica workloads; use maxUnavailable: 1 (or >=25%) with replicas >= 2, and monitor kube_poddisruptionbudget_status_pod_disruptions_allowed == 0.",
+    "byteSummary": "**Core Mechanics:** During a Kubernetes 1.28 -> 1.29 EKS upgrade across **180 nodes and 3 AZs**, node drains stall for **6 hours** with `HTTP 429 Cannot evict pod as it would violate the pod's disruption budget`.\n\n**Visual & Structural Flow:** Depicts Blocked Drain (0 Allowed Disruptions) vs. Safe Rolling Eviction (kubectl drain / EKS -> K8s Eviction API -> PDB Controller -> App Pods); Maintaining Quorum & N-1 Capacity During Node Drains (Eviction API -> AZ-A / AZ-B Pods -> AZ-C Draining -> Prometheus / OPA).\n\n**Trade-Offs & Production:** Deleting all PDBs unblocks node drains but allows the upgrade controller to evict *every* replica of a service simultaneously, causing an outage. Design PDBs so voluntary drains always succeed safely while protecting quorum: **Never Set `minAvailable == replicas`**: Run critical services with `replicas >= 2` across AZs.\n\n**Failure Modes & Application:** Disruption budgeting is vital across any orchestrated infrastructure: **Zero-Downtime Cluster Upgrades**: Enables automated EKS/GKE/Karpenter node rotation without manual intervention."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why Kubernetes PDBs & Safe Node Drains Matter",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "During a Kubernetes 1.28 -> 1.29 EKS upgrade across **180 nodes and 3 AZs**, node drains stall for **6 hours** with `HTTP 429 Cannot evict pod as it would violate the pod's disruption budget`. Three broken PDBs block eviction: `redis-cache` (`replicas: 1`, `minAvailable: 1`), a StatefulSet with `minAvailable: 100%`, and a Deployment with `maxUnavailable: 0`.",
+        "core": "**Constraints:**\n- Multi-AZ stateless services must keep at least `N-1` replicas during voluntary drains.\n- Zero unapproved `--force --grace-period=0` deletes on stateful production pods.",
+        "deepDive": "In production deployments of Kubernetes Pod Disruption Budgets & Safe Node Drains, watch how why kubernetes pdbs & safe node drains matter interacts with tail latency, retry amplification, and partial failures. A misconfigured PodDisruptionBudget (such as minAvailable: 100% or minAvailable == replicas) sets disruptionsAllowed=0, causing kubectl drain and Karpenter/GKE/EKS node upgrades to hang indefinitely with HTTP 429 eviction blocks."
+      },
+      "purpose": "The mechanism: understand how Why Kubernetes PDBs & Safe Node Drains Matter works from first principles."
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "Real-World Impact of Misconfigured PDBs",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "A PDB with `allowedDisruptions == 0` turns routine maintenance into an operational deadlock:",
+        "core": "1. **Blocked Security Upgrades**: EKS/Karpenter cannot cordon and drain nodes, leaving CVEs unpatched for hours.\n2. **Autoscaler Deadlock**: Cluster Autoscaler / Karpenter cannot consolidate underutilized nodes.\n3. **Panic Force-Deletes**: Frustrated operators run `--force --grace-period=0`, bypassing `preStop` hooks and corrupting stateful storage.",
+        "deepDive": "In production deployments of Kubernetes Pod Disruption Budgets & Safe Node Drains, watch how real-world impact of misconfigured pdbs interacts with tail latency, retry amplification, and partial failures. A misconfigured PodDisruptionBudget (such as minAvailable: 100% or minAvailable == replicas) sets disruptionsAllowed=0, causing kubectl drain and Karpenter/GKE/EKS node upgrades to hang indefinitely with HTTP 429 eviction blocks."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Kubernetes Eviction API & PDB Check",
+        "title": "Blocked Drain (0 Allowed Disruptions) vs. Safe Rolling Eviction",
+        "actors": [
+          {
+            "id": "drain",
+            "label": "kubectl drain / EKS"
+          },
+          {
+            "id": "api",
+            "label": "K8s Eviction API"
+          },
+          {
+            "id": "pdb",
+            "label": "PDB Controller"
+          },
+          {
+            "id": "pod",
+            "label": "App Pods"
+          }
+        ],
+        "events": [
+          {
+            "from": "drain",
+            "to": "api",
+            "label": "POST /eviction (replicas=1, minAvail=1)",
+            "status": "warn"
+          },
+          {
+            "from": "api",
+            "to": "pdb",
+            "label": "disruptionsAllowed == 0 -> HTTP 429!",
+            "status": "fail"
+          },
+          {
+            "from": "drain",
+            "to": "api",
+            "label": "Fixed: replicas>=2 + maxUnavailable: 1",
+            "status": "ok"
+          },
+          {
+            "from": "pdb",
+            "to": "pod",
+            "label": "disruptionsAllowed=1 -> SIGTERM + preStop",
+            "status": "ok"
+          },
+          {
+            "from": "pod",
+            "to": "drain",
+            "label": "New pod Ready -> next node drains",
+            "status": "ok"
+          }
+        ],
+        "summary": "Ensuring disruptionsAllowed >= 1 lets the Eviction API gracefully drain nodes while preserving N-1 availability."
+      },
+      "purpose": "The problem: see what breaks without Real-World Impact of Misconfigured PDBs under real concurrency or scale.",
+      "decisionFramework": {
+        "problem": "How to implement Kubernetes Pod Disruption Budgets & Safe Node Drains without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "If latency budgets leave no room for synchronous retries, never set minAvailable equal to replicas on single- or fixed-replica workloads; use maxUnavailable: 1 (or >=25%) with replicas >= 2, and monitor kube_poddisruptionbudget_status_pod_disruptions_allowed == 0.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Kubernetes Pod Disruption Budgets & Safe Node Drains experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Naive Solution (and Why It Breaks)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Think of **Naive Solution (and Why It Breaks)** as the intuition layer for Kubernetes Pod Disruption Budgets & Safe Node Drains: The problem: see what breaks without Naive Solution under real concurrency or scale.",
+        "core": "Deleting all PDBs unblocks node drains but allows the upgrade controller to evict *every* replica of a service simultaneously, causing an outage. Conversely, setting `minAvailable: 100%` or `maxUnavailable: 0` permanently blocks voluntary evictions whenever all pods are healthy—and even `minAvailable: 2` on a 3-replica service blocks drains if 1 pod is temporarily `CrashLoopBackOff`.",
+        "deepDive": "Under heavy load or partial failure, naive solution (and why it breaks) becomes a critical lever for predictable latency and correctness. A misconfigured PodDisruptionBudget (such as minAvailable: 100% or minAvailable == replicas) sets disruptionsAllowed=0, causing kubectl drain and Karpenter/GKE/EKS node upgrades to hang indefinitely with HTTP 429 eviction blocks."
+      },
+      "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "Component Topology",
+        "title": "Naive Solution (and Why It Breaks)",
+        "graphNodes": [
+          {
+            "id": "ingress",
+            "label": "Ingress / LB",
+            "role": "ingress",
+            "col": 0,
+            "row": 0,
+            "tone": "primary"
+          },
+          {
+            "id": "ctrl",
+            "label": "K8s Control",
+            "role": "compute",
+            "col": 1,
+            "row": 0,
+            "tone": "tint"
+          },
+          {
+            "id": "node",
+            "label": "Worker Node",
+            "role": "storage",
+            "col": 2,
+            "row": 0,
+            "tone": "tint"
+          },
+          {
+            "id": "pod",
+            "label": "App Pods",
+            "role": "control",
+            "col": 0,
+            "row": 1,
+            "tone": "tint"
+          }
+        ],
+        "graphEdges": [
+          {
+            "from": "ingress",
+            "to": "pod",
+            "label": "active traffic",
+            "style": "solid",
+            "tone": "green"
+          },
+          {
+            "from": "ctrl",
+            "to": "node",
+            "label": "reconcile",
+            "style": "solid",
+            "tone": "green"
+          },
+          {
+            "from": "node",
+            "to": "pod",
+            "label": "probe / SIGTERM",
+            "style": "solid",
+            "tone": "green"
+          }
+        ]
+      }
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise Solution: `maxUnavailable` Budgets, `replicas >= 2` & Alerting",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": {
+        "foundation": "Design PDBs so voluntary drains always succeed safely while protecting quorum:",
+        "core": "- **Never Set `minAvailable == replicas`**: Run critical services with `replicas >= 2` across AZs (`topologySpreadConstraints`) and use `maxUnavailable: 1` (or `25%`) so HPA scaling never breaks the budget.\n- **StatefulSets & Quorum**: For 3-node Raft/etcd/Kafka clusters, set `maxUnavailable: 1` so quorum (`2/3`) always holds.\n- **Admissions & Prometheus Alerting**: Reject `minAvailable == 100%` or `maxUnavailable == 0` via Kyverno/OPA policies, and alert when `kube_poddisruptionbudget_status_pod_disruptions_allowed == 0` for > 15m (using `unhealthyPodEvictionPolicy: IfHealthyBudget` in K8s 1.27+).",
+        "deepDive": "In production deployments of Kubernetes Pod Disruption Budgets & Safe Node Drains, watch how enterprise solution: `maxunavailable` budgets, `replicas >= 2` & alerting interacts with tail latency, retry amplification, and partial failures. A misconfigured PodDisruptionBudget (such as minAvailable: 100% or minAvailable == replicas) sets disruptionsAllowed=0, causing kubectl drain and Karpenter/GKE/EKS node upgrades to hang indefinitely with HTTP 429 eviction blocks."
+      },
+      "sectionDiagram": {
+        "kind": "quorum-cluster",
+        "eyebrow": "Multi-AZ PDB Quorum Safety",
+        "title": "Maintaining Quorum & N-1 Capacity During Node Drains",
+        "nodes": [
+          {
+            "label": "Eviction API",
+            "role": "Checks PDB before SIGTERM"
+          },
+          {
+            "label": "AZ-A / AZ-B Pods",
+            "role": "2+ healthy replicas"
+          },
+          {
+            "label": "AZ-C Draining",
+            "role": "maxUnavailable: 1"
+          },
+          {
+            "label": "Prometheus / OPA",
+            "role": "Alert disruptionsAllowed=0"
+          }
+        ],
+        "edges": [
+          {
+            "label": "Graceful drain"
+          },
+          {
+            "label": "Quorum preserved"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Use maxUnavailable",
+            "detail": "Scales cleanly with HPA unlike fixed minAvailable counts."
+          },
+          {
+            "label": "Minimum 2 Replicas",
+            "detail": "Single-replica pods cannot tolerate any disruption with a PDB."
+          },
+          {
+            "label": "K8s 1.27+ Policy",
+            "detail": "unhealthyPodEvictionPolicy: IfHealthyBudget unblocks stuck CrashLoop pods."
+          },
+          {
+            "label": "OPA / Kyverno Gate",
+            "detail": "Block maxUnavailable: 0 in CI/CD before it reaches EKS."
+          }
+        ],
+        "summary": "Topology spread + maxUnavailable: 1 + OPA admission checks guarantee zero-downtime EKS upgrades across 180 nodes."
+      },
+      "markdownContent": "```yaml\napiVersion: policy/v1\nkind: PodDisruptionBudget\nmetadata:\n  name: billing-worker-pdb\nspec:\n  maxUnavailable: 1\n  unhealthyPodEvictionPolicy: AlwaysAllow\n  selector:\n    matchLabels:\n      app: billing-worker\n---\napiVersion: kyverno.io/v1\nkind: ClusterPolicy\nmetadata:\n  name: block-deadlocking-pdb\nspec:\n  validationFailureAction: Enforce\n  rules:\n    - name: disallow-zero-disruptions\n      match:\n        any:\n          - resources:\n              kinds: [\"PodDisruptionBudget\"]\n      validate:\n        message: \"PDB must not set maxUnavailable=0 or minAvailable=100%.\"\n        deny:\n          conditions:\n            any:\n              - key: \"{{ request.object.spec.maxUnavailable || '' }}\"\n                operator: Equals\n                value: 0\n              - key: \"{{ request.object.spec.minAvailable || '' }}\"\n                operator: Equals\n                value: \"100%\"\n\n# 3-node quorum StatefulSet (e.g., Zookeeper/etcd): allows 1 node down at a time\nspec:\n  minAvailable: 2\n  selector:\n    matchLabels:\n      app: zookeeper\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where PDBs & Safe Drains Apply in System Design",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Disruption budgeting is vital across any orchestrated infrastructure:",
+        "core": "- **Zero-Downtime Cluster Upgrades**: Enables automated EKS/GKE/Karpenter node rotation without manual intervention.\n- **Stateful Databases & Brokers**: Protects Raft/Kafka quorum during kernel patching.\n- **Cost Optimization**: Lets Karpenter consolidate underutilized spot/on-demand nodes without violating SLAs.",
+        "deepDive": "In production deployments of Kubernetes Pod Disruption Budgets & Safe Node Drains, watch how where pdbs & safe drains apply in system design interacts with tail latency, retry amplification, and partial failures. A misconfigured PodDisruptionBudget (such as minAvailable: 100% or minAvailable == replicas) sets disruptionsAllowed=0, causing kubectl drain and Karpenter/GKE/EKS node upgrades to hang indefinitely with HTTP 429 eviction blocks."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "kubernetes-workloads",
+          "title": "Concept: Kubernetes Workloads",
+          "kind": "concept"
+        },
+        {
+          "slug": "rolling-deployment-strategy",
+          "title": "Concept: Rolling Deployment Strategy",
+          "kind": "concept"
+        },
+        {
+          "slug": "quorum-tuning",
+          "title": "Concept: Quorum Tuning",
+          "kind": "concept"
+        },
+        {
+          "slug": "design-zero-downtime",
+          "title": "System Design: Zero-Downtime Canary Pipeline",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why is `maxUnavailable: 1` generally safer than a fixed `minAvailable` count for Deployment PDBs?",
+      "options": [
+        {
+          "id": "a",
+          "text": "It adapts automatically when HPA scales replicas up or down and guarantees at least 1 voluntary eviction when replicas >= 2",
+          "correct": true,
+          "feedback": "Correct: fixed `minAvailable` can accidentally exceed or equal current replicas after HPA scale-down, freezing drains."
+        },
+        {
+          "id": "b",
+          "text": "`maxUnavailable` bypasses `preStop` hooks for faster node drains",
+          "correct": false,
+          "feedback": "Graceful termination hooks still run normally on eviction."
+        },
+        {
+          "id": "c",
+          "text": "`minAvailable` is deprecated in Kubernetes 1.29",
+          "correct": false,
+          "feedback": "`minAvailable` is still supported, just error-prone with autoscaling."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why is `maxUnavailable: 1` generally safer than a fixed `minAvailable` count for Deployment PDBs?",
+        "options": [
+          {
+            "id": "a",
+            "text": "It adapts automatically when HPA scales replicas up or down and guarantees at least 1 voluntary eviction when replicas >= 2",
+            "correct": true,
+            "feedback": "Correct: fixed `minAvailable` can accidentally exceed or equal current replicas after HPA scale-down, freezing drains."
+          },
+          {
+            "id": "b",
+            "text": "`maxUnavailable` bypasses `preStop` hooks for faster node drains",
+            "correct": false,
+            "feedback": "Graceful termination hooks still run normally on eviction."
+          },
+          {
+            "id": "c",
+            "text": "`minAvailable` is deprecated in Kubernetes 1.29",
+            "correct": false,
+            "feedback": "`minAvailable` is still supported, just error-prone with autoscaling."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why Kubernetes PDBs & Safe Node Drains Matter', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "b",
+            "text": "During a Kubernetes 1.28 -> 1.29 EKS upgrade across **180 nodes and 3 AZs**, node drains stall for **6 hours** with HTTP 429 Cannot evict pod as it would violate the pod's…",
+            "correct": true,
+            "feedback": "Correct: During a Kubernetes 1.28 -> 1.29 EKS upgrade across **180 nodes and 3 AZs**, node drains stall for **6 hours** with HTTP 429 Cannot evict pod as it would violate the pod's…"
+          },
+          {
+            "id": "c",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Real-World Impact of Misconfigured PDBs', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "b",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "c",
+            "text": "A PDB with allowedDisruptions == 0 turns routine maintenance into an operational deadlock: 1.",
+            "correct": true,
+            "feedback": "Correct: A PDB with allowedDisruptions == 0 turns routine maintenance into an operational deadlock: 1."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** During a Kubernetes 1.28 -> 1.29 EKS upgrade across **180 nodes and 3 AZs**, node drains stall for **6 hours** with `HTTP 429 Cannot evict pod as it would violate the pod's disruption budget`.\n\n**How It Flows:** Think of Kubernetes Pod Disruption Budgets & Safe Node Drains as a clear step-by-step chain: kubectl drain / EKS -> K8s Eviction API -> PDB Controller -> App Pods -> Eviction API.\n\n**Why Beginners Should Care:** Never set minAvailable equal to replicas on single- or fixed-replica workloads; use maxUnavailable: 1 (or >=25%) with replicas >= 2, and monitor kube_poddisruptionbudget_status_pod_disruptions_allowed == 0.",
+      "spark": {
+        "summary": "During a Kubernetes 1.28 -> 1.29 EKS upgrade across **180 nodes and 3 AZs**, node drains stall for **6 hours** with `HTTP 429 Cannot evict pod as it would violate the pod's disruption budget`.",
+        "keyTakeaway": "Never set minAvailable equal to replicas on single- or fixed-replica workloads; use maxUnavailable: 1 (or >=25%) with replicas >= 2, and monitor kube_poddisruptionbudget_status_pod_disruptions_allowed == 0."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why Kubernetes PDBs & Safe Node Drains Matter",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why Kubernetes PDBs & Safe Node Drains Matter works from first principles.",
+          "explanation": "During a Kubernetes 1.28 -> 1.29 EKS upgrade across **180 nodes and 3 AZs**, node drains stall for **6 hours** with `HTTP 429 Cannot evict pod as it would violate the pod's disruption budget`. Three broken PDBs block eviction: `redis-cache` (`replicas: 1`, `minAvailable: 1`), a StatefulSet with `minAvailable: 100%`, and a Deployment with `maxUnavailable: 0`.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Real-World Impact of Misconfigured PDBs",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without Real-World Impact of Misconfigured PDBs under real concurrency or scale.",
+          "explanation": "A PDB with `allowedDisruptions == 0` turns routine maintenance into an operational deadlock: 1. **Blocked Security Upgrades**: EKS/Karpenter cannot cordon and drain nodes, leaving CVEs unpatched for hours. 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Kubernetes Eviction API & PDB Check",
+            "title": "Blocked Drain (0 Allowed Disruptions) vs. Safe Rolling Eviction",
+            "actors": [
+              {
+                "id": "drain",
+                "label": "kubectl drain / EKS"
+              },
+              {
+                "id": "api",
+                "label": "K8s Eviction API"
+              },
+              {
+                "id": "pdb",
+                "label": "PDB Controller"
+              },
+              {
+                "id": "pod",
+                "label": "App Pods"
+              }
+            ],
+            "events": [
+              {
+                "from": "drain",
+                "to": "api",
+                "label": "POST /eviction (replicas=1, minAvail=1)",
+                "status": "warn"
+              },
+              {
+                "from": "api",
+                "to": "pdb",
+                "label": "disruptionsAllowed == 0 -> HTTP 429!",
+                "status": "fail"
+              },
+              {
+                "from": "drain",
+                "to": "api",
+                "label": "Fixed: replicas>=2 + maxUnavailable: 1",
+                "status": "ok"
+              },
+              {
+                "from": "pdb",
+                "to": "pod",
+                "label": "disruptionsAllowed=1 -> SIGTERM + preStop",
+                "status": "ok"
+              },
+              {
+                "from": "pod",
+                "to": "drain",
+                "label": "New pod Ready -> next node drains",
+                "status": "ok"
+              }
+            ],
+            "summary": "Ensuring disruptionsAllowed >= 1 lets the Eviction API gracefully drain nodes while preserving N-1 availability."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive Solution (and Why It Breaks)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+          "explanation": "Deleting all PDBs unblocks node drains but allows the upgrade controller to evict *every* replica of a service simultaneously, causing an outage. Conversely, setting `minAvailable: 100%` or `maxUnavailable: 0` permanently blocks voluntary evictions whenever all pods are healthy—and even `minAvailable: 2` on a 3-replica service blocks drains if 1 pod is temporarily `CrashLoopBackOff`.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise Solution: `maxUnavailable` Budgets, `replicas >= 2` & Alerting",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Design PDBs so voluntary drains always succeed safely while protecting quorum: **Never Set `minAvailable == replicas`**: Run critical services with `replicas >= 2` across AZs (`topologySpreadConstraints`) and use `maxUnavailable: 1` (or `25%`) so HPA scaling never breaks the budget. **StatefulSets & Quorum**: For 3-node Raft/etcd/Kafka clusters, set `maxUnavailable: 1` so quorum (`2/3`) always holds.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "quorum-cluster",
+            "eyebrow": "Multi-AZ PDB Quorum Safety",
+            "title": "Maintaining Quorum & N-1 Capacity During Node Drains",
+            "nodes": [
+              {
+                "label": "Eviction API",
+                "role": "Checks PDB before SIGTERM"
+              },
+              {
+                "label": "AZ-A / AZ-B Pods",
+                "role": "2+ healthy replicas"
+              },
+              {
+                "label": "AZ-C Draining",
+                "role": "maxUnavailable: 1"
+              },
+              {
+                "label": "Prometheus / OPA",
+                "role": "Alert disruptionsAllowed=0"
+              }
+            ],
+            "edges": [
+              {
+                "label": "Graceful drain"
+              },
+              {
+                "label": "Quorum preserved"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Use maxUnavailable",
+                "detail": "Scales cleanly with HPA unlike fixed minAvailable counts."
+              },
+              {
+                "label": "Minimum 2 Replicas",
+                "detail": "Single-replica pods cannot tolerate any disruption with a PDB."
+              },
+              {
+                "label": "K8s 1.27+ Policy",
+                "detail": "unhealthyPodEvictionPolicy: IfHealthyBudget unblocks stuck CrashLoop pods."
+              },
+              {
+                "label": "OPA / Kyverno Gate",
+                "detail": "Block maxUnavailable: 0 in CI/CD before it reaches EKS."
+              }
+            ],
+            "summary": "Topology spread + maxUnavailable: 1 + OPA admission checks guarantee zero-downtime EKS upgrades across 180 nodes."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Never set minAvailable equal to replicas on single- or fixed-replica workloads; use maxUnavailable: 1 (or >=25%) with replicas >= 2, and monitor kube_poddisruptionbudget_status_pod_disruptions_allowed == 0.",
+      "summary": "A misconfigured PodDisruptionBudget (such as minAvailable: 100% or minAvailable == replicas) sets disruptionsAllowed=0, causing kubectl drain and Karpenter/GKE/EKS node upgrades to hang indefinitely with HTTP 429 eviction blocks.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, never set minAvailable equal to replicas on single- or fixed-replica workloads; use maxUnavailable: 1 (or >=25%) with replicas >= 2, and monitor kube_poddisruptionbudget_status_pod_disruptions_allowed == 0."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** During a Kubernetes 1.28 -> 1.29 EKS upgrade across **180 nodes and 3 AZs**, node drains stall for **6 hours** with `HTTP 429 Cannot evict pod as it would violate the pod's disruption budget`.\n\n**Visual & Structural Flow:** Depicts Blocked Drain (0 Allowed Disruptions) vs. Safe Rolling Eviction (kubectl drain / EKS -> K8s Eviction API -> PDB Controller -> App Pods); Maintaining Quorum & N-1 Capacity During Node Drains (Eviction API -> AZ-A / AZ-B Pods -> AZ-C Draining -> Prometheus / OPA).\n\n**Trade-Offs & Production:** Deleting all PDBs unblocks node drains but allows the upgrade controller to evict *every* replica of a service simultaneously, causing an outage. Design PDBs so voluntary drains always succeed safely while protecting quorum: **Never Set `minAvailable == replicas`**: Run critical services with `replicas >= 2` across AZs.\n\n**Failure Modes & Application:** Disruption budgeting is vital across any orchestrated infrastructure: **Zero-Downtime Cluster Upgrades**: Enables automated EKS/GKE/Karpenter node rotation without manual intervention.",
+      "spark": {
+        "summary": "A misconfigured PodDisruptionBudget (such as minAvailable: 100% or minAvailable == replicas) sets disruptionsAllowed=0, causing kubectl drain and Karpenter/GKE/EKS node upgrades to hang indefinitely with HTTP 429 eviction blocks.",
+        "keyTakeaway": "Never set minAvailable equal to replicas on single- or fixed-replica workloads; use maxUnavailable: 1 (or >=25%) with replicas >= 2, and monitor kube_poddisruptionbudget_status_pod_disruptions_allowed == 0."
+      },
+      "summary": "A misconfigured PodDisruptionBudget (such as minAvailable: 100% or minAvailable == replicas) sets disruptionsAllowed=0, causing kubectl drain and Karpenter/GKE/EKS node upgrades to hang indefinitely with HTTP 429 eviction blocks.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, never set minAvailable equal to replicas on single- or fixed-replica workloads; use maxUnavailable: 1 (or >=25%) with replicas >= 2, and monitor kube_poddisruptionbudget_status_pod_disruptions_allowed == 0."
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** A misconfigured PodDisruptionBudget (such as minAvailable: 100% or minAvailable == replicas) sets disruptionsAllowed=0, causing kubectl drain and Karpenter/GKE/EKS node upgrades to hang indefinitely with HTTP 429 eviction blocks.\n\n**Production Trade-Offs:** Deleting all PDBs unblocks node drains but allows the upgrade controller to evict *every* replica of a service simultaneously, causing an outage.\n\n**Failure Modes & Edge Cases:** Disruption budgeting is vital across any orchestrated infrastructure: **Zero-Downtime Cluster Upgrades**: Enables automated EKS/GKE/Karpenter node rotation without manual intervention.\n\n**Principal Takeaway:** Never set minAvailable equal to replicas on single- or fixed-replica workloads; use maxUnavailable: 1 (or >=25%) with replicas >= 2, and monitor kube_poddisruptionbudget_status_pod_disruptions_allowed == 0.",
+      "spark": {
+        "summary": "A misconfigured PodDisruptionBudget (such as minAvailable: 100% or minAvailable == replicas) sets disruptionsAllowed=0, causing kubectl drain and Karpenter/GKE/EKS node upgrades to hang indefinitely with HTTP 429 eviction blocks.",
+        "keyTakeaway": "Never set minAvailable equal to replicas on single- or fixed-replica workloads; use maxUnavailable: 1 (or >=25%) with replicas >= 2, and monitor kube_poddisruptionbudget_status_pod_disruptions_allowed == 0."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why Kubernetes PDBs & Safe Node Drains Matter",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why Kubernetes PDBs & Safe Node Drains Matter works from first principles.",
+          "explanation": "During a Kubernetes 1.28 -> 1.29 EKS upgrade across **180 nodes and 3 AZs**, node drains stall for **6 hours** with `HTTP 429 Cannot evict pod as it would violate the pod's disruption budget`. Three broken PDBs block eviction: `redis-cache` (`replicas: 1`, `minAvailable: 1`), a StatefulSet with `minAvailable: 100%`, and a Deployment with `maxUnavailable: 0`.\n\n**Constraints:**\n- Multi-AZ stateless services must keep at least `N-1` replicas during voluntary drains.\n- Zero unapproved `--force --grace-period=0` deletes on stateful production pods.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Real-World Impact of Misconfigured PDBs",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without Real-World Impact of Misconfigured PDBs under real concurrency or scale.",
+          "explanation": "A PDB with `allowedDisruptions == 0` turns routine maintenance into an operational deadlock:\n\n1. **Blocked Security Upgrades**: EKS/Karpenter cannot cordon and drain nodes, leaving CVEs unpatched for hours.\n2. **Autoscaler Deadlock**: Cluster Autoscaler / Karpenter cannot consolidate underutilized nodes.\n3. **Panic Force-Deletes**: Frustrated operators run `--force --grace-period=0`, bypassing `preStop` hooks and corrupting stateful storage.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Kubernetes Eviction API & PDB Check",
+            "title": "Blocked Drain (0 Allowed Disruptions) vs. Safe Rolling Eviction",
+            "actors": [
+              {
+                "id": "drain",
+                "label": "kubectl drain / EKS"
+              },
+              {
+                "id": "api",
+                "label": "K8s Eviction API"
+              },
+              {
+                "id": "pdb",
+                "label": "PDB Controller"
+              },
+              {
+                "id": "pod",
+                "label": "App Pods"
+              }
+            ],
+            "events": [
+              {
+                "from": "drain",
+                "to": "api",
+                "label": "POST /eviction (replicas=1, minAvail=1)",
+                "status": "warn"
+              },
+              {
+                "from": "api",
+                "to": "pdb",
+                "label": "disruptionsAllowed == 0 -> HTTP 429!",
+                "status": "fail"
+              },
+              {
+                "from": "drain",
+                "to": "api",
+                "label": "Fixed: replicas>=2 + maxUnavailable: 1",
+                "status": "ok"
+              },
+              {
+                "from": "pdb",
+                "to": "pod",
+                "label": "disruptionsAllowed=1 -> SIGTERM + preStop",
+                "status": "ok"
+              },
+              {
+                "from": "pod",
+                "to": "drain",
+                "label": "New pod Ready -> next node drains",
+                "status": "ok"
+              }
+            ],
+            "summary": "Ensuring disruptionsAllowed >= 1 lets the Eviction API gracefully drain nodes while preserving N-1 availability."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive Solution (and Why It Breaks)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+          "explanation": "Deleting all PDBs unblocks node drains but allows the upgrade controller to evict *every* replica of a service simultaneously, causing an outage. Conversely, setting `minAvailable: 100%` or `maxUnavailable: 0` permanently blocks voluntary evictions whenever all pods are healthy—and even `minAvailable: 2` on a 3-replica service blocks drains if 1 pod is temporarily `CrashLoopBackOff`.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise Solution: `maxUnavailable` Budgets, `replicas >= 2` & Alerting",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Design PDBs so voluntary drains always succeed safely while protecting quorum:\n\n- **Never Set `minAvailable == replicas`**: Run critical services with `replicas >= 2` across AZs (`topologySpreadConstraints`) and use `maxUnavailable: 1` (or `25%`) so HPA scaling never breaks the budget.\n- **StatefulSets & Quorum**: For 3-node Raft/etcd/Kafka clusters, set `maxUnavailable: 1` so quorum (`2/3`) always holds.\n- **Admissions & Prometheus Alerting**: Reject `minAvailable == 100%` or `maxUnavailable == 0` via Kyverno/OPA policies, and alert when `kube_poddisruptionbudget_status_pod_disruptions_allowed == 0` for > 15m (using `unhealthyPodEvictionPolicy: IfHealthyBudget` in K8s 1.27+).",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "quorum-cluster",
+            "eyebrow": "Multi-AZ PDB Quorum Safety",
+            "title": "Maintaining Quorum & N-1 Capacity During Node Drains",
+            "nodes": [
+              {
+                "label": "Eviction API",
+                "role": "Checks PDB before SIGTERM"
+              },
+              {
+                "label": "AZ-A / AZ-B Pods",
+                "role": "2+ healthy replicas"
+              },
+              {
+                "label": "AZ-C Draining",
+                "role": "maxUnavailable: 1"
+              },
+              {
+                "label": "Prometheus / OPA",
+                "role": "Alert disruptionsAllowed=0"
+              }
+            ],
+            "edges": [
+              {
+                "label": "Graceful drain"
+              },
+              {
+                "label": "Quorum preserved"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Use maxUnavailable",
+                "detail": "Scales cleanly with HPA unlike fixed minAvailable counts."
+              },
+              {
+                "label": "Minimum 2 Replicas",
+                "detail": "Single-replica pods cannot tolerate any disruption with a PDB."
+              },
+              {
+                "label": "K8s 1.27+ Policy",
+                "detail": "unhealthyPodEvictionPolicy: IfHealthyBudget unblocks stuck CrashLoop pods."
+              },
+              {
+                "label": "OPA / Kyverno Gate",
+                "detail": "Block maxUnavailable: 0 in CI/CD before it reaches EKS."
+              }
+            ],
+            "summary": "Topology spread + maxUnavailable: 1 + OPA admission checks guarantee zero-downtime EKS upgrades across 180 nodes."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where PDBs & Safe Drains Apply in System Design",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Disruption budgeting is vital across any orchestrated infrastructure:\n\n- **Zero-Downtime Cluster Upgrades**: Enables automated EKS/GKE/Karpenter node rotation without manual intervention.\n- **Stateful Databases & Brokers**: Protects Raft/Kafka quorum during kernel patching.\n- **Cost Optimization**: Lets Karpenter consolidate underutilized spot/on-demand nodes without violating SLAs.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Never set minAvailable equal to replicas on single- or fixed-replica workloads; use maxUnavailable: 1 (or >=25%) with replicas >= 2, and monitor kube_poddisruptionbudget_status_pod_disruptions_allowed == 0.",
+      "summary": "A misconfigured PodDisruptionBudget (such as minAvailable: 100% or minAvailable == replicas) sets disruptionsAllowed=0, causing kubectl drain and Karpenter/GKE/EKS node upgrades to hang indefinitely with HTTP 429 eviction blocks.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, never set minAvailable equal to replicas on single- or fixed-replica workloads; use maxUnavailable: 1 (or >=25%) with replicas >= 2, and monitor kube_poddisruptionbudget_status_pod_disruptions_allowed == 0."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "simulation": {
+    "title": "Kubernetes Pod Disruption Budgets & Safe Node Drains — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "ingress",
+        "label": "Ingress / LB",
+        "role": "Traffic Shift"
+      },
+      {
+        "id": "ctrl",
+        "label": "K8s Control",
+        "role": "PDB & HPA"
+      },
+      {
+        "id": "node",
+        "label": "Worker Node",
+        "role": "Cgroups & Conntrack"
+      },
+      {
+        "id": "pod",
+        "label": "App Pods",
+        "role": "Readiness & Drain"
+      }
+    ],
+    "edges": [
+      {
+        "from": "ingress",
+        "to": "pod",
+        "label": "active traffic"
+      },
+      {
+        "from": "ctrl",
+        "to": "node",
+        "label": "reconcile"
+      },
+      {
+        "from": "node",
+        "to": "pod",
+        "label": "probe / SIGTERM"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why Kubernetes PDBs & Safe Node Drains Matter",
+        "actionLabel": "active traffic",
+        "status": "healthy",
+        "activeNodeIds": [
+          "ingress",
+          "ctrl"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "active traffic",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Ingress / LB sends work to K8s Control (Why Kubernetes PDBs & Safe Node Drains Matter)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Real-World Impact of Misconfigured PDBs",
+        "actionLabel": "reconcile",
+        "status": "healthy",
+        "activeNodeIds": [
+          "ctrl",
+          "node"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "reconcile",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "K8s Control coordinates with Worker Node while preserving the core invariant (Real-World Impact of Misconfigured PDBs)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Naive Solution (and Why It Breaks)",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "node",
+          "pod"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, App Pods absorbs pressure without cascading (Naive Solution (and Why It Breaks))."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Where PDBs & Safe Drains Apply in System Design",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "ingress",
+          "ctrl",
+          "node",
+          "pod"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Where PDBs & Safe Drains Apply in System Design)."
+      }
+    ]
+  }
+}

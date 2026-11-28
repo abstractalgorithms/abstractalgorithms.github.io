@@ -1,0 +1,772 @@
+{
+  "slug": "design-url-redirection-engine",
+  "title": "Design a Global URL Redirection Engine (100K RPS)",
+  "domain": "system-design",
+  "diagram": "diagram.png",
+  "spark": {
+    "summary": "Design a globally distributed URL shortening and redirection engine serving 100K RPS reads (<15ms p99), 1K RPS writes, 5-year durability, and real-time click analytics.",
+    "keyTakeaway": "If latency budgets leave no room for synchronous retries, serve redirects from Anycast Edge POPs with L1 LRU + regional Redis, coordinate writes via pre-allocated Base62 key-range shards, and replicate asynchronously across regions.",
+    "byteSummary": "A Global URL Redirection Engine is an ultra-read-heavy system (100:1 read/write ratio: 100K RPS reads vs. 1K RPS writes) requiring <15ms global p99 redirect latency and 99.99% availability. Over 5 years at 1K writes/sec, the store accumulates ~158 billion URLs (~80TB of raw mapping data).\n\nThe architecture spans: (1) Anycast Edge POPs running L1 in-memory LRU caches backed by regional Redis Clusters to serve 95%+ of redirects without crossing WANs; (2) a Multi-Region Write Coordinator leasing disjoint Base62 key-range shards from ZooKeeper/etcd so regions never collide; (3) an Active-Active geo-replicated Cassandra/DynamoDB store with Safe-Browsing phishing checks and TTL expiration; and (4) a Clickstream Kafka + Apache Flink pipeline powering real-time geo/referrer analytics.\n\nKey trade-offs include using asynchronous multi-region replication (eventual consistency of ~1-2s on new links, or read-your-writes sticky routing for the creator) to avoid cross-continent write consensus latency."
+  },
+  "learningJourney": [
+    {
+      "stage": 1,
+      "level": "foundation",
+      "title": "Traffic & 5-Year Storage Sizing",
+      "purpose": "Calculate read/write QPS, 5-year storage footprint, and Redis cache memory.",
+      "explanation": {
+        "foundation": "1K writes/sec * 86,400s * 365d * 5y = ~157.7B URLs.",
+        "core": "At ~500 bytes per record (short_code, long_url, user_id, created_at, expires_at), raw data is ~79TB (with 3x replication = ~237TB).",
+        "deepDive": "Applying the 80/20 rule for 100K RPS reads: caching the hot 20% of daily active links (~17M links * 500B = ~8.5GB) fits easily inside a modest regional Redis cluster."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 1 - Capacity Math",
+        "title": "100K RPS & 5-Year Storage Model",
+        "nodes": [
+          {
+            "id": "writes",
+            "label": "1K RPS Writes",
+            "sub": "158B URLs in 5 yrs",
+            "role": "source"
+          },
+          {
+            "id": "disk",
+            "label": "79 TB Raw / 237 TB Rep",
+            "sub": "500B/row x 3x RF",
+            "role": "storage"
+          },
+          {
+            "id": "reads",
+            "label": "100K RPS Reads",
+            "sub": "100:1 read/write",
+            "role": "processor"
+          },
+          {
+            "id": "ram",
+            "label": "8.5 GB Hot Cache",
+            "sub": "Top 20% daily links",
+            "role": "cache"
+          }
+        ],
+        "edges": [
+          {
+            "from": "writes",
+            "to": "disk",
+            "label": "5-year accumulation"
+          },
+          {
+            "from": "reads",
+            "to": "ram",
+            "label": "80/20 working set"
+          }
+        ],
+        "cards": [
+          {
+            "label": "7-Char Base62",
+            "detail": "62^7 = 3.52T easily covers 158B URLs (<5% utilization over 5 years)."
+          },
+          {
+            "label": "Bandwidth",
+            "detail": "100K RPS * 500B redirect response = ~50 MB/s (400 Mbps) aggregate egress."
+          }
+        ],
+        "summary": "79TB of 5-year data and an 8.5GB hot working set dictate NoSQL sharding plus regional Redis.",
+        "caption": "Compact 500B records keep hot-set caching remarkably inexpensive."
+      },
+      "id": "stage-1-traffic-5-year-storage-sizing"
+    },
+    {
+      "stage": 2,
+      "level": "foundation",
+      "title": "Anycast Edge POPs & L1/L2 Regional Caching",
+      "purpose": "Achieve <15ms global p99 redirect latency across continents.",
+      "explanation": {
+        "foundation": "Anycast BGP routes users to the nearest Edge POP.",
+        "core": "Each POP maintains an L1 in-memory LRU cache (100K hottest global slugs, <0.2ms) and queries a regional L2 Redis Cluster (<2ms) on L1 miss.",
+        "deepDive": "Only the ~2% long-tail cold misses traverse to the regional Cassandra/DynamoDB replica, keeping global p99 redirect latency under 15ms."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 2 - Global Edge",
+        "title": "Anycast POP + L1/L2 Cache Hierarchy",
+        "nodes": [
+          {
+            "id": "user",
+            "label": "Global User Click",
+            "sub": "Anycast BGP route",
+            "role": "source"
+          },
+          {
+            "id": "l1",
+            "label": "Edge POP L1 LRU",
+            "sub": "100K viral slugs",
+            "role": "cache"
+          },
+          {
+            "id": "l2",
+            "label": "Regional L2 Redis",
+            "sub": "95%+ hit rate",
+            "role": "processor"
+          },
+          {
+            "id": "db",
+            "label": "Local NoSQL Replica",
+            "sub": "<2% cold tail reads",
+            "role": "storage"
+          }
+        ],
+        "edges": [
+          {
+            "from": "user",
+            "to": "l1",
+            "label": "Nearest Edge POP"
+          },
+          {
+            "from": "l1",
+            "to": "l2",
+            "label": "Miss -> Regional Redis"
+          },
+          {
+            "from": "l2",
+            "to": "db",
+            "label": "Miss -> Local DB"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Viral Absorption",
+            "detail": "L1 LRU absorbs 50K+ RPS single-link spikes without hitting Redis."
+          },
+          {
+            "label": "Negative Cache",
+            "detail": "Edge Bloom filters + 60s 404 cache block invalid-code floods."
+          }
+        ],
+        "summary": "Three-tier Anycast + L1 + L2 caching keeps 98% of redirects within the local metro region.",
+        "caption": "Local NoSQL replicas ensure cold reads never cross oceans."
+      },
+      "decisionFramework": {
+        "problem": "How to implement Design a Global URL Redirection Engine (100K RPS) without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "If latency budgets leave no room for synchronous retries, serve redirects from Anycast Edge POPs with L1 LRU + regional Redis, coordinate writes via pre-allocated Base62 key-range shards, and replicate asynchronously across regions.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Design a Global URL Redirection Engine (100K RPS) experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      },
+      "id": "stage-2-anycast-edge-pops-l1-l2-regional-caching"
+    },
+    {
+      "stage": 3,
+      "level": "intermediate",
+      "title": "Multi-Region Write Coordinator & Key-Range Shards",
+      "purpose": "Generate globally unique short codes across US, EU, and APAC with zero cross-region locks.",
+      "explanation": {
+        "foundation": "Think of **Multi-Region Write Coordinator & Key-Range Shards** as the intuition layer for Design a Global URL Redirection Engine (100K RPS): Generate globally unique short codes across US, EU, and APAC with zero cross-region locks.",
+        "core": "Running cross-continent Paxos on every `POST /shorten` would add 150ms+ write latency. Instead, a central ZooKeeper/etcd coordinator assigns disjoint prefix ranges to each region (e.g., `a-g*` to US, `h-n*` to EU, `o-z*` to APAC), and regional write workers lease 1M-ID sub-blocks locally—generating globally unique codes in <1ms.",
+        "deepDive": "Under heavy load or partial failure, multi-region write coordinator & key-range shards becomes a critical lever for predictable latency and correctness. Optimize edge-batched Kafka + Flink GDPR clickstreams, partition-key TTL compaction, and Bloom-filter 404 shielding."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 3 - Multi-Region Writes",
+        "title": "Disjoint Regional Key-Range Shards",
+        "nodes": [
+          {
+            "id": "coord",
+            "label": "Global Range Lease",
+            "sub": "Assigns prefix blocks",
+            "role": "storage"
+          },
+          {
+            "id": "us",
+            "label": "US Write Pool",
+            "sub": "Range [a-g]*",
+            "role": "processor"
+          },
+          {
+            "id": "eu",
+            "label": "EU Write Pool",
+            "sub": "Range [h-n]*",
+            "role": "processor"
+          },
+          {
+            "id": "apac",
+            "label": "APAC Write Pool",
+            "sub": "Range [o-z]*",
+            "role": "processor"
+          }
+        ],
+        "edges": [
+          {
+            "from": "coord",
+            "to": "us",
+            "label": "Lease US shard"
+          },
+          {
+            "from": "coord",
+            "to": "eu",
+            "label": "Lease EU shard"
+          },
+          {
+            "from": "coord",
+            "to": "apac",
+            "label": "Lease APAC shard"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Zero Cross-WAN Write",
+            "detail": "Regions issue short codes completely independently with zero WAN round-trips."
+          },
+          {
+            "label": "Custom Vanity Slugs",
+            "detail": "Only user-chosen custom aliases use conditional quorum writes (LWT/ConditionalPut)."
+          }
+        ],
+        "summary": "Disjoint regional key-range shards eliminate cross-region consensus from the standard write path.",
+        "caption": "Custom vanity aliases are isolated to conditional writes without slowing auto-generated links."
+      },
+      "id": "stage-3-multi-region-write-coordinator-key-range-shards"
+    },
+    {
+      "stage": 4,
+      "level": "intermediate",
+      "title": "Active-Active Geo-Replicated NoSQL & Read-Your-Writes",
+      "purpose": "Replicate mappings globally while ensuring a creator's immediate test click never 404s.",
+      "explanation": {
+        "foundation": "Think of **Active-Active Geo-Replicated NoSQL & Read-Your-Writes** as the intuition layer for Design a Global URL Redirection Engine (100K RPS): Replicate mappings globally while ensuring a creator's immediate test click never 404s.",
+        "core": "Cassandra (NetworkTopologyStrategy) or DynamoDB Global Tables replicates writes asynchronously across regions in ~1-2s. To prevent a creator from hitting a 404 if they click their new link within 200ms in a different POP, the write response sets a short-lived regional affinity hint (or writes-through to the creator's local L2 Redis) and cold misses fall back cross-region once before returning 404.",
+        "deepDive": "Under heavy load or partial failure, active-active geo-replicated nosql & read-your-writes becomes a critical lever for predictable latency and correctness. Optimize edge-batched Kafka + Flink GDPR clickstreams, partition-key TTL compaction, and Bloom-filter 404 shielding."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 4 - Geo-Replication",
+        "title": "Active-Active NoSQL + Cross-Region Fallback",
+        "nodes": [
+          {
+            "id": "w_us",
+            "label": "US Write Worker",
+            "sub": "Writes DB + US Redis",
+            "role": "source"
+          },
+          {
+            "id": "rep",
+            "label": "Async Geo-Replication",
+            "sub": "~1-2s global sync",
+            "role": "processor"
+          },
+          {
+            "id": "r_eu",
+            "label": "EU Cold Miss",
+            "sub": "Checks EU DB -> 404?",
+            "role": "router"
+          },
+          {
+            "id": "fb",
+            "label": "1x Origin Fallback",
+            "sub": "Reads primary on miss",
+            "role": "sink"
+          }
+        ],
+        "edges": [
+          {
+            "from": "w_us",
+            "to": "rep",
+            "label": "Async replicate row"
+          },
+          {
+            "from": "r_eu",
+            "to": "fb",
+            "label": "Verify miss if fresh"
+          },
+          {
+            "from": "rep",
+            "to": "r_eu",
+            "label": "Serve locally after 1s"
+          }
+        ],
+        "cards": [
+          {
+            "label": "First-Char Hint",
+            "detail": "The slug's first character encodes its origin region, making 1x fallback routing exact."
+          },
+          {
+            "label": "Bounded Fallback",
+            "detail": "Only fall back for keys passing the Bloom filter or within 10s of creation."
+          }
+        ],
+        "summary": "Encoding origin region in the prefix enables exact single-hop fallback during replication lag.",
+        "caption": "Write-through to local Redis guarantees instant read-your-writes in the creator's region."
+      },
+      "id": "stage-4-active-active-geo-replicated-nosql-read-your-wri"
+    },
+    {
+      "stage": 5,
+      "level": "intermediate",
+      "title": "Safe-Browsing Phishing Scanner & Abuse Takedown",
+      "purpose": "Block malicious destinations at creation time and propagate takedowns globally in seconds.",
+      "explanation": {
+        "foundation": "Think of **Safe-Browsing Phishing Scanner & Abuse Takedown** as the intuition layer for Design a Global URL Redirection Engine (100K RPS): Block malicious destinations at creation time and propagate takedowns globally in seconds.",
+        "core": "On `POST /shorten`, the Write Worker checks the destination domain/URL against an in-memory Safe-Browsing prefix hash list (<1ms) and rejects known malware/phishing with `400 Bad Request`. An async crawler inspects newly created links for redirect chains/phishing kits; confirmed abusers trigger a Redis Pub/Sub cache invalidation across all Edge POPs and mark the DB row `BANNED`.",
+        "deepDive": "Under heavy load or partial failure, safe-browsing phishing scanner & abuse takedown becomes a critical lever for predictable latency and correctness. Optimize edge-batched Kafka + Flink GDPR clickstreams, partition-key TTL compaction, and Bloom-filter 404 shielding."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 5 - Abuse & Takedown",
+        "title": "Sync Blocklist + Global Cache Purge",
+        "nodes": [
+          {
+            "id": "post",
+            "label": "POST /shorten",
+            "sub": "Target URL check",
+            "role": "source"
+          },
+          {
+            "id": "sync_sb",
+            "label": "Sync Safe-Browsing",
+            "sub": "In-memory hash <1ms",
+            "role": "router"
+          },
+          {
+            "id": "async_cr",
+            "label": "Async Deep Scanner",
+            "sub": "Detects cloaked phish",
+            "role": "processor"
+          },
+          {
+            "id": "purge",
+            "label": "Global Edge Purge",
+            "sub": "Redis Pub/Sub -> 410",
+            "role": "sink"
+          }
+        ],
+        "edges": [
+          {
+            "from": "post",
+            "to": "sync_sb",
+            "label": "Screen known bad URLs"
+          },
+          {
+            "from": "sync_sb",
+            "to": "async_cr",
+            "label": "Queue deep inspection"
+          },
+          {
+            "from": "async_cr",
+            "to": "purge",
+            "label": "Evict L1/L2 on ban"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Fast Takedown",
+            "detail": "Global Pub/Sub purge evicts malicious L1/L2 cache entries across POPs within 2 seconds."
+          },
+          {
+            "label": "Rate-Limited Writes",
+            "detail": "Apply strict per-IP/API-key token buckets on POST /shorten to stop spam bots."
+          }
+        ],
+        "summary": "Combining sub-millisecond sync blocklists with async deep scanning stops abuse without slowing writes.",
+        "caption": "Global Pub/Sub cache purges enforce takedowns across all Edge POPs in seconds."
+      },
+      "id": "stage-5-safe-browsing-phishing-scanner-abuse-takedown"
+    },
+    {
+      "stage": 6,
+      "level": "advanced",
+      "title": "Clickstream Kafka + Flink Real-Time Analytics",
+      "purpose": "Deliver live click counts, geo maps, and bot-filtered unique visitors at 100K RPS.",
+      "explanation": {
+        "foundation": "Think of **Clickstream Kafka + Flink Real-Time Analytics** as the intuition layer for Design a Global URL Redirection Engine (100K RPS): Deliver live click counts, geo maps, and bot-filtered unique visitors at 100K RPS.",
+        "core": "Each Edge POP batches click events asynchronously to regional Kafka clusters (`short_clicks`). Apache Flink jobs filter known bot User-Agents, enrich IP prefixes with MaxMind GeoIP (dropping raw IPs for GDPR), and compute 1-minute tumbling aggregations + HyperLogLog unique counts into ClickHouse.",
+        "deepDive": "Under heavy load or partial failure, clickstream kafka + flink real-time analytics becomes a critical lever for predictable latency and correctness. Optimize edge-batched Kafka + Flink GDPR clickstreams, partition-key TTL compaction, and Bloom-filter 404 shielding."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 6 - Clickstream",
+        "title": "Edge-Batched Kafka + Flink Pipeline",
+        "nodes": [
+          {
+            "id": "pop",
+            "label": "Edge POP Emitter",
+            "sub": "Batched async produce",
+            "role": "source"
+          },
+          {
+            "id": "kafka",
+            "label": "Regional Kafka",
+            "sub": "100K events/sec",
+            "role": "processor"
+          },
+          {
+            "id": "flink",
+            "label": "Flink Bot & Geo Job",
+            "sub": "MaxMind + HLL uniques",
+            "role": "cache"
+          },
+          {
+            "id": "ch",
+            "label": "ClickHouse OLAP",
+            "sub": "Sub-second UI charts",
+            "role": "sink"
+          }
+        ],
+        "edges": [
+          {
+            "from": "pop",
+            "to": "kafka",
+            "label": "Send 100ms batches"
+          },
+          {
+            "from": "kafka",
+            "to": "flink",
+            "label": "Filter bots & enrich"
+          },
+          {
+            "from": "flink",
+            "to": "ch",
+            "label": "Write minute rollups"
+          }
+        ],
+        "cards": [
+          {
+            "label": "GDPR Compliance",
+            "detail": "Strip raw IP addresses inside Flink right after GeoIP lookup."
+          },
+          {
+            "label": "Zero Redirect Impact",
+            "detail": "Drop analytics buffers gracefully if Kafka backs up; never delay 302s."
+          }
+        ],
+        "summary": "Edge-batched Kafka ingestion and Flink enrichment scale analytics to 100K RPS cleanly.",
+        "caption": "Dropping raw IPs after GeoIP lookup keeps clickstream analytics privacy-compliant."
+      },
+      "id": "stage-6-clickstream-kafka-flink-real-time-analytics"
+    },
+    {
+      "stage": 7,
+      "level": "advanced",
+      "title": "TTL Expiration Engine & Tombstone Compaction",
+      "purpose": "Support expiring campaign links without degrading Cassandra read performance.",
+      "explanation": {
+        "foundation": "Links with `expires_at` store the timestamp in the payload and leverage Cassandra/DynamoDB TTLs.",
+        "core": "Reading an expired cached entry checks `now > expires_at` lazily and returns `410 Gone`.",
+        "deepDive": "To avoid Cassandra tombstone scan stalls on range queries, queries are strictly point-lookups by partition key (`short_code`), and compaction runs with `tombstone_threshold` tuning."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Stage 7 - TTL Lifecycle",
+        "title": "Point-Lookup TTL & Tombstone Cleanup",
+        "nodes": [
+          {
+            "id": "read",
+            "label": "GET /short_code",
+            "sub": "Partition key lookup",
+            "role": "source"
+          },
+          {
+            "id": "chk",
+            "label": "Lazy Expiry Check",
+            "sub": "now > expires_at?",
+            "role": "router"
+          },
+          {
+            "id": "g410",
+            "label": "Return 410 Gone",
+            "sub": "Evict from L1/L2",
+            "role": "cache"
+          },
+          {
+            "id": "comp",
+            "label": "NoSQL Compaction",
+            "sub": "Purge expired SSTables",
+            "role": "storage"
+          }
+        ],
+        "edges": [
+          {
+            "from": "read",
+            "to": "chk",
+            "label": "Inspect cached row"
+          },
+          {
+            "from": "chk",
+            "to": "g410",
+            "label": "Serve 410 if expired"
+          },
+          {
+            "from": "chk",
+            "to": "comp",
+            "label": "Background TTL purge"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Point-Lookup Safety",
+            "detail": "Partitioning by short_code avoids multi-row tombstone scans."
+          },
+          {
+            "label": "410 Gone",
+            "detail": "Returning 410 lets Edge CDNs cache the expired state and stop origin hits."
+          }
+        ],
+        "summary": "Lazy expiration checks and partition-key point lookups keep TTL cleanup fast and safe.",
+        "caption": "Caching 410 Gone responses prevents expired links from hitting origin databases."
+      },
+      "id": "stage-7-ttl-expiration-engine-tombstone-compaction"
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-1",
+        "question": "How does a Multi-Region URL Shortener generate globally unique short codes without paying 150ms+ cross-continent consensus latency on every write?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Assign disjoint Base62 prefix shards per region and lease 1M-ID blocks locally from regional ZooKeeper/etcd.",
+            "correct": true,
+            "feedback": "Correct! Disjoint regional prefix shards guarantee global uniqueness with zero cross-WAN coordination per write."
+          },
+          {
+            "id": "b",
+            "text": "Run a single PostgreSQL primary in US-East for all global writes.",
+            "correct": false,
+            "feedback": "A single primary forces 150ms+ WAN round-trips for EU and APAC writers."
+          },
+          {
+            "id": "c",
+            "text": "Use random 4-character strings without checking for collisions.",
+            "correct": false,
+            "feedback": "4-character random strings would collide constantly due to the birthday paradox."
+          },
+          {
+            "id": "d",
+            "text": "Disable writes in EU and APAC.",
+            "correct": false,
+            "feedback": "Multi-region write availability is a core requirement."
+          }
+        ],
+        "explanation": "Partitioning the key space by region (e.g., `[a-g]*`, `[h-n]*`, `[o-z]*`) lets each region generate unique slugs locally in <1ms."
+      },
+      {
+        "id": "kc-2",
+        "question": "A creator in London shortens a URL and immediately tests it from an Edge POP, hitting an EU replica before async geo-replication completes. How can the engine prevent a false 404?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Encode the origin region in the slug prefix and perform a single fallback lookup to the origin region on a cold miss.",
+            "correct": true,
+            "feedback": "Correct! Origin-encoded prefixes allow exact single-hop fallback during the ~1s replication window."
+          },
+          {
+            "id": "b",
+            "text": "Tell the user to wait 5 minutes before clicking their link.",
+            "correct": false,
+            "feedback": "Poor UX when immediate read-your-writes is expected."
+          },
+          {
+            "id": "c",
+            "text": "Force synchronous 3-continent Paxos on every click.",
+            "correct": false,
+            "feedback": "Synchronous cross-continent reads would destroy the <15ms redirect SLA."
+          },
+          {
+            "id": "d",
+            "text": "Return HTTP 301 to the homepage.",
+            "correct": false,
+            "feedback": "Redirecting to the wrong URL is a severe bug."
+          }
+        ],
+        "explanation": "Encoding the origin region in the slug prefix lets a cold miss check the origin region once before returning 404, bridging async replication lag."
+      },
+      {
+        "id": "kc-3",
+        "question": "Why should clickstream analytics events be emitted asynchronously to Kafka rather than written synchronously to ClickHouse during a 302 redirect?",
+        "options": [
+          {
+            "id": "a",
+            "text": "To keep redirect latency under 15ms and ensure analytics backpressure never causes 302 redirect outages.",
+            "correct": true,
+            "feedback": "Correct! Decoupling analytics via non-blocking Kafka batches protects the critical redirect path."
+          },
+          {
+            "id": "b",
+            "text": "Because ClickHouse cannot store timestamps.",
+            "correct": false,
+            "feedback": "ClickHouse handles timestamps natively; the reason is latency and fault isolation."
+          },
+          {
+            "id": "c",
+            "text": "Because 302 redirects do not carry HTTP headers.",
+            "correct": false,
+            "feedback": "302 requests carry standard headers like User-Agent and Referer."
+          },
+          {
+            "id": "d",
+            "text": "To bypass Bloom filter checks.",
+            "correct": false,
+            "feedback": "Bloom filters run before redirection."
+          }
+        ],
+        "explanation": "Users expect instant redirects. Offloading analytics to non-blocking Kafka batches isolates redirect availability from analytics load."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Design a global URL shortener like Bitly that handles 100,000 redirects per second across the world.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, serve redirects from Anycast Edge POPs with L1 LRU + regional Redis, coordinate writes via pre-allocated Base62 key-range shards, and replicate asynchronously across regions.",
+      "byteSummary": "At 100,000 clicks per second, speed comes from caching links as close to users as possible using Edge POPs and Redis. To create new links fast without regions clashing, each region gets its own starting letter range.\n\nClick tracking is sent in the background to Kafka so users get redirected in under 15 milliseconds."
+    },
+    "intermediate": {
+      "summary": "Architect 100K RPS Anycast L1/L2 caching, disjoint Base62 regional shards, active-active NoSQL, and Safe-Browsing checks.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, serve redirects from Anycast Edge POPs with L1 LRU + regional Redis, coordinate writes via pre-allocated Base62 key-range shards, and replicate asynchronously across regions.",
+      "byteSummary": "Anycast Edge POPs pair L1 in-memory LRU caches with regional Redis Clusters to serve 98% of 100K RPS reads locally in <15ms. Multi-region write coordinators lease disjoint Base62 prefix shards (`[a-g]*`, `[h-n]*`, `[o-z]*`) so regions write locally with zero WAN locks.\n\nActive-active Cassandra/DynamoDB replicates globally, with origin-encoded prefixes enabling single-hop fallback on fresh misses and Pub/Sub purges enforcing phishing takedowns in seconds."
+    },
+    "advanced": {
+      "summary": "Optimize edge-batched Kafka + Flink GDPR clickstreams, partition-key TTL compaction, and Bloom-filter 404 shielding.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, serve redirects from Anycast Edge POPs with L1 LRU + regional Redis, coordinate writes via pre-allocated Base62 key-range shards, and replicate asynchronously across regions.",
+      "byteSummary": "Edge POPs emit batched click events to Kafka, where Apache Flink filters bots, enriches MaxMind GeoIP, drops raw IPs for GDPR, and updates HyperLogLog unique counters in ClickHouse.\n\nPoint-lookup partitioning by `short_code` prevents Cassandra tombstone scan stalls during TTL compaction, while Edge Bloom filters and 410 Gone caching protect origins from invalid-code floods."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "prerequisites": [
+    {
+      "title": "Base62 URL Shortening & Edge Redirection",
+      "summary": "Base62 URL shortening maps 64-bit distributed counter IDs into compact 7-character alphanumeric codes (`62^7 = 3.52T` combinations), pairing collision-free writes with edge-cached HTTP 301/302 redirection."
+    }
+  ],
+  "simulation": {
+    "title": "Design a Global URL Redirection Engine (100K RPS) — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Client",
+        "role": "Redirect & Create"
+      },
+      {
+        "id": "cache",
+        "label": "Redis Cluster",
+        "role": "Hot Alias Lookup"
+      },
+      {
+        "id": "kgs",
+        "label": "Range Allocator",
+        "role": "Collision-Free Base62"
+      },
+      {
+        "id": "db",
+        "label": "Sharded URL DB",
+        "role": "Durable Mapping"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "cache",
+        "label": "GET /alias"
+      },
+      {
+        "from": "cache",
+        "to": "db",
+        "label": "miss fallback"
+      },
+      {
+        "from": "kgs",
+        "to": "db",
+        "label": "POST /shorten"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Traffic & 5-Year Storage Sizing",
+        "actionLabel": "GET /alias",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "cache"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "GET /alias",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Client sends work to Redis Cluster (Traffic & 5-Year Storage Sizing)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Anycast Edge POPs & L1/L2 Regional Caching",
+        "actionLabel": "miss fallback",
+        "status": "healthy",
+        "activeNodeIds": [
+          "cache",
+          "kgs"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "miss fallback",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Redis Cluster coordinates with Range Allocator while preserving the core invariant (Anycast Edge POPs & L1/L2 Regional Caching)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Multi-Region Write Coordinator & Key-Range Shards",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "kgs",
+          "db"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, Sharded URL DB absorbs pressure without cascading (Multi-Region Write Coordinator & Key-Range Shards)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "TTL Expiration Engine & Tombstone Compaction",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "cache",
+          "kgs",
+          "db"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (TTL Expiration Engine & Tombstone Compaction)."
+      }
+    ]
+  }
+}

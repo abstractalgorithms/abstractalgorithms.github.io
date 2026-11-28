@@ -1,0 +1,693 @@
+{
+  "slug": "search-ranking-ltr-architecture",
+  "title": "Multi-Stage Search & Learning-to-Rank (BM25 + LTR)",
+  "domain": "system-design",
+  "diagram": "diagram.png",
+  "spark": {
+    "summary": "Multi-stage search pairs fast inverted-index retrieval (BM25 + Roaring Bitmaps) over 100M+ documents with expensive Learning-to-Rank (GBDT/Neural) reranking on only the top ~200 candidates.",
+    "keyTakeaway": "If latency budgets leave no room for synchronous retries, scoring 100M documents with a neural/GBDT model blows past a 100ms latency budget; a funnel architecture (100M -> Top-1000/shard -> Top-200 -> Top-20) achieves both web-scale speed and ML relevance.",
+    "byteSummary": "Pure lexical BM25 finds documents containing query keywords in milliseconds, but it cannot tell an authoritative, high-CTR product or engineering doc from keyword-stuffed spam. Conversely, running a 500-feature GBDT or cross-encoder neural model across 100 million documents would take minutes per query.\n\nProduction search engines resolve this tension with a multi-stage ranking funnel. Stage 1 (L0 Retrieval) uses sharded inverted indexes with WAND/Block-Max WAND pruning and Roaring Bitmaps to return the Top-1,000 candidates per shard in <15ms.\n\nStage 2 merges shard results to the Top-200, hydrates real-time signals (CTR, recency, user affinity) from a low-latency Feature Store, and runs an L1/L2 Learning-to-Rank (LTR) model (LambdaMART GBDT / Neural reranker) to output the final Top-20 results within ~50ms."
+  },
+  "learningJourney": [
+    {
+      "id": "stage-1-bm25-limits",
+      "title": "Why Lexical BM25 Alone Fails Modern Search Relevance",
+      "level": "foundation",
+      "purpose": "Recognize the gap between term-frequency matching and user intent, freshness, and authority.",
+      "explanation": {
+        "foundation": "Think of **Why Lexical BM25 Alone Fails Modern Search Relevance** as the intuition layer for Multi-Stage Search & Learning-to-Rank (BM25 + LTR): Recognize the gap between term-frequency matching and user intent, freshness, and authority.",
+        "core": "BM25 scores documents purely on term frequency, inverse document frequency, and length normalization. It has no awareness of document quality, click-through rate, recency, personalization, or synonym semantics—meaning a stale 2014 page with repeated keywords can outrank today's canonical guide.",
+        "deepDive": "Under heavy load or partial failure, why lexical bm25 alone fails modern search relevance becomes a critical lever for predictable latency and correctness. Production search cascade: L0 Block-Max WAND, L1 GBDT, L2 quantized cross-encoder + MMR diversity, and IPS-debiased interleaving."
+      },
+      "codeExample": "def bm25_score(tf: int, df: int, doc_len: int, avg_dl: float, N: int, k1: float = 1.5, b: float = 0.75) -> float:\n    import math\n    idf = math.log((N - df + 0.5) / (df + 0.5) + 1.0)\n    denom = tf + k1 * (1.0 - b + b * (doc_len / avg_dl))\n    return idf * (tf * (k1 + 1.0)) / denom",
+      "sectionDiagram": {
+        "kind": "comparison",
+        "eyebrow": "FOUNDATION",
+        "title": "Lexical BM25 vs. Behavioral Signals",
+        "nodes": [
+          {
+            "id": "bm25",
+            "label": "BM25 Term Score",
+            "sub": "TF-IDF + length norm",
+            "role": "compute"
+          },
+          {
+            "id": "blind",
+            "label": "Missing Signals",
+            "sub": "No CTR, recency, or authority",
+            "role": "risk"
+          },
+          {
+            "id": "ltr",
+            "label": "LTR Multi-Signal",
+            "sub": "Combines text + behavior",
+            "role": "output"
+          }
+        ],
+        "edges": [
+          {
+            "from": "bm25",
+            "to": "blind",
+            "label": "ignores user engagement"
+          },
+          {
+            "from": "blind",
+            "to": "ltr",
+            "label": "motivates ML reranking"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Term Saturation",
+            "detail": "BM25 k1=1.5 dampens keyword stuffing but cannot judge authority."
+          },
+          {
+            "label": "Zero Context",
+            "detail": "BM25 treats a 10-year-old doc identically to yesterday's release."
+          }
+        ],
+        "summary": "BM25 excels at fast lexical recall but lacks behavioral, freshness, and personalization signals.",
+        "caption": "BM25 scores keyword overlap cleanly but misses CTR, recency, and authority signals."
+      }
+    },
+    {
+      "id": "stage-2-inverted-wand",
+      "title": "L0 Retrieval: Sharded Inverted Index & Block-Max WAND",
+      "level": "foundation",
+      "purpose": "Retrieve the Top-1,000 candidates per shard in <15ms without scanning entire posting lists.",
+      "explanation": {
+        "foundation": "Think of **L0 Retrieval: Sharded Inverted Index & Block-Max WAND** as the intuition layer for Multi-Stage Search & Learning-to-Rank (BM25 + LTR): Retrieve the Top-1,000 candidates per shard in <15ms without scanning entire posting lists.",
+        "core": "For common terms like `'python'` or `'system'`, posting lists can hold 10M+ document IDs. Block-Max WAND (Weak AND) stores the maximum BM25 score per 128-doc block in skip pointers, allowing the scorer to jump over entire blocks whose upper-bound score cannot beat the current Top-1,000 heap threshold.",
+        "deepDive": "Under heavy load or partial failure, l0 retrieval: sharded inverted index & block-max wand becomes a critical lever for predictable latency and correctness. Production search cascade: L0 Block-Max WAND, L1 GBDT, L2 quantized cross-encoder + MMR diversity, and IPS-debiased interleaving."
+      },
+      "codeExample": "def should_skip_block(block_max_score: float, other_terms_upper: float, kth_heap_threshold: float) -> bool:\n    return (block_max_score + other_terms_upper) <= kth_heap_threshold",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "FOUNDATION",
+        "title": "Block-Max WAND Dynamic Pruning",
+        "nodes": [
+          {
+            "id": "post",
+            "label": "Posting Lists + Roaring",
+            "sub": "10M+ docIDs + ACL filters",
+            "role": "ingress"
+          },
+          {
+            "id": "wand",
+            "label": "Block-Max WAND",
+            "sub": "Skips low-upper-bound blocks",
+            "role": "compute"
+          },
+          {
+            "id": "heap",
+            "label": "Top-1000 Min-Heap",
+            "sub": "Emits candidates in <15ms",
+            "role": "output"
+          }
+        ],
+        "edges": [
+          {
+            "from": "post",
+            "to": "wand",
+            "label": "reads block max-score metadata"
+          },
+          {
+            "from": "wand",
+            "to": "heap",
+            "label": "prunes >90% of postings"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Roaring Bitmaps",
+            "detail": "Compressed bitsets filter `in_stock=true` or tenant ACLs in microseconds."
+          },
+          {
+            "label": "5-10x Speedup",
+            "detail": "Block-Max WAND skips hopeless blocks without decompressing docIDs."
+          }
+        ],
+        "summary": "Block-Max WAND and Roaring Bitmaps prune millions of postings to emit Top-1,000 candidates fast.",
+        "caption": "Block-Max WAND skips entire posting blocks that cannot enter the Top-1,000 min-heap."
+      },
+      "decisionFramework": {
+        "problem": "How to implement Multi-Stage Search & Learning-to-Rank (BM25 + LTR) without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "If latency budgets leave no room for synchronous retries, scoring 100M documents with a neural/GBDT model blows past a 100ms latency budget; a funnel architecture (100M -> Top-1000/shard -> Top-200 -> Top-20) achieves both web-scale speed and ML relevance.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Multi-Stage Search & Learning-to-Rank (BM25 + LTR) experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-3-scatter-merge",
+      "title": "Coordinator Scatter-Gather & Deduplication (Top-200)",
+      "level": "intermediate",
+      "purpose": "Merge candidate lists from N shards cleanly and guard against tail-latency stragglers.",
+      "explanation": {
+        "foundation": "Think of **Coordinator Scatter-Gather & Deduplication (Top-200)** as the intuition layer for Multi-Stage Search & Learning-to-Rank (BM25 + LTR): Merge candidate lists from N shards cleanly and guard against tail-latency stragglers.",
+        "core": "The Search Coordinator scatters the rewritten query to all index shards in parallel with a strict 25ms deadline. Using hedged requests (firing a backup replica read if a shard hasn't responded in 12ms) and global IDF statistics, it merges shard Top-1,000 lists into a unified Top-200 candidate set.",
+        "deepDive": "Under heavy load or partial failure, coordinator scatter-gather & deduplication (top-200) becomes a critical lever for predictable latency and correctness. Production search cascade: L0 Block-Max WAND, L1 GBDT, L2 quantized cross-encoder + MMR diversity, and IPS-debiased interleaving."
+      },
+      "codeExample": "def merge_shard_candidates(shard_results: list[list[tuple]], top_k: int = 200) -> list[tuple]:\n    merged = []\n    for res in shard_results:\n        merged.extend(res)\n    merged.sort(key=lambda x: x[1], reverse=True)\n    return merged[:top_k]",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "INTERMEDIATE",
+        "title": "Hedged Scatter-Gather Merge",
+        "nodes": [
+          {
+            "id": "coord",
+            "label": "Search Coordinator",
+            "sub": "25ms shard SLA + hedging",
+            "role": "compute"
+          },
+          {
+            "id": "shards",
+            "label": "Index Shards 1..N",
+            "sub": "Each returns Top-1000",
+            "role": "storage"
+          },
+          {
+            "id": "top200",
+            "label": "Merged Top-200",
+            "sub": "Deduplicated candidate pool",
+            "role": "output"
+          }
+        ],
+        "edges": [
+          {
+            "from": "coord",
+            "to": "shards",
+            "label": "parallel scatter with 12ms hedge"
+          },
+          {
+            "from": "shards",
+            "to": "top200",
+            "label": "gathers & truncates to 200"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Tail Latency",
+            "detail": "A single slow GC-pausing shard stalls the whole query without hedging."
+          },
+          {
+            "label": "Global IDF",
+            "detail": "Synchronized corpus IDF keeps BM25 scores comparable across shards."
+          }
+        ],
+        "summary": "Hedged scatter-gather keeps shard merge latency bounded even when one replica hits GC.",
+        "caption": "Coordinator hedging and global IDF merge shard candidates into a clean Top-200 pool."
+      }
+    },
+    {
+      "id": "stage-4-feature-hydration",
+      "title": "Low-Latency Feature Hydration from the Feature Store",
+      "level": "intermediate",
+      "purpose": "Fetch dynamic document and user features for the Top-200 candidates in a single batch call.",
+      "explanation": {
+        "foundation": "Think of **Low-Latency Feature Hydration from the Feature Store** as the intuition layer for Multi-Stage Search & Learning-to-Rank (BM25 + LTR): Fetch dynamic document and user features for the Top-200 candidates in a single batch call.",
+        "core": "Static inverted indexes shouldn't be re-indexed every time a product's 1-hour CTR or inventory count changes. Instead, the Reranker issues a single `MGET` batch call to a Redis/RocksDB Feature Store to hydrate 50–200 real-time features (`ctr_7d`, `freshness_hours`, `user_brand_affinity`) for the 200 candidate IDs in <5ms.",
+        "deepDive": "Under heavy load or partial failure, low-latency feature hydration from the feature store becomes a critical lever for predictable latency and correctness. Production search cascade: L0 Block-Max WAND, L1 GBDT, L2 quantized cross-encoder + MMR diversity, and IPS-debiased interleaving."
+      },
+      "codeExample": "def hydrate_features(feature_store, doc_ids: list[str], user_ctx: dict) -> list[dict]:\n    doc_feats = feature_store.mget_docs(doc_ids)\n    return [{**doc_feats.get(did, {}), 'user_tier': user_ctx.get('tier', 0)} for did in doc_ids]",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "INTERMEDIATE",
+        "title": "Batch Feature Store Hydration",
+        "nodes": [
+          {
+            "id": "ids",
+            "label": "Top-200 Doc IDs",
+            "sub": "From Coordinator merge",
+            "role": "ingress"
+          },
+          {
+            "id": "fs",
+            "label": "Redis Feature Store",
+            "sub": "Single MGET batch (<5ms)",
+            "role": "storage"
+          },
+          {
+            "id": "vec",
+            "label": "Feature Matrix",
+            "sub": "200 rows x 100 features",
+            "role": "output"
+          }
+        ],
+        "edges": [
+          {
+            "from": "ids",
+            "to": "fs",
+            "label": "batches MGET for 200 IDs"
+          },
+          {
+            "from": "fs",
+            "to": "vec",
+            "label": "assembles LTR input matrix"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Zero Index Churn",
+            "detail": "Dynamic CTR and popularity update in Redis without touching Lucene segments."
+          },
+          {
+            "label": "Graceful Default",
+            "detail": "Missing feature keys fall back to neutral imputed defaults."
+          }
+        ],
+        "summary": "Batch `MGET` feature hydration decouples fast-changing behavioral signals from static inverted indexes.",
+        "caption": "A single batch lookup hydrates real-time CTR and user features for the Top-200 candidates."
+      }
+    },
+    {
+      "id": "stage-5-ltr-models",
+      "title": "L1/L2 Learning-to-Rank: Pointwise, Pairwise & Listwise (LambdaMART)",
+      "level": "intermediate",
+      "purpose": "Train GBDT/LambdaMART models directly on NDCG ranking order rather than raw click regression.",
+      "explanation": {
+        "foundation": "Think of **L1/L2 Learning-to-Rank: Pointwise, Pairwise & Listwise (LambdaMART)** as the intuition layer for Multi-Stage Search & Learning-to-Rank (BM25 + LTR): Train GBDT/LambdaMART models directly on NDCG ranking order rather than raw click regression.",
+        "core": "Pointwise models predict click probability independently per document. Pairwise (RankNet) and Listwise (LambdaMART / LambdaRank) models directly optimize ranking metrics like `NDCG@10` by weighting gradient updates according to how much swapping two documents changes NDCG.",
+        "deepDive": "Under heavy load or partial failure, l1/l2 learning-to-rank: pointwise, pairwise & listwise (lambdamart) becomes a critical lever for predictable latency and correctness. Production search cascade: L0 Block-Max WAND, L1 GBDT, L2 quantized cross-encoder + MMR diversity, and IPS-debiased interleaving."
+      },
+      "codeExample": "def dcg_at_k(relevances: list[float], k: int = 10) -> float:\n    import math\n    return sum((2 ** rel - 1) / math.log2(idx + 2) for idx, rel in enumerate(relevances[:k]))",
+      "sectionDiagram": {
+        "kind": "comparison",
+        "eyebrow": "INTERMEDIATE",
+        "title": "Pointwise vs. Pairwise vs. Listwise LTR",
+        "nodes": [
+          {
+            "id": "pt",
+            "label": "Pointwise",
+            "sub": "Predicts single-doc score",
+            "role": "compute"
+          },
+          {
+            "id": "pw",
+            "label": "Pairwise",
+            "sub": "Optimizes doc A > doc B",
+            "role": "compute"
+          },
+          {
+            "id": "lw",
+            "label": "Listwise (LambdaMART)",
+            "sub": "Directly optimizes NDCG@10",
+            "role": "output"
+          }
+        ],
+        "edges": [
+          {
+            "from": "pt",
+            "to": "pw",
+            "label": "improves relative ordering"
+          },
+          {
+            "from": "pw",
+            "to": "lw",
+            "label": "weights swaps by NDCG gain"
+          }
+        ],
+        "cards": [
+          {
+            "label": "LambdaMART Standard",
+            "detail": "GBDTs (LightGBM/XGBoost) score 200 x 100 matrices in ~5-10ms on CPU."
+          },
+          {
+            "label": "Position Bias",
+            "detail": "Training data must debias higher click rates at position #1 vs #8."
+          }
+        ],
+        "summary": "Listwise GBDT models like LambdaMART directly optimize `NDCG@10` on tabular search features.",
+        "caption": "LambdaMART weights pairwise gradients by NDCG gain to optimize top-of-page ranking."
+      }
+    },
+    {
+      "id": "stage-6-neural-cascade",
+      "title": "L2 Neural Cross-Encoder Cascade & Diversity Reranking",
+      "level": "advanced",
+      "purpose": "Apply semantic cross-encoders and MMR diversity to the Top-30 without blowing the latency budget.",
+      "explanation": {
+        "foundation": "Think of **L2 Neural Cross-Encoder Cascade & Diversity Reranking** as the intuition layer for Multi-Stage Search & Learning-to-Rank (BM25 + LTR): Apply semantic cross-encoders and MMR diversity to the Top-30 without blowing the latency budget.",
+        "core": "Even a fast GBDT struggles with subtle semantic nuance (`'apple watch band'` vs `'watch apple keynote'`). An L2 cascade passes only the Top-30 candidates from L1 GBDT into a quantized ONNX MiniLM cross-encoder on GPU/AVX-512, followed by Maximal Marginal Relevance (MMR) to prevent 5 near-duplicate results at the top.",
+        "deepDive": "Under heavy load or partial failure, l2 neural cross-encoder cascade & diversity reranking becomes a critical lever for predictable latency and correctness. Production search cascade: L0 Block-Max WAND, L1 GBDT, L2 quantized cross-encoder + MMR diversity, and IPS-debiased interleaving."
+      },
+      "codeExample": "def mmr_diversify(candidates: list[dict], sim_fn, lambda_rel: float = 0.7, top_n: int = 20) -> list[dict]:\n    selected, pool = [], list(candidates)\n    while pool and len(selected) < top_n:\n        best = max(pool, key=lambda c: lambda_rel * c['score'] - (1 - lambda_rel) * max((sim_fn(c, s) for s in selected), default=0.0))\n        selected.append(best); pool.remove(best)\n    return selected",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "ADVANCED",
+        "title": "L2 Cross-Encoder + MMR Diversity",
+        "nodes": [
+          {
+            "id": "l1",
+            "label": "L1 GBDT (Top-200 -> 30)",
+            "sub": "~8ms CPU scoring",
+            "role": "compute"
+          },
+          {
+            "id": "l2",
+            "label": "L2 Cross-Encoder",
+            "sub": "Quantized ONNX on Top-30",
+            "role": "compute"
+          },
+          {
+            "id": "mmr",
+            "label": "MMR Diversity Gate",
+            "sub": "Final Top-20 SERP",
+            "role": "output"
+          }
+        ],
+        "edges": [
+          {
+            "from": "l1",
+            "to": "l2",
+            "label": "promotes Top-30 to neural"
+          },
+          {
+            "from": "l2",
+            "to": "mmr",
+            "label": "deduplicates near-identical hits"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Cascade Budget",
+            "detail": "Running neural models on 30 docs instead of 200 keeps latency <20ms."
+          },
+          {
+            "label": "SERP Diversity",
+            "detail": "MMR ensures varied results rather than 5 clones from one domain."
+          }
+        ],
+        "summary": "An L1 GBDT -> L2 Cross-Encoder -> MMR cascade balances semantic precision, diversity, and speed.",
+        "caption": "Restricting neural cross-encoders to the L1 Top-30 keeps total search latency under 50ms."
+      }
+    },
+    {
+      "id": "stage-7-online-evaluation",
+      "title": "Position-Debiased Click Logs & Interleaving Online Tests",
+      "level": "advanced",
+      "purpose": "Measure real ranking improvements safely using Team-Draft Interleaving and counterfactual propensity weighting.",
+      "explanation": {
+        "foundation": "Think of **Position-Debiased Click Logs & Interleaving Online Tests** as the intuition layer for Multi-Stage Search & Learning-to-Rank (BM25 + LTR): Measure real ranking improvements safely using Team-Draft Interleaving and counterfactual propensity weighting.",
+        "core": "Users click position #1 far more often than position #5 even when #5 is more relevant (position bias). Logging `(query_id, doc_id, position, propensity_weight, click)` enables Inverse Propensity Scoring (IPS) offline, while Team-Draft Interleaving blends Model A and Model B results in one SERP to detect wins with 10x less traffic than A/B tests.",
+        "deepDive": "Under heavy load or partial failure, position-debiased click logs & interleaving online tests becomes a critical lever for predictable latency and correctness. Production search cascade: L0 Block-Max WAND, L1 GBDT, L2 quantized cross-encoder + MMR diversity, and IPS-debiased interleaving."
+      },
+      "codeExample": "def ips_weighted_ctr(clicks: list[tuple[int, float]]) -> float:\n    # Each item is (clicked 0|1, position_propensity)\n    return sum(c / max(0.05, p) for c, p in clicks) / max(1, len(clicks))",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "ADVANCED",
+        "title": "Debiased Telemetry & Interleaving",
+        "nodes": [
+          {
+            "id": "serp",
+            "label": "Interleaved SERP",
+            "sub": "Blends Model A & B",
+            "role": "ingress"
+          },
+          {
+            "id": "ips",
+            "label": "IPS Propensity Log",
+            "sub": "Corrects position #1 bias",
+            "role": "compute"
+          },
+          {
+            "id": "train",
+            "label": "Weekly LTR Retrain",
+            "sub": "Publishes new LambdaMART",
+            "role": "output"
+          }
+        ],
+        "edges": [
+          {
+            "from": "serp",
+            "to": "ips",
+            "label": "logs debiased click rewards"
+          },
+          {
+            "from": "ips",
+            "to": "train",
+            "label": "feeds fresh training labels"
+          }
+        ],
+        "cards": [
+          {
+            "label": "10x Sensitivity",
+            "detail": "Interleaving pairs A and B on the same query, cutting noise dramatically."
+          },
+          {
+            "label": "Guardrail Metrics",
+            "detail": "Always monitor zero-result rate and p99 latency alongside CTR."
+          }
+        ],
+        "summary": "Position-debiased IPS logs and Team-Draft Interleaving prevent feedback loops in LTR retraining.",
+        "caption": "Inverse Propensity Scoring and interleaving turn noisy click logs into unbiased LTR training data."
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-1",
+        "question": "Why do production search engines restrict GBDT and Neural LTR models to the Top-200/Top-30 candidates instead of scoring all 100M documents?",
+        "options": [
+          {
+            "id": "a",
+            "text": "GBDT models cannot score more than 200 rows.",
+            "correct": false,
+            "feedback": "Models have no 200-row limit; the constraint is latency."
+          },
+          {
+            "id": "b",
+            "text": "Hydrating 100+ features and running ML inference on 100M documents would violate sub-100ms query latency budgets.",
+            "correct": true,
+            "feedback": "Correct! Fast inverted-index pruning (Block-Max WAND) narrows 100M docs to ~200 candidates in <15ms so ML can score them in ~20ms."
+          },
+          {
+            "id": "c",
+            "text": "Inverted indexes cannot return more than 200 results.",
+            "correct": false,
+            "feedback": "Inverted indexes can return thousands of candidates; the funnel intentionally truncates for L1/L2 cost."
+          },
+          {
+            "id": "d",
+            "text": "Roaring Bitmaps delete documents after rank 200.",
+            "correct": false,
+            "feedback": "Roaring Bitmaps are used for fast set filtering."
+          }
+        ],
+        "explanation": "The multi-stage funnel trades negligible recall loss for orders-of-magnitude latency savings."
+      },
+      {
+        "id": "kc-2",
+        "question": "What problem does Block-Max WAND solve during L0 inverted-index retrieval?",
+        "options": [
+          {
+            "id": "a",
+            "text": "It translates queries into multiple languages.",
+            "correct": false,
+            "feedback": "Query translation happens in query understanding, not posting-list traversal."
+          },
+          {
+            "id": "b",
+            "text": "It skips entire blocks of posting lists whose upper-bound BM25 score cannot beat the current Top-K heap threshold.",
+            "correct": true,
+            "feedback": "Correct! Block-Max WAND avoids decompressing and scoring >90% of irrelevant postings."
+          },
+          {
+            "id": "c",
+            "text": "It trains the LambdaMART model online.",
+            "correct": false,
+            "feedback": "LambdaMART is trained offline on logged features and clicks."
+          },
+          {
+            "id": "d",
+            "text": "It replaces Redis Feature Stores.",
+            "correct": false,
+            "feedback": "Block-Max WAND operates inside the inverted index."
+          }
+        ],
+        "explanation": "Block-Max WAND uses per-block maximum score metadata to prune uncompetitive document blocks."
+      },
+      {
+        "id": "kc-3",
+        "question": "Why is Inverse Propensity Scoring (IPS) used when training LTR models on historical click logs?",
+        "options": [
+          {
+            "id": "a",
+            "text": "To compress click logs into Parquet.",
+            "correct": false,
+            "feedback": "IPS is a statistical debiasing technique, not a compression format."
+          },
+          {
+            "id": "b",
+            "text": "To correct for position bias, since users disproportionately click top-ranked items regardless of true relevance.",
+            "correct": true,
+            "feedback": "Correct! Weighting clicks by `1 / propensity(position)` prevents the model from merely memorizing old rankings."
+          },
+          {
+            "id": "c",
+            "text": "To remove all documents with zero clicks from the index.",
+            "correct": false,
+            "feedback": "Zero-click documents remain searchable."
+          },
+          {
+            "id": "d",
+            "text": "To speed up Elasticsearch shard merges.",
+            "correct": false,
+            "feedback": "IPS is used in offline ML training."
+          }
+        ],
+        "explanation": "Debiasing position effects stops LTR feedback loops from reinforcing suboptimal historical rankings."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Modern search works like a funnel: fast keyword matching narrows millions of pages to 200, then an AI model ranks the best 20.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, scoring 100M documents with a neural/GBDT model blows past a 100ms latency budget; a funnel architecture (100M -> Top-1000/shard -> Top-200 -> Top-20) achieves both web-scale speed and ML relevance.",
+      "byteSummary": "Searching 100 million pages with a complex AI model for every query would be way too slow. Instead, an inverted index grabs the top 200 keyword matches in 15 milliseconds, and a Learning-to-Rank model sorts those 200 using clicks, freshness, and relevance."
+    },
+    "intermediate": {
+      "summary": "Block-Max WAND + Roaring Bitmap L0 retrieval -> hedged shard merge -> Redis Feature Store hydration -> LambdaMART L1 reranking.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, scoring 100M documents with a neural/GBDT model blows past a 100ms latency budget; a funnel architecture (100M -> Top-1000/shard -> Top-200 -> Top-20) achieves both web-scale speed and ML relevance.",
+      "byteSummary": "Index shards prune postings with Block-Max WAND to emit Top-1000 candidates. A hedged Coordinator merges to Top-200, hydrates real-time features via Redis `MGET`, and scores with LambdaMART GBDT to optimize `NDCG@10`."
+    },
+    "advanced": {
+      "summary": "Production search cascade: L0 Block-Max WAND, L1 GBDT, L2 quantized cross-encoder + MMR diversity, and IPS-debiased interleaving.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, scoring 100M documents with a neural/GBDT model blows past a 100ms latency budget; a funnel architecture (100M -> Top-1000/shard -> Top-200 -> Top-20) achieves both web-scale speed and ML relevance.",
+      "byteSummary": "Adding an L2 quantized MiniLM cross-encoder and MMR diversity gate on the L1 Top-30 captures deep semantic intent under 50ms, while Team-Draft Interleaving and Inverse Propensity Scoring continuously refine model weights."
+    }
+  },
+  "pedagogicalFramework": "PRIME",
+  "simulation": {
+    "title": "Multi-Stage Search & Learning-to-Rank (BM25 + LTR) — Interactive Execution Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Workload & Budget"
+      },
+      {
+        "id": "router",
+        "label": "Gateway / Router",
+        "role": "Admission & Dispatch"
+      },
+      {
+        "id": "engine",
+        "label": "Core Engine",
+        "role": "Primary Execution"
+      },
+      {
+        "id": "replica",
+        "label": "Replica / Fallback",
+        "role": "Durability & Recovery"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "router",
+        "label": "request"
+      },
+      {
+        "from": "router",
+        "to": "engine",
+        "label": "route"
+      },
+      {
+        "from": "engine",
+        "to": "replica",
+        "label": "sync / fallback"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why Lexical BM25 Alone Fails Modern Search Relevance",
+        "actionLabel": "Dispatch nominal request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "router"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "Ingress",
+          "p99_ms": 8,
+          "error_rate": "0.0%"
+        },
+        "explanation": "Caller sends work into the gateway with explicit timeout and concurrency bounds (Why Lexical BM25 Alone Fails Modern Search Relevance)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "L0 Retrieval: Sharded Inverted Index & Block-Max WAND",
+        "actionLabel": "Execute core invariant",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "Core Path",
+          "p99_ms": 18,
+          "in_flight": 124
+        },
+        "explanation": "The core engine processes the hot path while keeping state transitions deterministic (L0 Retrieval: Sharded Inverted Index & Block-Max WAND)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Coordinator Scatter-Gather & Deduplication (Top-200)",
+        "actionLabel": "Detect skew or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Degraded",
+          "p99_ms": 64,
+          "retries_capped": "true"
+        },
+        "explanation": "Under load or replica lag, bounded backoff and isolation prevent cascading saturation (Coordinator Scatter-Gather & Deduplication (Top-200))."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Position-Debiased Click Logs & Interleaving Online Tests",
+        "actionLabel": "Converge & restore SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 11,
+          "drift": 0
+        },
+        "explanation": "State converges cleanly and telemetry confirms the system returned within its SLO envelope (Position-Debiased Click Logs & Interleaving Online Tests)."
+      }
+    ]
+  }
+}

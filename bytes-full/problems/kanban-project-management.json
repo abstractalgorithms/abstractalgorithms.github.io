@@ -1,0 +1,730 @@
+{
+  "slug": "kanban-project-management",
+  "title": "Design an Enterprise Project Management & Kanban System (Jira Scale)",
+  "domain": "system-design",
+  "diagram": "diagram.png",
+  "spark": {
+    "summary": "Design a multi-tenant Jira-scale Kanban & issue-tracking platform supporting real-time board collaboration, custom workflow state machines, and JQL search.",
+    "keyTakeaway": "If latency budgets leave no room for synchronous retries, separate transactional issue writes (tenant-sharded PostgreSQL + Lexorank + optimistic locking) from real-time board fan-out (Redis Pub/Sub + WebSockets) and async JQL indexing (CDC Outbox -> Elasticsearch).",
+    "byteSummary": "An enterprise project management platform must handle 100k+ concurrent organizations, custom per-project workflow state machines, instant drag-and-drop Kanban reordering, and complex JQL search queries without cross-tenant noisy neighbors.\n\nThe write path routes through an API Gateway to a Workflow & Lexorank Ordering Service backed by PostgreSQL sharded by `tenant_id`. Every issue mutation validates allowed status transitions against a cached workflow DAG and uses optimistic locking (`version`) plus Lexorank to keep drag-and-drop writes O(1).\n\nReal-time board updates fan out over Redis Pub/Sub to WebSocket gateways scoped by `board_id`, while a Transactional Outbox + Debezium CDC pipeline asynchronously indexes custom fields into Elasticsearch for sub-100ms JQL filtering."
+  },
+  "learningJourney": [
+    {
+      "id": "stage-1-scale-isolation",
+      "title": "Multi-Tenant Sharding & Noisy-Neighbor Isolation",
+      "level": "foundation",
+      "purpose": "Partition issue and board data by `tenant_id` so large enterprise orgs never degrade smaller tenants.",
+      "explanation": {
+        "foundation": "Think of **Multi-Tenant Sharding & Noisy-Neighbor Isolation** as the intuition layer for Design an Enterprise Project Management & Kanban System (Jira Scale): Partition issue and board data by `tenant_id` so large enterprise orgs never degrade smaller tenants.",
+        "core": "In a shared database, a single enterprise tenant running bulk CSV imports or massive JQL exports can saturate connection pools and IOPS. Sharding PostgreSQL by `tenant_id` (consistent hashing across logical shards) keeps every board query, sprint rollup, and Lexorank rebalance local to a single shard without distributed joins.",
+        "deepDive": "Under heavy load or partial failure, multi-tenant sharding & noisy-neighbor isolation becomes a critical lever for predictable latency and correctness. Enterprise Jira design: consistent-hash tenant sharding, partial B-tree keyset pagination, 3-bucket Lexorank, and CDC outbox."
+      },
+      "codeExample": "def route_shard(tenant_id: str, num_shards: int = 64) -> int:\n    import hashlib\n    digest = int(hashlib.sha256(tenant_id.encode()).hexdigest(), 16)\n    return digest % num_shards",
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "FOUNDATION",
+        "title": "Tenant-Sharded Data Plane",
+        "cards": [
+          {
+            "label": "Single-Shard Joins",
+            "detail": "All issues, sprints, and comments for a tenant live on one shard."
+          },
+          {
+            "label": "Bulkhead Pool",
+            "detail": "Per-tenant rate limits cap bulk import concurrency."
+          }
+        ],
+        "summary": "Sharding by `tenant_id` eliminates cross-shard joins and isolates noisy-neighbor workloads.",
+        "caption": "Consistent hashing on `tenant_id` keeps all project queries local to a single PostgreSQL shard.",
+        "graphNodes": [
+          {
+            "id": "gw",
+            "label": "API Gateway",
+            "role": "ingress",
+            "col": 0,
+            "row": 0,
+            "tone": "primary"
+          },
+          {
+            "id": "router",
+            "label": "Shard Router",
+            "role": "compute",
+            "col": 1,
+            "row": 0,
+            "tone": "tint"
+          },
+          {
+            "id": "pg",
+            "label": "PostgreSQL Shards",
+            "role": "storage",
+            "col": 2,
+            "row": 0,
+            "tone": "tint"
+          }
+        ],
+        "graphEdges": [
+          {
+            "from": "gw",
+            "to": "router",
+            "label": "forwards authenticated request",
+            "style": "solid",
+            "tone": "green"
+          },
+          {
+            "from": "router",
+            "to": "pg",
+            "label": "routes to single shard",
+            "style": "solid",
+            "tone": "green"
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-2-workflow-dag",
+      "title": "Custom Workflow State Machine & Guard Validation",
+      "level": "foundation",
+      "purpose": "Validate configurable status transitions, role permissions, and required-field validators before persisting.",
+      "explanation": {
+        "foundation": "Think of **Custom Workflow State Machine & Guard Validation** as the intuition layer for Design an Enterprise Project Management & Kanban System (Jira Scale): Validate configurable status transitions, role permissions, and required-field validators before persisting.",
+        "core": "Unlike fixed-status apps, Jira projects define custom workflows (e.g., `In Review -> QA -> Done` with a mandatory `reviewer_id` guard). Caching compiled workflow DAGs in Redis/local memory lets the Issue Service validate transitions in <1ms before opening a database transaction.",
+        "deepDive": "Under heavy load or partial failure, custom workflow state machine & guard validation becomes a critical lever for predictable latency and correctness. Enterprise Jira design: consistent-hash tenant sharding, partial B-tree keyset pagination, 3-bucket Lexorank, and CDC outbox."
+      },
+      "codeExample": "def validate_transition(workflow_dag: dict, current: str, target: str, payload: dict) -> None:\n    allowed = workflow_dag.get(current, {})\n    if target not in allowed:\n        raise PermissionError(f'Transition {current} -> {target} not permitted')\n    for req_field in allowed[target].get('required_fields', []):\n        if not payload.get(req_field):\n            raise ValueError(f'Missing required field: {req_field}')",
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "FOUNDATION",
+        "title": "Compiled Workflow DAG Validation",
+        "cards": [
+          {
+            "label": "L1 Cache",
+            "detail": "Workflow definitions change rarely and cache cleanly with versioned keys."
+          },
+          {
+            "label": "Fail-Fast",
+            "detail": "Invalid transitions are rejected before acquiring DB row locks."
+          }
+        ],
+        "summary": "In-memory workflow DAGs enforce per-project transition rules before touching PostgreSQL.",
+        "caption": "Validating workflow transitions and required fields in memory avoids wasted DB transactions.",
+        "states": [
+          {
+            "id": "cache",
+            "label": "Workflow DAG Cache",
+            "sublabel": "Redis + L1 in-memory",
+            "tone": "blue"
+          },
+          {
+            "id": "guard",
+            "label": "Transition Guard",
+            "sublabel": "Checks roles & required fields",
+            "tone": "blue"
+          },
+          {
+            "id": "tx",
+            "label": "Issue Mutation",
+            "sublabel": "Commits new status",
+            "tone": "blue"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "cache",
+            "to": "guard",
+            "label": "supplies compiled transition rules"
+          },
+          {
+            "from": "guard",
+            "to": "tx",
+            "label": "permits valid transition"
+          }
+        ]
+      },
+      "decisionFramework": {
+        "problem": "How to implement Design an Enterprise Project Management & Kanban System (Jira Scale) without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "If latency budgets leave no room for synchronous retries, separate transactional issue writes (tenant-sharded PostgreSQL + Lexorank + optimistic locking) from real-time board fan-out (Redis Pub/Sub + WebSockets) and async JQL indexing (CDC Outbox -> Elasticsearch).",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Design an Enterprise Project Management & Kanban System (Jira Scale) experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-3-lexorank-board",
+      "title": "O(1) Kanban Reordering with Lexorank & CAS",
+      "level": "intermediate",
+      "purpose": "Apply Lexorank midpoint calculation and optimistic version checks to handle concurrent board drags.",
+      "explanation": {
+        "foundation": "When a user drags issue `ENG-42` between two cards in the `In Progress` column, the service validates the workflow transition, computes the Lexorank midpoint, and executes an optimistic `UPDATE ...",
+        "core": "WHERE version = expected_version`.",
+        "deepDive": "On a `UNIQUE (board_id, rank)` collision, it retries up to 4 times with jitter."
+      },
+      "codeExample": "def reorder_issue(pg, board_id, issue_id, target_status, left_rank, right_rank, version):\n    new_rank = lexo_midpoint(left_rank, right_rank)\n    rows = pg.execute(\n        'UPDATE issues SET status=%s, rank=%s, version=version+1 '\n        'WHERE id=%s AND board_id=%s AND version=%s RETURNING version',\n        (target_status, new_rank, issue_id, board_id, version)\n    )\n    if not rows:\n        raise ConflictError('Stale issue version; refresh board state')\n    return new_rank, rows[0]['version']",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "INTERMEDIATE",
+        "title": "Optimistic Lexorank Reorder",
+        "nodes": [
+          {
+            "id": "drag",
+            "label": "Board Drag Payload",
+            "sub": "issue_id + left/right + ver",
+            "role": "ingress"
+          },
+          {
+            "id": "lexo",
+            "label": "Lexorank Midpoint",
+            "sub": "Computes 0|i0000b:",
+            "role": "compute"
+          },
+          {
+            "id": "cas",
+            "label": "PostgreSQL CAS",
+            "sub": "Checks version & UNIQUE rank",
+            "role": "storage"
+          }
+        ],
+        "edges": [
+          {
+            "from": "drag",
+            "to": "lexo",
+            "label": "passes neighbor ranks"
+          },
+          {
+            "from": "lexo",
+            "to": "cas",
+            "label": "executes single-row update"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Optimistic Concurrency",
+            "detail": "Stale clients get HTTP 409 Conflict instead of overwriting edits."
+          },
+          {
+            "label": "Zero Range Locks",
+            "detail": "Only 1 issue row is locked per drag-and-drop."
+          }
+        ],
+        "summary": "Lexorank + optimistic `version` CAS keeps board reordering fast and conflict-safe.",
+        "caption": "Single-row CAS updates combine workflow status changes and Lexorank reordering atomically."
+      }
+    },
+    {
+      "id": "stage-4-realtime-fanout",
+      "title": "Real-Time Board Sync via Redis Pub/Sub & WebSockets",
+      "level": "intermediate",
+      "purpose": "Broadcast committed issue updates to all active board viewers in under 50ms.",
+      "explanation": {
+        "foundation": "Polling every 5 seconds wastes bandwidth and shows stale card positions.",
+        "core": "Once PostgreSQL commits, the service publishes a compact delta event (`{issueId, status, rank, version}`) to Redis Pub/Sub channel `board:{board_id}`.",
+        "deepDive": "Stateful WebSocket servers subscribed to active boards push the delta to connected browsers, which reconcile using `version`."
+      },
+      "codeExample": "async def broadcast_board_delta(redis, board_id: str, delta: dict) -> None:\n    channel = f'board:{board_id}'\n    payload = json.dumps(delta)\n    await redis.publish(channel, payload)",
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "INTERMEDIATE",
+        "title": "WebSocket Board Delta Fan-Out",
+        "cards": [
+          {
+            "label": "Version Ordering",
+            "detail": "Clients ignore deltas with version <= local_version."
+          },
+          {
+            "label": "Graceful Fallback",
+            "detail": "Disconnected clients catch up via /boards/{id}/delta?since=ts."
+          }
+        ],
+        "summary": "Redis Pub/Sub decouples stateless API writes from stateful WebSocket board connections.",
+        "caption": "Committed board deltas flow through Redis Pub/Sub to WebSocket gateways for instant UI sync.",
+        "graphNodes": [
+          {
+            "id": "svc",
+            "label": "Issue Service",
+            "role": "compute",
+            "col": 0,
+            "row": 0,
+            "tone": "primary"
+          },
+          {
+            "id": "redis",
+            "label": "Redis Pub/Sub",
+            "role": "broker",
+            "col": 1,
+            "row": 0,
+            "tone": "tint"
+          },
+          {
+            "id": "ws",
+            "label": "WebSocket Gateways",
+            "role": "output",
+            "col": 2,
+            "row": 0,
+            "tone": "tint"
+          }
+        ],
+        "graphEdges": [
+          {
+            "from": "svc",
+            "to": "redis",
+            "label": "publishes committed delta",
+            "style": "solid",
+            "tone": "green"
+          },
+          {
+            "from": "redis",
+            "to": "ws",
+            "label": "fans out to active viewers",
+            "style": "solid",
+            "tone": "green"
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-5-outbox-search",
+      "title": "Transactional Outbox & Async JQL Search Indexing",
+      "level": "intermediate",
+      "purpose": "Eliminate dual-write drift between PostgreSQL and Elasticsearch using CDC outbox events.",
+      "explanation": {
+        "foundation": "Writing to PostgreSQL and Elasticsearch in the same request creates split-brain drift if Elasticsearch times out.",
+        "core": "Instead, the Issue Service writes an event row to an `outbox_events` table inside the same PostgreSQL transaction.",
+        "deepDive": "Debezium CDC streams those rows to Kafka, where indexers update Elasticsearch for JQL queries."
+      },
+      "codeExample": "def update_issue_with_outbox(conn, issue_id, fields):\n    with conn.transaction():\n        conn.execute('UPDATE issues SET summary=%s, updated_at=NOW() WHERE id=%s', (fields['summary'], issue_id))\n        conn.execute('INSERT INTO outbox_events (aggregate_id, event_type, payload) VALUES (%s, %s, %s)',\n                     (issue_id, 'ISSUE_UPDATED', json.dumps(fields)))",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "INTERMEDIATE",
+        "title": "CDC Outbox to Elasticsearch",
+        "nodes": [
+          {
+            "id": "pg",
+            "label": "PG Issues + Outbox",
+            "sub": "Atomic local commit",
+            "role": "storage"
+          },
+          {
+            "id": "cdc",
+            "label": "Debezium CDC",
+            "sub": "Tails WAL -> Kafka",
+            "role": "stream"
+          },
+          {
+            "id": "es",
+            "label": "Elasticsearch Index",
+            "sub": "Serves JQL & custom fields",
+            "role": "search"
+          }
+        ],
+        "edges": [
+          {
+            "from": "pg",
+            "to": "cdc",
+            "label": "streams committed WAL events"
+          },
+          {
+            "from": "cdc",
+            "to": "es",
+            "label": "upserts flattened issue docs"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Zero Dual-Write Drift",
+            "detail": "Outbox guarantees every committed DB write reaches Elasticsearch."
+          },
+          {
+            "label": "Custom Fields",
+            "detail": "JSONB custom fields flatten into ES dynamic/nested mappings."
+          }
+        ],
+        "summary": "The Transactional Outbox guarantees eventual consistency between PostgreSQL and Elasticsearch.",
+        "caption": "Debezium tails the PostgreSQL outbox table to keep Elasticsearch JQL indexes synchronized."
+      }
+    },
+    {
+      "id": "stage-6-audit-history",
+      "title": "Immutable Audit Log & Attachment Storage",
+      "level": "advanced",
+      "purpose": "Store compliance-grade issue change history and large binary attachments without bloating OLTP tables.",
+      "explanation": {
+        "foundation": "Think of **Immutable Audit Log & Attachment Storage** as the intuition layer for Design an Enterprise Project Management & Kanban System (Jira Scale): Store compliance-grade issue change history and large binary attachments without bloating OLTP tables.",
+        "core": "Enterprise compliance requires an immutable trail of every status, assignee, and permission change. Append-only audit events stream to partitioned storage (or object-backed cold tiers after 90 days), while attachments upload directly from the browser to S3 via short-lived pre-signed URLs after virus scanning.",
+        "deepDive": "Under heavy load or partial failure, immutable audit log & attachment storage becomes a critical lever for predictable latency and correctness. Enterprise Jira design: consistent-hash tenant sharding, partial B-tree keyset pagination, 3-bucket Lexorank, and CDC outbox."
+      },
+      "codeExample": "def create_presigned_upload(s3_client, bucket: str, tenant_id: str, filename: str) -> dict:\n    key = f'tenants/{tenant_id}/uploads/{uuid.uuid4()}/{filename}'\n    return s3_client.generate_presigned_post(Bucket=bucket, Key=key, ExpiresIn=300,\n                                             Conditions=[['content-length-range', 1, 52428800]])",
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "ADVANCED",
+        "title": "Direct-to-S3 Pre-Signed Uploads",
+        "cards": [
+          {
+            "label": "Zero Proxy Bottleneck",
+            "detail": "API servers never buffer 50MB binary attachments in RAM."
+          },
+          {
+            "label": "Immutable Audit",
+            "detail": "Change logs are append-only and partitioned by month."
+          }
+        ],
+        "summary": "Pre-signed S3 uploads offload binary traffic from API servers while audit logs stay append-only.",
+        "caption": "Browsers upload attachments directly to S3 via pre-signed URLs, keeping API servers stateless.",
+        "graphNodes": [
+          {
+            "id": "client",
+            "label": "Browser Client",
+            "role": "client",
+            "col": 0,
+            "row": 0,
+            "tone": "primary"
+          },
+          {
+            "id": "api",
+            "label": "Attachment Service",
+            "role": "compute",
+            "col": 1,
+            "row": 0,
+            "tone": "tint"
+          },
+          {
+            "id": "s3",
+            "label": "S3 + AV Scanner",
+            "role": "storage",
+            "col": 2,
+            "row": 0,
+            "tone": "tint"
+          }
+        ],
+        "graphEdges": [
+          {
+            "from": "client",
+            "to": "api",
+            "label": "requests pre-signed POST",
+            "style": "solid",
+            "tone": "green"
+          },
+          {
+            "from": "client",
+            "to": "s3",
+            "label": "uploads binary directly",
+            "style": "solid",
+            "tone": "green"
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-7-backlog-archival",
+      "title": "Large Backlog Pagination & Sprint Rollup Caching",
+      "level": "advanced",
+      "purpose": "Keep boards with 50,000+ historical issues fast via active-sprint partitioning and keyset pagination.",
+      "explanation": {
+        "foundation": "Think of **Large Backlog Pagination & Sprint Rollup Caching** as the intuition layer for Design an Enterprise Project Management & Kanban System (Jira Scale): Keep boards with 50,000+ historical issues fast via active-sprint partitioning and keyset pagination.",
+        "core": "Loading all 50,000 historical `Done` issues onto a Kanban board destroys browser and DB performance. Active boards query only non-archived issues (`archived_at IS NULL`) using keyset pagination on `(rank, id)`, while sprint burndown metrics are pre-aggregated in Redis/materialized views on issue transition.",
+        "deepDive": "Under heavy load or partial failure, large backlog pagination & sprint rollup caching becomes a critical lever for predictable latency and correctness. Enterprise Jira design: consistent-hash tenant sharding, partial B-tree keyset pagination, 3-bucket Lexorank, and CDC outbox."
+      },
+      "codeExample": "def fetch_board_page(conn, board_id: str, cursor_rank: str = '0|000000:', limit: int = 100):\n    return conn.execute(\n        'SELECT id, key, summary, status, rank, version FROM issues '\n        'WHERE board_id=%s AND archived_at IS NULL AND rank > %s '\n        'ORDER BY rank ASC LIMIT %s',\n        (board_id, cursor_rank, limit)\n    )",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "ADVANCED",
+        "title": "Keyset Pagination on Active Issues",
+        "nodes": [
+          {
+            "id": "idx",
+            "label": "Partial B-Tree Index",
+            "sub": "WHERE archived_at IS NULL",
+            "role": "index"
+          },
+          {
+            "id": "keyset",
+            "label": "Keyset Cursor",
+            "sub": "WHERE rank > cursor_rank",
+            "role": "compute"
+          },
+          {
+            "id": "ui",
+            "label": "Virtualized Board",
+            "sub": "Renders visible viewport",
+            "role": "output"
+          }
+        ],
+        "edges": [
+          {
+            "from": "idx",
+            "to": "keyset",
+            "label": "scans O(limit) rows"
+          },
+          {
+            "from": "keyset",
+            "to": "ui",
+            "label": "streams 100-issue slices"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Partial Index",
+            "detail": "Excluding archived issues shrinks the hot B-tree index by >80%."
+          },
+          {
+            "label": "O(1) Seek",
+            "detail": "Keyset pagination on `rank` avoids slow OFFSET scans."
+          }
+        ],
+        "summary": "Partial indexes and keyset cursors on `rank` keep massive enterprise boards responsive.",
+        "caption": "Keyset pagination over a partial B-tree index keeps board loads O(limit) regardless of history size."
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-1",
+        "question": "Why should the Issue Service write to an `outbox_events` table in PostgreSQL instead of updating Elasticsearch synchronously during an issue edit?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Elasticsearch does not support HTTP writes from application servers.",
+            "correct": false,
+            "feedback": "Elasticsearch supports HTTP writes, but dual-writing across two datastores is not atomic."
+          },
+          {
+            "id": "b",
+            "text": "Dual-writing to PostgreSQL and Elasticsearch risks permanent data drift if one succeeds and the other fails.",
+            "correct": true,
+            "feedback": "Correct! A local DB transaction + CDC outbox guarantees at-least-once delivery to Elasticsearch."
+          },
+          {
+            "id": "c",
+            "text": "PostgreSQL outbox tables automatically compress JSON documents by 10x.",
+            "correct": false,
+            "feedback": "Outbox tables are for transactional reliability, not compression."
+          },
+          {
+            "id": "d",
+            "text": "Elasticsearch cannot index custom fields without Debezium.",
+            "correct": false,
+            "feedback": "Elasticsearch can index any JSON; Debezium provides reliable CDC transport."
+          }
+        ],
+        "explanation": "The Transactional Outbox pattern avoids distributed 2PC while eliminating split-brain drift between OLTP storage and search."
+      },
+      {
+        "id": "kc-2",
+        "question": "What is the primary benefit of sharding Jira's PostgreSQL cluster by `tenant_id` rather than `issue_id`?",
+        "options": [
+          {
+            "id": "a",
+            "text": "It allows boards, sprints, and Lexorank queries for an organization to execute on a single shard without distributed joins.",
+            "correct": true,
+            "feedback": "Correct! Co-locating all entities of a tenant on one shard keeps board queries and rebalancing local."
+          },
+          {
+            "id": "b",
+            "text": "It guarantees every shard has the exact same row count.",
+            "correct": false,
+            "feedback": "Enterprise tenants vary in size, so `tenant_id` sharding can require dedicated shards for mega-tenants."
+          },
+          {
+            "id": "c",
+            "text": "It eliminates the need for Elasticsearch.",
+            "correct": false,
+            "feedback": "JQL full-text and custom-field queries still rely on Elasticsearch."
+          },
+          {
+            "id": "d",
+            "text": "It removes the need for optimistic locking.",
+            "correct": false,
+            "feedback": "Concurrent users within the same tenant still need optimistic locking."
+          }
+        ],
+        "explanation": "Tenant-keyed sharding co-locates boards, issues, and sprints so transactional queries never cross shard boundaries."
+      },
+      {
+        "id": "kc-3",
+        "question": "How do connected browser clients avoid out-of-order UI updates when receiving real-time board deltas over WebSockets?",
+        "options": [
+          {
+            "id": "a",
+            "text": "By locking the entire Kanban board in Redis during every drag.",
+            "correct": false,
+            "feedback": "Global board locks would destroy collaborative UX."
+          },
+          {
+            "id": "b",
+            "text": "By disabling WebSockets whenever more than 2 users view a board.",
+            "correct": false,
+            "feedback": "WebSockets are specifically designed for multi-user collaboration."
+          },
+          {
+            "id": "c",
+            "text": "By comparing the incoming delta's monotonic `version` against the locally rendered issue `version` and ignoring stale messages.",
+            "correct": true,
+            "feedback": "Correct! Monotonic version numbers let clients drop out-of-order or duplicate deltas safely."
+          },
+          {
+            "id": "d",
+            "text": "By polling the database every 100ms.",
+            "correct": false,
+            "feedback": "100ms polling would overload the database."
+          }
+        ],
+        "explanation": "Attaching the committed PostgreSQL `version` to every Pub/Sub delta lets clients discard stale updates idempotently."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "A Jira-like Kanban system stores issues in a database, uses Lexorank for card order, and broadcasts updates via WebSockets.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, separate transactional issue writes (tenant-sharded PostgreSQL + Lexorank + optimistic locking) from real-time board fan-out (Redis Pub/Sub + WebSockets) and async JQL indexing (CDC Outbox -> Elasticsearch).",
+      "byteSummary": "When you drag a card on a Kanban board, the server checks if the move is allowed, saves the new Lexorank position in PostgreSQL, and sends a quick WebSocket message to your teammates. Search indexing happens in the background so it never slows down your drag."
+    },
+    "intermediate": {
+      "summary": "Multi-tenant Jira architecture: tenant-sharded PostgreSQL with Lexorank + optimistic CAS, Redis Pub/Sub WebSockets, and CDC Outbox to Elasticsearch.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, separate transactional issue writes (tenant-sharded PostgreSQL + Lexorank + optimistic locking) from real-time board fan-out (Redis Pub/Sub + WebSockets) and async JQL indexing (CDC Outbox -> Elasticsearch).",
+      "byteSummary": "The write path validates workflow DAG rules in memory, updates PostgreSQL with single-row Lexorank CAS, and writes an outbox event. Redis Pub/Sub fans out deltas to WebSocket viewers, while Debezium CDC keeps Elasticsearch JQL indexes fresh."
+    },
+    "advanced": {
+      "summary": "Enterprise Jira design: consistent-hash tenant sharding, partial B-tree keyset pagination, 3-bucket Lexorank, and CDC outbox.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, separate transactional issue writes (tenant-sharded PostgreSQL + Lexorank + optimistic locking) from real-time board fan-out (Redis Pub/Sub + WebSockets) and async JQL indexing (CDC Outbox -> Elasticsearch).",
+      "byteSummary": "Large enterprise tenants are isolated onto dedicated PostgreSQL shards with partial indexes (`WHERE archived_at IS NULL`) and keyset pagination on `rank`. Optimistic `version` checks linearize concurrent edits and order WebSocket deltas idempotently."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "prerequisites": [
+    {
+      "title": "Lexorank & Distributed Kanban Board Ordering",
+      "summary": "Lexorank encodes list positions as variable-length base-36 strings prefixed by a rebalancing bucket, enabling O(1) drag-and-drop card reordering without rewriting sibling rows."
+    }
+  ],
+  "simulation": {
+    "title": "Design an Enterprise Project Management & Kanban System (Jira Scale) — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Input Workload"
+      },
+      {
+        "id": "entry",
+        "label": "Router / API",
+        "role": "Admission Control"
+      },
+      {
+        "id": "worker",
+        "label": "Processor",
+        "role": "Domain Logic"
+      },
+      {
+        "id": "store",
+        "label": "State Layer",
+        "role": "Durable Store"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "entry",
+        "label": "request"
+      },
+      {
+        "from": "entry",
+        "to": "worker",
+        "label": "dispatch"
+      },
+      {
+        "from": "worker",
+        "to": "store",
+        "label": "read/write"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Multi-Tenant Sharding & Noisy-Neighbor Isolation",
+        "actionLabel": "request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "entry"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "request",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Caller sends work to Router / API (Multi-Tenant Sharding & Noisy-Neighbor Isolation)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Custom Workflow State Machine & Guard Validation",
+        "actionLabel": "dispatch",
+        "status": "healthy",
+        "activeNodeIds": [
+          "entry",
+          "worker"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "dispatch",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Router / API coordinates with Processor while preserving the core invariant (Custom Workflow State Machine & Guard Validation)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "O(1) Kanban Reordering with Lexorank & CAS",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "worker",
+          "store"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, State Layer absorbs pressure without cascading (O(1) Kanban Reordering with Lexorank & CAS)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Large Backlog Pagination & Sprint Rollup Caching",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "entry",
+          "worker",
+          "store"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Large Backlog Pagination & Sprint Rollup Caching)."
+      }
+    ]
+  }
+}

@@ -1,0 +1,699 @@
+{
+  "slug": "design-ride-hailing-geospatial-matching-uber",
+  "title": "Design a Ride-Hailing Geospatial Matching & Dispatch Engine (Uber Scale)",
+  "domain": "system-design",
+  "diagram": "diagram.png",
+  "spark": {
+    "summary": "Architect an Uber-scale geospatial matching and dispatch platform ingesting 1M+ driver GPS pings/sec, computing real-time surge/ETA, and locking drivers atomically without double-dispatch.",
+    "keyTakeaway": "If latency budgets leave no room for synchronous retries, stream GPS pings via Kafka/Flink into a city-partitioned in-memory H3 index, rank k-ring candidates by road ETA, and use a Stateful Trip Offer Manager with distributed driver leases to prevent double-booking.",
+    "byteSummary": "A global ride-hailing platform must track 4M+ active drivers sending GPS pings every 4 seconds (1M+ writes/sec) and match a rider to the optimal driver in under 500ms—while guaranteeing that two concurrent riders never get matched to the same driver.\n\nDriver pings stream through Kafka and Flink into an In-Memory H3 Geospatial Index partitioned by metro region. When a rider requests a trip, the Dispatch & Matching Service queries H3 k-rings, fetches road-network ETAs and Res 7 surge multipliers, and selects the best candidate.\n\nTo prevent race conditions, a Stateful Trip Offer Manager acquires an exclusive 15-second distributed lease (`SET driver_lock:{id} trip_id NX EX 15`) in Redis before pushing the trip offer to the driver's app."
+  },
+  "learningJourney": [
+    {
+      "id": "stage-1-gps-ingestion",
+      "title": "High-Throughput Driver GPS Ingestion (1M+ Pings/Sec)",
+      "level": "foundation",
+      "purpose": "Ingest and map-match millions of noisy mobile GPS pings per second without choking databases.",
+      "explanation": {
+        "foundation": "4 million drivers pinging every 4 seconds generate 1M QPS.",
+        "core": "Mobile apps batch/compress telemetry over persistent gRPC/WebSocket gateways into Kafka partitioned by `city_id`.",
+        "deepDive": "A Flink stream processor snaps noisy GPS coordinates to road segments (Kalman filter/HMM map-matching) and updates the in-memory H3 index."
+      },
+      "codeExample": "def ingest_driver_ping(kafka_producer, city_id: str, driver_id: str, lat: float, lon: float, ts_ms: int):\n    kafka_producer.send(\n        topic='driver.location.pings',\n        key=city_id.encode(),\n        value={'driver_id': driver_id, 'lat': lat, 'lon': lon, 'ts_ms': ts_ms}\n    )",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "FOUNDATION",
+        "title": "Kafka + Flink GPS Ingestion",
+        "nodes": [
+          {
+            "id": "app",
+            "label": "Driver Apps",
+            "sub": "GPS ping every 4s (1M QPS)",
+            "role": "ingress"
+          },
+          {
+            "id": "kafka",
+            "label": "Kafka (city_id)",
+            "sub": "Partitioned by metro region",
+            "role": "stream"
+          },
+          {
+            "id": "flink",
+            "label": "Flink Map-Matcher",
+            "sub": "Updates H3 index in RAM",
+            "role": "compute"
+          }
+        ],
+        "edges": [
+          {
+            "from": "app",
+            "to": "kafka",
+            "label": "streams compressed pings"
+          },
+          {
+            "from": "kafka",
+            "to": "flink",
+            "label": "computes Res 9 H3 cell"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Metro Partitioning",
+            "detail": "Keying Kafka by `city_id` keeps regional spatial indexes local."
+          },
+          {
+            "label": "Kalman Snapping",
+            "detail": "Map-matching prevents urban canyon GPS drift from misplacing drivers."
+          }
+        ],
+        "summary": "Partitioning GPS streams by `city_id` feeds regional in-memory H3 indexes at 1M+ QPS.",
+        "caption": "Driver GPS pings flow through city-partitioned Kafka into Flink to update the in-memory H3 index."
+      }
+    },
+    {
+      "id": "stage-2-city-sharding",
+      "title": "Metro-Region Partitioning & Stateless vs. Stateful Separation",
+      "level": "foundation",
+      "purpose": "Scale the in-memory spatial index horizontally by city/metro boundary with zero cross-region queries.",
+      "explanation": {
+        "foundation": "Think of **Metro-Region Partitioning & Stateless vs. Stateful Separation** as the intuition layer for Design a Ride-Hailing Geospatial Matching & Dispatch Engine (Uber Scale): Scale the in-memory spatial index horizontally by city/metro boundary with zero cross-region queries.",
+        "core": "A rider in Bengaluru never needs to match a driver in London. Partitioning the In-Memory H3 Index and Dispatch clusters by metro region (`city_id`) keeps each cluster's working set small enough to fit completely in RAM (e.g., 100k drivers = <50 MB) with active-passive failover per city.",
+        "deepDive": "Under heavy load or partial failure, metro-region partitioning & stateless vs. stateful separation becomes a critical lever for predictable latency and correctness. Production dispatch with HMM map-matching, spatially smoothed Res 7 surge, owner-checked Lua lease release, and dual-path live trip tracking."
+      },
+      "codeExample": "def route_to_city_cluster(city_registry: dict, city_id: str) -> str:\n    endpoint = city_registry.get(city_id)\n    if not endpoint:\n        raise KeyError(f'Unknown metro region: {city_id}')\n    return endpoint",
+      "sectionDiagram": {
+        "kind": "architecture",
+        "eyebrow": "FOUNDATION",
+        "title": "City-Isolated Spatial Clusters",
+        "nodes": [
+          {
+            "id": "gw",
+            "label": "API Gateway",
+            "sub": "Resolves city_id from lat/lon",
+            "role": "ingress"
+          },
+          {
+            "id": "blr",
+            "label": "Bengaluru Shard",
+            "sub": "100% in-RAM H3 index",
+            "role": "compute"
+          },
+          {
+            "id": "nyc",
+            "label": "NYC Shard",
+            "sub": "Isolated failure domain",
+            "role": "compute"
+          }
+        ],
+        "edges": [
+          {
+            "from": "gw",
+            "to": "blr",
+            "label": "routes BLR rides"
+          },
+          {
+            "from": "gw",
+            "to": "nyc",
+            "label": "routes NYC rides"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Blast Radius",
+            "detail": "A traffic spike or outage in one city never affects other metros."
+          },
+          {
+            "label": "Sub-Millisecond RAM",
+            "detail": "Keeping a city's active drivers in RAM avoids disk/network hops."
+          }
+        ],
+        "summary": "Metro-region sharding isolates failure domains and keeps every city's H3 index in RAM.",
+        "caption": "Routing requests by city_id isolates each metro's in-memory H3 index and dispatch cluster."
+      },
+      "decisionFramework": {
+        "problem": "How to implement Design a Ride-Hailing Geospatial Matching & Dispatch Engine (Uber Scale) without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "If latency budgets leave no room for synchronous retries, stream GPS pings via Kafka/Flink into a city-partitioned in-memory H3 index, rank k-ring candidates by road ETA, and use a Stateful Trip Offer Manager with distributed driver leases to prevent double-booking.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Design a Ride-Hailing Geospatial Matching & Dispatch Engine (Uber Scale) experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-3-batched-matching",
+      "title": "Greedy Nearest-Driver vs. Batched Bipartite Matching",
+      "level": "intermediate",
+      "purpose": "Maximize global fleet efficiency by batching nearby requests over 2-second windows.",
+      "explanation": {
+        "foundation": "Think of **Greedy Nearest-Driver vs. Batched Bipartite Matching** as the intuition layer for Design a Ride-Hailing Geospatial Matching & Dispatch Engine (Uber Scale): Maximize global fleet efficiency by batching nearby requests over 2-second windows.",
+        "core": "Naive greedy matching (immediately assigning the closest car to Rider A) can cause Rider B 100 meters away to wait 10 minutes for a distant car. Accumulating requests in a 2-second window per zone and solving minimum-weight bipartite matching (Hungarian / min-cost flow) reduces average global ETA by 10-15%.",
+        "deepDive": "Under heavy load or partial failure, greedy nearest-driver vs. batched bipartite matching becomes a critical lever for predictable latency and correctness. Production dispatch with HMM map-matching, spatially smoothed Res 7 surge, owner-checked Lua lease release, and dual-path live trip tracking."
+      },
+      "codeExample": "def match_batch_greedy_fallback(riders: list, drivers: list, eta_matrix: dict) -> list[tuple]:\n    pairs = sorted(((eta_matrix[(r, d)], r, d) for r in riders for d in drivers), key=lambda x: x[0])\n    used_r, used_d, matches = set(), set(), []\n    for eta, r, d in pairs:\n        if r not in used_r and d not in used_d:\n            used_r.add(r); used_d.add(d); matches.append((r, d, eta))\n    return matches",
+      "sectionDiagram": {
+        "kind": "comparison",
+        "eyebrow": "INTERMEDIATE",
+        "title": "2s Batched Bipartite Dispatch",
+        "nodes": [
+          {
+            "id": "win",
+            "label": "2s Batch Window",
+            "sub": "Collects riders + H3 drivers",
+            "role": "ingress"
+          },
+          {
+            "id": "bip",
+            "label": "Bipartite Solver",
+            "sub": "Minimizes sum of pickup ETAs",
+            "role": "compute"
+          },
+          {
+            "id": "out",
+            "label": "Optimal Pairings",
+            "sub": "-12% avg wait time",
+            "role": "output"
+          }
+        ],
+        "edges": [
+          {
+            "from": "win",
+            "to": "bip",
+            "label": "builds rider-driver ETA graph"
+          },
+          {
+            "from": "bip",
+            "to": "out",
+            "label": "emits globally optimal matches"
+          }
+        ],
+        "cards": [
+          {
+            "label": "2-Second Trade-Off",
+            "detail": "A 2s matching delay is invisible to riders and cuts deadhead miles."
+          },
+          {
+            "label": "Dynamic Falloff",
+            "detail": "Low-density suburbs fall back to immediate greedy dispatch."
+          }
+        ],
+        "summary": "Short 2-second batching windows optimize global pickup ETAs across competing riders.",
+        "caption": "Solving bipartite matching over 2-second batches outperforms greedy first-come dispatch."
+      }
+    },
+    {
+      "id": "stage-4-driver-lease",
+      "title": "Preventing Double-Dispatch with Distributed Driver Leases",
+      "level": "intermediate",
+      "purpose": "Guarantee a driver receives at most one active trip offer at a time using atomic Redis leases.",
+      "explanation": {
+        "foundation": "When two Dispatch workers simultaneously pick the same driver for two riders, sending both offers causes double-booking and cancellations.",
+        "core": "Before pushing an offer, the Stateful Trip Offer Manager acquires an exclusive 15-second Redis lease (`SET lock:driver:{id} {trip_id} NX EX 15`).",
+        "deepDive": "Only the lease winner dispatches the push notification."
+      },
+      "codeExample": "def try_acquire_driver_lease(redis, driver_id: str, trip_id: str, ttl_sec: int = 15) -> bool:\n    return bool(redis.set(f'lock:driver:{driver_id}', trip_id, nx=True, ex=ttl_sec))\n\ndef release_driver_lease(redis, driver_id: str, trip_id: str) -> None:\n    lua = \"if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end\"\n    redis.eval(lua, 1, f'lock:driver:{driver_id}', trip_id)",
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "INTERMEDIATE",
+        "title": "Exclusive Driver Offer Lease",
+        "nodes": [
+          {
+            "id": "cand",
+            "label": "Matched Driver",
+            "sub": "Selected by Dispatch",
+            "role": "ingress"
+          },
+          {
+            "id": "lock",
+            "label": "Redis NX EX 15s",
+            "sub": "Atomic driver lease",
+            "role": "gate"
+          },
+          {
+            "id": "offer",
+            "label": "Push Trip Offer",
+            "sub": "15s driver accept window",
+            "role": "output"
+          }
+        ],
+        "edges": [
+          {
+            "from": "cand",
+            "to": "lock",
+            "label": "competes for exclusive lease"
+          },
+          {
+            "from": "lock",
+            "to": "offer",
+            "label": "pushes offer only to winner"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Safe Unlock",
+            "detail": "Always check `value == trip_id` in Lua before deleting a lease on decline."
+          },
+          {
+            "label": "Auto-Expiry",
+            "detail": "15s TTL automatically frees the driver if their phone loses signal."
+          }
+        ],
+        "summary": "Atomic Redis leases with owner-checked Lua release prevent double-dispatch races.",
+        "caption": "A 15-second Redis NX lease ensures only one Trip Offer Manager can lock a driver."
+      }
+    },
+    {
+      "id": "stage-5-offer-state-machine",
+      "title": "Stateful Trip Offer & Timeout Re-Matching Loop",
+      "level": "intermediate",
+      "purpose": "Handle driver declines, network drops, and acceptances cleanly with an event-driven state machine.",
+      "explanation": {
+        "foundation": "Once an offer is pushed, a 15-second timer starts.",
+        "core": "If the driver accepts (`ACCEPTED`), the trip transitions to `DRIVER_EN_ROUTE` and persists to CockroachDB/PostgreSQL.",
+        "deepDive": "If the driver declines or the 15-second timer expires, the Trip Offer Manager releases the lease, blacklists that driver for this `trip_id`, and requests the next-best candidate."
+      },
+      "codeExample": "def handle_offer_timeout(trip_mgr, redis, trip_id: str, driver_id: str):\n    release_driver_lease(redis, driver_id, trip_id)\n    trip_mgr.add_declined_driver(trip_id, driver_id)\n    trip_mgr.requeue_for_next_driver(trip_id)",
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "INTERMEDIATE",
+        "title": "Trip Offer State Transitions",
+        "nodes": [
+          {
+            "id": "pend",
+            "label": "OFFER_PENDING",
+            "sub": "15s countdown active",
+            "role": "state"
+          },
+          {
+            "id": "acc",
+            "label": "DRIVER_EN_ROUTE",
+            "sub": "Persisted to Trip DB",
+            "role": "output"
+          },
+          {
+            "id": "exp",
+            "label": "DECLINED / EXPIRED",
+            "sub": "Frees lease -> next driver",
+            "role": "compute"
+          }
+        ],
+        "edges": [
+          {
+            "from": "pend",
+            "to": "acc",
+            "label": "driver taps Accept"
+          },
+          {
+            "from": "pend",
+            "to": "exp",
+            "label": "decline or 15s timeout"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Decline Exclusion",
+            "detail": "Excluding declined drivers prevents re-offering the same trip."
+          },
+          {
+            "label": "Idempotent Accept",
+            "detail": "Late accepts after 15s expiry return HTTP 409 Offer Expired."
+          }
+        ],
+        "summary": "An explicit offer state machine with exclusion lists recovers smoothly from driver declines.",
+        "caption": "Expired or declined offers release the driver lease and immediately re-match the next candidate."
+      }
+    },
+    {
+      "id": "stage-6-surge-pricing",
+      "title": "Real-Time Supply/Demand Surge Pricing on Res 7 Hexagons",
+      "level": "advanced",
+      "purpose": "Compute smooth, tamper-resistant surge multipliers using 1-minute rolling H3 windows.",
+      "explanation": {
+        "foundation": "If a concert ends, 500 riders open the app in one Res 7 hexagon.",
+        "core": "A Flink window aggregates `open_ride_requests` vs.",
+        "deepDive": "`available_drivers` per Res 7 cell every 60 seconds, applying spatial smoothing across `k=1` neighbors so multipliers don't jump from 1.0x to 3.0x across a street, and locks the quoted `fare_id` in Redis for 5 minutes."
+      },
+      "codeExample": "def compute_smoothed_surge(cell_ratio: float, neighbor_ratios: list[float]) -> float:\n    blended = 0.6 * cell_ratio + 0.4 * (sum(neighbor_ratios) / max(1, len(neighbor_ratios)))\n    return round(min(4.0, max(1.0, 1.0 + 0.5 * max(0.0, blended - 1.2))), 1)",
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "ADVANCED",
+        "title": "Spatially Smoothed Surge Engine",
+        "nodes": [
+          {
+            "id": "req",
+            "label": "Rider App Opens",
+            "sub": "Demand signal per Res 7",
+            "role": "ingress"
+          },
+          {
+            "id": "sup",
+            "label": "Available Drivers",
+            "sub": "Supply signal per Res 7",
+            "role": "ingress"
+          },
+          {
+            "id": "smooth",
+            "label": "k=1 Spatial Smoothing",
+            "sub": "Caps 1.0x-4.0x + 5m quote lock",
+            "role": "output"
+          }
+        ],
+        "edges": [
+          {
+            "from": "req",
+            "to": "smooth",
+            "label": "computes demand/supply ratio"
+          },
+          {
+            "from": "sup",
+            "to": "smooth",
+            "label": "blends with 6 H3 neighbors"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Neighbor Smoothing",
+            "detail": "Blending with 6 H3 neighbors prevents sharp price cliffs across blocks."
+          },
+          {
+            "label": "Quote Lock",
+            "detail": "Caching `quote_id` for 5 minutes guarantees price consistency at booking."
+          }
+        ],
+        "summary": "Spatially smoothed Res 7 surge ratios prevent sharp price cliffs while balancing local supply.",
+        "caption": "Flink blends demand/supply ratios across H3 neighbors and locks quoted fares for 5 minutes."
+      }
+    },
+    {
+      "id": "stage-7-trip-persistence",
+      "title": "Active Trip Tracking, Partitioned Ledger & Live Rider Map",
+      "level": "advanced",
+      "purpose": "Stream matched driver GPS updates directly to the rider's map while keeping trip state durable.",
+      "explanation": {
+        "foundation": "Think of **Active Trip Tracking, Partitioned Ledger & Live Rider Map** as the intuition layer for Design a Ride-Hailing Geospatial Matching & Dispatch Engine (Uber Scale): Stream matched driver GPS updates directly to the rider's map while keeping trip state durable.",
+        "core": "Once `DRIVER_EN_ROUTE`, the driver's 4-second GPS pings still flow through the ingestion pipeline, but Flink routes pings for active `trip_id`s to a dedicated `trip.tracking` WebSocket/PubSub channel pushed to the rider's map. Trip state transitions (`REQUESTED -> MATCHED -> IN_PROGRESS -> COMPLETED`) write to a geo-replicated SQL ledger.",
+        "deepDive": "Under heavy load or partial failure, active trip tracking, partitioned ledger & live rider map becomes a critical lever for predictable latency and correctness. Production dispatch with HMM map-matching, spatially smoothed Res 7 surge, owner-checked Lua lease release, and dual-path live trip tracking."
+      },
+      "codeExample": "def publish_trip_location(pubsub, trip_id: str, lat: float, lon: float, eta_sec: int) -> None:\n    pubsub.publish(f'trip:{trip_id}', json.dumps({'lat': lat, 'lon': lon, 'eta_sec': eta_sec}))",
+      "sectionDiagram": {
+        "kind": "architecture",
+        "eyebrow": "ADVANCED",
+        "title": "Live Trip Tracking & SQL Ledger",
+        "nodes": [
+          {
+            "id": "ping",
+            "label": "Matched Driver Ping",
+            "sub": "Tagged with active trip_id",
+            "role": "ingress"
+          },
+          {
+            "id": "ws",
+            "label": "Trip Pub/Sub -> WS",
+            "sub": "Renders moving car on rider map",
+            "role": "output"
+          },
+          {
+            "id": "db",
+            "label": "Geo-Replicated SQL",
+            "sub": "Durable trip state & fare",
+            "role": "storage"
+          }
+        ],
+        "edges": [
+          {
+            "from": "ping",
+            "to": "ws",
+            "label": "streams live car coordinates"
+          },
+          {
+            "from": "ping",
+            "to": "db",
+            "label": "logs route polyline & transitions"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Dual Path",
+            "detail": "Ephemeral car animations use Pub/Sub; billing/state transitions use ACID SQL."
+          },
+          {
+            "label": "Offline Resilience",
+            "detail": "Driver app buffers GPS waypoints locally during tunnels and syncs at drop-off."
+          }
+        ],
+        "summary": "Splitting ephemeral live map streaming from ACID trip ledgers keeps both fast and auditable.",
+        "caption": "Live driver coordinates stream over Pub/Sub to the rider while trip transitions commit to ACID SQL."
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-1",
+        "question": "How does the Trip Offer Manager prevent two concurrent riders from being matched to the exact same driver?",
+        "options": [
+          {
+            "id": "a",
+            "text": "By locking the entire city's H3 index during every ride request.",
+            "correct": false,
+            "feedback": "City-wide locks would serialize all dispatches and kill throughput."
+          },
+          {
+            "id": "b",
+            "text": "By acquiring an exclusive 15-second distributed lease (`SET lock:driver:{id} trip_id NX EX 15`) in Redis before sending the offer.",
+            "correct": true,
+            "feedback": "Correct! Only the worker that wins the atomic `NX` lease pushes the offer to the driver."
+          },
+          {
+            "id": "c",
+            "text": "By letting both riders' phones race and picking whoever pings last.",
+            "correct": false,
+            "feedback": "Race conditions would cause double-dispatch cancellations."
+          },
+          {
+            "id": "d",
+            "text": "By deleting the driver from Kafka.",
+            "correct": false,
+            "feedback": "Kafka is an append-only log, not a lock manager."
+          }
+        ],
+        "explanation": "Per-driver atomic Redis leases serialize offers for a single driver without blocking other drivers in the city."
+      },
+      {
+        "id": "kc-2",
+        "question": "Why should surge pricing smooth each Res 7 hexagon's demand/supply ratio with its `k=1` H3 neighbors?",
+        "options": [
+          {
+            "id": "a",
+            "text": "To make surge multipliers always equal 1.0x.",
+            "correct": false,
+            "feedback": "Surge still rises during high demand."
+          },
+          {
+            "id": "b",
+            "text": "To eliminate sharp price cliffs where walking 10 meters across a cell boundary drops the fare from 2.8x to 1.0x.",
+            "correct": true,
+            "feedback": "Correct! Spatial smoothing across the 6 uniform H3 neighbors creates gradual, predictable pricing zones."
+          },
+          {
+            "id": "c",
+            "text": "Because Flink cannot read single-cell counts.",
+            "correct": false,
+            "feedback": "Flink can easily aggregate single cells; smoothing is a product & fairness requirement."
+          },
+          {
+            "id": "d",
+            "text": "To double the number of Redis servers.",
+            "correct": false,
+            "feedback": "Smoothing runs in stream processing."
+          }
+        ],
+        "explanation": "Smoothing across H3 neighbors prevents erratic price jumps across artificial cell borders."
+      },
+      {
+        "id": "kc-3",
+        "question": "What happens if a driver's phone loses signal while a 15-second trip offer is pending?",
+        "options": [
+          {
+            "id": "a",
+            "text": "The driver remains permanently locked and can never receive another ride.",
+            "correct": false,
+            "feedback": "That would happen only without a TTL."
+          },
+          {
+            "id": "b",
+            "text": "The Redis lease automatically expires after 15 seconds (`EX 15`), freeing the driver and triggering re-match for the rider.",
+            "correct": true,
+            "feedback": "Correct! The TTL prevents deadlocked driver state on network drops."
+          },
+          {
+            "id": "c",
+            "text": "The rider's trip is marked completed.",
+            "correct": false,
+            "feedback": "Unaccepted offers never start a trip."
+          },
+          {
+            "id": "d",
+            "text": "Kafka replays the last 24 hours of GPS pings.",
+            "correct": false,
+            "feedback": "Only the offer timeout handler re-queues the trip."
+          }
+        ],
+        "explanation": "TTL-bounded leases guarantee self-healing recovery when mobile clients drop offline."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Uber streams driver GPS locations into a city-by-city hexagon map, finds the fastest nearby car, and locks it for 15 seconds while offering the trip.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, stream GPS pings via Kafka/Flink into a city-partitioned in-memory H3 index, rank k-ring candidates by road ETA, and use a Stateful Trip Offer Manager with distributed driver leases to prevent double-booking.",
+      "byteSummary": "Drivers send GPS updates every 4 seconds into an in-memory hexagon map. When you request a ride, the dispatch service checks nearby hexagons, picks the car with the shortest driving time, and places a 15-second lock on that driver while they tap Accept."
+    },
+    "intermediate": {
+      "summary": "Kafka + Flink GPS ingestion into city-sharded in-memory H3 indexes, 2s batched bipartite matching, and Redis NX driver leases.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, stream GPS pings via Kafka/Flink into a city-partitioned in-memory H3 index, rank k-ring candidates by road ETA, and use a Stateful Trip Offer Manager with distributed driver leases to prevent double-booking.",
+      "byteSummary": "1M+ GPS pings/sec partition by `city_id` through Kafka and Flink into RAM-resident H3 indexes. Dispatch batches requests over 2-second windows for bipartite ETA matching and acquires 15s Redis `NX` leases before pushing offers."
+    },
+    "advanced": {
+      "summary": "Production dispatch with HMM map-matching, spatially smoothed Res 7 surge, owner-checked Lua lease release, and dual-path live trip tracking.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, stream GPS pings via Kafka/Flink into a city-partitioned in-memory H3 index, rank k-ring candidates by road ETA, and use a Stateful Trip Offer Manager with distributed driver leases to prevent double-booking.",
+      "byteSummary": "Flink snaps noisy GPS pings via HMM map-matching and computes k=1 smoothed Res 7 surge multipliers. Stateful Trip Offer Managers use Lua-verified lease releases on decline/timeout and stream active trip coordinates over Pub/Sub."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "prerequisites": [
+    {
+      "title": "Geospatial Indexing: Uber H3 Hexagons, Geohash & Quadtrees",
+      "summary": "Geospatial indexing maps 2D `(lat, lon)` coordinates into 1D cell IDs for fast proximity lookups; Uber H3 uses hexagonal cells so every neighbor is equidistant, eliminating square-grid corner distortion."
+    }
+  ],
+  "simulation": {
+    "title": "Design a Ride-Hailing Geospatial Matching & Dispatch Engine (Uber Scale) — Interactive Execution Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Workload & Budget"
+      },
+      {
+        "id": "router",
+        "label": "Gateway / Router",
+        "role": "Admission & Dispatch"
+      },
+      {
+        "id": "engine",
+        "label": "Core Engine",
+        "role": "Primary Execution"
+      },
+      {
+        "id": "replica",
+        "label": "Replica / Fallback",
+        "role": "Durability & Recovery"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "router",
+        "label": "request"
+      },
+      {
+        "from": "router",
+        "to": "engine",
+        "label": "route"
+      },
+      {
+        "from": "engine",
+        "to": "replica",
+        "label": "sync / fallback"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "High-Throughput Driver GPS Ingestion (1M+ Pings/Sec)",
+        "actionLabel": "Dispatch nominal request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "router"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "Ingress",
+          "p99_ms": 8,
+          "error_rate": "0.0%"
+        },
+        "explanation": "Caller sends work into the gateway with explicit timeout and concurrency bounds (High-Throughput Driver GPS Ingestion (1M+ Pings/Sec))."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Metro-Region Partitioning & Stateless vs. Stateful Separatio",
+        "actionLabel": "Execute core invariant",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "Core Path",
+          "p99_ms": 18,
+          "in_flight": 124
+        },
+        "explanation": "The core engine processes the hot path while keeping state transitions deterministic (Metro-Region Partitioning & Stateless vs. Stateful Separation)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Greedy Nearest-Driver vs. Batched Bipartite Matching",
+        "actionLabel": "Detect skew or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Degraded",
+          "p99_ms": 64,
+          "retries_capped": "true"
+        },
+        "explanation": "Under load or replica lag, bounded backoff and isolation prevent cascading saturation (Greedy Nearest-Driver vs. Batched Bipartite Matching)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Active Trip Tracking, Partitioned Ledger & Live Rider Map",
+        "actionLabel": "Converge & restore SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 11,
+          "drift": 0
+        },
+        "explanation": "State converges cleanly and telemetry confirms the system returned within its SLO envelope (Active Trip Tracking, Partitioned Ledger & Live Rider Map)."
+      }
+    ]
+  }
+}

@@ -1,0 +1,770 @@
+{
+  "id": "problem-xdp-syn-flood-ddos-mitigation",
+  "slug": "xdp-syn-flood-ddos-mitigation",
+  "title": "XDP In-Kernel SYN Flood & DDoS Packet Dropping",
+  "problemType": "architecture",
+  "difficulty": "hard",
+  "prompt": "Your Linux edge load balancers (16 vCPU, 25 Gbps NICs) are hit by a spoofed 20,000,000 PPS TCP SYN flood. Your existing `iptables` + `nf_conntrack` rules saturate 100% SoftIRQ CPU (`ksoftirqd`) within seconds, exhaust the 262K-entry `nf_conntrack` table, and drop 95% of legitimate customer HTTPS connections—even though bandwidth is under 12 Gbps. Design an XDP/eBPF in-kernel mitigation pipeline that drops the 20M PPS flood while keeping legitimate traffic healthy under <15% CPU.",
+  "spark": {
+    "summary": "Move SYN flood filtering out of iptables/nf_conntrack into a Native XDP eBPF program using a Per-CPU LPM CIDR blocklist, stateless SYN-flood rate limits, and ringbuf drop sampling.",
+    "keyTakeaway": "When traffic spikes expose hidden coupling, drop spoofed SYN floods via XDP_DROP before sk_buff or nf_conntrack allocation, and use Per-CPU maps + atomic link pinning for zero-downtime rule updates.",
+    "byteSummary": "A 20M PPS small-packet SYN flood exhausts CPU and kernel tables long before it saturates 25 Gbps link bandwidth. Because `iptables` runs *after* `sk_buff` allocation and `nf_conntrack` insertion, each spoofed SYN allocates kernel memory and contends on conntrack hash-bucket locks, pegging `ksoftirqd` at 100% CPU and starving legitimate HTTPS handshakes.\n\nMoving mitigation to **Native XDP** inside the NIC driver intercepts packets before `sk_buff` or `nf_conntrack` exists. A lightweight XDP program parses Ethernet/IPv4/TCP headers with Verifier-safe bounds checks, matches known-bad CIDRs in `BPF_MAP_TYPE_LPM_TRIE`, and tracks per-CPU SYN rates using `BPF_MAP_TYPE_PERCPU_HASH` (or issues stateless **XDP SYN-cookies** via `XDP_TX` for suspicious bursts).\n\nFlood packets return `XDP_DROP` (~20M PPS across 16 cores at <15% CPU), while legitimate established flows and clean SYNs return `XDP_PASS` into the kernel stack (optionally with `NOTRACK` / `tcp_syncookies=1` backup). A user-space Go/Python control plane updates the LPM blocklist atomically and reads 1-in-10,000 drop samples from `BPF_MAP_TYPE_RINGBUF`.\n\nThe core trade-off is collateral false-positive risk vs survival: stateless XDP rate limits or coarse `/24` LPM blocks can affect NAT-shared users if thresholds are too tight, so always pair XDP with an explicit allowlist map, sampled drop telemetry, and a dead-man rollback timer."
+  },
+  "learningJourney": [
+    {
+      "id": "stage-1-why-iptables-collapses",
+      "eyebrow": "Stage 1 • Triage",
+      "title": "Why 20M PPS Destroys iptables & nf_conntrack Before Bandwidth Saturates",
+      "level": "foundation",
+      "purpose": "Quantify per-packet SoftIRQ, sk_buff, and conntrack lock bottlenecks under spoofed SYN floods.",
+      "explanation": {
+        "foundation": "20M 64-byte SYN packets use only `~10.2 Gbps` of wire bandwidth, yet crash a 25 Gbps Linux host because:",
+        "core": "- **50 ns Budget**: 20M PPS across 16 cores allows ~800 ns per packet per core.\n- **`sk_buff` + `nf_conntrack`**: Allocating `sk_buff`, running Netfilter hooks, and inserting 20M unique spoofed source IPs into `nf_conntrack` takes >1,500 ns and overflows the 262,144-entry conntrack table in **13 milliseconds**.",
+        "deepDive": "In production deployments of XDP In-Kernel SYN Flood & DDoS Packet Dropping, watch how why 20m pps destroys iptables & nf_conntrack before bandwidth saturates interacts with tail latency, retry amplification, and partial failures. Move SYN flood filtering out of iptables/nf_conntrack into a Native XDP eBPF program using a Per-CPU LPM CIDR blocklist, stateless SYN-flood rate limits, and ringbuf drop sampling."
+      },
+      "sectionDiagram": {
+        "kind": "flow",
+        "eyebrow": "Stack Collapse",
+        "title": "20M PPS Flood -> nf_conntrack Full in 13 ms",
+        "nodes": [
+          {
+            "id": "syn",
+            "label": "20M PPS Spoofed SYN",
+            "sublabel": "10.2 Gbps wire rate"
+          },
+          {
+            "id": "ct",
+            "label": "sk_buff + nf_conntrack",
+            "sublabel": "262K table fills in 13ms"
+          },
+          {
+            "id": "cpu",
+            "label": "100% ksoftirqd CPU",
+            "sublabel": "95% good traffic dropped"
+          }
+        ],
+        "edges": [
+          {
+            "from": "syn",
+            "to": "ct",
+            "label": "Unique spoofed src IPs"
+          },
+          {
+            "from": "ct",
+            "to": "cpu",
+            "label": "Hash lock + slab thrashing"
+          }
+        ],
+        "cards": [
+          {
+            "title": "PPS vs Gbps",
+            "body": "Small-packet floods attack CPU/PPS limits, not NIC bandwidth."
+          },
+          {
+            "title": "Conntrack Exhaustion",
+            "body": "Spoofed random source IPs defeat stateful conntrack tables."
+          }
+        ],
+        "summary": "Caption: A 20M PPS spoofed SYN flood overflows nf_conntrack in 13 ms and saturates ksoftirqd CPU with sk_buff allocations."
+      }
+    },
+    {
+      "id": "stage-2-xdp-early-drop",
+      "eyebrow": "Stage 2 • Mitigation Architecture",
+      "title": "Pre-sk_buff XDP Pipeline: Allowlist -> LPM Blocklist -> SYN Rate Check",
+      "level": "foundation",
+      "purpose": "Order XDP packet checks from cheapest/safest to stateful so clean traffic flows with minimal latency.",
+      "explanation": {
+        "foundation": "Structure the Native XDP filter in three deterministic fast-path stages:",
+        "core": "1. **Trusted Allowlist (`BPF_MAP_TYPE_LPM_TRIE`)**: Health checks, internal VPCs, and CDN edges immediately return `XDP_PASS`.\n2. **Dynamic CIDR Blocklist (`BPF_MAP_TYPE_LPM_TRIE`)**: Known botnet prefixes return `XDP_DROP` in <30 ns.\n3. **TCP SYN-Only Filter**: Non-SYN packets (established `ACK`/`PSH` flows) bypass rate checks immediately (`XDP_PASS`). Only pure `TCP_SYN` packets (`syn && !ack`) enter per-CPU token-bucket/rate accounting.",
+        "deepDive": "In production deployments of XDP In-Kernel SYN Flood & DDoS Packet Dropping, watch how pre-sk_buff xdp pipeline: allowlist -> lpm blocklist -> syn rate check interacts with tail latency, retry amplification, and partial failures. Move SYN flood filtering out of iptables/nf_conntrack into a Native XDP eBPF program using a Per-CPU LPM CIDR blocklist, stateless SYN-flood rate limits, and ringbuf drop sampling."
+      },
+      "sectionDiagram": {
+        "kind": "flow",
+        "eyebrow": "XDP Fast Path",
+        "title": "Allowlist -> LPM Blocklist -> SYN-Only Limiter",
+        "nodes": [
+          {
+            "id": "alw",
+            "label": "1. Allowlist LPM",
+            "sublabel": "CDN / health -> XDP_PASS"
+          },
+          {
+            "id": "blk",
+            "label": "2. Blocklist LPM",
+            "sublabel": "Botnet CIDR -> XDP_DROP"
+          },
+          {
+            "id": "syn",
+            "label": "3. SYN-Only Guard",
+            "sublabel": "Established ACK -> XDP_PASS"
+          }
+        ],
+        "edges": [
+          {
+            "from": "alw",
+            "to": "blk",
+            "label": "Not allowlisted"
+          },
+          {
+            "from": "blk",
+            "to": "syn",
+            "label": "Pure TCP SYN only"
+          }
+        ],
+        "cards": [
+          {
+            "title": "Protect Existing Sessions",
+            "body": "Skipping SYN rate checks for ACK packets ensures established HTTPS users are never dropped."
+          },
+          {
+            "title": "Native Mode Required",
+            "body": "Verify xdpdrv attach mode on NICs (e.g., Mellanox mlx5, Intel ixgbe/ice, AWS ENA)."
+          }
+        ],
+        "summary": "Caption: Checking allowlists, LPM blocklists, and established ACK flags before SYN rate limiting drops floods at wire speed while sparing active sessions."
+      },
+      "decisionFramework": {
+        "problem": "How to implement XDP In-Kernel SYN Flood & DDoS Packet Dropping without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "When traffic spikes expose hidden coupling, drop spoofed SYN floods via XDP_DROP before sk_buff or nf_conntrack allocation, and use Per-CPU maps + atomic link pinning for zero-downtime rule updates.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When XDP In-Kernel SYN Flood & DDoS Packet Dropping experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-3-stateless-syn-cookies",
+      "eyebrow": "Stage 3 • Spoof Defense",
+      "title": "Handling Spoofed Source IPs with XDP SYN-Cookies (`XDP_TX`)",
+      "level": "intermediate",
+      "purpose": "Defend against randomized spoofed source IPs that evade per-IP rate limiters.",
+      "explanation": {
+        "foundation": "When an attacker randomizes source IPs across all `2^32` addresses, per-IP rate limits never trigger on any single IP. Under global SYN-rate threshold breach (`global_syn_pps > 500K`):",
+        "core": "- **XDP SYN-Proxy / Cookie**: XDP computes a cryptographic **SYN-cookie** (`SipHash(src_ip, src_port, dst_ip, dst_port, secret, minute)`) as the TCP Initial Sequence Number, swaps MAC/IP/Port headers, and bounces a `SYN-ACK` back out the NIC via **`XDP_TX`**—without allocating any kernel socket.\n- Spoofed bots never reply with the final `ACK`; real clients send `ACK` with `ack_seq == cookie + 1`, which XDP verifies before handing the handshake to the kernel.",
+        "deepDive": "In production deployments of XDP In-Kernel SYN Flood & DDoS Packet Dropping, watch how handling spoofed source ips with xdp syn-cookies (`xdp_tx`) interacts with tail latency, retry amplification, and partial failures. Move SYN flood filtering out of iptables/nf_conntrack into a Native XDP eBPF program using a Per-CPU LPM CIDR blocklist, stateless SYN-flood rate limits, and ringbuf drop sampling."
+      },
+      "sectionDiagram": {
+        "kind": "comparison",
+        "eyebrow": "Spoofed Flood Defense",
+        "title": "Per-IP Limiter vs Stateless XDP_TX SYN-Cookie",
+        "nodes": [
+          {
+            "id": "ip",
+            "label": "Per-IP Rate Limit",
+            "sublabel": "Bypassed by spoofed IPs"
+          },
+          {
+            "id": "ck",
+            "label": "XDP_TX SYN-Cookie",
+            "sublabel": "Zero state; verifies real ACK"
+          }
+        ],
+        "edges": [
+          {
+            "from": "ip",
+            "to": "ck",
+            "label": "Activate when global SYN > 500K PPS"
+          }
+        ],
+        "cards": [
+          {
+            "title": "Zero Kernel State",
+            "body": "SYN-cookies store 0 bytes per half-open connection."
+          },
+          {
+            "title": "Clean Mode Trigger",
+            "body": "Only activate SYN-cookie proxy mode during active global SYN spikes to preserve TCP options normally."
+          }
+        ],
+        "summary": "Caption: Under randomized spoofed-IP floods, XDP_TX SYN-cookies challenge clients statelessly without allocating any kernel socket or conntrack state."
+      }
+    },
+    {
+      "id": "stage-4-percpu-accounting-sampling",
+      "eyebrow": "Stage 4 • Concurrency & Visibility",
+      "title": "Per-CPU Drop Counters & Sampled Ringbuf Telemetry",
+      "level": "intermediate",
+      "purpose": "Observe dropped attack traffic without saturating CPU or missing packets in tcpdump.",
+      "explanation": {
+        "foundation": "Since `tcpdump` cannot see `XDP_DROP` frames, emit lightweight visibility without slowing the 20M PPS hot path:",
+        "core": "- **Per-CPU Counters**: Increment `PERCPU_ARRAY[DROP_SYN_FLOOD]` in L1 cache (0 locks).\n- **1-in-10,000 Ringbuf Sampling**: Only when `(counter & 0x3FFF) == 0`, copy the 54-byte header into `BPF_MAP_TYPE_RINGBUF` for user-space inspection and automated `/24` botnet CIDR extraction.",
+        "deepDive": "In production deployments of XDP In-Kernel SYN Flood & DDoS Packet Dropping, watch how per-cpu drop counters & sampled ringbuf telemetry interacts with tail latency, retry amplification, and partial failures. Move SYN flood filtering out of iptables/nf_conntrack into a Native XDP eBPF program using a Per-CPU LPM CIDR blocklist, stateless SYN-flood rate limits, and ringbuf drop sampling."
+      },
+      "sectionDiagram": {
+        "kind": "flow",
+        "eyebrow": "Zero-Overhead Telemetry",
+        "title": "Per-CPU Counter + 1-in-16K Ringbuf Sampling",
+        "nodes": [
+          {
+            "id": "cnt",
+            "label": "PERCPU_ARRAY",
+            "sublabel": "Every dropped pkt"
+          },
+          {
+            "id": "smp",
+            "label": "(cnt & 0x3FFF) == 0",
+            "sublabel": "1-in-16,384 sample"
+          },
+          {
+            "id": "rb",
+            "label": "BPF Ringbuf",
+            "sublabel": "User-space SIEM / CIDR"
+          }
+        ],
+        "edges": [
+          {
+            "from": "cnt",
+            "to": "smp",
+            "label": "Bitmask check"
+          },
+          {
+            "from": "smp",
+            "to": "rb",
+            "label": "Async user-space read"
+          }
+        ],
+        "cards": [
+          {
+            "title": "Bounded Telemetry",
+            "body": "Sampling 1-in-16K at 20M PPS sends only ~1,200 events/sec to user space."
+          },
+          {
+            "title": "False-Positive Audit",
+            "body": "Operators verify dropped headers in real time without touching the hot path."
+          }
+        ],
+        "summary": "Caption: Per-CPU counters paired with bitmask-sampled BPF ringbuf events provide real-time visibility into XDP drops at negligible CPU cost."
+      }
+    },
+    {
+      "id": "stage-5-implementation",
+      "eyebrow": "Stage 5 • Implementation",
+      "title": "Safe Python Control-Plane LPM Blocklist Updater with Rollback",
+      "level": "intermediate",
+      "purpose": "Provide safe control-plane code that validates CIDRs, retries transient map updates, and rolls back on failure.",
+      "explanation": {
+        "foundation": "The user-space mitigation daemon ingests ringbuf drop samples, aggregates offending `/24` prefixes, and pushes them into the kernel `BPF_MAP_TYPE_LPM_TRIE` with strict allowlist protection, bounded retries, and rollback:",
+        "core": "```python\nimport ipaddress, random, time\nfrom typing import Protocol\n\nclass LPMMapClient(Protocol):\n    def upsert_cidr(self, cidr: str, ttl_s: int) -> None: ...\n    def delete_cidr(self, cidr: str) -> None: ...\n\nPROTECTED_ALLOWLIST = [ipaddress.ip_network('10.0.0.0/8'), ipaddress.ip_network('172.16.0.0/12')]",
+        "deepDive": "def block_offending_cidrs(bpf_map: LPMMapClient, cidrs: list[str], ttl_s: int = 300) -> list[str]:\n    applied: list[str] = []\n    try:\n        for raw in cidrs:\n            net = ipaddress.ip_network(raw, strict=False)\n            if net.prefixlen < 16 or any(net.overlaps(a) for a in PROTECTED_ALLOWLIST):\n                continue  # Guard against blocking broad /8s or internal VPCs\n            for attempt in range(3):\n                try:\n                    bpf_map.upsert_cidr(str(net), ttl_s=ttl_s)\n                    applied.append(str(net))\n                    break\n                except OSError:\n                    if attempt == 2:\n                        raise\n                    time.sleep((0.05 * (2 ** attempt)) + random.uniform(0, 0.02))\n        return applied\n    except Exception as exc:\n        for c in applied:\n            bpf_map.delete_cidr(c)  # Atomic rollback of partial batch\n        raise RuntimeError(f'LPM blocklist update rolled back: {exc}') from exc\n```"
+      },
+      "sectionDiagram": {
+        "kind": "flow",
+        "eyebrow": "Control-Plane Safety",
+        "title": "CIDR Guard -> Bounded Retry -> Batch Rollback",
+        "nodes": [
+          {
+            "id": "grd",
+            "label": "Prefix >= /16 & Allowlist",
+            "sublabel": "Block self-inflicted outage"
+          },
+          {
+            "id": "ret",
+            "label": "BPF Map Upsert",
+            "sublabel": "3x bounded backoff"
+          },
+          {
+            "id": "rbk",
+            "label": "Rollback on Error",
+            "sublabel": "Delete partial batch"
+          }
+        ],
+        "edges": [
+          {
+            "from": "grd",
+            "to": "ret",
+            "label": "Validated CIDRs"
+          },
+          {
+            "from": "ret",
+            "to": "rbk",
+            "label": "Fail-safe recovery"
+          }
+        ],
+        "cards": [
+          {
+            "title": "Self-DoS Guard",
+            "body": "Rejecting prefixes broader than /16 and VPC overlaps prevents blocking entire regions."
+          },
+          {
+            "title": "TTL Expiration",
+            "body": "300s auto-expiry ensures temporary attack blocks never become permanent."
+          }
+        ],
+        "summary": "Caption: Control-plane blocklist updates enforce >=/16 prefix bounds, allowlist overlap checks, bounded retries, and batch rollback."
+      }
+    },
+    {
+      "id": "stage-6-rss-irq-pinning",
+      "eyebrow": "Stage 6 • NIC & CPU Scaling",
+      "title": "Multi-Queue NIC RSS Hashing & NUMA IRQ Pinning",
+      "level": "advanced",
+      "purpose": "Distribute 20M PPS evenly across all 16 cores via NIC Receive Side Scaling (RSS).",
+      "explanation": {
+        "foundation": "If all NIC RX packets land on Queue 0 (Core 0), even XDP caps out at ~1.5–3M PPS on that single core:",
+        "core": "- **Enable 16 RX Queues (`ethtool -L eth0 combined 16`)**: Hardware RSS hashes the 5-tuple across 16 queues, pinning 1 queue per CPU core.\n- **Disable `irqbalance` Drift**: Pin each RX queue's IRQ affinity directly to its NUMA-local core so XDP runs lock-free on `PERCPU` maps at 20M+ PPS total.",
+        "deepDive": "In production deployments of XDP In-Kernel SYN Flood & DDoS Packet Dropping, watch how multi-queue nic rss hashing & numa irq pinning interacts with tail latency, retry amplification, and partial failures. Move SYN flood filtering out of iptables/nf_conntrack into a Native XDP eBPF program using a Per-CPU LPM CIDR blocklist, stateless SYN-flood rate limits, and ringbuf drop sampling."
+      },
+      "sectionDiagram": {
+        "kind": "comparison",
+        "eyebrow": "Hardware Scaling",
+        "title": "Single RX Queue Bottleneck vs 16-Queue RSS",
+        "nodes": [
+          {
+            "id": "q1",
+            "label": "1 RX Queue",
+            "sublabel": "Core 0 at 100%, 15 idle"
+          },
+          {
+            "id": "q16",
+            "label": "16 RSS Queues",
+            "sublabel": "1.25M PPS/core, <15% CPU"
+          }
+        ],
+        "edges": [
+          {
+            "from": "q1",
+            "to": "q16",
+            "label": "Linear 16-core scaling"
+          }
+        ],
+        "cards": [
+          {
+            "title": "Symmetric RSS",
+            "body": "Use Toeplitz symmetric keys if doing bidirectional XDP_TX/AF_XDP flow tracking."
+          },
+          {
+            "title": "NUMA Alignment",
+            "body": "Keep NIC PCIe slot, RX rings, and pinned IRQs on the same NUMA node."
+          }
+        ],
+        "summary": "Caption: Configuring 16 RSS RX queues pinned 1-to-1 to CPU cores scales XDP linearly to 20M+ PPS under <15% CPU."
+      }
+    },
+    {
+      "id": "stage-7-slos-canary-rollback",
+      "eyebrow": "Stage 7 • Verification",
+      "title": "Dead-Man Rollback Watchdog & Attack-Time SLOs",
+      "level": "advanced",
+      "purpose": "Ensure XDP deployments cannot lock out SSH/BGP control planes and verify <15% CPU under flood.",
+      "explanation": {
+        "foundation": "Before deploying XDP to edge load balancers:",
+        "core": "- **Dead-Man Auto-Detach**: During program rollout, require a health-check heartbeat within 30s or automatically detach/revert to the prior pinned BPF link so a buggy rule can never brick SSH/BGP.\n- **Verify Under Synthetic Flood**: Replay 20M PPS via `pktgen` / `TRex` in staging and assert `ksoftirqd_cpu < 15%`, `nf_conntrack_count < 10%`, and `https_handshake_p99 < 10 ms`.",
+        "deepDive": "In production deployments of XDP In-Kernel SYN Flood & DDoS Packet Dropping, watch how dead-man rollback watchdog & attack-time slos interacts with tail latency, retry amplification, and partial failures. Move SYN flood filtering out of iptables/nf_conntrack into a Native XDP eBPF program using a Per-CPU LPM CIDR blocklist, stateless SYN-flood rate limits, and ringbuf drop sampling."
+      },
+      "sectionDiagram": {
+        "kind": "comparison",
+        "eyebrow": "Post-Fix Telemetry",
+        "title": "iptables Collapse vs Native XDP Defense",
+        "nodes": [
+          {
+            "id": "bad",
+            "label": "Before (iptables)",
+            "sublabel": "100% CPU • 95% leg. dropped"
+          },
+          {
+            "id": "good",
+            "label": "After (Native XDP)",
+            "sublabel": "<15% CPU • 0% leg. dropped"
+          }
+        ],
+        "edges": [
+          {
+            "from": "bad",
+            "to": "good",
+            "label": "20M PPS dropped pre-sk_buff"
+          }
+        ],
+        "cards": [
+          {
+            "title": "OOB Management",
+            "body": "Keep SSH/BGP ports or management NICs on the XDP allowlist."
+          },
+          {
+            "title": "Conntrack Relief",
+            "body": "XDP_DROP keeps nf_conntrack clean for legitimate established HTTPS flows."
+          }
+        ],
+        "summary": "Caption: Native XDP with 16-queue RSS, LPM/SYN-cookie filtering, and dead-man rollback absorbs 20M PPS floods under <15% CPU with zero legitimate packet loss."
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why did the 20M PPS SYN flood crash the 25 Gbps edge servers even though packet volume was only ~10.2 Gbps?",
+      "options": [
+        "Each spoofed SYN packet triggered sk_buff allocation, SoftIRQ processing, and nf_conntrack insertion, saturating CPU and exhausting the 262K conntrack table in 13 ms",
+        "TCP SYN packets consume 10x more Ethernet wire bandwidth than HTTPS packets",
+        "25 Gbps NICs automatically shut down above 10M PPS",
+        "iptables pauses user-space DNS for 30 seconds per packet"
+      ],
+      "correctIndex": 0,
+      "explanation": "Small-packet DDoS attacks exhaust per-packet CPU (sk_buff/SoftIRQ) and stateful kernel tables (nf_conntrack) rather than NIC link bandwidth."
+    },
+    "knowledgeChecks": [
+      {
+        "id": "kc-xdp-spoof",
+        "question": "If the attacker randomizes spoofed source IPs across millions of addresses, why is per-IP rate limiting alone insufficient—and what XDP technique solves it?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Per-IP buckets never saturate for random IPs; XDP_TX stateless SYN-cookies challenge clients with cryptographic ISNs without allocating kernel state",
+            "correct": true,
+            "feedback": "Correct! Stateless XDP_TX SYN-cookies verify whether the client can complete the 3-way handshake without storing per-IP state in the kernel."
+          },
+          {
+            "id": "b",
+            "text": "Increasing nf_conntrack_max to 100 million entries",
+            "correct": false,
+            "feedback": "Stateless XDP_TX SYN-cookies verify whether the client can complete the 3-way handshake without storing per-IP state in the kernel."
+          },
+          {
+            "id": "c",
+            "text": "Running tcpdump on eth0 to block IPs in Python",
+            "correct": false,
+            "feedback": "Stateless XDP_TX SYN-cookies verify whether the client can complete the 3-way handshake without storing per-IP state in the kernel."
+          },
+          {
+            "id": "d",
+            "text": "Switching from Native XDP to Generic XDP",
+            "correct": false,
+            "feedback": "Stateless XDP_TX SYN-cookies verify whether the client can complete the 3-way handshake without storing per-IP state in the kernel."
+          }
+        ],
+        "correctIndex": 0,
+        "explanation": "Stateless XDP_TX SYN-cookies verify whether the client can complete the 3-way handshake without storing per-IP state in the kernel."
+      },
+      {
+        "id": "kc-xdp-established",
+        "question": "How does the XDP filter ensure legitimate active HTTPS users are not dropped during SYN-flood mitigation?",
+        "options": [
+          {
+            "id": "a",
+            "text": "It checks allowlists first and immediately returns XDP_PASS for non-SYN packets (established ACK/PSH traffic) before applying SYN rate limits",
+            "correct": true,
+            "feedback": "Correct! Filtering specifically on pure SYN packets (syn && !ack) protects established HTTPS sessions from ever hitting rate-limiter thresholds."
+          },
+          {
+            "id": "b",
+            "text": "It disables TLS encryption during floods",
+            "correct": false,
+            "feedback": "Filtering specifically on pure SYN packets (syn && !ack) protects established HTTPS sessions from ever hitting rate-limiter thresholds."
+          },
+          {
+            "id": "c",
+            "text": "It sends all packets to user-space Python via epoll",
+            "correct": false,
+            "feedback": "Filtering specifically on pure SYN packets (syn && !ack) protects established HTTPS sessions from ever hitting rate-limiter thresholds."
+          },
+          {
+            "id": "d",
+            "text": "It drops all ACK packets and only passes SYN packets",
+            "correct": false,
+            "feedback": "Filtering specifically on pure SYN packets (syn && !ack) protects established HTTPS sessions from ever hitting rate-limiter thresholds."
+          }
+        ],
+        "correctIndex": 0,
+        "explanation": "Filtering specifically on pure SYN packets (syn && !ack) protects established HTTPS sessions from ever hitting rate-limiter thresholds."
+      },
+      {
+        "id": "kc-xdp-rss",
+        "question": "You deploy Native XDP on a 16-core host, yet Core 0 hits 100% CPU while Cores 1–15 sit idle at 2%. What is the likely cause?",
+        "options": [
+          {
+            "id": "a",
+            "text": "NIC Receive Side Scaling (RSS) is routing all RX packets to a single RX queue/IRQ on Core 0 instead of 16 queues across all 16 cores",
+            "correct": true,
+            "feedback": "Correct! XDP runs in the SoftIRQ context of the core handling the NIC RX queue; configuring 16 RSS queues pinned 1-to-1 to cores scales throughput linearly."
+          },
+          {
+            "id": "b",
+            "text": "eBPF programs can only execute on CPU Core 0",
+            "correct": false,
+            "feedback": "XDP runs in the SoftIRQ context of the core handling the NIC RX queue; configuring 16 RSS queues pinned 1-to-1 to cores scales throughput linearly."
+          },
+          {
+            "id": "c",
+            "text": "PERCPU_ARRAY maps lock Core 0",
+            "correct": false,
+            "feedback": "XDP runs in the SoftIRQ context of the core handling the NIC RX queue; configuring 16 RSS queues pinned 1-to-1 to cores scales throughput linearly."
+          },
+          {
+            "id": "d",
+            "text": "XDP_DROP requires single-threaded execution",
+            "correct": false,
+            "feedback": "XDP runs in the SoftIRQ context of the core handling the NIC RX queue; configuring 16 RSS queues pinned 1-to-1 to cores scales throughput linearly."
+          }
+        ],
+        "correctIndex": 0,
+        "explanation": "XDP runs in the SoftIRQ context of the core handling the NIC RX queue; configuring 16 RSS queues pinned 1-to-1 to cores scales throughput linearly."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "A 20M packet-per-second SYN flood crashes Linux firewalls because the kernel creates heavy packet tracking objects for every fake packet. Using XDP in the network driver lets you drop flood packets immediately before tracking state is created, keeping legitimate traffic fast.",
+      "spark": {
+        "summary": "Stop 20M PPS SYN floods by dropping bad packets in the NIC driver with XDP before Linux allocates conntrack state.",
+        "keyTakeaway": "Drop flood SYNs with XDP_DROP, pass established ACK traffic, and spread NIC queues across all CPU cores."
+      },
+      "learningJourney": [
+        {
+          "stageId": "stage-1-why-iptables-collapses",
+          "summary": "Fake SYN packets fill kernel connection tables in milliseconds."
+        },
+        {
+          "stageId": "stage-2-xdp-early-drop",
+          "summary": "Check allowlists and established traffic first, then filter pure SYNs."
+        },
+        {
+          "stageId": "stage-3-stateless-syn-cookies",
+          "summary": "Use XDP_TX SYN-cookies when attackers fake random source IPs."
+        },
+        {
+          "stageId": "stage-4-percpu-accounting-sampling",
+          "summary": "Count drops per CPU and sample a few packets to inspect."
+        },
+        {
+          "stageId": "stage-5-implementation",
+          "summary": "Protect internal VPC IPs and roll back failed blocklist updates."
+        },
+        {
+          "stageId": "stage-6-rss-irq-pinning",
+          "summary": "Enable 16 NIC queues so all CPU cores share the load."
+        },
+        {
+          "stageId": "stage-7-slos-canary-rollback",
+          "summary": "Use an auto-rollback timer so an XDP rule never locks you out."
+        }
+      ],
+      "finalSummary": "Native XDP filtering with multi-queue RSS drops massive SYN floods before the kernel stack gets overwhelmed.",
+      "summary": "Move SYN flood filtering out of iptables/nf_conntrack into a Native XDP eBPF program using a Per-CPU LPM CIDR blocklist, stateless SYN-flood rate limits, and ringbuf drop sampling.",
+      "keyTakeaway": "When traffic spikes expose hidden coupling, drop spoofed SYN floods via XDP_DROP before sk_buff or nf_conntrack allocation, and use Per-CPU maps + atomic link pinning for zero-downtime rule updates."
+    },
+    "intermediate": {
+      "byteSummary": "A 20M PPS spoofed SYN flood overflows nf_conntrack in 13 ms and pegs ksoftirqd via sk_buff allocations. Native XDP bypasses sk_buff using LPM CIDR allow/blocklists, SYN-only rate limits, stateless XDP_TX SYN-cookies, 16-queue RSS, and 1-in-16K ringbuf drop sampling to hold CPU under 15%.",
+      "spark": {
+        "summary": "Mitigate 20M PPS SYN floods at <15% CPU using Native XDP, LPM/Per-CPU maps, stateless XDP_TX SYN-cookies, and 16-queue RSS.",
+        "keyTakeaway": "Filter before sk_buff/conntrack, isolate established ACK flows, and guard blocklist updates with prefix checks and rollback."
+      },
+      "learningJourney": [
+        {
+          "stageId": "stage-1-why-iptables-collapses",
+          "summary": "800 ns/pkt budget vs sk_buff allocation and 13 ms conntrack overflow."
+        },
+        {
+          "stageId": "stage-2-xdp-early-drop",
+          "summary": "Allowlist -> LPM blocklist -> SYN-only limiter fast path."
+        },
+        {
+          "stageId": "stage-3-stateless-syn-cookies",
+          "summary": "XDP_TX SipHash SYN-cookies defeat randomized source-IP spoofing."
+        },
+        {
+          "stageId": "stage-4-percpu-accounting-sampling",
+          "summary": "PERCPU_ARRAY counters + 1-in-16K ringbuf drop sampling."
+        },
+        {
+          "stageId": "stage-5-implementation",
+          "summary": "Python LPM updater with >=/16 guard, allowlist check, and rollback."
+        },
+        {
+          "stageId": "stage-6-rss-irq-pinning",
+          "summary": "16-queue NIC RSS and NUMA-local IRQ pinning."
+        },
+        {
+          "stageId": "stage-7-slos-canary-rollback",
+          "summary": "30s dead-man auto-detach and synthetic 20M PPS flood verification."
+        }
+      ],
+      "finalSummary": "Native XDP + 16-queue RSS + stateless SYN-cookies drop 20M PPS floods pre-sk_buff while preserving legitimate HTTPS traffic.",
+      "summary": "Move SYN flood filtering out of iptables/nf_conntrack into a Native XDP eBPF program using a Per-CPU LPM CIDR blocklist, stateless SYN-flood rate limits, and ringbuf drop sampling.",
+      "keyTakeaway": "When traffic spikes expose hidden coupling, drop spoofed SYN floods via XDP_DROP before sk_buff or nf_conntrack allocation, and use Per-CPU maps + atomic link pinning for zero-downtime rule updates."
+    },
+    "advanced": {
+      "byteSummary": "Defending 25G/16-core edge nodes against 20M PPS spoofed SYN floods requires shifting filtering ahead of sk_buff and nf_conntrack into Native XDP across 16 NUMA-pinned RSS queues. Combining LPM allow/blocklists, ACK-bypass fast paths, stateless XDP_TX SipHash SYN-cookies, PERCPU counters, bitmask-sampled ringbuf telemetry, and dead-man link rollback sustains <15% CPU.",
+      "spark": {
+        "summary": "Wire-speed DDoS defense: 16-queue RSS + Native XDP, ACK-bypass fast paths, XDP_TX SYN-cookies, ringbuf sampling, and dead-man rollback.",
+        "keyTakeaway": "Eliminate sk_buff/conntrack from the flood path, scale linearly across RSS queues, and enforce allowlist/rollback guards on control-plane updates."
+      },
+      "learningJourney": [
+        {
+          "stageId": "stage-1-why-iptables-collapses",
+          "summary": "Slab/conntrack lock collapse under 20M PPS small-packet floods."
+        },
+        {
+          "stageId": "stage-2-xdp-early-drop",
+          "summary": "Pre-sk_buff LPM allow/blocklist ordering and ACK fast-path bypass."
+        },
+        {
+          "stageId": "stage-3-stateless-syn-cookies",
+          "summary": "Stateless XDP_TX SipHash SYN-cookies under randomized IP spoofing."
+        },
+        {
+          "stageId": "stage-4-percpu-accounting-sampling",
+          "summary": "Zero-lock PERCPU counters and bitmask-sampled ringbuf visibility."
+        },
+        {
+          "stageId": "stage-5-implementation",
+          "summary": "Prefix-bounded, allowlist-guarded LPM updates with batch rollback."
+        },
+        {
+          "stageId": "stage-6-rss-irq-pinning",
+          "summary": "16-queue Toeplitz RSS and NUMA-aligned IRQ affinity."
+        },
+        {
+          "stageId": "stage-7-slos-canary-rollback",
+          "summary": "Dead-man link watchdog and TRex/pktgen 20M PPS SLO validation."
+        }
+      ],
+      "finalSummary": "Pre-sk_buff Native XDP paired with 16-queue RSS and stateless SYN-cookies neutralizes 20M PPS floods at <15% CPU.",
+      "summary": "Move SYN flood filtering out of iptables/nf_conntrack into a Native XDP eBPF program using a Per-CPU LPM CIDR blocklist, stateless SYN-flood rate limits, and ringbuf drop sampling.",
+      "keyTakeaway": "When traffic spikes expose hidden coupling, drop spoofed SYN floods via XDP_DROP before sk_buff or nf_conntrack allocation, and use Per-CPU maps + atomic link pinning for zero-downtime rule updates."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "prerequisites": [
+    {
+      "title": "eBPF & XDP In-Kernel Packet Processing",
+      "summary": "eBPF runs sandboxed, JIT-compiled bytecode safely inside the Linux kernel, and XDP (eXpress Data Path) hooks directly into the NIC driver RX ring before sk_buff allocation—enabling 20M+ PPS filtering per core."
+    },
+    {
+      "title": "Zero-Copy I/O, sendfile & io_uring",
+      "summary": "Zero-copy I/O keeps file bytes inside the Linux kernel page cache and streams them straight to a network socket via DMA scatter-gather, while io_uring batches asynchronous syscalls over shared memory ring buffers."
+    },
+    {
+      "title": "Circuit Breaker Pattern",
+      "summary": "A stateful proxy that monitors downstream failures and slow calls over a sliding window, tripping open to fail fast in microseconds instead of letting 2,000ms+ timeouts exhaust caller thread pools."
+    }
+  ],
+  "simulation": {
+    "title": "XDP In-Kernel SYN Flood & DDoS Packet Dropping — Interactive Execution Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Workload & Budget"
+      },
+      {
+        "id": "router",
+        "label": "Gateway / Router",
+        "role": "Admission & Dispatch"
+      },
+      {
+        "id": "engine",
+        "label": "Core Engine",
+        "role": "Primary Execution"
+      },
+      {
+        "id": "replica",
+        "label": "Replica / Fallback",
+        "role": "Durability & Recovery"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "router",
+        "label": "request"
+      },
+      {
+        "from": "router",
+        "to": "engine",
+        "label": "route"
+      },
+      {
+        "from": "engine",
+        "to": "replica",
+        "label": "sync / fallback"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why 20M PPS Destroys iptables & nf_conntrack Before Bandwidt",
+        "actionLabel": "Dispatch nominal request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "router"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "Ingress",
+          "p99_ms": 8,
+          "error_rate": "0.0%"
+        },
+        "explanation": "Caller sends work into the gateway with explicit timeout and concurrency bounds (Why 20M PPS Destroys iptables & nf_conntrack Before Bandwidth Saturates)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Pre-sk_buff XDP Pipeline: Allowlist -> LPM Blocklist -> SYN ",
+        "actionLabel": "Execute core invariant",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "Core Path",
+          "p99_ms": 18,
+          "in_flight": 124
+        },
+        "explanation": "The core engine processes the hot path while keeping state transitions deterministic (Pre-sk_buff XDP Pipeline: Allowlist -> LPM Blocklist -> SYN Rate Check)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Handling Spoofed Source IPs with XDP SYN-Cookies (`XDP_TX`)",
+        "actionLabel": "Detect skew or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Degraded",
+          "p99_ms": 64,
+          "retries_capped": "true"
+        },
+        "explanation": "Under load or replica lag, bounded backoff and isolation prevent cascading saturation (Handling Spoofed Source IPs with XDP SYN-Cookies (`XDP_TX`))."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Dead-Man Rollback Watchdog & Attack-Time SLOs",
+        "actionLabel": "Converge & restore SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 11,
+          "drift": 0
+        },
+        "explanation": "State converges cleanly and telemetry confirms the system returned within its SLO envelope (Dead-Man Rollback Watchdog & Attack-Time SLOs)."
+      }
+    ]
+  }
+}

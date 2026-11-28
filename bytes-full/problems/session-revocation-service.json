@@ -1,0 +1,569 @@
+{
+  "id": "session-revocation-service",
+  "slug": "session-revocation-service",
+  "title": "Design a Multi-Region Session & Token Revocation Service",
+  "problemType": "system-design",
+  "difficulty": "hard",
+  "prompt": "Design a globally distributed session and JWT revocation service for 100M active users across 4 regions. Edge API gateways handle 2M auth checks/sec and must validate tokens with < 2 ms p99 overhead, while security-critical revocations (password reset, compromised device, admin force-logout) must propagate globally within 5 seconds—even during cross-region network partitions or cache-node failures.",
+  "spark": {
+    "summary": "Pair short-lived stateless JWTs (5–15 min TTL) with an in-memory edge revocation filter, an authoritative multi-region session store, and async cross-region push invalidation with bounded retries and DLQ.",
+    "keyTakeaway": "If latency budgets leave no room for synchronous retries, never make synchronous cross-region database calls on every API request; keep the hot read path in edge memory and bound the revocation window with short JWT TTLs + fast push invalidation.",
+    "byteSummary": "Purely stateless JWTs cannot be revoked before expiry, while purely stateful session lookups across 2M RPS/sec bottleneck on centralized Redis/DB latency. A production multi-region revocation architecture combines short-lived access tokens (`5–10 min` TTL) with a compact, two-tier revocation check at every regional Edge Gateway.\n\nOn the hot read path (`< 2 ms` p99), each Edge Gateway verifies the JWT signature locally using cached JWKS keys and checks `(jti, user_id, session_epoch)` against an in-memory revocation filter (e.g., compact hash set / Bloom + regional Redis fallback). Only revoked tokens or epoch-bumped users need entries, keeping memory footprint small because entries expire automatically when the JWT's `exp` passes.\n\nOn the write path, a Revocation API writes durably to the authoritative session store (e.g., multi-region DynamoDB/Spanner) and publishes an invalidation event to a cross-region replication stream. Regional fan-out workers update local Redis caches and push deltas to edge gateway memory within 1–3 seconds, routing any failed regional deliveries through bounded exponential backoff and a Dead Letter Queue (DLQ) with reconciliation polling."
+  },
+  "learningJourney": [
+    {
+      "id": "01-requirements-and-sizing",
+      "eyebrow": "STAGE 01 · REQUIREMENTS & MATH",
+      "title": "Read/Write Asymmetry & Revocation Memory Footprint",
+      "level": "foundation",
+      "purpose": "Size the 2M RPS read path and bounded revocation set so edge memory stays tiny and predictable.",
+      "explanation": {
+        "foundation": "- **Read Path**: 2M auth checks/sec globally (~500K RPS/region) at `< 2 ms` p99.",
+        "core": "- **Write Path**: ~1,000–5,000 revocations/sec (logouts, password resets, risk triggers).",
+        "deepDive": "- **Bounded State**: With a 10-minute access token TTL, even 5,000 revocations/sec produces at most `5,000 × 600 = 3M` active deny entries (~100 MB in compact hash/Redis memory) before TTL eviction."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Request & State Flow",
+        "title": "Read/Write Asymmetry & Revocation Memory Footprint",
+        "actors": [
+          {
+            "id": "client",
+            "label": "Client / Workload"
+          },
+          {
+            "id": "pep",
+            "label": "Edge Policy Enforcer"
+          },
+          {
+            "id": "idp",
+            "label": "IdP / JWKS / Vault"
+          },
+          {
+            "id": "api",
+            "label": "Protected API"
+          }
+        ],
+        "events": [
+          {
+            "from": "client",
+            "to": "pep",
+            "label": "Present signed token / mTLS cert"
+          },
+          {
+            "from": "pep",
+            "to": "idp",
+            "label": "Verify signature via cached JWKS"
+          },
+          {
+            "from": "pep",
+            "to": "api",
+            "label": "Forward attenuated identity claims"
+          },
+          {
+            "from": "api",
+            "to": "client",
+            "label": "Return scoped resource response"
+          }
+        ]
+      }
+    },
+    {
+      "id": "02-short-lived-jwt-plus-epoch",
+      "eyebrow": "STAGE 02 · TOKEN DESIGN",
+      "title": "Short-Lived Access Tokens + User Session Epoch",
+      "level": "foundation",
+      "purpose": "Support both single-session logout (`jti`) and global 'log out all devices' (`epoch`) without storing every active token.",
+      "explanation": {
+        "foundation": "Include two compact claims in every 10-minute access JWT:\n- **`jti` (Token ID)**: Enables surgical revocation of a single compromised device/session.",
+        "core": "- **`ver` (User Security Epoch)**: A monotonically increasing integer per user.",
+        "deepDive": "On password reset or account takeover, incrementing `ver` in one record invalidates *all* outstanding access and refresh tokens for that user without enumerating every `jti`."
+      },
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "Component Topology",
+        "title": "Short-Lived Access Tokens + User Session Epoch",
+        "graphNodes": [
+          {
+            "id": "client",
+            "label": "Client",
+            "role": "ingress",
+            "col": 0,
+            "row": 0,
+            "tone": "primary"
+          },
+          {
+            "id": "pep",
+            "label": "Edge Gateway",
+            "role": "compute",
+            "col": 1,
+            "row": 0,
+            "tone": "tint"
+          },
+          {
+            "id": "idp",
+            "label": "JWKS / Vault",
+            "role": "storage",
+            "col": 2,
+            "row": 0,
+            "tone": "tint"
+          },
+          {
+            "id": "api",
+            "label": "Target Service",
+            "role": "control",
+            "col": 0,
+            "row": 1,
+            "tone": "tint"
+          }
+        ],
+        "graphEdges": [
+          {
+            "from": "client",
+            "to": "pep",
+            "label": "Bearer / mTLS",
+            "style": "solid",
+            "tone": "green"
+          },
+          {
+            "from": "pep",
+            "to": "idp",
+            "label": "key lookup",
+            "style": "solid",
+            "tone": "green"
+          },
+          {
+            "from": "pep",
+            "to": "api",
+            "label": "scoped call",
+            "style": "solid",
+            "tone": "green"
+          }
+        ]
+      },
+      "decisionFramework": {
+        "problem": "How to implement Design a Multi-Region Session & Token Revocation Service without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "If latency budgets leave no room for synchronous retries, never make synchronous cross-region database calls on every API request; keep the hot read path in edge memory and bound the revocation window with short JWT TTLs + fast push invalidation.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Design a Multi-Region Session & Token Revocation Service experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-edge-hot-read-path",
+      "eyebrow": "STAGE 03 · EDGE HOT PATH",
+      "title": "Sub-2 ms Edge Verification via Local Filter + Regional Redis",
+      "level": "intermediate",
+      "purpose": "Keep 99.9%+ of API requests off the network using in-memory edge filters and fail-closed/fail-open risk tiers.",
+      "explanation": {
+        "foundation": "Each Edge Gateway maintains an in-memory map of `(revoked_jti -> exp)` and `(user_id -> min_valid_epoch)` synced via streaming deltas from its regional Redis cluster:",
+        "core": "1. Verify JWT signature locally with cached JWKS.\n2. Check local in-memory filter (`O(1)`, `< 50 µs`).\n3. If the edge filter is stale (`last_sync_age > 5s`), fall back to Regional Redis for high-risk endpoints (payments, password change) while allowing low-risk reads if configured.",
+        "deepDive": "In production deployments of Design a Multi-Region Session & Token Revocation Service, watch how sub-2 ms edge verification via local filter + regional redis interacts with tail latency, retry amplification, and partial failures. 2M RPS multi-region revocation architecture: `jti` + monotonic `epoch` claims, sub-2 ms edge filters, Lua monotonic guards, skew-buffered TTLs, and partition fail-closed tiers."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "title": "Edge Gateway Sub-2 ms Token Verification Path",
+        "nodes": [
+          {
+            "id": "req",
+            "label": "Inbound JWT",
+            "sub": "2M RPS"
+          },
+          {
+            "id": "sig",
+            "label": "Local JWKS Verify",
+            "sub": "< 0.2 ms"
+          },
+          {
+            "id": "mem",
+            "label": "In-Memory Filter",
+            "sub": "jti + epoch (< 0.1 ms)"
+          },
+          {
+            "id": "redis",
+            "label": "Regional Redis",
+            "sub": "Stale-Sync Fallback"
+          }
+        ],
+        "caption": "Caption: Edge gateways verify signatures and revocation state in local memory, hitting Redis only on stale syncs."
+      }
+    },
+    {
+      "id": "04-cross-region-propagation",
+      "eyebrow": "STAGE 04 · WRITE & PROPAGATION",
+      "title": "Authoritative Store, Cross-Region Stream & Push Invalidation",
+      "level": "intermediate",
+      "purpose": "Propagate revocations globally in under 5 seconds using durable writes + async fan-out + periodic anti-entropy.",
+      "explanation": {
+        "foundation": "When a user revokes a session or resets their password:",
+        "core": "1. **Authoritative Write**: Update the multi-region DB (or revoke refresh token family) transactionally.\n2. **Publish Event**: Emit `{ type: 'REVOKE_JTI' | 'BUMP_EPOCH', id, ttl }` to a cross-region replicated stream (e.g., Kafka MirrorMaker / DynamoDB Streams).\n3. **Regional Fan-Out**: Workers in all 4 regions write to Regional Redis (`SETEX` with remaining JWT TTL) and push via pub/sub to Edge Gateways.",
+        "deepDive": "In production deployments of Design a Multi-Region Session & Token Revocation Service, watch how authoritative store, cross-region stream & push invalidation interacts with tail latency, retry amplification, and partial failures. 2M RPS multi-region revocation architecture: `jti` + monotonic `epoch` claims, sub-2 ms edge filters, Lua monotonic guards, skew-buffered TTLs, and partition fail-closed tiers."
+      },
+      "sectionDiagram": {
+        "kind": "behavior-transition",
+        "eyebrow": "Design Trade-Off",
+        "title": "Authoritative Store, Cross-Region Stream & Push Invalidation",
+        "before": {
+          "label": "Long-Lived Bearer + Implicit Trust",
+          "metrics": [
+            "Stolen token works everywhere",
+            "JWKS rotation triggers 500s",
+            "Confused-deputy escalation"
+          ]
+        },
+        "after": {
+          "label": "Short-Lived mTLS + Scoped Claims",
+          "metrics": [
+            "Stale-while-revalidate JWKS",
+            "Strict alg/aud/iss pinning",
+            "Least-privilege hop attenuation"
+          ]
+        }
+      }
+    },
+    {
+      "id": "05-safe-revocation-worker-code",
+      "eyebrow": "STAGE 05 · SAFE PROPAGATION CODE",
+      "title": "Idempotent Regional Invalidation Worker with Bounded Retry & DLQ",
+      "level": "intermediate",
+      "purpose": "Ensure transient regional Redis or network failures never drop revocations or block healthy regions.",
+      "explanation": {
+        "foundation": "Each regional fan-out worker must apply epoch updates **monotonically** (never overwrite a newer epoch with a stale out-of-order event) and route persistent failures to a DLQ:",
+        "core": "```python\nimport time, random",
+        "deepDive": "def apply_revocation_event(redis_client, dlq, event, max_retries=4):\n    for attempt in range(max_retries):\n        try:\n            if event['type'] == 'REVOKE_JTI':\n                ttl = max(1, int(event['exp'] - time.time()))\n                redis_client.setex(f\"rev:jti:{event['jti']}\", ttl, '1')\n            elif event['type'] == 'BUMP_EPOCH':\n                # Monotonic Lua/atomic guard so out-of-order events never regress min_epoch\n                redis_client.eval(\n                    \"local cur = tonumber(redis.call('GET', KEYS[1]) or '0'); \"\n                    \"if tonumber(ARGV[1]) > cur then redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2]) end;\",\n                    1, f\"rev:epoch:{event['user_id']}\", str(event['epoch']), str(event['ttl'])\n                )\n            return True\n        except RedisTransientError:\n            if attempt == max_retries - 1:\n                dlq.publish(event, reason='regional_redis_write_failed')\n                return False\n            time.sleep(min(2.0, (0.05 * (2 ** attempt)) + random.uniform(0, 0.05)))\n```"
+      },
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "Lifecycle & Failure Recovery",
+        "title": "Idempotent Regional Invalidation Worker with Bounded Retry & DLQ",
+        "states": [
+          {
+            "id": "unauth",
+            "label": "Unauthenticated",
+            "tone": "neutral"
+          },
+          {
+            "id": "verified",
+            "label": "Signature Verified",
+            "tone": "info"
+          },
+          {
+            "id": "authorized",
+            "label": "Policy Allowed",
+            "tone": "good"
+          },
+          {
+            "id": "revoked",
+            "label": "Expired / Revoked",
+            "tone": "warn"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "unauth",
+            "to": "verified",
+            "label": "check pubkey"
+          },
+          {
+            "from": "verified",
+            "to": "authorized",
+            "label": "RBAC/ABAC match"
+          },
+          {
+            "from": "verified",
+            "to": "revoked",
+            "label": "kid/TTL mismatch"
+          }
+        ]
+      }
+    },
+    {
+      "id": "06-partition-and-failover",
+      "eyebrow": "STAGE 06 · RESILIENCE",
+      "title": "Handling Cross-Region Partitions & Refresh Token Rotation",
+      "level": "advanced",
+      "purpose": "Combine refresh-token reuse detection with fail-closed sensitive endpoints during regional isolation.",
+      "explanation": {
+        "foundation": "Think of **Handling Cross-Region Partitions & Refresh Token Rotation** as the intuition layer for Design a Multi-Region Session & Token Revocation Service: Combine refresh-token reuse detection with fail-closed sensitive endpoints during regional isolation.",
+        "core": "- **Refresh Token Reuse Detection**: Refresh tokens are always validated against the authoritative store; if a rotated/revoked refresh token is replayed, immediately bump the user's `epoch`.\n- **Partition Mode**: If a region loses stream connectivity (`sync_lag > 10s`), high-risk endpoints (`/transfer`, `/password`) fail closed to the authoritative store while non-sensitive reads stay available.",
+        "deepDive": "Under heavy load or partial failure, handling cross-region partitions & refresh token rotation becomes a critical lever for predictable latency and correctness. 2M RPS multi-region revocation architecture: `jti` + monotonic `epoch` claims, sub-2 ms edge filters, Lua monotonic guards, skew-buffered TTLs, and partition fail-closed tiers."
+      }
+    },
+    {
+      "id": "07-failure-modes",
+      "eyebrow": "STAGE 07 · GOTCHAS",
+      "title": "Clock Skew, Out-of-Order Epochs & Cache Stampedes",
+      "level": "advanced",
+      "purpose": "Mitigate JWT clock-skew leaks, epoch regressions, and JWKS rotation thundering herds.",
+      "explanation": {
+        "foundation": "- **Clock Skew**: Add a 30–60s buffer to revocation `SETEX` TTLs so a token accepted by a slightly skewed edge clock cannot slip past an expired deny entry.",
+        "core": "- **Out-of-Order Events**: Always compare `new_epoch > current_epoch` atomically in Redis Lua.",
+        "deepDive": "- **JWKS Stampedes**: Cache JWKS with background refresh + jitter rather than synchronous fetch on unknown `kid`."
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-1",
+        "question": "A user clicks 'Log out of all devices' after an account compromise, and they have 14 active sessions across mobile and web. How can the service revoke all 14 access JWTs in O(1) state?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Increment the user's `epoch` (`ver`) in the authoritative store and propagate `(user_id -> min_valid_epoch)` to regional caches and edge filters.",
+            "correct": true,
+            "feedback": "Correct! Bumping a single per-user `epoch` invalidates all older access and refresh tokens for that user in O(1) without tracking every individual `jti`."
+          },
+          {
+            "id": "b",
+            "text": "Wait 24 hours for all 14 JWTs to expire naturally.",
+            "correct": false,
+            "feedback": "Bumping a single per-user `epoch` invalidates all older access and refresh tokens for that user in O(1) without tracking every individual `jti`."
+          },
+          {
+            "id": "c",
+            "text": "Rotate the global RSA signing key for all 100M users.",
+            "correct": false,
+            "feedback": "Bumping a single per-user `epoch` invalidates all older access and refresh tokens for that user in O(1) without tracking every individual `jti`."
+          },
+          {
+            "id": "d",
+            "text": "Query the primary database on every incoming API request.",
+            "correct": false,
+            "feedback": "Bumping a single per-user `epoch` invalidates all older access and refresh tokens for that user in O(1) without tracking every individual `jti`."
+          }
+        ],
+        "correctIndex": 0,
+        "explanation": "Bumping a single per-user `epoch` invalidates all older access and refresh tokens for that user in O(1) without tracking every individual `jti`."
+      },
+      {
+        "id": "kc-2",
+        "question": "Why should revocation entries in Regional Redis have a TTL equal to `(token_exp - now) + clock_skew_buffer`?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Once a JWT's `exp` (plus clock skew) passes, signature validation already rejects it, bounding Redis and edge memory to active token lifetimes.",
+            "correct": true,
+            "feedback": "Correct! Expired JWTs are already rejected by `exp` verification, so keeping deny entries only until `exp + skew` bounds memory cleanly."
+          },
+          {
+            "id": "b",
+            "text": "Redis deletes keys automatically if TTL is omitted.",
+            "correct": false,
+            "feedback": "Expired JWTs are already rejected by `exp` verification, so keeping deny entries only until `exp + skew` bounds memory cleanly."
+          },
+          {
+            "id": "c",
+            "text": "It forces the user's browser to clear cookies immediately.",
+            "correct": false,
+            "feedback": "Expired JWTs are already rejected by `exp` verification, so keeping deny entries only until `exp + skew` bounds memory cleanly."
+          },
+          {
+            "id": "d",
+            "text": "It extends the lifetime of valid JWTs during partitions.",
+            "correct": false,
+            "feedback": "Expired JWTs are already rejected by `exp` verification, so keeping deny entries only until `exp + skew` bounds memory cleanly."
+          }
+        ],
+        "correctIndex": 0,
+        "explanation": "Expired JWTs are already rejected by `exp` verification, so keeping deny entries only until `exp + skew` bounds memory cleanly."
+      },
+      {
+        "id": "kc-3",
+        "question": "During a cross-region network partition, Region B's edge gateways have not received revocation stream updates for 20 seconds. What should happen for a `/v1/wire-transfer` request?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Fail closed or fall back to an authoritative session check for high-risk endpoints when `sync_lag` exceeds the freshness SLA.",
+            "correct": true,
+            "feedback": "Correct! High-risk endpoints must not rely on stale local revocation caches beyond the 5-second SLA; falling back to authoritative verification or failing closed prevents compromised token abuse."
+          },
+          {
+            "id": "b",
+            "text": "Allow all requests indefinitely using only local JWKS.",
+            "correct": false,
+            "feedback": "High-risk endpoints must not rely on stale local revocation caches beyond the 5-second SLA; falling back to authoritative verification or failing closed prevents compromised token abuse."
+          },
+          {
+            "id": "c",
+            "text": "Flush the entire in-memory revocation filter to free RAM.",
+            "correct": false,
+            "feedback": "High-risk endpoints must not rely on stale local revocation caches beyond the 5-second SLA; falling back to authoritative verification or failing closed prevents compromised token abuse."
+          },
+          {
+            "id": "d",
+            "text": "Reset the user's `epoch` back to `0`.",
+            "correct": false,
+            "feedback": "High-risk endpoints must not rely on stale local revocation caches beyond the 5-second SLA; falling back to authoritative verification or failing closed prevents compromised token abuse."
+          }
+        ],
+        "correctIndex": 0,
+        "explanation": "High-risk endpoints must not rely on stale local revocation caches beyond the 5-second SLA; falling back to authoritative verification or failing closed prevents compromised token abuse."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Use short-lived login tokens plus a fast in-memory deny list at each edge server so stolen tokens are blocked within seconds.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, never make synchronous cross-region database calls on every API request; keep the hot read path in edge memory and bound the revocation window with short JWT TTLs + fast push invalidation.",
+      "byteSummary": "If a login token lasts for weeks, logging out won't stop a hacker who copied it. Instead, apps give out short 10-minute tokens and keep a small in-memory list of recently revoked tokens at each edge gateway.\n\nWhen someone logs out or resets their password, a central service saves the change and pushes the update to every region in a couple of seconds."
+    },
+    "intermediate": {
+      "summary": "Combine 10-minute JWTs (`jti` + `ver` epoch) with `< 2 ms` edge in-memory filters, regional Redis fallback, and async cross-region push invalidation.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, never make synchronous cross-region database calls on every API request; keep the hot read path in edge memory and bound the revocation window with short JWT TTLs + fast push invalidation.",
+      "byteSummary": "Edge gateways validate JWT signatures locally and check `(jti, user_epoch)` against an in-memory revocation filter synced from Regional Redis (`< 2 ms` p99).\n\nRevocations write to an authoritative multi-region store and stream via async fan-out workers (with bounded retry + DLQ) to all regions within 5 seconds, expiring automatically once the JWT's `exp` passes."
+    },
+    "advanced": {
+      "summary": "2M RPS multi-region revocation architecture: `jti` + monotonic `epoch` claims, sub-2 ms edge filters, Lua monotonic guards, skew-buffered TTLs, and partition fail-closed tiers.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, never make synchronous cross-region database calls on every API request; keep the hot read path in edge memory and bound the revocation window with short JWT TTLs + fast push invalidation.",
+      "byteSummary": "With 2M RPS reads and a 5s global revocation SLA, synchronous cross-region DB reads are infeasible. Short-lived JWTs (10m TTL) cap active deny-list state to ~3M entries (~100 MB), while `jti` + monotonic `ver` epoch claims handle both single-device and global logouts in O(1).\n\nEdge gateways check local filters (`< 50 µs`) and fall back to Regional Redis or authoritative DB on stale syncs for sensitive routes. Regional workers use atomic Lua `new_epoch > cur_epoch` guards, skew-buffered `SETEX` TTLs, and bounded backoff + DLQ."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "prerequisites": [
+    {
+      "title": "Passkeys, WebAuthn & FIDO2 Passwordless Auth",
+      "summary": "WebAuthn/FIDO2 replaces passwords with per-site asymmetric keypairs generated inside a user's hardware authenticator, where private keys never leave the device and signatures are cryptographically bound to the exact Relying Party origin."
+    },
+    {
+      "title": "API Security: OAuth 2.1, JWT & mTLS",
+      "summary": "Modern API security pairs OAuth 2.0 (for delegated user/client authorization), signed JWTs (for stateless, verifiable claims), and Mutual TLS (mTLS) (for cryptographic workload and high-assurance client identity)."
+    },
+    {
+      "title": "JWT Validation Pitfalls & Hardening (RFC 8725)",
+      "summary": "Stateless JSON Web Tokens fail catastrophically when verifiers trust header fields (`alg`, `kid`, `jku`), skip audience/issuer checks, or confuse asymmetric public keys with HMAC secrets."
+    }
+  ],
+  "simulation": {
+    "title": "Design a Multi-Region Session & Token Revocation Service — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Client",
+        "role": "Signed Credential"
+      },
+      {
+        "id": "pep",
+        "label": "Edge Gateway",
+        "role": "Token & Policy Check"
+      },
+      {
+        "id": "idp",
+        "label": "JWKS / Vault",
+        "role": "Key Rotation"
+      },
+      {
+        "id": "api",
+        "label": "Target Service",
+        "role": "Scoped Execution"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "pep",
+        "label": "Bearer / mTLS"
+      },
+      {
+        "from": "pep",
+        "to": "idp",
+        "label": "key lookup"
+      },
+      {
+        "from": "pep",
+        "to": "api",
+        "label": "scoped call"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Read/Write Asymmetry & Revocation Memory Footprint",
+        "actionLabel": "Bearer / mTLS",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "pep"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "Bearer / mTLS",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Client sends work to Edge Gateway (Read/Write Asymmetry & Revocation Memory Footprint)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Short-Lived Access Tokens + User Session Epoch",
+        "actionLabel": "key lookup",
+        "status": "healthy",
+        "activeNodeIds": [
+          "pep",
+          "idp"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "key lookup",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Edge Gateway coordinates with JWKS / Vault while preserving the core invariant (Short-Lived Access Tokens + User Session Epoch)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Sub-2 ms Edge Verification via Local Filter + Regional Redis",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "idp",
+          "api"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, Target Service absorbs pressure without cascading (Sub-2 ms Edge Verification via Local Filter + Regional Redis)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Clock Skew, Out-of-Order Epochs & Cache Stampedes",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "pep",
+          "idp",
+          "api"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Clock Skew, Out-of-Order Epochs & Cache Stampedes)."
+      }
+    ]
+  }
+}

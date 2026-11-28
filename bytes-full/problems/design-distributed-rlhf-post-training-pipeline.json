@@ -1,0 +1,768 @@
+{
+  "slug": "design-distributed-rlhf-post-training-pipeline",
+  "title": "Design a 512-GPU Distributed RLHF & GRPO Post-Training Pipeline",
+  "domain": "ai-machine-learning-systems",
+  "spark": {
+    "summary": "Architect a 512-GPU H100/B200 distributed RLHF/GRPO post-training pipeline that eliminates straggler stalls and GPU bubbles using disaggregated vLLM rollout workers, a Ray Object Store prioritized replay buffer, FSDP2 trainers, and non-blocking NCCL weight sync.",
+    "keyTakeaway": "When inference latency or GPU memory limits bind throughput, split the 512-GPU cluster into disaggregated vLLM Rollout Workers (GPUs 1-256) and FSDP2/ZeRO-3 Trainers (GPUs 257-512), bridged by a bounded-staleness Ray replay buffer and an InfiniBand NCCL weight-sync ring.",
+    "byteSummary": "In a naive synchronous 512-GPU RLHF job, every GPU waits for the single longest 16K-token reasoning rollout before starting the backward pass, then stalls another 60 seconds writing and reloading 140 GB checkpoints—leaving cluster utilization below 30%.\n\nThis design disaggregates the 512-GPU InfiniBand cluster into two specialized pools: GPUs 1–256 run TP=4/8 vLLM Rollout Workers with dynamic length-bucketing and continuous batching, streaming finished G=8 trajectory groups into a Ray Object Store Prioritized Replay Buffer alongside sandboxed verifier scoring.\n\nGPUs 257–512 run FSDP2 (ZeRO-3 + activation checkpointing) Trainers pulling fixed-length-packed mini-batches from the replay buffer. Every K gradient steps, a non-blocking NCCL Weight-Sync ring broadcasts layer-pipelined BF16 weights (or LoRA deltas) directly over RDMA to the rollout workers."
+  },
+  "learningJourney": [
+    {
+      "stage": 1,
+      "level": "foundation",
+      "title": "512-GPU Cluster Topology & Disaggregated Pool Sizing",
+      "purpose": "Partition 512 H100/B200 GPUs across Rollout Actors, Verifiers, and FSDP2 Trainers based on throughput balance.",
+      "explanation": {
+        "foundation": "Think of **512-GPU Cluster Topology & Disaggregated Pool Sizing** as the intuition layer for Design a 512-GPU Distributed RLHF & GRPO Post-Training Pipeline: Partition 512 H100/B200 GPUs across Rollout Actors, Verifiers, and FSDP2 Trainers based on throughput balance.",
+        "core": "In a 70B GRPO run with G=8 completions per prompt (avg 1,500 output tokens, max 16K) and 2,048 prompts per global step (~24.5M generated tokens/step), rollout generation dominates wall-clock time (~3.5x the FLOPs of the forward/backward trainer pass). Splitting 512 GPUs (64 × 8-GPU NVLink nodes) as 256 GPUs (32 nodes, TP=4 × 64 vLLM replicas) for Rollout Workers and 256 GPUs (32 nodes, DP=32 × FSDP2 TP=8) for Policy + Reference Trainers balances the producer-consumer rate so the replay buffer neither starves nor overflows.",
+        "deepDive": "Under heavy load or partial failure, 512-gpu cluster topology & disaggregated pool sizing becomes a critical lever for predictable latency and correctness. 512-GPU InfiniBand RLHF/GRPO architecture featuring disaggregated vLLM rollouts (shared-prefix + length-bucketing), Ray Plasma variance-prioritized buffering (K<=3), FSDP2 varlen packing, and isolated NCCL RDMA sync."
+      },
+      "sectionDiagram": {
+        "kind": "architecture",
+        "eyebrow": "STAGE 1 · TOPOLOGY",
+        "title": "512-GPU Disaggregated Rollout vs. Trainer Pool Split",
+        "nodes": [
+          {
+            "id": "q",
+            "label": "Global Prompt Queue",
+            "sub": "2,048 prompts / step",
+            "role": "prompt-source"
+          },
+          {
+            "id": "roll",
+            "label": "vLLM Rollout Pool (1-256)",
+            "sub": "64 replicas x TP=4",
+            "role": "rollout-cluster"
+          },
+          {
+            "id": "ver",
+            "label": "CPU/Sandboxed Verifiers",
+            "sub": "Firecracker + RM pool",
+            "role": "reward-cluster"
+          },
+          {
+            "id": "trn",
+            "label": "FSDP2 Trainer Pool (257-512)",
+            "sub": "32 nodes ZeRO-3 + ckpt",
+            "role": "trainer-cluster"
+          }
+        ],
+        "edges": [
+          {
+            "from": "q",
+            "to": "roll",
+            "label": "Feeds G=8 prompt groups"
+          },
+          {
+            "from": "roll",
+            "to": "ver",
+            "label": "Streams completed traces"
+          },
+          {
+            "from": "ver",
+            "to": "trn",
+            "label": "Enqueues scored batches"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Dynamic Rebalancing",
+            "detail": "When CoT lengths grow from 1.5K to 8K, shift 8 nodes from Trainer to Rollout pool."
+          },
+          {
+            "label": "NVLink vs. InfiniBand",
+            "detail": "Keep TP=4/8 strictly inside 8-GPU NVLink domains; run FSDP DP and weight sync over 400Gbps IB."
+          }
+        ],
+        "summary": "Splitting 64 8-GPU nodes evenly between TP=4 vLLM actors and ZeRO-3 FSDP2 trainers balances rollout throughput with backward-pass speed.",
+        "caption": "Keeping Tensor Parallelism inside single 8-GPU NVLink nodes avoids cross-node AllReduce latency."
+      }
+    },
+    {
+      "stage": 2,
+      "level": "foundation",
+      "title": "Dynamic Length-Bucketing & Continuous Batching on Rollout GPUs",
+      "purpose": "Eliminate intra-batch padding and straggler stalls during G=8 trajectory generation.",
+      "explanation": {
+        "foundation": "Generating G=8 completions for a 16K-token coding prompt alongside a 300-token trivia prompt inside a static batch wastes 95% of KV-cache slots waiting for the 16K trace.",
+        "core": "Rollout workers use vLLM continuous batching with Prefix Caching across the shared G=8 prompt prefix (saving 87.5% of prompt prefill KV memory!).",
+        "deepDive": "A Prompt Scheduler estimates output length from historical domain buckets and co-schedules similar-length prompts together, while long-tail stragglers (>8K tokens) are preempted to a dedicated long-context replica pool so short prompts never stall."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 2 · ROLLOUT ENGINE",
+        "title": "Shared-Prefix vLLM Continuous Batching & Length Bucketing",
+        "nodes": [
+          {
+            "id": "bkt",
+            "label": "Length-Bucketed Router",
+            "sub": "Short (<2K) vs Long (16K)",
+            "role": "length-router"
+          },
+          {
+            "id": "apc",
+            "label": "G=8 Shared Prompt KV",
+            "sub": "87.5% prefill savings",
+            "role": "prefix-cache"
+          },
+          {
+            "id": "cb",
+            "label": "vLLM Continuous Scheduler",
+            "sub": "Immediate slot backfill",
+            "role": "slot-scheduler"
+          },
+          {
+            "id": "emit",
+            "label": "Per-Group Emitter",
+            "sub": "Flushes when G=8 finish",
+            "role": "group-emitter"
+          }
+        ],
+        "edges": [
+          {
+            "from": "bkt",
+            "to": "apc",
+            "label": "Routes by est. length"
+          },
+          {
+            "from": "apc",
+            "to": "cb",
+            "label": "Shares prompt KV blocks"
+          },
+          {
+            "from": "cb",
+            "to": "emit",
+            "label": "Emits complete G=8 groups"
+          }
+        ],
+        "cards": [
+          {
+            "label": "G=8 Prefix Sharing",
+            "detail": "Prefilling the prompt once and branching 8 decode heads cuts rollout TTFT by ~8x."
+          },
+          {
+            "label": "Straggler Isolation",
+            "detail": "Routing >8K CoT tasks to dedicated replicas keeps fast-turn throughput high."
+          }
+        ],
+        "summary": "Shared-prefix vLLM continuous batching and length-bucketed routing prevent long CoT stragglers from stalling short-turn rollouts.",
+        "caption": "Branching G=8 decode streams from one cached prompt prefix saves 87.5% of prompt KV memory."
+      },
+      "decisionFramework": {
+        "problem": "How to implement Design a 512-GPU Distributed RLHF & GRPO Post-Training Pipeline without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "When inference latency or GPU memory limits bind throughput, split the 512-GPU cluster into disaggregated vLLM Rollout Workers (GPUs 1-256) and FSDP2/ZeRO-3 Trainers (GPUs 257-512), bridged by a bounded-staleness Ray replay buffer and an InfiniBand NCCL weight-sync ring.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Design a 512-GPU Distributed RLHF & GRPO Post-Training Pipeline experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "stage": 3,
+      "level": "intermediate",
+      "title": "Ray Object Store Prioritized Replay Buffer & Bounded Staleness",
+      "purpose": "Decouple rollout production from trainer consumption using zero-copy Ray shared memory.",
+      "explanation": {
+        "foundation": "Finished `(prompt, G_completions, rewards, old_logprobs)` groups stream into a distributed Ray Object Store (Plasma shared-memory) Prioritized Replay Buffer.",
+        "core": "To prevent off-policy divergence, every trajectory carries `policy_version = v_t`. The trainer only samples batches where `current_step - policy_version <= K_max` (typically `K_max = 3`), evicting staler items automatically.",
+        "deepDive": "Prioritization upweights high-variance groups (where `0 < pass_rate < 1`) and downweights near-zero-advantage groups:\n```python\ndef sample_trainer_batch(replay_buf, current_step: int, batch_size: int, k_max: int = 3):\n    valid = [item for item in replay_buf if (current_step - item[\"policy_ver\"]) <= k_max]\n    if len(valid) < batch_size:\n        return None  # Wait briefly for fresh rollouts rather than training on stale data\n    valid.sort(key=lambda x: x[\"reward_std\"], reverse=True)\n    return valid[:batch_size]\n```"
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 3 · REPLAY BUFFER",
+        "title": "Ray Object Store Prioritized Buffer with K_max=3 Staleness",
+        "nodes": [
+          {
+            "id": "in",
+            "label": "Completed G=8 Groups",
+            "sub": "Tagged w/ policy_ver",
+            "role": "buffer-ingress"
+          },
+          {
+            "id": "ray",
+            "label": "Ray Plasma Object Store",
+            "sub": "Zero-copy Arrow/Tensor",
+            "role": "shared-store"
+          },
+          {
+            "id": "stale",
+            "label": "Staleness Evictor (K<=3)",
+            "sub": "Drops expired versions",
+            "role": "staleness-gate"
+          },
+          {
+            "id": "prio",
+            "label": "Variance Prioritizer",
+            "sub": "Ranks by reward_std",
+            "role": "batch-sampler"
+          }
+        ],
+        "edges": [
+          {
+            "from": "in",
+            "to": "ray",
+            "label": "Writes zero-copy tensors"
+          },
+          {
+            "from": "ray",
+            "to": "stale",
+            "label": "Filters policy_ver delta"
+          },
+          {
+            "from": "stale",
+            "to": "prio",
+            "label": "Selects high-signal groups"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Bounded Off-Policy",
+            "detail": "Capping staleness at K<=3 steps preserves GRPO convergence without synchronous blocking."
+          },
+          {
+            "label": "Zero-Copy IPC",
+            "detail": "Ray Plasma passes multi-megabyte token/logprob tensors via shared memory without pickle overhead."
+          }
+        ],
+        "summary": "A Ray Object Store replay buffer with K<=3 staleness filtering and reward-variance prioritization feeds high-signal batches to trainers.",
+        "caption": "Filtering out expired policy versions keeps asynchronous RLHF mathematically sound."
+      }
+    },
+    {
+      "stage": 4,
+      "level": "intermediate",
+      "title": "FSDP2 Trainer Pool with Sequence Packing & ZeRO-3 Checkpointing",
+      "purpose": "Maximize trainer MFU across GPUs 257-512 by packing variable-length trajectories and trading compute for HBM.",
+      "explanation": {
+        "foundation": "Even within a filtered batch, trajectory lengths vary from 200 to 8,000 tokens.",
+        "core": "Padding every sequence to 8,000 wastes 75% of attention FLOPs. The trainer uses FlashAttention-2/3 `varlen` Sequence Packing (`cu_seqlens`) to concatenate multiple trajectories into a single 32K-token packed micro-batch with zero cross-trajectory attention leakage.",
+        "deepDive": "FSDP2 (`fully_shard`) shards 70B parameters, gradients, and AdamW states across GPUs 257–512 with selective activation checkpointing on MLP/attention blocks so 32K packed sequences fit comfortably in 80–192 GB HBM."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 4 · TRAINER POOL",
+        "title": "FSDP2 ZeRO-3 Training with FlashAttention Varlen Packing",
+        "nodes": [
+          {
+            "id": "pack",
+            "label": "Varlen Sequence Packer",
+            "sub": "cu_seqlens 32K packed",
+            "role": "batch-packer"
+          },
+          {
+            "id": "fa",
+            "label": "FlashAttention-3 Varlen",
+            "sub": "Zero cross-sample leak",
+            "role": "attention-kernel"
+          },
+          {
+            "id": "fsdp",
+            "label": "FSDP2 ZeRO-3 Shards",
+            "sub": "BF16 + FP32 AdamW",
+            "role": "sharded-trainer"
+          },
+          {
+            "id": "act",
+            "label": "Selective Act. Ckpt",
+            "sub": "Recomputes heavy layers",
+            "role": "memory-saver"
+          }
+        ],
+        "edges": [
+          {
+            "from": "pack",
+            "to": "fa",
+            "label": "Passes packed cu_seqlens"
+          },
+          {
+            "from": "fa",
+            "to": "fsdp",
+            "label": "Runs fwd/bwd on shards"
+          },
+          {
+            "from": "act",
+            "to": "fsdp",
+            "label": "Bounds peak HBM"
+          }
+        ],
+        "cards": [
+          {
+            "label": "3x Effective FLOPs",
+            "detail": "Varlen sequence packing eliminates padding waste on heavy-tailed reasoning traces."
+          },
+          {
+            "label": "Reference Logprobs",
+            "detail": "Compute reference policy logprobs in packed mode too, maximizing memory bandwidth."
+          }
+        ],
+        "summary": "FlashAttention varlen sequence packing and FSDP2 ZeRO-3 sharding eliminate padding waste across variable-length RL trajectories.",
+        "caption": "Packing variable-length completions into 32K cu_seqlens batches triples trainer MFU."
+      }
+    },
+    {
+      "stage": 5,
+      "level": "intermediate",
+      "title": "Non-Blocking NCCL Weight-Sync Ring (Every K Steps)",
+      "purpose": "Update 256 rollout GPUs from 256 trainer GPUs over InfiniBand without pausing inference or touching disk.",
+      "explanation": {
+        "foundation": "Every K optimizer steps (e.g., K=1–4), trainer rank-0s per FSDP group gather each transformer layer into a staging buffer and push it over a dedicated NCCL Weight-Sync Ring (`400 Gbps InfiniBand NDR`) directly to the vLLM rollout workers.",
+        "core": "To make this non-blocking, vLLM workers use a double-buffered staging slot or brief pause-and-swap between continuous-batching decode steps (<2s for 70B BF16, <80ms for LoRA).",
+        "deepDive": "Crucially, the NCCL Weight-Sync communicator is isolated from the FSDP training communicator so a slow rollout node never deadlocks FSDP gradients."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 5 · WEIGHT SYNC",
+        "title": "Isolated InfiniBand NCCL Weight-Sync Ring",
+        "nodes": [
+          {
+            "id": "src",
+            "label": "FSDP2 Layer Gather",
+            "sub": "1 layer BF16 buffer",
+            "role": "param-gatherer"
+          },
+          {
+            "id": "ring",
+            "label": "NCCL Sync Ring (IB NDR)",
+            "sub": "Isolated from FSDP comm",
+            "role": "rdma-ring"
+          },
+          {
+            "id": "dbl",
+            "label": "vLLM Staging Slot",
+            "sub": "Atomic pointer swap",
+            "role": "weight-receiver"
+          },
+          {
+            "id": "ver",
+            "label": "Bump policy_ver = t+1",
+            "sub": "Tags new trajectories",
+            "role": "version-tagger"
+          }
+        ],
+        "edges": [
+          {
+            "from": "src",
+            "to": "ring",
+            "label": "Streams layer buckets"
+          },
+          {
+            "from": "ring",
+            "to": "dbl",
+            "label": "Writes to vLLM HBM"
+          },
+          {
+            "from": "dbl",
+            "to": "ver",
+            "label": "Activates policy_ver t+1"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Communicator Isolation",
+            "detail": "Never reuse the FSDP training NCCL group for weight sync—isolate failure domains."
+          },
+          {
+            "label": "Step Tagging",
+            "detail": "Increment policy_ver atomically on swap so in-flight old rollouts are tagged accurately."
+          }
+        ],
+        "summary": "An isolated InfiniBand NCCL ring streams layer-bucketed weights into vLLM staging buffers in ~2 seconds with zero disk I/O.",
+        "caption": "Isolating the weight-sync NCCL communicator prevents rollout hiccups from hanging FSDP gradient all-reduces."
+      }
+    },
+    {
+      "stage": 6,
+      "level": "advanced",
+      "title": "Elastic Fault Tolerance & Straggler Node Replacement",
+      "purpose": "Survive GPU XID/ECC faults on 512-GPU runs without restarting from scratch.",
+      "explanation": {
+        "foundation": "On a 512-GPU cluster, hardware or InfiniBand link failures occur every 12–24 hours on average.",
+        "core": "Disaggregated architecture makes recovery dramatically simpler for the rollout pool: if a TP=4 vLLM replica crashes, Ray restarts it on a spare node and pulls the latest weights via NCCL without interrupting the FSDP2 trainer or the other 63 rollout replicas!",
+        "deepDive": "If a trainer node fails, TorchElastic / Megatron-style rendezvous drains the replay buffer, restores the latest pinned-RAM async checkpoint (<15s), and swaps in a hot-spare node."
+      },
+      "sectionDiagram": {
+        "kind": "architecture",
+        "eyebrow": "STAGE 6 · FAULT TOLERANCE",
+        "title": "Asymmetric Rollout vs. Trainer Fault Recovery",
+        "nodes": [
+          {
+            "id": "xid",
+            "label": "DCGM / XID Health Probe",
+            "sub": "Detects ECC / NVLink err",
+            "role": "hardware-monitor"
+          },
+          {
+            "id": "r_rec",
+            "label": "Rollout Hot-Swap",
+            "sub": "1 replica restarts, 63 live",
+            "role": "rollout-recovery"
+          },
+          {
+            "id": "t_rec",
+            "label": "TorchElastic Rendezvous",
+            "sub": "Loads pinned-RAM ckpt",
+            "role": "trainer-recovery"
+          },
+          {
+            "id": "spare",
+            "label": "16 Hot-Spare GPUs",
+            "sub": "2-node warm standby",
+            "role": "spare-pool"
+          }
+        ],
+        "edges": [
+          {
+            "from": "xid",
+            "to": "r_rec",
+            "label": "Isolates failed vLLM node"
+          },
+          {
+            "from": "xid",
+            "to": "t_rec",
+            "label": "Triggers trainer rendezvous"
+          },
+          {
+            "from": "spare",
+            "to": "t_rec",
+            "label": "Joins IB ring in <15s"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Zero-Cascade Rollouts",
+            "detail": "Rollout replicas are stateless workers; losing one only dips generation rate by 1.5%."
+          },
+          {
+            "label": "Pre-Flight IB Burn-In",
+            "detail": "Run a 10s NCCL all-reduce test on spare nodes before admitting them to the FSDP ring."
+          }
+        ],
+        "summary": "Disaggregation isolates rollout replica crashes from FSDP training, while TorchElastic and hot-spare nodes recover trainer faults in <15 seconds.",
+        "caption": "Stateless rollout replicas degrade throughput gracefully by 1.5% on crash instead of halting all 512 GPUs."
+      }
+    },
+    {
+      "stage": 7,
+      "level": "advanced",
+      "title": "Cluster MFU Profiling, Reward-Hack Guards & Benchmark Eval",
+      "purpose": "Monitor MFU, rollout-to-trainer queue depth, and held-out reasoning benchmarks continuously.",
+      "explanation": {
+        "foundation": "To keep a 512-GPU run cost-effective, an observability stack (Prometheus + TensorBoard/W&B + Nsight traces) tracks Rollout Token/s, Trainer MFU (target >45%), Replay Buffer queue depth, and Weight-Sync pause duration.",
+        "core": "Simultaneously, every 50 steps, an async eval hook runs held-out benchmarks (MATH-500, SWE-bench-Lite, IFEval) and checks response-length vs.",
+        "deepDive": "reward correlation to catch silent reward hacking before burning another $50K of compute."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 7 · OBSERVABILITY",
+        "title": "512-GPU MFU Telemetry & Continuous Held-Out Benchmarks",
+        "nodes": [
+          {
+            "id": "mfu",
+            "label": "MFU & Buffer Depth Probe",
+            "sub": "Target >45% trainer MFU",
+            "role": "perf-monitor"
+          },
+          {
+            "id": "hack",
+            "label": "Length-Reward Correlator",
+            "sub": "Flags verbosity hacking",
+            "role": "hack-detector"
+          },
+          {
+            "id": "bench",
+            "label": "50-Step Held-Out Eval",
+            "sub": "MATH / SWE / IFEval",
+            "role": "benchmark-runner"
+          },
+          {
+            "id": "dash",
+            "label": "Run Control Dashboard",
+            "sub": "Auto-alerts on stall",
+            "role": "control-plane"
+          }
+        ],
+        "edges": [
+          {
+            "from": "mfu",
+            "to": "dash",
+            "label": "Tracks rollout/train balance"
+          },
+          {
+            "from": "hack",
+            "to": "dash",
+            "label": "Alerts on reward drift"
+          },
+          {
+            "from": "bench",
+            "to": "dash",
+            "label": "Plots generalization curve"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Queue Depth Signal",
+            "detail": "Empty replay buffer = rollout-bound (shift GPUs to vLLM); growing staleness = trainer-bound."
+          },
+          {
+            "label": "Generalization Gate",
+            "detail": "Stop early if training reward climbs while held-out MATH/SWE scores plateau."
+          }
+        ],
+        "summary": "Monitoring replay-buffer depth, trainer MFU, and held-out benchmark curves catches hardware imbalances and reward hacking early.",
+        "caption": "Replay buffer depth is the clearest real-time signal for rebalancing rollout vs. trainer GPU counts."
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-1",
+        "question": "In a 512-GPU disaggregated RLHF pipeline, you notice the Ray Replay Buffer is consistently empty and FSDP2 Trainer GPUs are idling 35% of the time waiting for batches. What is the root cause and best fix?",
+        "options": [
+          {
+            "id": "a",
+            "text": "The pipeline is rollout-bound; shift nodes from the FSDP2 Trainer pool to the vLLM Rollout pool (or enable length-bucketing).",
+            "correct": true,
+            "feedback": "Correct! An empty replay buffer means trainers consume trajectories faster than rollout workers generate them."
+          },
+          {
+            "id": "b",
+            "text": "The pipeline is trainer-bound; add more FSDP2 Trainer GPUs.",
+            "correct": false,
+            "feedback": "Adding more trainer GPUs when the buffer is empty will only increase idle time."
+          },
+          {
+            "id": "c",
+            "text": "Increase K_max staleness from 3 to 500.",
+            "correct": false,
+            "feedback": "Raising staleness to 500 breaks on-policy convergence and does not speed up empty-buffer generation."
+          },
+          {
+            "id": "d",
+            "text": "Disable FlashAttention varlen sequence packing.",
+            "correct": false,
+            "feedback": "Disabling sequence packing slows down the trainer rather than speeding up rollouts."
+          }
+        ],
+        "explanation": "Replay buffer depth directly indicates whether the cluster is rollout-bound (empty) or trainer-bound (backlogged)."
+      },
+      {
+        "id": "kc-2",
+        "question": "Why should the NCCL communicator used for Weight-Sync (Trainer -> Rollout Actors) be isolated from the FSDP2 training NCCL communicator?",
+        "options": [
+          {
+            "id": "a",
+            "text": "NCCL communicators can only transfer 16-bit integers.",
+            "correct": false,
+            "feedback": "NCCL supports BF16, FP16, FP32, and arbitrary byte buffers."
+          },
+          {
+            "id": "b",
+            "text": "Isolating communicators prevents a crashed or slow vLLM rollout node from hanging FSDP2 gradient all-reduces.",
+            "correct": true,
+            "feedback": "Correct! Separate NCCL groups contain failure domains so rollout node restarts don't deadlock training."
+          },
+          {
+            "id": "c",
+            "text": "FSDP2 communicators do not run over InfiniBand.",
+            "correct": false,
+            "feedback": "Both FSDP2 and weight-sync communicators use InfiniBand RDMA across nodes."
+          },
+          {
+            "id": "d",
+            "text": "It eliminates the need to tag trajectories with policy_version.",
+            "correct": false,
+            "feedback": "Version tagging is still needed for bounded-staleness filtering in the replay buffer."
+          }
+        ],
+        "explanation": "Communicator isolation ensures rollout faults degrade generation slightly without deadlocking the FSDP2 training ring."
+      },
+      {
+        "id": "kc-3",
+        "question": "How does FlashAttention `varlen` sequence packing (`cu_seqlens`) improve FSDP2 trainer efficiency on RLHF trajectories?",
+        "options": [
+          {
+            "id": "a",
+            "text": "It replaces AdamW with Lion optimizer.",
+            "correct": false,
+            "feedback": "Sequence packing is an attention-kernel batching technique, not an optimizer."
+          },
+          {
+            "id": "b",
+            "text": "It concatenates variable-length completions into dense 32K micro-batches with zero padding waste and zero cross-trajectory attention leakage.",
+            "correct": true,
+            "feedback": "Correct! Packing avoids wasting up to 75% of attention FLOPs on padding tokens."
+          },
+          {
+            "id": "c",
+            "text": "It executes untrusted Python code inside the GPU kernel.",
+            "correct": false,
+            "feedback": "Untrusted code runs in isolated CPU sandboxes (gVisor/Firecracker), never inside GPU kernels."
+          },
+          {
+            "id": "d",
+            "text": "It removes the need for activation checkpointing.",
+            "correct": false,
+            "feedback": "Selective activation checkpointing is still used to fit 32K packed sequences in HBM."
+          }
+        ],
+        "explanation": "Varlen sequence packing eliminates padding FLOPs on heavy-tailed reasoning rollouts while preserving exact attention masks."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "A 512-GPU RLHF pipeline splits GPUs into two teams: half generate candidate answers continuously, while the other half learn from finished batches and beam updated weights back over high-speed cables.",
+      "keyTakeaway": "When inference latency or GPU memory limits bind throughput, split the 512-GPU cluster into disaggregated vLLM Rollout Workers (GPUs 1-256) and FSDP2/ZeRO-3 Trainers (GPUs 257-512), bridged by a bounded-staleness Ray replay buffer and an InfiniBand NCCL weight-sync ring.",
+      "byteSummary": "If 512 GPUs all wait for the single longest AI answer to finish before learning, nearly half the cluster sits idle. Instead, 256 GPUs act as fast answer generators (using vLLM) and stream finished answers into a shared Ray buffer.\n\nThe other 256 GPUs continuously train on those finished batches, then broadcast their updated weights directly across InfiniBand cables to the generators every few steps—skipping slow hard-drive saves."
+    },
+    "intermediate": {
+      "summary": "A 512-GPU RLHF pipeline pairs 256 TP-sharded vLLM rollout GPUs (length-bucketed, continuous batching) with 256 FSDP2 trainer GPUs via a K<=3 Ray Object Store replay buffer and NCCL weight sync.",
+      "keyTakeaway": "When inference latency or GPU memory limits bind throughput, split the 512-GPU cluster into disaggregated vLLM Rollout Workers (GPUs 1-256) and FSDP2/ZeRO-3 Trainers (GPUs 257-512), bridged by a bounded-staleness Ray replay buffer and an InfiniBand NCCL weight-sync ring.",
+      "byteSummary": "GPUs 1-256 run 64 TP=4 vLLM replicas with G=8 shared prompt prefixes and length bucketing, streaming finished trajectories into a Ray Plasma replay buffer filtered to policy staleness K<=3.\n\nGPUs 257-512 run FSDP2 ZeRO-3 with FlashAttention varlen sequence packing (32K cu_seqlens) and selective activation checkpointing. Every K steps, an isolated InfiniBand NCCL ring broadcasts layer-bucketed weights directly into vLLM HBM."
+    },
+    "advanced": {
+      "summary": "512-GPU InfiniBand RLHF/GRPO architecture featuring disaggregated vLLM rollouts (shared-prefix + length-bucketing), Ray Plasma variance-prioritized buffering (K<=3), FSDP2 varlen packing, and isolated NCCL RDMA sync.",
+      "keyTakeaway": "When inference latency or GPU memory limits bind throughput, split the 512-GPU cluster into disaggregated vLLM Rollout Workers (GPUs 1-256) and FSDP2/ZeRO-3 Trainers (GPUs 257-512), bridged by a bounded-staleness Ray replay buffer and an InfiniBand NCCL weight-sync ring.",
+      "byteSummary": "Balancing 32 NVLink nodes of TP=4 vLLM actors against 32 nodes of FSDP2 ZeRO-3 trainers aligns rollout token generation with backward-pass throughput. Shared G=8 prompt prefixes cut prefill HBM by 87.5%, while Ray Plasma buffers filter stale trajectories (K>3) and prioritize high-variance groups.\n\nVarlen FlashAttention-3 packing eliminates padding waste on 16K CoT traces. Isolated NCCL RDMA rings swap weights in ~2s (<80ms LoRA), and stateless rollout replicas recover from XID faults without interrupting FSDP rendezvous."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "prerequisites": [
+    {
+      "title": "Distributed RLHF, DPO & GRPO Post-Training",
+      "summary": "Distributed post-training aligns base LLMs via multi-model RL loops (PPO/GRPO) or offline preference optimization (DPO), coordinating high-throughput vLLM rollout actors, reward/verifier pools, frozen reference KL penalties, and FSDP policy trainers."
+    }
+  ],
+  "simulation": {
+    "title": "Design a 512-GPU Distributed RLHF & GRPO Post-Training Pipeline — Interactive Execution Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Workload & Budget"
+      },
+      {
+        "id": "router",
+        "label": "Gateway / Router",
+        "role": "Admission & Dispatch"
+      },
+      {
+        "id": "engine",
+        "label": "Core Engine",
+        "role": "Primary Execution"
+      },
+      {
+        "id": "replica",
+        "label": "Replica / Fallback",
+        "role": "Durability & Recovery"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "router",
+        "label": "request"
+      },
+      {
+        "from": "router",
+        "to": "engine",
+        "label": "route"
+      },
+      {
+        "from": "engine",
+        "to": "replica",
+        "label": "sync / fallback"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "512-GPU Cluster Topology & Disaggregated Pool Sizing",
+        "actionLabel": "Dispatch nominal request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "router"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "Ingress",
+          "p99_ms": 8,
+          "error_rate": "0.0%"
+        },
+        "explanation": "Caller sends work into the gateway with explicit timeout and concurrency bounds (512-GPU Cluster Topology & Disaggregated Pool Sizing)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Dynamic Length-Bucketing & Continuous Batching on Rollout GP",
+        "actionLabel": "Execute core invariant",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "Core Path",
+          "p99_ms": 18,
+          "in_flight": 124
+        },
+        "explanation": "The core engine processes the hot path while keeping state transitions deterministic (Dynamic Length-Bucketing & Continuous Batching on Rollout GPUs)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Ray Object Store Prioritized Replay Buffer & Bounded Stalene",
+        "actionLabel": "Detect skew or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Degraded",
+          "p99_ms": 64,
+          "retries_capped": "true"
+        },
+        "explanation": "Under load or replica lag, bounded backoff and isolation prevent cascading saturation (Ray Object Store Prioritized Replay Buffer & Bounded Staleness)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Cluster MFU Profiling, Reward-Hack Guards & Benchmark Eval",
+        "actionLabel": "Converge & restore SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 11,
+          "drift": 0
+        },
+        "explanation": "State converges cleanly and telemetry confirms the system returned within its SLO envelope (Cluster MFU Profiling, Reward-Hack Guards & Benchmark Eval)."
+      }
+    ]
+  }
+}

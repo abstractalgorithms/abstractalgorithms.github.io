@@ -1,0 +1,871 @@
+{
+  "id": "wal-aries-recovery",
+  "slug": "wal-aries-recovery",
+  "name": "Write-Ahead Logging (WAL) & ARIES Recovery",
+  "domain": "Distributed Systems & Storage",
+  "tagline": "Guaranteeing atomic, durable storage under STEAL/NO-FORCE buffer management via sequential log appends and three-phase ARIES crash recovery.",
+  "purpose": "Explain how modern relational and distributed storage engines achieve high write throughput without sacrificing crash atomicity or durability.",
+  "spark": {
+    "summary": "Write-Ahead Logging turns random dirty-page disk writes into sequential log appends, while ARIES (Analysis, Redo, Undo) reconstructs exact database state after a crash.",
+    "keyTakeaway": "When concurrent writes contend on shared state, never flush a modified data page to disk before its log record is fsynced (STEAL), and never force data pages on commit (NO-FORCE)—let ARIES Analysis, Redo, and Undo reconcile everything after a crash.",
+    "byteSummary": "Modern databases avoid flushing scattered 8 KB or 16 KB heap/B-Tree pages on every transaction commit because random synchronous I/O destroys throughput. Instead, under a STEAL/NO-FORCE buffer pool policy, the engine appends compact mutation records—each tagged with a monotonically increasing Log Sequence Number (LSN)—to an append-only Write-Ahead Log (WAL) and calls fsync on the log tail before returning COMMIT.\n\nDuring normal execution, two in-memory structures track state: the Dirty Page Table (DPT) records each modified page's recLSN (the first LSN that dirtied it since the last flush), and the Transaction Table (TT) tracks active transactions and their lastLSN. Every data page header stores pageLSN, and the WAL invariant guarantees that a dirty page cannot be evicted to disk until flushedLSN >= pageLSN.\n\nWhen power fails, ARIES executes three deterministic passes. Analysis scans forward from the last fuzzy checkpoint to rebuild the DPT and identify winner versus loser transactions. Redo repeats history forward from min(recLSN) across all DPT entries, reapplying any record where pageLSN < record.LSN—even for uncommitted transactions—so page states match the exact crash instant. Finally, Undo walks prevLSN pointers backward for loser transactions, writing Compensation Log Records (CLRs) with undoNextLSN so recovery itself is idempotent even if the server crashes mid-recovery.\n\nThe primary trade-offs center on checkpoint frequency, WAL amplification, and recovery time objectives (RTO). Infrequent checkpoints keep runtime overhead low but lengthen Redo scans; full-page writes (FPWs) after checkpoints prevent torn 8 KB pages on 4 KB filesystem blocks at the cost of temporary WAL spikes; and unpaced checkpoints or pinned replication slots can saturate disk IOPS and stall foreground commits."
+  },
+  "learningJourney": [
+    {
+      "id": "stage-1-durability-paradox",
+      "eyebrow": "Stage 1 • Foundation",
+      "title": "The Random I/O Paradox & STEAL/NO-FORCE Policies",
+      "level": "foundation",
+      "purpose": "Establish why buffer pools need STEAL/NO-FORCE and how the WAL invariant reconciles memory eviction with durability.",
+      "explanation": {
+        "foundation": "A storage engine's buffer pool caches fixed-size pages (for example, 8 KB pages in PostgreSQL 16 or 16 KB pages in MySQL 8.0 InnoDB) in RAM. If a transaction updates 50 rows across 50 scattered B-Tree leaf pages, flushing all 50 pages synchronously on `COMMIT` (**FORCE** policy) requires 50 random I/O operations. Conversely, forbidding the buffer pool from evicting dirty pages of uncommitted transactions (**NO-STEAL** policy) caps active transaction size to available RAM and causes out-of-memory failures during bulk updates.",
+        "core": "Production engines therefore adopt **STEAL / NO-FORCE**:\n- **STEAL**: The buffer manager may evict an uncommitted dirty page to disk to free a frame, *provided* the WAL record describing that change is already `fsync`ed (`flushedLSN >= page.pageLSN`).\n- **NO-FORCE**: A transaction commits as soon as its commit WAL record is durable on disk; its modified data pages remain dirty in RAM and are flushed asynchronously later.",
+        "deepDive": "This creates the fundamental **Write-Ahead Logging invariant**:\n1. Log records must reach durable storage (`fsync` / `fdatasync`) *before* the corresponding dirty data page is written to the data file.\n2. A transaction is not committed until its `COMMIT` log record (and all prior `prevLSN` records) is `fsync`ed to the WAL."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Buffer Pool vs WAL",
+        "title": "STEAL / NO-FORCE Write Path",
+        "nodes": [
+          {
+            "id": "tx",
+            "label": "Transaction",
+            "sublabel": "UPDATE row"
+          },
+          {
+            "id": "bp",
+            "label": "Buffer Pool",
+            "sublabel": "Dirty page (pageLSN=102)"
+          },
+          {
+            "id": "wal",
+            "label": "WAL Buffer -> Disk",
+            "sublabel": "fsync(flushedLSN=102)"
+          }
+        ],
+        "edges": [
+          {
+            "from": "tx",
+            "to": "bp",
+            "label": "1. Modify page in RAM"
+          },
+          {
+            "from": "tx",
+            "to": "wal",
+            "label": "2. Append LSN 102 + fsync"
+          },
+          {
+            "from": "wal",
+            "to": "bp",
+            "label": "3. Allow page eviction (STEAL)"
+          }
+        ],
+        "cards": [
+          {
+            "title": "NO-FORCE Commit",
+            "body": "Commit returns after WAL fsync without waiting for random heap page flushes."
+          },
+          {
+            "title": "WAL Invariant",
+            "body": "Data page eviction is blocked until disk flushedLSN >= page.pageLSN."
+          }
+        ],
+        "summary": "Caption: Under STEAL/NO-FORCE, transactions append sequential WAL records and fsync before commit, while dirty data pages stay in RAM and can only be evicted once their pageLSN is covered by flushedLSN."
+      }
+    },
+    {
+      "id": "stage-2-lsn-and-metadata",
+      "eyebrow": "Stage 2 • Core Mechanics",
+      "title": "LSNs, Page Headers, Dirty Page Table, and Transaction Table",
+      "level": "foundation",
+      "purpose": "Detail the exact in-memory and on-disk metadata structures that make deterministic ARIES recovery possible.",
+      "explanation": {
+        "foundation": "Every WAL record receives a globally ordered 64-bit **Log Sequence Number (LSN)**—typically the byte offset within the WAL stream (e.g., `0/1A4F208` in PostgreSQL). Four coordinated structures link log records to data pages:",
+        "core": "- **WAL Record (`LSN`, `txId`, `prevLSN`, `type`, `pageId`, `redoData`, `undoData`)**: `prevLSN` forms a backward linked list per transaction so Undo can walk a single transaction's changes in reverse order without scanning unrelated records.\n- **Page Header (`pageLSN`)**: Stored in the first bytes of every 8 KB/16 KB page. Updated atomically whenever a modification is applied in memory. During Redo, if `page.pageLSN >= record.LSN`, that update is already reflected on disk and safely skipped.\n- **Dirty Page Table (DPT)**: Maps `pageId -> recLSN`, where `recLSN` is the *earliest* LSN that dirtied the page since it was last written cleanly to disk. `min(recLSN)` across the DPT bounds how far back Redo must start.\n- **Transaction Table (TT)**: Maps active `txId -> (status, lastLSN)`. Fuzzy checkpoints serialize snapshots of both the DPT and TT directly into the WAL without halting incoming writes.",
+        "deepDive": "In production deployments of Write-Ahead Logging (WAL) & ARIES Recovery, watch how lsns, page headers, dirty page table, and transaction table interacts with tail latency, retry amplification, and partial failures. Write-Ahead Logging turns random dirty-page disk writes into sequential log appends, while ARIES (Analysis, Redo, Undo) reconstructs exact database state after a crash."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "ARIES Metadata",
+        "title": "In-Memory Tables vs On-Disk Page Headers",
+        "nodes": [
+          {
+            "id": "dpt",
+            "label": "Dirty Page Table",
+            "sublabel": "pageId -> recLSN"
+          },
+          {
+            "id": "tt",
+            "label": "Transaction Table",
+            "sublabel": "txId -> status, lastLSN"
+          },
+          {
+            "id": "page",
+            "label": "Data Page Header",
+            "sublabel": "pageLSN"
+          }
+        ],
+        "edges": [
+          {
+            "from": "dpt",
+            "to": "page",
+            "label": "recLSN bounds Redo start"
+          },
+          {
+            "from": "tt",
+            "to": "page",
+            "label": "lastLSN drives Undo chain"
+          }
+        ],
+        "cards": [
+          {
+            "title": "Idempotency Key",
+            "body": "Comparing record.LSN against page.pageLSN prevents double-applying updates during Redo."
+          },
+          {
+            "title": "Fuzzy Checkpoints",
+            "body": "Checkpoints log DPT and TT snapshots asynchronously without freezing active transactions."
+          }
+        ],
+        "summary": "Caption: ARIES coordinates the Dirty Page Table (recLSN), Transaction Table (lastLSN), and per-page pageLSN headers so recovery knows both where Redo begins and which transactions must be rolled back."
+      },
+      "decisionFramework": {
+        "problem": "How to implement Write-Ahead Logging (WAL) & ARIES Recovery without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "When concurrent writes contend on shared state, never flush a modified data page to disk before its log record is fsynced (STEAL), and never force data pages on commit (NO-FORCE)—let ARIES Analysis, Redo, and Undo reconcile everything after a crash.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Write-Ahead Logging (WAL) & ARIES Recovery experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-3-aries-analysis-redo",
+      "eyebrow": "Stage 3 • Crash Recovery",
+      "title": "ARIES Phase 1 (Analysis) & Phase 2 (Redo: Repeating History)",
+      "level": "intermediate",
+      "purpose": "Show how Analysis reconstructs crash-time tables and why Redo replays even uncommitted transactions.",
+      "explanation": {
+        "foundation": "Upon restart after a crash, ARIES does not immediately discard uncommitted work. Instead, it runs **Analysis** and **Redo** sequentially:",
+        "core": "1. **Analysis Pass (Forward from Last Checkpoint)**:\n   - Reads the `END_CHECKPOINT` record to initialize the DPT and TT.\n   - Scans forward to the end of the WAL. When it sees a `BEGIN` or update for a `txId`, it adds/updates `TT[txId].lastLSN`. When it sees `COMMIT` or `ABORT`, it removes `txId` from the active loser set. When it sees an update for a `pageId` not yet in DPT, it sets `DPT[pageId].recLSN = record.LSN`.\n   - At the end of Analysis, `TT` contains the exact **loser transactions** to undo, and `redoStartLSN = min(DPT.values())`.",
+        "deepDive": "2. **Redo Pass (Repeating History from `redoStartLSN`)**:\n   - Scans forward from `redoStartLSN` to the end of the WAL, reapplying *every* logged page modification—including loser transactions—unless:\n     - `pageId` is not in `DPT`, OR\n     - `record.LSN < DPT[pageId].recLSN`, OR\n     - Fetching the page from disk shows `page.pageLSN >= record.LSN`.\n   - **Why repeat history for losers?** Physical/physiological B-Tree splits or space allocations by a loser transaction may be depended upon by a later committed transaction's LSN on the same page. Repeating history restores the exact physical page layout before logical Undo runs."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Recovery Passes 1 & 2",
+        "title": "Analysis -> Redo (Repeating History)",
+        "nodes": [
+          {
+            "id": "ckpt",
+            "label": "Last Checkpoint",
+            "sublabel": "Initial DPT & TT"
+          },
+          {
+            "id": "ana",
+            "label": "1. Analysis",
+            "sublabel": "Find losers & min(recLSN)"
+          },
+          {
+            "id": "redo",
+            "label": "2. Redo",
+            "sublabel": "Apply if pageLSN < LSN"
+          }
+        ],
+        "edges": [
+          {
+            "from": "ckpt",
+            "to": "ana",
+            "label": "Scan forward to WAL end"
+          },
+          {
+            "from": "ana",
+            "to": "redo",
+            "label": "Jump back to min(recLSN)"
+          }
+        ],
+        "cards": [
+          {
+            "title": "Redo Skip Rule",
+            "body": "Skip I/O if pageId is absent from DPT or disk pageLSN >= record.LSN."
+          },
+          {
+            "title": "Why Repeat History",
+            "body": "Restores physical B-Tree structure so subsequent Undo operations see valid pages."
+          }
+        ],
+        "summary": "Caption: Analysis scans forward from the last checkpoint to identify loser transactions and min(recLSN), then Redo replays history forward for any page whose on-disk pageLSN lags behind the WAL record."
+      }
+    },
+    {
+      "id": "stage-4-aries-undo-clrs",
+      "eyebrow": "Stage 4 • Crash Recovery",
+      "title": "ARIES Phase 3 (Undo) & Compensation Log Records (CLRs)",
+      "level": "intermediate",
+      "purpose": "Explain backward prevLSN traversal and how CLRs guarantee crash-safe, idempotent rollback.",
+      "explanation": {
+        "foundation": "Once Redo completes, the database mirrors the exact physical state at the moment of the crash. Now **Undo** rolls back all uncommitted **loser transactions** in strict reverse LSN order using a max-heap priority queue of `nextUndoLSN` values:",
+        "core": "- Pop the highest LSN from the loser frontier.\n- If the record is a standard update: apply the `undoData` inverse operation to the page, update `page.pageLSN`, and **append a Compensation Log Record (CLR)** to the WAL *before* modifying the page (WAL invariant still applies!).\n- Set `CLR.undoNextLSN = record.prevLSN` and push `record.prevLSN` onto the heap.\n- If the record is itself a **CLR** (from an earlier aborted recovery attempt): do **not** undo it! Simply jump directly to `CLR.undoNextLSN`.",
+        "deepDive": "Because CLRs are Redo-only records that point past already-undone work, a second or third crash during Undo never repeats an undo step and never causes an infinite rollback loop."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Recovery Pass 3",
+        "title": "Backward Undo with CLRs",
+        "nodes": [
+          {
+            "id": "heap",
+            "label": "Loser Max-Heap",
+            "sublabel": "Largest lastLSN"
+          },
+          {
+            "id": "clr",
+            "label": "Append CLR",
+            "sublabel": "undoNextLSN = prevLSN"
+          },
+          {
+            "id": "page",
+            "label": "Apply Inverse",
+            "sublabel": "Update pageLSN"
+          }
+        ],
+        "edges": [
+          {
+            "from": "heap",
+            "to": "clr",
+            "label": "Log compensation first"
+          },
+          {
+            "from": "clr",
+            "to": "page",
+            "label": "Revert page in RAM"
+          }
+        ],
+        "cards": [
+          {
+            "title": "Crash During Undo",
+            "body": "On restart, Redo replays CLRs and Undo jumps via undoNextLSN, avoiding duplicate rollbacks."
+          },
+          {
+            "title": "Global Reverse Order",
+            "body": "A max-heap ensures interleaved loser transactions unwind in strict reverse LSN order."
+          }
+        ],
+        "summary": "Caption: Undo pops the highest pending loser LSN, logs a Redo-only Compensation Log Record (CLR) pointing to prevLSN, and reverts the page so even repeated crashes during recovery converge cleanly."
+      }
+    },
+    {
+      "id": "stage-5-implementation",
+      "eyebrow": "Stage 5 • Implementation",
+      "title": "Safe WAL Append, Group Commit, and Bounded fsync Retry",
+      "level": "intermediate",
+      "purpose": "Provide production-safe Python code demonstrating group commit, explicit fsync durability, and bounded I/O retry.",
+      "explanation": {
+        "foundation": "Writing and `fsync`ing one 4 KB block per transaction limits NVMe or cloud block storage (e.g., AWS EBS gp3) to ~2,000–5,000 commits/sec. Production engines use **group commit**: a leader thread batches all WAL records queued during an active `fsync` window and flushes them in a single `os.fsync()` syscall.",
+        "core": "Below is a minimal, crash-safe WAL writer in Python with explicit `fsync`, CRC32 checksums, and bounded exponential backoff on transient `EIO`/`EAGAIN` errors before failing closed:\n\n```python\nimport os, struct, time, zlib, random\n\nclass WALWriter:\n    def __init__(self, path: str, max_retries: int = 3):\n        self.fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_APPEND, 0o644)\n        self.lsn = os.lseek(self.fd, 0, os.SEEK_END)\n        self.max_retries = max_retries\n\ndef append_and_sync(self, tx_id: int, prev_lsn: int, payload: bytes) -> int:\n        record_lsn = self.lsn\n        header = struct.pack('>QQI', record_lsn, tx_id, len(payload))\n        body = header + struct.pack('>Q', prev_lsn) + payload\n        crc = zlib.crc32(body) & 0xFFFFFFFF\n        frame = body + struct.pack('>I', crc)\n\nwritten = 0\n        while written < len(frame):\n            written += os.write(self.fd, frame[written:])",
+        "deepDive": "for attempt in range(self.max_retries):\n            try:\n                os.fsync(self.fd)\n                self.lsn += len(frame)\n                return record_lsn\n            except OSError as exc:\n                if attempt == self.max_retries - 1:\n                    # Fail closed: roll back in-memory LSN and alert caller\n                    raise RuntimeError(f'WAL fsync failed at LSN {record_lsn}: {exc}') from exc\n                time.sleep((0.02 * (2 ** attempt)) + random.uniform(0, 0.01))\n        return record_lsn\n```"
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Group Commit",
+        "title": "Batched WAL Append & Durable fsync",
+        "nodes": [
+          {
+            "id": "batch",
+            "label": "Group Commit Queue",
+            "sublabel": "Batch tx frames"
+          },
+          {
+            "id": "crc",
+            "label": "CRC32 Frame",
+            "sublabel": "LSN + prevLSN + payload"
+          },
+          {
+            "id": "sync",
+            "label": "Single os.fsync",
+            "sublabel": "Bounded retry / fail closed"
+          }
+        ],
+        "edges": [
+          {
+            "from": "batch",
+            "to": "crc",
+            "label": "Serialize frames"
+          },
+          {
+            "from": "crc",
+            "to": "sync",
+            "label": "One syscall per batch"
+          }
+        ],
+        "cards": [
+          {
+            "title": "Partial Write Protection",
+            "body": "CRC32 checksums detect torn tail records after a mid-write power loss."
+          },
+          {
+            "title": "Fail-Closed Durability",
+            "body": "Never acknowledge COMMIT if fsync fails after bounded retries."
+          }
+        ],
+        "summary": "Caption: Group commit amortizes expensive fsync syscalls across concurrent transactions while CRC32 framing and fail-closed error handling protect against torn tail writes."
+      }
+    },
+    {
+      "id": "stage-6-torn-pages-fpw",
+      "eyebrow": "Stage 6 • Production Edge Cases",
+      "title": "Torn Pages, Full-Page Writes (FPW), and Doublewrite Buffers",
+      "level": "advanced",
+      "purpose": "Address hardware sector mismatches (8 KB/16 KB DB pages on 4 KB OS blocks) that break physiological Redo.",
+      "explanation": {
+        "foundation": "ARIES Redo often uses **physiological logging**: log the page ID and the logical operation within that page (e.g., *insert tuple at slot 4*) rather than logging the entire 8 KB before/after image. Physiological logging is compact, but it assumes the underlying page on disk is **internally consistent**.",
+        "core": "If the database uses 8 KB pages (PostgreSQL) or 16 KB pages (MySQL InnoDB) on top of 4 KB filesystem blocks and 512-byte NVMe sectors, a power outage mid-flush can leave half the page new and half old—a **torn page**. Applying a physiological Redo delta onto a torn page corrupts B-Tree pointers.",
+        "deepDive": "Engines solve this in two ways:\n- **Full-Page Writes (`full_page_writes = on` in PostgreSQL)**: The first modification to any page *after* a checkpoint logs the entire 8 KB page image into the WAL. Redo overwrites the torn disk page wholesale before applying subsequent compact delta records.\n- **Doublewrite Buffer (MySQL InnoDB)**: Before flushing dirty 16 KB pages to their final tablespace offsets, InnoDB writes them sequentially to a contiguous 2 MB doublewrite area and `fsync`s it. On crash, InnoDB restores any torn page from the doublewrite buffer before running Redo."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Torn Page Protection",
+        "title": "PostgreSQL FPW vs InnoDB Doublewrite Buffer",
+        "nodes": [
+          {
+            "id": "fpw",
+            "label": "PostgreSQL FPW",
+            "sublabel": "Full 8KB image on 1st touch post-ckpt"
+          },
+          {
+            "id": "dwb",
+            "label": "InnoDB Doublewrite",
+            "sublabel": "Sequential 2MB staging area before flush"
+          }
+        ],
+        "edges": [
+          {
+            "from": "fpw",
+            "to": "dwb",
+            "label": "Both prevent 4KB/512B torn pages"
+          }
+        ],
+        "cards": [
+          {
+            "title": "FPW Write Amplification",
+            "body": "Disabling FPW saves WAL bandwidth only if ZFS/hardware guarantees atomic 8KB writes."
+          },
+          {
+            "title": "Paced Checkpoints",
+            "body": "Spreading checkpoints avoids huge post-checkpoint FPW bursts."
+          }
+        ],
+        "summary": "Caption: Full-Page Writes (PostgreSQL) and the Doublewrite Buffer (InnoDB) protect against torn multi-sector pages so physiological Redo always starts from a valid page image."
+      }
+    },
+    {
+      "id": "stage-7-tradeoffs-pitfalls",
+      "eyebrow": "Stage 7 • Architecture & Operations",
+      "title": "Checkpoint Tuning, WAL Retention, and Distributed Consensus Logs",
+      "level": "advanced",
+      "purpose": "Connect single-node ARIES recovery to operational WAL sizing, replication slots, and Raft/Paxos logs.",
+      "explanation": {
+        "foundation": "The same append-only WAL principle powers distributed consensus engines like **Raft** (etcd, CockroachDB, TiKV) and **Kafka**. In Raft, the replicated log *is* the WAL: a leader appends an entry locally, replicates it via `AppendEntries`, and only applies it to the state machine (RocksDB/BoltDB) once a majority quorum `fsync`s it.",
+        "core": "Common production pitfalls include:\n- **Unbounded WAL Growth**: Inactive replication slots or long-running `IDLE IN TRANSACTION` sessions prevent WAL segment recycling, filling `/var/lib/postgresql/data/pg_wal` and crashing the primary.\n- **Checkpoint I/O Storms**: Setting `checkpoint_completion_target` too low (or `max_wal_size` too small) forces dirty pages to flush in a tight burst, saturating NVMe/EBS bandwidth and starving reads.\n- **Misconfigured `synchronous_commit`**: Turning `synchronous_commit = off` boosts throughput by ~3x but introduces a bounded window (e.g., up to 600 ms with `wal_writer_delay = 200ms`) where committed transactions can vanish on power loss.",
+        "deepDive": "In production deployments of Write-Ahead Logging (WAL) & ARIES Recovery, watch how checkpoint tuning, wal retention, and distributed consensus logs interacts with tail latency, retry amplification, and partial failures. Write-Ahead Logging turns random dirty-page disk writes into sequential log appends, while ARIES (Analysis, Redo, Undo) reconstructs exact database state after a crash."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Operational Trade-offs",
+        "title": "Durability vs Throughput & RTO",
+        "nodes": [
+          {
+            "id": "sync_on",
+            "label": "synchronous_commit=on",
+            "sublabel": "Zero RPO, fsync per commit"
+          },
+          {
+            "id": "sync_off",
+            "label": "synchronous_commit=off",
+            "sublabel": "Higher TPS, ~600ms RPO risk"
+          },
+          {
+            "id": "raft",
+            "label": "Distributed Raft WAL",
+            "sublabel": "Quorum fsync before apply"
+          }
+        ],
+        "edges": [
+          {
+            "from": "sync_on",
+            "to": "raft",
+            "label": "Single-node -> Quorum durability"
+          }
+        ],
+        "cards": [
+          {
+            "title": "WAL Disk Isolation",
+            "body": "Place pg_wal on a dedicated NVMe/IOPS volume so sequential WAL writes never contend with random heap reads."
+          },
+          {
+            "title": "Bounded Replication Slots",
+            "body": "Configure max_slot_wal_keep_size to drop dead replicas before disk exhaustion."
+          }
+        ],
+        "summary": "Caption: Operational WAL tuning balances zero-RPO fsync guarantees against commit latency, checkpoint pacing, and bounded replication slot retention."
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "During ARIES crash recovery, why does the Redo pass replay updates from transactions that never committed (loser transactions)?",
+      "options": [
+        "To permanently commit those loser transactions before Undo runs",
+        "To repeat physical history so pages match crash-time state before backward Undo runs",
+        "Because the Transaction Table is empty until Undo finishes",
+        "To avoid reading the Dirty Page Table from the last checkpoint"
+      ],
+      "correctIndex": 1,
+      "explanation": "Repeating history during Redo restores the exact physical page layouts (such as B-Tree splits or space allocations) at crash time so that subsequent physiological/logical Undo operations and CLRs operate on valid pages."
+    },
+    "knowledgeChecks": [
+      {
+        "id": "kc-wal-invariant",
+        "question": "A buffer pool wants to evict a dirty 8 KB page with pageLSN = 4500 to disk while flushedLSN on the WAL is currently 4200. What must the storage engine do?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Evict the page immediately because NO-FORCE allows async page writes",
+            "correct": false,
+            "feedback": "Under the STEAL policy and the WAL invariant, a dirty page cannot be written to disk until flushedLSN >= pageLSN; otherwise, a crash after eviction would leave uncommitted changes on disk with no log record to undo them."
+          },
+          {
+            "id": "b",
+            "text": "Flush and fsync the WAL up to at least LSN 4500 before writing the page",
+            "correct": true,
+            "feedback": "Correct! Under the STEAL policy and the WAL invariant, a dirty page cannot be written to disk until flushedLSN >= pageLSN; otherwise, a crash after eviction would leave uncommitted changes on disk with no log record to undo them."
+          },
+          {
+            "id": "c",
+            "text": "Discard the page without writing it and rely on Undo after restart",
+            "correct": false,
+            "feedback": "Under the STEAL policy and the WAL invariant, a dirty page cannot be written to disk until flushedLSN >= pageLSN; otherwise, a crash after eviction would leave uncommitted changes on disk with no log record to undo them."
+          },
+          {
+            "id": "d",
+            "text": "Reset pageLSN to 4200 so the invariant holds",
+            "correct": false,
+            "feedback": "Under the STEAL policy and the WAL invariant, a dirty page cannot be written to disk until flushedLSN >= pageLSN; otherwise, a crash after eviction would leave uncommitted changes on disk with no log record to undo them."
+          }
+        ],
+        "correctIndex": 1,
+        "explanation": "Under the STEAL policy and the WAL invariant, a dirty page cannot be written to disk until flushedLSN >= pageLSN; otherwise, a crash after eviction would leave uncommitted changes on disk with no log record to undo them."
+      },
+      {
+        "id": "kc-aries-clr",
+        "question": "If the database crashes a second time halfway through the ARIES Undo phase, what prevents it from infinitely re-undoing the same records on the next reboot?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Undo deletes WAL records from disk as it rolls them back",
+            "correct": false,
+            "feedback": "CLRs are Redo-only records whose undoNextLSN field points to the undone record's prevLSN. On a subsequent restart, Redo replays the CLRs and Undo jumps directly to undoNextLSN, guaranteeing bounded, idempotent recovery."
+          },
+          {
+            "id": "b",
+            "text": "Redo skips all pages that were touched by loser transactions",
+            "correct": false,
+            "feedback": "CLRs are Redo-only records whose undoNextLSN field points to the undone record's prevLSN. On a subsequent restart, Redo replays the CLRs and Undo jumps directly to undoNextLSN, guaranteeing bounded, idempotent recovery."
+          },
+          {
+            "id": "c",
+            "text": "Each Undo action writes a Redo-only Compensation Log Record (CLR) with undoNextLSN pointing past the undone record",
+            "correct": true,
+            "feedback": "Correct! CLRs are Redo-only records whose undoNextLSN field points to the undone record's prevLSN. On a subsequent restart, Redo replays the CLRs and Undo jumps directly to undoNextLSN, guaranteeing bounded, idempotent recovery."
+          },
+          {
+            "id": "d",
+            "text": "The server disables checkpoints until Undo completes",
+            "correct": false,
+            "feedback": "CLRs are Redo-only records whose undoNextLSN field points to the undone record's prevLSN. On a subsequent restart, Redo replays the CLRs and Undo jumps directly to undoNextLSN, guaranteeing bounded, idempotent recovery."
+          }
+        ],
+        "correctIndex": 2,
+        "explanation": "CLRs are Redo-only records whose undoNextLSN field points to the undone record's prevLSN. On a subsequent restart, Redo replays the CLRs and Undo jumps directly to undoNextLSN, guaranteeing bounded, idempotent recovery."
+      },
+      {
+        "id": "kc-torn-page",
+        "question": "Why does PostgreSQL enable full_page_writes by default after every checkpoint even though it increases WAL volume?",
+        "options": [
+          {
+            "id": "a",
+            "text": "To compress B-Tree indexes during idle periods",
+            "correct": false,
+            "feedback": "If a crash occurs mid-flush of an 8 KB page onto 4 KB OS blocks or 512-byte sectors, the on-disk page is torn. Logging the full 8 KB page image on the first modification after a checkpoint lets Redo overwrite the torn page cleanly."
+          },
+          {
+            "id": "b",
+            "text": "To repair 8 KB pages that are partially written (torn) across 4 KB OS blocks during a power failure",
+            "correct": true,
+            "feedback": "Correct! If a crash occurs mid-flush of an 8 KB page onto 4 KB OS blocks or 512-byte sectors, the on-disk page is torn. Logging the full 8 KB page image on the first modification after a checkpoint lets Redo overwrite the torn page cleanly."
+          },
+          {
+            "id": "c",
+            "text": "To eliminate the need for fsync on transaction commit",
+            "correct": false,
+            "feedback": "If a crash occurs mid-flush of an 8 KB page onto 4 KB OS blocks or 512-byte sectors, the on-disk page is torn. Logging the full 8 KB page image on the first modification after a checkpoint lets Redo overwrite the torn page cleanly."
+          },
+          {
+            "id": "d",
+            "text": "To allow logical replication slots to skip Analysis",
+            "correct": false,
+            "feedback": "If a crash occurs mid-flush of an 8 KB page onto 4 KB OS blocks or 512-byte sectors, the on-disk page is torn. Logging the full 8 KB page image on the first modification after a checkpoint lets Redo overwrite the torn page cleanly."
+          }
+        ],
+        "correctIndex": 1,
+        "explanation": "If a crash occurs mid-flush of an 8 KB page onto 4 KB OS blocks or 512-byte sectors, the on-disk page is torn. Logging the full 8 KB page image on the first modification after a checkpoint lets Redo overwrite the torn page cleanly."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "Write-Ahead Logging (WAL) keeps databases fast and crash-safe by writing every change to an append-only log file before updating the main data files. If the server crashes, ARIES recovery reads the log in three steps: Analysis finds what was running, Redo replays missing changes, and Undo rolls back unfinished transactions.",
+      "spark": {
+        "summary": "Write changes sequentially to a log before touching scattered data pages, then use Analysis, Redo, and Undo to recover cleanly from crashes.",
+        "keyTakeaway": "Sequential log writes give you speed; Analysis, Redo, and Undo give you crash safety."
+      },
+      "learningJourney": [
+        {
+          "stageId": "stage-1-durability-paradox",
+          "summary": "Why writing a sequential log is much faster than updating scattered pages on every commit.",
+          "id": "stage-1-durability-paradox",
+          "title": "The Random I/O Paradox & STEAL/NO-FORCE Policies",
+          "eyebrow": "Stage 1 • Foundation",
+          "explanation": "Why writing a sequential log is much faster than updating scattered pages on every commit."
+        },
+        {
+          "stageId": "stage-2-lsn-and-metadata",
+          "summary": "How LSNs act like timestamps linking log records to data pages.",
+          "id": "stage-2-lsn-and-metadata",
+          "title": "LSNs, Page Headers, Dirty Page Table, and Transaction Table",
+          "eyebrow": "Stage 2 • Core Mechanics",
+          "explanation": "How LSNs act like timestamps linking log records to data pages."
+        },
+        {
+          "stageId": "stage-3-aries-analysis-redo",
+          "summary": "Analysis finds unfinished transactions; Redo replays missing log entries.",
+          "id": "stage-3-aries-analysis-redo",
+          "title": "ARIES Phase 1 (Analysis) & Phase 2 (Redo: Repeating History)",
+          "eyebrow": "Stage 3 • Crash Recovery",
+          "explanation": "Analysis finds unfinished transactions; Redo replays missing log entries."
+        },
+        {
+          "stageId": "stage-4-aries-undo-clrs",
+          "summary": "Undo walks backward to revert unfinished work and logs CLRs so crashes during recovery are safe.",
+          "id": "stage-4-aries-undo-clrs",
+          "title": "ARIES Phase 3 (Undo) & Compensation Log Records (CLRs)",
+          "eyebrow": "Stage 4 • Crash Recovery",
+          "explanation": "Undo walks backward to revert unfinished work and logs CLRs so crashes during recovery are safe."
+        },
+        {
+          "stageId": "stage-5-implementation",
+          "summary": "Batching multiple transactions into one fsync (group commit) keeps writes fast.",
+          "id": "stage-5-implementation",
+          "title": "Safe WAL Append, Group Commit, and Bounded fsync Retry",
+          "eyebrow": "Stage 5 • Implementation",
+          "explanation": "Batching multiple transactions into one fsync (group commit) keeps writes fast."
+        },
+        {
+          "stageId": "stage-6-torn-pages-fpw",
+          "summary": "Full-page writes protect against half-written pages after a sudden power loss.",
+          "id": "stage-6-torn-pages-fpw",
+          "title": "Torn Pages, Full-Page Writes (FPW), and Doublewrite Buffers",
+          "eyebrow": "Stage 6 • Production Edge Cases",
+          "explanation": "Full-page writes protect against half-written pages after a sudden power loss."
+        },
+        {
+          "stageId": "stage-7-tradeoffs-pitfalls",
+          "summary": "Watch out for full WAL disks from stuck replicas and tune checkpoints to avoid I/O spikes.",
+          "id": "stage-7-tradeoffs-pitfalls",
+          "title": "Checkpoint Tuning, WAL Retention, and Distributed Consensus Logs",
+          "eyebrow": "Stage 7 • Architecture & Operations",
+          "explanation": "Watch out for full WAL disks from stuck replicas and tune checkpoints to avoid I/O spikes."
+        }
+      ],
+      "finalSummary": "WAL turns random writes into sequential appends, and ARIES (Analysis, Redo, Undo) guarantees zero lost commits and clean rollbacks after any crash.",
+      "summary": "Write-Ahead Logging turns random dirty-page disk writes into sequential log appends, while ARIES (Analysis, Redo, Undo) reconstructs exact database state after a crash.",
+      "keyTakeaway": "When concurrent writes contend on shared state, never flush a modified data page to disk before its log record is fsynced (STEAL), and never force data pages on commit (NO-FORCE)—let ARIES Analysis, Redo, and Undo reconcile everything after a crash."
+    },
+    "intermediate": {
+      "byteSummary": "Under a STEAL/NO-FORCE buffer pool, WAL guarantees durability and atomicity by enforcing flushedLSN >= pageLSN before page eviction and fsyncing commit records. ARIES coordinates the Dirty Page Table (recLSN), Transaction Table (lastLSN), and pageLSN headers across Analysis, Redo (repeating history from min recLSN), and Undo (backward prevLSN traversal with CLRs).",
+      "spark": {
+        "summary": "STEAL/NO-FORCE buffer pools rely on WAL invariants and three-pass ARIES recovery (Analysis, Redo, Undo with CLRs) for fast commits and idempotent crash recovery.",
+        "keyTakeaway": "Enforce flushedLSN >= pageLSN before evicting dirty pages, and use CLRs with undoNextLSN to make crash recovery idempotent."
+      },
+      "learningJourney": [
+        {
+          "stageId": "stage-1-durability-paradox",
+          "summary": "STEAL/NO-FORCE avoids random commit I/O while enforcing the WAL invariant.",
+          "id": "stage-1-durability-paradox",
+          "title": "The Random I/O Paradox & STEAL/NO-FORCE Policies",
+          "eyebrow": "Stage 1 • Foundation",
+          "explanation": "STEAL/NO-FORCE avoids random commit I/O while enforcing the WAL invariant."
+        },
+        {
+          "stageId": "stage-2-lsn-and-metadata",
+          "summary": "DPT (recLSN), TT (lastLSN), and pageLSN headers track recovery bounds.",
+          "id": "stage-2-lsn-and-metadata",
+          "title": "LSNs, Page Headers, Dirty Page Table, and Transaction Table",
+          "eyebrow": "Stage 2 • Core Mechanics",
+          "explanation": "DPT (recLSN), TT (lastLSN), and pageLSN headers track recovery bounds."
+        },
+        {
+          "stageId": "stage-3-aries-analysis-redo",
+          "summary": "Analysis identifies losers; Redo repeats history from min(recLSN) when pageLSN < LSN.",
+          "id": "stage-3-aries-analysis-redo",
+          "title": "ARIES Phase 1 (Analysis) & Phase 2 (Redo: Repeating History)",
+          "eyebrow": "Stage 3 • Crash Recovery",
+          "explanation": "Analysis identifies losers; Redo repeats history from min(recLSN) when pageLSN < LSN."
+        },
+        {
+          "stageId": "stage-4-aries-undo-clrs",
+          "summary": "Undo uses a loser max-heap and writes Redo-only CLRs with undoNextLSN.",
+          "id": "stage-4-aries-undo-clrs",
+          "title": "ARIES Phase 3 (Undo) & Compensation Log Records (CLRs)",
+          "eyebrow": "Stage 4 • Crash Recovery",
+          "explanation": "Undo uses a loser max-heap and writes Redo-only CLRs with undoNextLSN."
+        },
+        {
+          "stageId": "stage-5-implementation",
+          "summary": "Group commit amortizes fsync cost with CRC32 framing and bounded retry.",
+          "id": "stage-5-implementation",
+          "title": "Safe WAL Append, Group Commit, and Bounded fsync Retry",
+          "eyebrow": "Stage 5 • Implementation",
+          "explanation": "Group commit amortizes fsync cost with CRC32 framing and bounded retry."
+        },
+        {
+          "stageId": "stage-6-torn-pages-fpw",
+          "summary": "PostgreSQL FPW and InnoDB doublewrite buffers prevent torn-page corruption.",
+          "id": "stage-6-torn-pages-fpw",
+          "title": "Torn Pages, Full-Page Writes (FPW), and Doublewrite Buffers",
+          "eyebrow": "Stage 6 • Production Edge Cases",
+          "explanation": "PostgreSQL FPW and InnoDB doublewrite buffers prevent torn-page corruption."
+        },
+        {
+          "stageId": "stage-7-tradeoffs-pitfalls",
+          "summary": "Balance checkpoint pacing, replication slot caps, and synchronous_commit settings.",
+          "id": "stage-7-tradeoffs-pitfalls",
+          "title": "Checkpoint Tuning, WAL Retention, and Distributed Consensus Logs",
+          "eyebrow": "Stage 7 • Architecture & Operations",
+          "explanation": "Balance checkpoint pacing, replication slot caps, and synchronous_commit settings."
+        }
+      ],
+      "finalSummary": "ARIES pairs STEAL/NO-FORCE buffer management with LSN-indexed DPT/TT metadata, physiological Redo, and CLR-backed Undo to achieve high throughput and crash-safe recovery.",
+      "summary": "Write-Ahead Logging turns random dirty-page disk writes into sequential log appends, while ARIES (Analysis, Redo, Undo) reconstructs exact database state after a crash.",
+      "keyTakeaway": "When concurrent writes contend on shared state, never flush a modified data page to disk before its log record is fsynced (STEAL), and never force data pages on commit (NO-FORCE)—let ARIES Analysis, Redo, and Undo reconcile everything after a crash."
+    },
+    "advanced": {
+      "byteSummary": "ARIES decouples transaction commit latency from random dirty-page writeback via STEAL/NO-FORCE and physiological logging, bounded by fuzzy checkpoints serializing DPT (recLSN) and TT (lastLSN). Redo repeats history from min(recLSN) using pageLSN idempotency checks and post-checkpoint Full-Page Writes (or doublewrite staging) to heal torn 8 KB/16 KB pages, while Undo unwinds loser prevLSN chains in global reverse LSN order via Redo-only CLRs.",
+      "spark": {
+        "summary": "Physiological WAL logging, fuzzy checkpoints, torn-page healing (FPW/doublewrite), and CLR-indexed ARIES recovery form the durability backbone of both single-node RDBMSs and Raft-replicated storage engines.",
+        "keyTakeaway": "Repeating history in Redo and logging CLRs with undoNextLSN makes multi-crash recovery strictly bounded and idempotent."
+      },
+      "learningJourney": [
+        {
+          "stageId": "stage-1-durability-paradox",
+          "summary": "Formal STEAL/NO-FORCE invariants and eviction latches on flushedLSN.",
+          "id": "stage-1-durability-paradox",
+          "title": "The Random I/O Paradox & STEAL/NO-FORCE Policies",
+          "eyebrow": "Stage 1 • Foundation",
+          "explanation": "Formal STEAL/NO-FORCE invariants and eviction latches on flushedLSN."
+        },
+        {
+          "stageId": "stage-2-lsn-and-metadata",
+          "summary": "Fuzzy checkpointing of DPT recLSN and TT lastLSN without quiescing writers.",
+          "id": "stage-2-lsn-and-metadata",
+          "title": "LSNs, Page Headers, Dirty Page Table, and Transaction Table",
+          "eyebrow": "Stage 2 • Core Mechanics",
+          "explanation": "Fuzzy checkpointing of DPT recLSN and TT lastLSN without quiescing writers."
+        },
+        {
+          "stageId": "stage-3-aries-analysis-redo",
+          "summary": "Why physiological Redo must repeat history even for loser structural page splits.",
+          "id": "stage-3-aries-analysis-redo",
+          "title": "ARIES Phase 1 (Analysis) & Phase 2 (Redo: Repeating History)",
+          "eyebrow": "Stage 3 • Crash Recovery",
+          "explanation": "Why physiological Redo must repeat history even for loser structural page splits."
+        },
+        {
+          "stageId": "stage-4-aries-undo-clrs",
+          "summary": "Priority-queue reverse LSN traversal and CLR undoNextLSN idempotency.",
+          "id": "stage-4-aries-undo-clrs",
+          "title": "ARIES Phase 3 (Undo) & Compensation Log Records (CLRs)",
+          "eyebrow": "Stage 4 • Crash Recovery",
+          "explanation": "Priority-queue reverse LSN traversal and CLR undoNextLSN idempotency."
+        },
+        {
+          "stageId": "stage-5-implementation",
+          "summary": "Group commit leader election, CRC32 framing, and fail-closed fsync error handling.",
+          "id": "stage-5-implementation",
+          "title": "Safe WAL Append, Group Commit, and Bounded fsync Retry",
+          "eyebrow": "Stage 5 • Implementation",
+          "explanation": "Group commit leader election, CRC32 framing, and fail-closed fsync error handling."
+        },
+        {
+          "stageId": "stage-6-torn-pages-fpw",
+          "summary": "Mitigating 4 KB/512B partial writes via PostgreSQL FPW vs InnoDB doublewrite.",
+          "id": "stage-6-torn-pages-fpw",
+          "title": "Torn Pages, Full-Page Writes (FPW), and Doublewrite Buffers",
+          "eyebrow": "Stage 6 • Production Edge Cases",
+          "explanation": "Mitigating 4 KB/512B partial writes via PostgreSQL FPW vs InnoDB doublewrite."
+        },
+        {
+          "stageId": "stage-7-tradeoffs-pitfalls",
+          "summary": "WAL volume isolation, max_slot_wal_keep_size, and Raft quorum log parallels.",
+          "id": "stage-7-tradeoffs-pitfalls",
+          "title": "Checkpoint Tuning, WAL Retention, and Distributed Consensus Logs",
+          "eyebrow": "Stage 7 • Architecture & Operations",
+          "explanation": "WAL volume isolation, max_slot_wal_keep_size, and Raft quorum log parallels."
+        }
+      ],
+      "finalSummary": "Mastery of WAL invariants, torn-page defenses, and ARIES 3-pass recovery enables tuning checkpoint pacing, RPO/RTO bounds, and distributed consensus storage engines.",
+      "summary": "Write-Ahead Logging turns random dirty-page disk writes into sequential log appends, while ARIES (Analysis, Redo, Undo) reconstructs exact database state after a crash.",
+      "keyTakeaway": "When concurrent writes contend on shared state, never flush a modified data page to disk before its log record is fsynced (STEAL), and never force data pages on commit (NO-FORCE)—let ARIES Analysis, Redo, and Undo reconcile everything after a crash."
+    }
+  },
+  "pedagogicalFramework": "PRIME",
+  "prerequisites": [
+    {
+      "title": "ACID Transaction Fundamentals",
+      "summary": "ACID groups four guarantees for a database transaction: Atomicity (all-or-nothing), Consistency (enforced rules stay valid), Isolation (concurrent work does not expose partial state), and Durability (committed changes survive a crash under configured disk-flus..."
+    },
+    {
+      "title": "B-Tree vs. LSM-Tree Storage Engines",
+      "summary": "B-Trees update fixed-size disk pages (4-16 KiB) in place for fast, predictable point and range reads, whereas LSM-Trees buffer writes sequentially in memory (MemTable + WAL) and merge immutable sorted runs (SSTables) in the background for orders-of-magnitude h..."
+    }
+  ],
+  "simulation": {
+    "title": "Write-Ahead Logging (WAL) & ARIES Recovery — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "tx",
+        "label": "Client Tx",
+        "role": "Snapshot Read/Write"
+      },
+      {
+        "id": "plan",
+        "label": "Query Planner",
+        "role": "Index & Lock Order"
+      },
+      {
+        "id": "wal",
+        "label": "WAL Buffer",
+        "role": "Group Commit"
+      },
+      {
+        "id": "disk",
+        "label": "Storage Pages",
+        "role": "MVCC / Vacuum"
+      }
+    ],
+    "edges": [
+      {
+        "from": "tx",
+        "to": "plan",
+        "label": "SQL query"
+      },
+      {
+        "from": "plan",
+        "to": "wal",
+        "label": "append redo"
+      },
+      {
+        "from": "wal",
+        "to": "disk",
+        "label": "checkpoint flush"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "The Random I/O Paradox & STEAL/NO-FORCE Policies",
+        "actionLabel": "SQL query",
+        "status": "healthy",
+        "activeNodeIds": [
+          "tx",
+          "plan"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "SQL query",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Client Tx sends work to Query Planner (The Random I/O Paradox & STEAL/NO-FORCE Policies)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "LSNs, Page Headers, Dirty Page Table, and Transaction Table",
+        "actionLabel": "append redo",
+        "status": "healthy",
+        "activeNodeIds": [
+          "plan",
+          "wal"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "append redo",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Query Planner coordinates with WAL Buffer while preserving the core invariant (LSNs, Page Headers, Dirty Page Table, and Transaction Table)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "ARIES Phase 1 (Analysis) & Phase 2 (Redo: Repeating History)",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "wal",
+          "disk"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, Storage Pages absorbs pressure without cascading (ARIES Phase 1 (Analysis) & Phase 2 (Redo: Repeating History))."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Checkpoint Tuning, WAL Retention, and Distributed Consensus Logs",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "tx",
+          "plan",
+          "wal",
+          "disk"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Checkpoint Tuning, WAL Retention, and Distributed Consensus Logs)."
+      }
+    ]
+  }
+}

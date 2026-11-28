@@ -1,0 +1,524 @@
+{
+  "id": "design-10m-metric-tsdb-engine",
+  "slug": "design-10m-metric-tsdb-engine",
+  "title": "Design a 10M-Metric/Sec Time-Series Database & Downsampling Engine",
+  "problemType": "architecture",
+  "difficulty": "hard",
+  "domain": "Time-Series Databases",
+  "tagline": "Ingesting 10M points/sec with Gorilla in-memory chunks, inverted label indexes, and tiered S3 rollups.",
+  "purpose": "Design a Prometheus/Mimir-scale distributed time-series database that handles 10M samples/sec, bounds high-cardinality label index blowups, and serves both 2-hour alerting queries and 1-year dashboards in <200 ms.",
+  "prompt": "Design a distributed Time-Series Database ingesting 10M samples/sec across 50M active series (10s scrape interval), supporting <50 ms alerting queries over the last 2 hours, <500 ms 90-day dashboard queries, and 1-year retention.",
+  "pedagogicalFramework": "RESHADED",
+  "prerequisites": [
+    {
+      "title": "Gorilla Time-Series Compression",
+      "summary": "Know how 2-hour Gorilla chunks compress 16-byte `(ts, float64)` samples to ~1.37 bytes in RAM."
+    },
+    {
+      "title": "Inverted Indexes & Cardinality",
+      "summary": "Understand how `label=value` posting lists map metric selectors to Series IDs—and why unbounded labels like `user_id` explode memory."
+    }
+  ],
+  "spark": {
+    "summary": "Shard ingestion by series hash onto Gorilla-compressed 2h in-memory Head blocks backed by WAL, flush immutable blocks to S3, and compact 10s raw points into 5m/1h downsampled rollups.",
+    "keyTakeaway": "When designing a 10M-metric/sec TSDB, keep hot 2-hour Gorilla chunks in sharded ingester RAM with a WAL, flush immutable blocks to object storage, and pre-compute 5m/1h downsampled rollups so long-range dashboards never scan raw 10s points.",
+    "byteSummary": "At 10M samples/sec, raw ingestion is 160 MB/s (13.8 TB/day) uncompressed, and 50M active series will overwhelm any single-node B-Tree or row-oriented SQL database with random disk I/O.\n\nThe architecture splits into a stateful Ingester Head and a stateless Object-Storage Compactor/Querier: (1) Metric routers consistent-hash `(metric_name, sorted_labels)` to Ingester shards, where each series appends to a 2-hour Gorilla-compressed in-memory chunk (~1.37 B/pt) protected by a sequential Write-Ahead Log (WAL); (2) Every 2 hours, ingesters flush immutable TSDB/Parquet blocks + inverted label indexes to S3/GCS and truncate the WAL; (3) Background compactors merge blocks and generate 5-minute and 1-hour downsampled rollups (`min, max, sum, count`).\n\nAlerting queries over the last 2 hours hit Ingester RAM directly in <50 ms, while 90-day dashboards read pre-aggregated 1h rollups from S3/Parquet in <500 ms—cutting scan volume by 360x."
+  },
+  "learningJourney": [
+    {
+      "id": "stage-1-requirements-estimations",
+      "stageNumber": 1,
+      "title": "R & E · Requirements, Ingestion & Retention Math",
+      "whyThisMatters": "Quantifies DRAM savings from Gorilla and scan savings from 5m/1h downsampling.",
+      "explanation": {
+        "foundation": "10M samples/sec x 16 bytes uncompressed = 160 MB/sec = 13.8 TB/day = 5.04 PB/year if stored raw.",
+        "core": "Illustrative Sizing: With Gorilla compression (~1.4 B/pt), 10M samples/sec = 14 MB/sec = 1.21 TB/day. A 2-hour hot Head window across 50M active series needs `14 MB/s * 7,200 s ~ 101 GB` of compressed chunk RAM (plus ~100 GB for the in-memory inverted label index -> easily served by 16–20 ingester nodes with 32 GB RAM each at RF=3).",
+        "deepDive": "For a 90-day dashboard query at 10s resolution, scanning raw data requires reading `777,600` points per series; scanning a 1-hour downsampled rollup reads just `2,160` points—a 360x reduction in S3 bytes and CPU."
+      },
+      "sectionDiagram": {
+        "kind": "behavior-transition",
+        "eyebrow": "Storage & Query Scale",
+        "title": "Raw Row DB (5 PB/yr) vs. Gorilla Head + Rollup Tiering",
+        "before": {
+          "label": "Raw Uncompressed TSDB",
+          "metrics": [
+            "13.8 TB/day raw writes",
+            "Random B-Tree disk thrashing",
+            "90d query scans 777K pts/series"
+          ]
+        },
+        "after": {
+          "label": "Gorilla + Object Store + Rollups",
+          "metrics": [
+            "1.21 TB/day (~11x smaller)",
+            "101 GB hot 2h Gorilla RAM",
+            "360x faster 90d rollup scans"
+          ]
+        }
+      }
+    },
+    {
+      "id": "stage-2-storage-schema-inverted-index",
+      "stageNumber": 2,
+      "title": "S · Storage: Inverted Label Index + 2h Gorilla Chunks",
+      "whyThisMatters": "Shows how `{service='api', status='500'}` resolves to Series IDs without scanning 50M series.",
+      "explanation": {
+        "foundation": "Users query metrics by label selectors like `http_requests_total{env='prod', region='us-east'}`. Scanning 50M series names sequentially would take seconds.",
+        "core": "Each block maintains an Inverted Index: `Postings[(label_name, label_val)] -> sorted uint32[] SeriesIDs`. Querying `env='prod' AND region='us-east'` intersects two sorted posting lists in sub-millisecond time, then reads only the matching SeriesIDs' Gorilla chunks.",
+        "deepDive": "Cardinality Guardrail: High-cardinality labels (`request_id`, `user_id`) blow up the inverted index. Enforce per-tenant active-series limits (e.g., max 2M active series/tenant) and drop/reject samples exceeding cardinality caps at the Distributor before they hit Ingester RAM."
+      },
+      "sectionDiagram": {
+        "kind": "tree-index",
+        "eyebrow": "Block Layout",
+        "title": "Inverted Label Postings -> Series ID Table -> Gorilla Chunks",
+        "levels": [
+          {
+            "label": "Symbols & Label Postings",
+            "detail": "(key, val) -> sorted SeriesID[]"
+          },
+          {
+            "label": "Series Meta Table",
+            "detail": "SeriesID -> chunk byte offsets"
+          },
+          {
+            "label": "Gorilla Chunk Pool",
+            "detail": "2h Delta-of-Delta + XOR blocks"
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-3-high-level-architecture",
+      "stageNumber": 3,
+      "title": "H & A · Write Path, Replication & Fan-Out Query Engine",
+      "whyThisMatters": "Traces ingestion durability (WAL + RF=3) and how Queriers merge hot RAM + cold S3.",
+      "explanation": {
+        "foundation": "Distributors receive Prometheus `remote_write` batches, enforce tenant cardinality/rate limits, and hash `(tenant_id, metric_labels)` onto a consistent-hash ring of Ingesters with RF=3.",
+        "core": "Each Ingester appends incoming samples to a local sequential WAL (for crash recovery) and into the series' 2-hour Gorilla chunk. Every 2 hours, Ingesters compact the sealed Head chunk into an immutable block and upload it to S3/GCS. Queriers fan out reads in parallel: `t > now - 2h` goes to Ingesters; `t <= now - 2h` goes to Store-Gateways reading S3 blocks.",
+        "deepDive": "With RF=3 and W=2, R=2 quorum writes, losing an Ingester node never drops recent metrics—and a restarted Ingester replays its local WAL in ~15–30 seconds."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Write & Read Paths",
+        "title": "Distributor -> Ingester (WAL + Gorilla) -> S3 Block -> Querier Merge",
+        "actors": [
+          {
+            "id": "dist",
+            "label": "Distributor"
+          },
+          {
+            "id": "ing",
+            "label": "Ingester (RF=3)"
+          },
+          {
+            "id": "s3",
+            "label": "S3 / Compactor"
+          },
+          {
+            "id": "q",
+            "label": "Query Engine"
+          }
+        ],
+        "steps": [
+          {
+            "from": "dist",
+            "to": "ing",
+            "label": "Hash(series) -> W=2 Gorilla append"
+          },
+          {
+            "from": "ing",
+            "to": "s3",
+            "label": "Flush 2h block + inverted index"
+          },
+          {
+            "from": "q",
+            "to": "ing",
+            "label": "Fetch hot <2h chunks"
+          },
+          {
+            "from": "q",
+            "to": "s3",
+            "label": "Fetch cold >2h rollups & merge"
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-4-detailed-design-downsampling",
+      "stageNumber": 4,
+      "title": "D · Detailed Design: Downsampling & Cardinality Protection",
+      "whyThisMatters": "Prevents OOM crashes from label explosions and speeds up 90-day queries by 360x.",
+      "explanation": {
+        "foundation": "When a buggy microservice accidentally puts a `trace_id` into a Prometheus label, active series count jumps from 50K to 50M in minutes—crashing Ingesters with OOM.",
+        "core": "Protect Ingesters at the Distributor using a per-tenant HyperLogLog / bounded series-cache limiter: reject new series with HTTP `429` once a tenant exceeds its quota. Meanwhile, asynchronous Compactors read raw 2h S3 blocks and emit 5m and 1h rollup blocks storing `{min, max, sum, count}` per bucket.",
+        "deepDive": "Why store `{sum, count}` instead of `avg`? Because averages are not associative (`avg(avg_A, avg_B) != true_avg`)! Storing `sum` and `count` lets the Querier compute exact `avg = sum(sums) / sum(counts)` across arbitrary time windows."
+      },
+      "codeExample": {
+        "language": "python",
+        "title": "Associative Rollup Aggregator & Cardinality Gate",
+        "code": "def downsample_bucket(samples_10s):\n    # Store associative aggregates (min, max, sum, count), never raw avg!\n    if not samples_10s:\n        return None\n    return {\n        'min': min(samples_10s),\n        'max': max(samples_10s),\n        'sum': sum(samples_10s),\n        'count': len(samples_10s),\n    }\n\ndef admit_series(tenant_id, series_hash, active_hll, quota_limit):\n    if active_hll.estimate(tenant_id) >= quota_limit and not active_hll.seen(series_hash):\n        raise CardinalityLimitError('429: Active series quota exceeded')\n    active_hll.add(tenant_id, series_hash)\n"
+      },
+      "decisionFramework": {
+        "problem": "How to keep both 2-hour alerting (<50 ms) and 90-day dashboards (<500 ms) fast at 10M metrics/sec.",
+        "naiveSolution": "Store all 10s raw points in one database and scan raw rows for 90-day graphs.",
+        "whyItFails": "90-day queries scan 777,600 points per series, saturating disk/S3 bandwidth and timing out.",
+        "alternatives": "Raw-only scans vs. Pre-computed `avg` rollups vs. Associative `{min, max, sum, count}` rollups.",
+        "decision": "Keep 2h Gorilla chunks in Ingester RAM, flush 2h blocks to S3, and compact into 5m/1h `{min, max, sum, count}` rollups.",
+        "tradeOffs": "Adds ~15–20% extra S3 storage for rollup tiers in exchange for 360x faster multi-month dashboard queries."
+      },
+      "decisionExercise": {
+        "prompt": "A team pre-computes 1-hour rollups storing only `avg_value` per hour. When a user queries `avg_over_time` across 7 days with uneven scrape counts (some hours had 10 samples, others had 360), the dashboard shows wrong numbers. Why?",
+        "options": [
+          {
+            "id": "a",
+            "label": "Averages are non-associative; rollups must store `sum` and `count` so the querier computes `sum(sums) / sum(counts)`.",
+            "isCorrect": true,
+            "explanation": "Correct! Taking the mean of means weights sparse hours equally with dense hours; `{sum, count}` stays exact."
+          },
+          {
+            "id": "b",
+            "label": "Gorilla compression only works on integers.",
+            "isCorrect": false,
+            "explanation": "Gorilla compresses float64 values losslessly."
+          },
+          {
+            "id": "c",
+            "label": "S3 object storage reorders hourly blocks.",
+            "isCorrect": false,
+            "explanation": "Block ordering does not cause weighted-average math errors."
+          }
+        ]
+      },
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "Data Tiering & Rollups",
+        "title": "Hot 2h Gorilla (10s) -> Cold S3 (10s) -> 5m Rollup -> 1h Rollup",
+        "states": [
+          {
+            "id": "hot",
+            "label": "Hot Head (10s, RAM)",
+            "tone": "good"
+          },
+          {
+            "id": "cold",
+            "label": "S3 Raw Block (10s)",
+            "tone": "info"
+          },
+          {
+            "id": "r5m",
+            "label": "5m Rollup (30d)",
+            "tone": "info"
+          },
+          {
+            "id": "r1h",
+            "label": "1h Rollup (1yr)",
+            "tone": "good"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "hot",
+            "to": "cold",
+            "label": "flush every 2h"
+          },
+          {
+            "from": "cold",
+            "to": "r5m",
+            "label": "compact > 24h"
+          },
+          {
+            "from": "r5m",
+            "to": "r1h",
+            "label": "compact > 30d"
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-5-evaluation-assumptions-glossary",
+      "stageNumber": 5,
+      "title": "E & D · Evaluation, Assumptions, Limitations & Glossary",
+      "whyThisMatters": "Documents sizing assumptions, out-of-order tradeoffs, and TSDB terminology.",
+      "explanation": {
+        "foundation": "Sizing assumes a 10s regular scrape interval across 50M active series (~10M/sec) and ~1.4 bytes/point average Gorilla compression.",
+        "core": "Assumptions & Limitations: If clients send heavily out-of-order samples (>2 hours late), they cannot append to the active Head chunk and must write to an Out-of-Order (OOO) head block that compacts separately on flush. Inverted index RAM scales with unique label-value pairs, requiring strict per-tenant cardinality quotas.",
+        "deepDive": "Glossary: Head Block (active 2h in-memory Gorilla chunk tier); Posting List (sorted list of Series IDs matching a `label=value` pair); Cardinality Explosion (unbounded growth of unique label combinations); Associative Rollup (storing `{min, max, sum, count}` for exact re-aggregation)."
+      },
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "End-to-End TSDB",
+        "title": "Distributor -> Ingester (WAL + Gorilla) -> Compactor -> S3 -> Querier",
+        "nodes": [
+          {
+            "id": "dist",
+            "label": "Distributor (Quota)",
+            "tier": "ingress"
+          },
+          {
+            "id": "ing",
+            "label": "Ingester (2h Gorilla)",
+            "tier": "compute"
+          },
+          {
+            "id": "s3",
+            "label": "S3 Blocks + Rollups",
+            "tier": "storage"
+          },
+          {
+            "id": "qry",
+            "label": "Querier (Hot + Cold)",
+            "tier": "control"
+          }
+        ],
+        "edges": [
+          {
+            "from": "dist",
+            "to": "ing",
+            "label": "RF=3 W=2"
+          },
+          {
+            "from": "ing",
+            "to": "s3",
+            "label": "2h block flush"
+          },
+          {
+            "from": "qry",
+            "to": "ing",
+            "label": "<2h hot"
+          },
+          {
+            "from": "qry",
+            "to": "s3",
+            "label": ">2h rollups"
+          }
+        ]
+      }
+    }
+  ],
+  "simulation": {
+    "title": "10M-Metric/Sec TSDB — Ingest, Flush & Rollup Query",
+    "nodes": [
+      {
+        "id": "dist",
+        "label": "Distributor",
+        "role": "Hash & Cardinality Gate"
+      },
+      {
+        "id": "ing",
+        "label": "Ingester Head",
+        "role": "WAL + 2h Gorilla RAM"
+      },
+      {
+        "id": "comp",
+        "label": "Compactor / S3",
+        "role": "Immutable Blocks & Rollups"
+      },
+      {
+        "id": "qry",
+        "label": "Query Engine",
+        "role": "Merge Hot + Cold"
+      }
+    ],
+    "edges": [
+      {
+        "from": "dist",
+        "to": "ing",
+        "label": "consistent hash (W=2)"
+      },
+      {
+        "from": "ing",
+        "to": "comp",
+        "label": "flush 2h block"
+      },
+      {
+        "from": "qry",
+        "to": "comp",
+        "label": "read 1h rollups"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "10M/s Ingest Into 2h Gorilla Head",
+        "actionLabel": "Append WAL + Gorilla bits",
+        "status": "healthy",
+        "activeNodeIds": [
+          "dist",
+          "ing"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "ingest_rate": "10M/s",
+          "head_ram_gb": 101,
+          "p99_alert_ms": 22
+        },
+        "explanation": "Distributors route samples to RF=3 Ingesters; WAL guarantees durability while Gorilla compresses to 1.4 B/pt."
+      },
+      {
+        "stepNumber": 2,
+        "title": "2-Hour Block Flush & 5m/1h Rollups",
+        "actionLabel": "Upload immutable block to S3",
+        "status": "healthy",
+        "activeNodeIds": [
+          "ing",
+          "comp"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "block_window": "2h",
+          "rollup_speedup": "360x",
+          "wal_truncated": "true"
+        },
+        "explanation": "Sealed 2h blocks flush to S3 and Compactors build associative {min, max, sum, count} rollups."
+      },
+      {
+        "stepNumber": 3,
+        "title": "High-Cardinality Spike Blocked",
+        "actionLabel": "Reject unbounded trace_id label",
+        "status": "warning",
+        "activeNodeIds": [
+          "dist"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "tenant_series": "2.0M (CAP)",
+          "status": "429 Throttled",
+          "oom_prevented": "true"
+        },
+        "explanation": "Distributor catches a sudden label cardinality explosion and sheds excess new series before Ingesters OOM."
+      },
+      {
+        "stepNumber": 4,
+        "title": "90-Day Dashboard Query (<500 ms)",
+        "actionLabel": "Merge 2h Head + 90d 1h Rollups",
+        "status": "healthy",
+        "activeNodeIds": [
+          "ing",
+          "comp",
+          "qry"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "pts_scanned": "2,160",
+          "query_ms": 185,
+          "errors": 0
+        },
+        "explanation": "Querier merges live Head points with pre-computed 1h rollups from S3 in 185 ms."
+      }
+    ]
+  },
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-1",
+        "question": "At 10M samples/sec, why does a TSDB keep 2 hours of Gorilla chunks in Ingester RAM instead of writing directly to S3 on every scrape?",
+        "options": [
+          {
+            "id": "a",
+            "text": "S3 cannot handle 10M tiny appends/sec, and keeping 2h Gorilla chunks in RAM (~101 GB) lets alerting queries run in <50 ms.",
+            "correct": true,
+            "feedback": "Correct! Batching 2-hour chunks amortizes S3 PUTs while keeping hot alerts fast in RAM."
+          },
+          {
+            "id": "b",
+            "text": "S3 does not support storing numbers.",
+            "correct": false,
+            "feedback": "S3 stores arbitrary binary blocks; it's the per-object latency and request rate that requires batching."
+          },
+          {
+            "id": "c",
+            "text": "Gorilla compression only works in RAM, never on disk.",
+            "correct": false,
+            "feedback": "Gorilla chunks are flushed directly into immutable disk/S3 blocks."
+          },
+          {
+            "id": "d",
+            "text": "To avoid using a Write-Ahead Log.",
+            "correct": false,
+            "feedback": "Ingesters still use a local sequential WAL for crash durability."
+          }
+        ],
+        "explanation": "Object stores optimize for large immutable blocks, while alerting needs sub-50 ms access to recent samples."
+      },
+      {
+        "id": "kc-2",
+        "question": "Why should downsampled TSDB rollups store `{sum, count}` rather than pre-computing `avg`?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Because `avg` is non-associative across buckets with different sample counts, whereas `sum` and `count` re-aggregate exactly.",
+            "correct": true,
+            "feedback": "Correct! `sum(sums) / sum(counts)` is mathematically exact across any window."
+          },
+          {
+            "id": "b",
+            "text": "`avg` cannot be stored as a float64.",
+            "correct": false,
+            "feedback": "`avg` is a float64, just non-associative."
+          },
+          {
+            "id": "c",
+            "text": "To double the size of the inverted index.",
+            "correct": false,
+            "feedback": "Rollups store metric values, not inverted label indexes."
+          },
+          {
+            "id": "d",
+            "text": "Because Prometheus forbids `avg_over_time`.",
+            "correct": false,
+            "feedback": "PromQL supports `avg_over_time`, which relies on exact underlying aggregates."
+          }
+        ],
+        "explanation": "Associative aggregates (`min`, `max`, `sum`, `count`) allow multi-tier rollups without statistical skew."
+      },
+      {
+        "id": "kc-3",
+        "question": "Where should high-cardinality label explosions (e.g., accidentally adding `request_id` as a metric label) be stopped?",
+        "options": [
+          {
+            "id": "a",
+            "text": "At the stateless Distributor layer via per-tenant active-series quotas before new series allocate Ingester RAM.",
+            "correct": true,
+            "feedback": "Correct! Stopping excess series at the Distributor prevents Ingester OOM crashes."
+          },
+          {
+            "id": "b",
+            "text": "Inside the S3 Compactor 2 hours later.",
+            "correct": false,
+            "feedback": "By 2 hours later, Ingesters have already OOM-crashed."
+          },
+          {
+            "id": "c",
+            "text": "By deleting the WAL every 5 seconds.",
+            "correct": false,
+            "feedback": "Deleting the WAL causes data loss and doesn't free active Head memory."
+          },
+          {
+            "id": "d",
+            "text": "By disabling inverted indexes.",
+            "correct": false,
+            "feedback": "Without inverted indexes, label queries cannot run."
+          }
+        ],
+        "explanation": "Admitting bounded series at the stateless ingress Distributor protects stateful Ingester memory."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Handle 10M metrics/sec by buffering 2 hours of Gorilla-compressed data in memory, saving blocks to S3, and pre-computing 5m/1h summaries for fast long-range graphs.",
+      "keyTakeaway": "When building a high-scale metrics database, compress recent data in memory with Gorilla and pre-compute hourly summaries so multi-month dashboards load fast.",
+      "byteSummary": "Ingesters compress the last 2 hours of metrics in RAM (~1.4 bytes/point) with a WAL for safety, flush blocks to S3, and compact old data into 5m and 1h rollups."
+    },
+    "intermediate": {
+      "summary": "Shard 50M series onto RF=3 Ingesters (WAL + 2h Gorilla Head + Inverted Index), flush to S3, and compact into associative `{min, max, sum, count}` rollups.",
+      "keyTakeaway": "When designing a 10M-metric/sec TSDB, pair 2-hour Gorilla Head blocks + inverted label indexes with Distributor cardinality quotas and associative S3 rollups.",
+      "byteSummary": "Distributors enforce per-tenant cardinality caps, Ingesters hold ~101 GB of 2h Gorilla chunks in RAM, and Compactors build 5m/1h `{min, max, sum, count}` rollups for 360x faster 90-day queries."
+    },
+    "advanced": {
+      "summary": "Consistent-hashed RF=3 Ingester ring with W=2/R=2 WAL recovery, inverted posting-list intersection, OOO head handling, and associative S3 rollup compaction.",
+      "keyTakeaway": "When scaling TSDBs to 10M+ samples/sec, isolate out-of-order writes from Gorilla chunks, enforce Distributor cardinality limits, and merge hot RAM + cold rollups in parallel.",
+      "byteSummary": "Combining Distributor cardinality gating, RF=3 Ingesters with 2h Gorilla + OOO heads, inverted posting-list intersection, and associative `{min, max, sum, count}` S3 rollups sustains <50 ms alerts and <500 ms 90-day queries."
+    }
+  }
+}

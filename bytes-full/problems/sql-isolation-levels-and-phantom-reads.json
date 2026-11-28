@@ -1,0 +1,878 @@
+{
+  "id": "problem-sql-isolation-levels-and-phantom-reads",
+  "slug": "sql-isolation-levels-and-phantom-reads",
+  "title": "SQL Isolation Levels: Preventing Phantom Reads",
+  "problemType": "architecture",
+  "difficulty": "hard",
+  "prompt": "A cloud resource-quota and shift-scheduling service running on PostgreSQL 16 (default READ COMMITTED) enforces a rule: 'A team may have at most 3 active on-call engineers per shift, and total allocated GPU quota per project cannot exceed 16 GPUs.' Under concurrent API requests, two transactions both query `SELECT SUM(gpus) FROM allocations WHERE project_id = $1`, both read 12 GPUs, and both `INSERT` a new 4-GPU allocation—resulting in 20 GPUs allocated. Worse, re-running the `SELECT` inside the same transaction suddenly shows the newly committed row (a phantom read). Design the exact isolation, locking, and retry strategy to prevent both phantom reads and multi-row invariant violations.",
+  "spark": {
+    "summary": "Under READ COMMITTED, each SQL statement acquires a fresh snapshot, allowing concurrent INSERTs to appear mid-transaction as phantom rows; meanwhile, PostgreSQL REPEATABLE READ prevents phantoms via transaction-level snapshots but still permits write skew without SERIALIZABLE or explicit parent locking.",
+    "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, match isolation to the invariant: use PostgreSQL SERIALIZABLE (with retry on SQLSTATE 40001) or explicit parent-row SELECT ... FOR UPDATE for multi-row business invariants, and understand how PostgreSQL SSI differs from InnoDB Next-Key Locking.",
+    "byteSummary": "**Core Mechanics:** A PostgreSQL 16 quota service enforces `SUM(gpus) <= 16` per project (`5–20` concurrent requests/sec per project, `10,000` active projects).\n\n**Visual & Structural Flow:** Depicts PostgreSQL REPEATABLE READ Allows Both Quota Inserts to Commit (Tx A (+6 GPUs) -> Postgres MVCC -> Tx B (+6 GPUs)); MVCC Snapshot + SIREAD Predicate Locks / Parent Row Lock (Tx A & Tx B (5-20 RPS/proj) -> Postgres 16 MVCC / SSI -> projects (Parent Row) -> allocations (Child Rows)).\n\n**Trade-Offs & Production:** Unlike MySQL InnoDB—which uses **Next-Key (Gap) Locks** to block phantom `INSERT`s into a range under `REPEATABLE READ`—**PostgreSQL has no gap locks**. Enforce multi-row invariants cleanly at `< 40 ms` p99 across 10,000 projects: **Parent-Row `SELECT ... FOR UPDATE`**: Lock the single `projects` row (`WHERE id = $1 FOR UPDATE`) before querying `SUM(gpus)` and inserting.\n\n**Failure Modes & Application:** Understanding MVCC vs. locking isolation prevents subtle financial and quota bugs: **Cloud Quota & Seat-Limit Enforcement**: Prevents over-allocating GPUs, licenses, or shift slots."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why SELECT SUM(...) + INSERT breaks quota invariants under MVCC",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "Think of **Why SELECT SUM(...) + INSERT breaks quota invariants under MVCC** as the intuition layer for SQL Isolation Levels: Preventing Phantom Reads: The mechanism: understand how Why SELECT SUM(...) + INSERT breaks quota invariants under MVCC works from first principles.",
+        "core": "A PostgreSQL 16 quota service enforces `SUM(gpus) <= 16` per project (`5–20` concurrent requests/sec per project, `10,000` active projects). Under default `READ COMMITTED`, each statement takes a fresh MVCC snapshot—allowing two concurrent transactions to both read `SUM(gpus) = 12`, both insert `4` GPUs (Wait—or `8` GPUs!), and silently violate the 16-GPU cap.",
+        "deepDive": "Under heavy load or partial failure, why select sum(...) + insert breaks quota invariants under mvcc becomes a critical lever for predictable latency and correctness. Under READ COMMITTED, each SQL statement acquires a fresh snapshot, allowing concurrent INSERTs to appear mid-transaction as phantom rows; meanwhile, PostgreSQL REPEATABLE READ prevents phantoms via transaction-level snapshots but still permits write skew without SERIALIZABLE or explicit parent locking."
+      },
+      "purpose": "The mechanism: understand how Why SELECT SUM(...) + INSERT breaks quota invariants under MVCC works from first principles.",
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Stage 1 Interaction",
+        "title": "Why SELECT SUM(...) + INSERT breaks quota invariants under...",
+        "actors": [
+          {
+            "id": "caller",
+            "label": "Client / Caller"
+          },
+          {
+            "id": "coord",
+            "label": "Coordinator"
+          },
+          {
+            "id": "store",
+            "label": "State / Engine"
+          }
+        ],
+        "steps": [
+          {
+            "from": "caller",
+            "to": "coord",
+            "label": "1. Dispatch request + bounds"
+          },
+          {
+            "from": "coord",
+            "to": "store",
+            "label": "2. Execute deterministic step"
+          },
+          {
+            "from": "store",
+            "to": "coord",
+            "label": "3. Return state & proof"
+          },
+          {
+            "from": "coord",
+            "to": "caller",
+            "label": "4. Ack with bounded latency"
+          }
+        ]
+      }
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "Phantom rows under READ COMMITTED and write skew under REPEATABLE READ",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Multi-row invariants fail silently across two isolation levels in PostgreSQL:",
+        "core": "1. **Phantom Reads (`READ COMMITTED`)**: Concurrent `INSERT`s committed by Tx B appear mid-transaction in Tx A.\n2. **Write Skew (`REPEATABLE READ`)**: PostgreSQL's Snapshot Isolation eliminates phantoms for queries, **but two concurrent `INSERT`s see the same pre-insert `SUM` and both commit**, violating the 16-GPU or 3-on-call-engineer cap.",
+        "deepDive": "In production deployments of SQL Isolation Levels: Preventing Phantom Reads, watch how phantom rows under read committed and write skew under repeatable read interacts with tail latency, retry amplification, and partial failures. Under READ COMMITTED, each SQL statement acquires a fresh snapshot, allowing concurrent INSERTs to appear mid-transaction as phantom rows; meanwhile, PostgreSQL REPEATABLE READ prevents phantoms via transaction-level snapshots but still permits write skew without SERIALIZABLE or explicit parent locking."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Snapshot Isolation Write Skew",
+        "title": "PostgreSQL REPEATABLE READ Allows Both Quota Inserts to Commit",
+        "actors": [
+          {
+            "id": "txa",
+            "label": "Tx A (+6 GPUs)"
+          },
+          {
+            "id": "pg",
+            "label": "Postgres MVCC"
+          },
+          {
+            "id": "txb",
+            "label": "Tx B (+6 GPUs)"
+          }
+        ],
+        "events": [
+          {
+            "from": "txa",
+            "to": "pg",
+            "label": "BEGIN REPEATABLE READ (SUM=10)",
+            "status": "ok"
+          },
+          {
+            "from": "txb",
+            "to": "pg",
+            "label": "BEGIN REPEATABLE READ (SUM=10)",
+            "status": "ok"
+          },
+          {
+            "from": "txa",
+            "to": "pg",
+            "label": "10+6 <= 16 -> INSERT + COMMIT",
+            "status": "warn"
+          },
+          {
+            "from": "txb",
+            "to": "pg",
+            "label": "10+6 <= 16 -> INSERT + COMMIT!",
+            "status": "fail"
+          },
+          {
+            "from": "pg",
+            "to": "txb",
+            "label": "Fix: SERIALIZABLE (40001) / FOR UPDATE",
+            "status": "ok"
+          }
+        ],
+        "summary": "PostgreSQL REPEATABLE READ prevents phantoms, but only SERIALIZABLE (SSI) or parent-row FOR UPDATE prevents write skew."
+      },
+      "purpose": "The problem: see what breaks without Phantom rows under READ COMMITTED and write skew under REPEATABLE READ under real concurrency or scale.",
+      "decisionFramework": {
+        "problem": "How to implement SQL Isolation Levels: Preventing Phantom Reads without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "To keep the architecture evolvable without sacrificing reliability, match isolation to the invariant: use PostgreSQL SERIALIZABLE (with retry on SQLSTATE 40001) or explicit parent-row SELECT ... FOR UPDATE for multi-row business invariants, and understand how PostgreSQL SSI differs from InnoDB Next-Key Locking.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When SQL Isolation Levels: Preventing Phantom Reads experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Why SELECT ... FOR UPDATE on child rows fails in PostgreSQL",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Unlike MySQL InnoDB—which uses **Next-Key (Gap) Locks** to block phantom `INSERT`s into a range under `REPEATABLE READ`—**PostgreSQL has no gap locks**.",
+        "core": "Running `SELECT ...",
+        "deepDive": "FROM allocations WHERE project_id = $1 FOR UPDATE` only locks *existing* rows and does **not** block a concurrent `INSERT` of a new row!"
+      },
+      "purpose": "The problem: see what breaks without Why SELECT ... FOR UPDATE on child rows fails in PostgreSQL under real concurrency or scale.",
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "Stage 3 Lifecycle",
+        "title": "Why SELECT ... FOR UPDATE on child rows fails in PostgreSQ...",
+        "states": [
+          {
+            "id": "init",
+            "label": "Ready / Idle",
+            "tone": "neutral"
+          },
+          {
+            "id": "active",
+            "label": "In-Flight",
+            "tone": "info"
+          },
+          {
+            "id": "verified",
+            "label": "Committed",
+            "tone": "good"
+          },
+          {
+            "id": "degraded",
+            "label": "Fallback / Retry",
+            "tone": "warn"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "init",
+            "to": "active",
+            "label": "acquire"
+          },
+          {
+            "from": "active",
+            "to": "verified",
+            "label": "quorum ok"
+          },
+          {
+            "from": "active",
+            "to": "degraded",
+            "label": "timeout / skew"
+          },
+          {
+            "from": "degraded",
+            "to": "init",
+            "label": "backoff reset"
+          }
+        ]
+      }
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise solution: PostgreSQL SERIALIZABLE (SSI) or Parent-Row FOR UPDATE",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": {
+        "foundation": "Enforce multi-row invariants cleanly at `< 40 ms` p99 across 10,000 projects:",
+        "core": "- **Parent-Row `SELECT ... FOR UPDATE`**: Lock the single `projects` row (`WHERE id = $1 FOR UPDATE`) before querying `SUM(gpus)` and inserting. Contention is scoped per-project (`5–20 RPS`), leaving the other `9,999` projects lock-free.\n- **PostgreSQL `SERIALIZABLE` (SSI)**: Uses non-blocking `SIREAD` predicate locks to detect `rw`-antidependency cycles and abort one conflicting writer with `SQLSTATE 40001`, which the app retries with bounded exponential backoff + jitter.",
+        "deepDive": "In production deployments of SQL Isolation Levels: Preventing Phantom Reads, watch how enterprise solution: postgresql serializable (ssi) or parent-row for update interacts with tail latency, retry amplification, and partial failures. Under READ COMMITTED, each SQL statement acquires a fresh snapshot, allowing concurrent INSERTs to appear mid-transaction as phantom rows; meanwhile, PostgreSQL REPEATABLE READ prevents phantoms via transaction-level snapshots but still permits write skew without SERIALIZABLE or explicit parent locking."
+      },
+      "sectionDiagram": {
+        "kind": "wal-mvcc",
+        "eyebrow": "PostgreSQL SSI vs. Parent Lock",
+        "title": "MVCC Snapshot + SIREAD Predicate Locks / Parent Row Lock",
+        "nodes": [
+          {
+            "label": "Tx A & Tx B (5-20 RPS/proj)",
+            "role": "Retry on SQLSTATE 40001"
+          },
+          {
+            "label": "Postgres 16 MVCC / SSI",
+            "role": "SIREAD predicate / parent lock"
+          },
+          {
+            "label": "projects (Parent Row)",
+            "role": "Per-project serialization point"
+          },
+          {
+            "label": "allocations (Child Rows)",
+            "role": "Invariant SUM(gpus) <= 16"
+          }
+        ],
+        "cards": [
+          {
+            "label": "No Gap Locks in PG",
+            "detail": "FOR UPDATE on child rows does not block new INSERTs in Postgres (unlike InnoDB Next-Key locks)."
+          },
+          {
+            "label": "Parent-Row Lock",
+            "detail": "Locking projects.id serializes only that project without blocking 10,000 others."
+          },
+          {
+            "label": "SSI (SQLSTATE 40001)",
+            "detail": "Detects write-skew rw-cycles without blocking readers; app retries 40001 with jitter."
+          }
+        ],
+        "summary": "Locking the parent row or using SERIALIZABLE with 40001 retries enforces multi-row invariants under MVCC."
+      },
+      "markdownContent": "```sql\n-- Option A: Parent-row lock serializes quota checks per project (works in READ COMMITTED)\nBEGIN;\nSELECT gpu_quota FROM projects WHERE id = $1 FOR UPDATE;\nSELECT COALESCE(SUM(gpus), 0) FROM allocations WHERE project_id = $1;\n-- Verify sum + new_gpus <= 16, then INSERT INTO allocations ...\nCOMMIT;\n\n-- Option B: PostgreSQL SERIALIZABLE (SSI) with retry loop on SQLSTATE 40001\nBEGIN ISOLATION LEVEL SERIALIZABLE;\nSELECT COALESCE(SUM(gpus), 0) FROM allocations WHERE project_id = $1;\nINSERT INTO allocations (project_id, gpus) VALUES ($1, $2);\nCOMMIT; -- Aborts one concurrent writer with 40001 if write skew detected\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where isolation-level guarantees protect business invariants",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Understanding MVCC vs. locking isolation prevents subtle financial and quota bugs:",
+        "core": "- **Cloud Quota & Seat-Limit Enforcement**: Prevents over-allocating GPUs, licenses, or shift slots.\n- **Double-Entry Ledgers & Balances**: Uses parent-account `FOR UPDATE` or `SERIALIZABLE` to prevent negative balances.\n- **Booking & Inventory Systems**: Avoids double-booking overlapping time slots via `EXCLUDE USING gist` or SSI.",
+        "deepDive": "In production deployments of SQL Isolation Levels: Preventing Phantom Reads, watch how where isolation-level guarantees protect business invariants interacts with tail latency, retry amplification, and partial failures. Under READ COMMITTED, each SQL statement acquires a fresh snapshot, allowing concurrent INSERTs to appear mid-transaction as phantom rows; meanwhile, PostgreSQL REPEATABLE READ prevents phantoms via transaction-level snapshots but still permits write skew without SERIALIZABLE or explicit parent locking."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "database-isolation-levels-anomalies",
+          "title": "Concept: Database Isolation Levels & Anomalies",
+          "kind": "concept"
+        },
+        {
+          "slug": "acid-transaction-fundamentals",
+          "title": "Concept: ACID Transaction Fundamentals",
+          "kind": "concept"
+        },
+        {
+          "slug": "pessimistic-locking-strategies",
+          "title": "Concept: Pessimistic Locking Strategies",
+          "kind": "concept"
+        },
+        {
+          "slug": "mysql-innodb-gap-lock-deadlocks",
+          "title": "Problem: MySQL InnoDB Gap-Lock Deadlocks",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Stage 5 Interaction",
+        "title": "Where isolation-level guarantees protect business invarian...",
+        "actors": [
+          {
+            "id": "caller",
+            "label": "Client / Caller"
+          },
+          {
+            "id": "coord",
+            "label": "Coordinator"
+          },
+          {
+            "id": "store",
+            "label": "State / Engine"
+          }
+        ],
+        "steps": [
+          {
+            "from": "caller",
+            "to": "coord",
+            "label": "1. Dispatch request + bounds"
+          },
+          {
+            "from": "coord",
+            "to": "store",
+            "label": "2. Execute deterministic step"
+          },
+          {
+            "from": "store",
+            "to": "coord",
+            "label": "3. Return state & proof"
+          },
+          {
+            "from": "coord",
+            "to": "caller",
+            "label": "4. Ack with bounded latency"
+          }
+        ]
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why does `SELECT ... FROM allocations WHERE project_id = $1 FOR UPDATE` fail to prevent concurrent quota over-allocation in PostgreSQL?",
+      "options": [
+        {
+          "id": "a",
+          "text": "PostgreSQL has no gap/next-key locks, so FOR UPDATE only locks existing rows and does not block concurrent INSERTs of new allocation rows",
+          "correct": true,
+          "feedback": "Correct: lock the parent `projects` row or use `SERIALIZABLE` (SSI) with 40001 retries."
+        },
+        {
+          "id": "b",
+          "text": "PostgreSQL ignores FOR UPDATE inside READ COMMITTED transactions",
+          "correct": false,
+          "feedback": "FOR UPDATE locks existing rows in READ COMMITTED, but cannot lock non-existent phantom rows."
+        },
+        {
+          "id": "c",
+          "text": "SQLSTATE 40001 disables MVCC snapshots",
+          "correct": false,
+          "feedback": "40001 is the serialization failure error code emitted by SSI/REPEATABLE READ."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why does `SELECT ... FROM allocations WHERE project_id = $1 FOR UPDATE` fail to prevent concurrent quota over-allocation in PostgreSQL?",
+        "options": [
+          {
+            "id": "a",
+            "text": "PostgreSQL has no gap/next-key locks, so FOR UPDATE only locks existing rows and does not block concurrent INSERTs of new allocation rows",
+            "correct": true,
+            "feedback": "Correct: lock the parent `projects` row or use `SERIALIZABLE` (SSI) with 40001 retries."
+          },
+          {
+            "id": "b",
+            "text": "PostgreSQL ignores FOR UPDATE inside READ COMMITTED transactions",
+            "correct": false,
+            "feedback": "FOR UPDATE locks existing rows in READ COMMITTED, but cannot lock non-existent phantom rows."
+          },
+          {
+            "id": "c",
+            "text": "SQLSTATE 40001 disables MVCC snapshots",
+            "correct": false,
+            "feedback": "40001 is the serialization failure error code emitted by SSI/REPEATABLE READ."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why SELECT SUM(...) + INSERT breaks quota invariants under MVCC', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "b",
+            "text": "A PostgreSQL 16 quota service enforces SUM(gpus) <= 16 per project (5–20 concurrent requests/sec per project, 10,000 active projects).",
+            "correct": true,
+            "feedback": "Correct: A PostgreSQL 16 quota service enforces SUM(gpus) <= 16 per project (5–20 concurrent requests/sec per project, 10,000 active projects)."
+          },
+          {
+            "id": "c",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Phantom rows under READ COMMITTED and write skew under REPEATABLE READ', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "b",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "c",
+            "text": "Multi-row invariants fail silently across two isolation levels in PostgreSQL: 1.",
+            "correct": true,
+            "feedback": "Correct: Multi-row invariants fail silently across two isolation levels in PostgreSQL: 1."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** A PostgreSQL 16 quota service enforces `SUM(gpus) <= 16` per project (`5–20` concurrent requests/sec per project, `10,000` active projects).\n\n**How It Flows:** Think of SQL Isolation Levels: Preventing Phantom Reads as a clear step-by-step chain: Tx A (+6 GPUs) -> Postgres MVCC -> Tx B (+6 GPUs) -> Tx A & Tx B (5-20 RPS/proj) -> Postgres 16 MVCC / SSI.\n\n**Why Beginners Should Care:** Match isolation to the invariant: use PostgreSQL SERIALIZABLE (with retry on SQLSTATE 40001) or explicit parent-row SELECT ... FOR UPDATE for multi-row business invariants, and understand how PostgreSQL SSI differs from InnoDB Next-Key Locking.",
+      "spark": {
+        "summary": "A PostgreSQL 16 quota service enforces `SUM(gpus) <= 16` per project (`5–20` concurrent requests/sec per project, `10,000` active projects).",
+        "keyTakeaway": "Match isolation to the invariant: use PostgreSQL SERIALIZABLE (with retry on SQLSTATE 40001) or explicit parent-row SELECT ..."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why SELECT SUM(...) + INSERT breaks quota invariants under MVCC",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why SELECT SUM(...) + INSERT breaks quota invariants under MVCC works from first principles.",
+          "explanation": "A PostgreSQL 16 quota service enforces `SUM(gpus) <= 16` per project (`5–20` concurrent requests/sec per project, `10,000` active projects). Under default `READ COMMITTED`, each statement takes a fresh MVCC snapshot—allowing two concurrent transactions to both read `SUM(gpus) = 12`, both insert `4` GPUs (Wait—or `8` GPUs!), and silently violate the 16-GPU cap.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Phantom rows under READ COMMITTED and write skew under REPEATABLE READ",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without Phantom rows under READ COMMITTED and write skew under REPEATABLE READ under real concurrency or scale.",
+          "explanation": "Multi-row invariants fail silently across two isolation levels in PostgreSQL: 1. **Phantom Reads (`READ COMMITTED`)**: Concurrent `INSERT`s committed by Tx B appear mid-transaction in Tx A. 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Snapshot Isolation Write Skew",
+            "title": "PostgreSQL REPEATABLE READ Allows Both Quota Inserts to Commit",
+            "actors": [
+              {
+                "id": "txa",
+                "label": "Tx A (+6 GPUs)"
+              },
+              {
+                "id": "pg",
+                "label": "Postgres MVCC"
+              },
+              {
+                "id": "txb",
+                "label": "Tx B (+6 GPUs)"
+              }
+            ],
+            "events": [
+              {
+                "from": "txa",
+                "to": "pg",
+                "label": "BEGIN REPEATABLE READ (SUM=10)",
+                "status": "ok"
+              },
+              {
+                "from": "txb",
+                "to": "pg",
+                "label": "BEGIN REPEATABLE READ (SUM=10)",
+                "status": "ok"
+              },
+              {
+                "from": "txa",
+                "to": "pg",
+                "label": "10+6 <= 16 -> INSERT + COMMIT",
+                "status": "warn"
+              },
+              {
+                "from": "txb",
+                "to": "pg",
+                "label": "10+6 <= 16 -> INSERT + COMMIT!",
+                "status": "fail"
+              },
+              {
+                "from": "pg",
+                "to": "txb",
+                "label": "Fix: SERIALIZABLE (40001) / FOR UPDATE",
+                "status": "ok"
+              }
+            ],
+            "summary": "PostgreSQL REPEATABLE READ prevents phantoms, but only SERIALIZABLE (SSI) or parent-row FOR UPDATE prevents write skew."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Why SELECT ... FOR UPDATE on child rows fails in PostgreSQL",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "The problem: see what breaks without Why SELECT ... FOR UPDATE on child rows fails in PostgreSQL under real concurrency or scale.",
+          "explanation": "Unlike MySQL InnoDB—which uses **Next-Key (Gap) Locks** to block phantom `INSERT`s into a range under `REPEATABLE READ`—**PostgreSQL has no gap locks**. Running `SELECT ... FROM allocations WHERE project_id = $1 FOR UPDATE` only locks *existing* rows and does **not** block a concurrent `INSERT` of a new row!",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: PostgreSQL SERIALIZABLE (SSI) or Parent-Row FOR UPDATE",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Enforce multi-row invariants cleanly at `< 40 ms` p99 across 10,000 projects: **Parent-Row `SELECT ... FOR UPDATE`**: Lock the single `projects` row (`WHERE id = $1 FOR UPDATE`) before querying `SUM(gpus)` and inserting. Contention is scoped per-project (`5–20 RPS`), leaving the other `9,999` projects lock-free.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "wal-mvcc",
+            "eyebrow": "PostgreSQL SSI vs. Parent Lock",
+            "title": "MVCC Snapshot + SIREAD Predicate Locks / Parent Row Lock",
+            "nodes": [
+              {
+                "label": "Tx A & Tx B (5-20 RPS/proj)",
+                "role": "Retry on SQLSTATE 40001"
+              },
+              {
+                "label": "Postgres 16 MVCC / SSI",
+                "role": "SIREAD predicate / parent lock"
+              },
+              {
+                "label": "projects (Parent Row)",
+                "role": "Per-project serialization point"
+              },
+              {
+                "label": "allocations (Child Rows)",
+                "role": "Invariant SUM(gpus) <= 16"
+              }
+            ],
+            "cards": [
+              {
+                "label": "No Gap Locks in PG",
+                "detail": "FOR UPDATE on child rows does not block new INSERTs in Postgres (unlike InnoDB Next-Key locks)."
+              },
+              {
+                "label": "Parent-Row Lock",
+                "detail": "Locking projects.id serializes only that project without blocking 10,000 others."
+              },
+              {
+                "label": "SSI (SQLSTATE 40001)",
+                "detail": "Detects write-skew rw-cycles without blocking readers; app retries 40001 with jitter."
+              }
+            ],
+            "summary": "Locking the parent row or using SERIALIZABLE with 40001 retries enforces multi-row invariants under MVCC."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Match isolation to the invariant: use PostgreSQL SERIALIZABLE (with retry on SQLSTATE 40001) or explicit parent-row SELECT ...",
+      "summary": "Under READ COMMITTED, each SQL statement acquires a fresh snapshot, allowing concurrent INSERTs to appear mid-transaction as phantom rows; meanwhile, PostgreSQL REPEATABLE READ prevents phantoms via transaction-level snapshots but still permits write skew without SERIALIZABLE or explicit parent locking.",
+      "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, match isolation to the invariant: use PostgreSQL SERIALIZABLE (with retry on SQLSTATE 40001) or explicit parent-row SELECT ... FOR UPDATE for multi-row business invariants, and understand how PostgreSQL SSI differs from InnoDB Next-Key Locking."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** A PostgreSQL 16 quota service enforces `SUM(gpus) <= 16` per project (`5–20` concurrent requests/sec per project, `10,000` active projects).\n\n**Visual & Structural Flow:** Depicts PostgreSQL REPEATABLE READ Allows Both Quota Inserts to Commit (Tx A (+6 GPUs) -> Postgres MVCC -> Tx B (+6 GPUs)); MVCC Snapshot + SIREAD Predicate Locks / Parent Row Lock (Tx A & Tx B (5-20 RPS/proj) -> Postgres 16 MVCC / SSI -> projects (Parent Row) -> allocations (Child Rows)).\n\n**Trade-Offs & Production:** Unlike MySQL InnoDB—which uses **Next-Key (Gap) Locks** to block phantom `INSERT`s into a range under `REPEATABLE READ`—**PostgreSQL has no gap locks**. Enforce multi-row invariants cleanly at `< 40 ms` p99 across 10,000 projects: **Parent-Row `SELECT ... FOR UPDATE`**: Lock the single `projects` row (`WHERE id = $1 FOR UPDATE`) before querying `SUM(gpus)` and inserting.\n\n**Failure Modes & Application:** Understanding MVCC vs. locking isolation prevents subtle financial and quota bugs: **Cloud Quota & Seat-Limit Enforcement**: Prevents over-allocating GPUs, licenses, or shift slots.",
+      "spark": {
+        "summary": "Under READ COMMITTED, each SQL statement acquires a fresh snapshot, allowing concurrent INSERTs to appear mid-transaction as phantom rows; meanwhile, PostgreSQL REPEATABLE READ prevents phantoms via transaction-level snapshots but still permits write skew without SERIALIZABLE or explicit parent locking.",
+        "keyTakeaway": "Match isolation to the invariant: use PostgreSQL SERIALIZABLE (with retry on SQLSTATE 40001) or explicit parent-row SELECT ... FOR UPDATE for multi-row business invariants, and understand how PostgreSQL SSI differs from InnoDB Next-Key Locking."
+      },
+      "summary": "Under READ COMMITTED, each SQL statement acquires a fresh snapshot, allowing concurrent INSERTs to appear mid-transaction as phantom rows; meanwhile, PostgreSQL REPEATABLE READ prevents phantoms via transaction-level snapshots but still permits write skew without SERIALIZABLE or explicit parent locking.",
+      "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, match isolation to the invariant: use PostgreSQL SERIALIZABLE (with retry on SQLSTATE 40001) or explicit parent-row SELECT ... FOR UPDATE for multi-row business invariants, and understand how PostgreSQL SSI differs from InnoDB Next-Key Locking."
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** Under READ COMMITTED, each SQL statement acquires a fresh snapshot, allowing concurrent INSERTs to appear mid-transaction as phantom rows; meanwhile, PostgreSQL REPEATABLE READ prevents phantoms via transaction-level snapshots but still.\n\n**Production Trade-Offs:** Unlike MySQL InnoDB—which uses **Next-Key (Gap) Locks** to block phantom `INSERT`s into a range under `REPEATABLE READ`—**PostgreSQL has no gap locks**. Running `SELECT ... FROM allocations WHERE project_id = $1 FOR UPDATE` only locks *existing* rows and does **not** block a concurrent `INSERT` of a new row!\n\n**Failure Modes & Edge Cases:** Understanding MVCC vs. locking isolation prevents subtle financial and quota bugs: **Cloud Quota & Seat-Limit Enforcement**: Prevents over-allocating GPUs, licenses, or shift slots.\n\n**Principal Takeaway:** Match isolation to the invariant: use PostgreSQL SERIALIZABLE (with retry on SQLSTATE 40001) or explicit parent-row SELECT ... FOR UPDATE for multi-row business invariants, and understand how PostgreSQL SSI differs from InnoDB Next-Key Locking.",
+      "spark": {
+        "summary": "Under READ COMMITTED, each SQL statement acquires a fresh snapshot, allowing concurrent INSERTs to appear mid-transaction as phantom rows; meanwhile, PostgreSQL REPEATABLE READ prevents phantoms via transaction-level snapshots but still.",
+        "keyTakeaway": "Match isolation to the invariant: use PostgreSQL SERIALIZABLE (with retry on SQLSTATE 40001) or explicit parent-row SELECT ..."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why SELECT SUM(...) + INSERT breaks quota invariants under MVCC",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why SELECT SUM(...) + INSERT breaks quota invariants under MVCC works from first principles.",
+          "explanation": "A PostgreSQL 16 quota service enforces `SUM(gpus) <= 16` per project (`5–20` concurrent requests/sec per project, `10,000` active projects). Under default `READ COMMITTED`, each statement takes a fresh MVCC snapshot—allowing two concurrent transactions to both read `SUM(gpus) = 12`, both insert `4` GPUs (Wait—or `8` GPUs!), and silently violate the 16-GPU cap.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Phantom rows under READ COMMITTED and write skew under REPEATABLE READ",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without Phantom rows under READ COMMITTED and write skew under REPEATABLE READ under real concurrency or scale.",
+          "explanation": "Multi-row invariants fail silently across two isolation levels in PostgreSQL:\n\n1. **Phantom Reads (`READ COMMITTED`)**: Concurrent `INSERT`s committed by Tx B appear mid-transaction in Tx A.\n2. **Write Skew (`REPEATABLE READ`)**: PostgreSQL's Snapshot Isolation eliminates phantoms for queries, **but two concurrent `INSERT`s see the same pre-insert `SUM` and both commit**, violating the 16-GPU or 3-on-call-engineer cap.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "Snapshot Isolation Write Skew",
+            "title": "PostgreSQL REPEATABLE READ Allows Both Quota Inserts to Commit",
+            "actors": [
+              {
+                "id": "txa",
+                "label": "Tx A (+6 GPUs)"
+              },
+              {
+                "id": "pg",
+                "label": "Postgres MVCC"
+              },
+              {
+                "id": "txb",
+                "label": "Tx B (+6 GPUs)"
+              }
+            ],
+            "events": [
+              {
+                "from": "txa",
+                "to": "pg",
+                "label": "BEGIN REPEATABLE READ (SUM=10)",
+                "status": "ok"
+              },
+              {
+                "from": "txb",
+                "to": "pg",
+                "label": "BEGIN REPEATABLE READ (SUM=10)",
+                "status": "ok"
+              },
+              {
+                "from": "txa",
+                "to": "pg",
+                "label": "10+6 <= 16 -> INSERT + COMMIT",
+                "status": "warn"
+              },
+              {
+                "from": "txb",
+                "to": "pg",
+                "label": "10+6 <= 16 -> INSERT + COMMIT!",
+                "status": "fail"
+              },
+              {
+                "from": "pg",
+                "to": "txb",
+                "label": "Fix: SERIALIZABLE (40001) / FOR UPDATE",
+                "status": "ok"
+              }
+            ],
+            "summary": "PostgreSQL REPEATABLE READ prevents phantoms, but only SERIALIZABLE (SSI) or parent-row FOR UPDATE prevents write skew."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Why SELECT ... FOR UPDATE on child rows fails in PostgreSQL",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "The problem: see what breaks without Why SELECT ... FOR UPDATE on child rows fails in PostgreSQL under real concurrency or scale.",
+          "explanation": "Unlike MySQL InnoDB—which uses **Next-Key (Gap) Locks** to block phantom `INSERT`s into a range under `REPEATABLE READ`—**PostgreSQL has no gap locks**. Running `SELECT ... FROM allocations WHERE project_id = $1 FOR UPDATE` only locks *existing* rows and does **not** block a concurrent `INSERT` of a new row!",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: PostgreSQL SERIALIZABLE (SSI) or Parent-Row FOR UPDATE",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Enforce multi-row invariants cleanly at `< 40 ms` p99 across 10,000 projects:\n\n- **Parent-Row `SELECT ... FOR UPDATE`**: Lock the single `projects` row (`WHERE id = $1 FOR UPDATE`) before querying `SUM(gpus)` and inserting. Contention is scoped per-project (`5–20 RPS`), leaving the other `9,999` projects lock-free.\n- **PostgreSQL `SERIALIZABLE` (SSI)**: Uses non-blocking `SIREAD` predicate locks to detect `rw`-antidependency cycles and abort one conflicting writer with `SQLSTATE 40001`, which the app retries with bounded exponential backoff + jitter.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "wal-mvcc",
+            "eyebrow": "PostgreSQL SSI vs. Parent Lock",
+            "title": "MVCC Snapshot + SIREAD Predicate Locks / Parent Row Lock",
+            "nodes": [
+              {
+                "label": "Tx A & Tx B (5-20 RPS/proj)",
+                "role": "Retry on SQLSTATE 40001"
+              },
+              {
+                "label": "Postgres 16 MVCC / SSI",
+                "role": "SIREAD predicate / parent lock"
+              },
+              {
+                "label": "projects (Parent Row)",
+                "role": "Per-project serialization point"
+              },
+              {
+                "label": "allocations (Child Rows)",
+                "role": "Invariant SUM(gpus) <= 16"
+              }
+            ],
+            "cards": [
+              {
+                "label": "No Gap Locks in PG",
+                "detail": "FOR UPDATE on child rows does not block new INSERTs in Postgres (unlike InnoDB Next-Key locks)."
+              },
+              {
+                "label": "Parent-Row Lock",
+                "detail": "Locking projects.id serializes only that project without blocking 10,000 others."
+              },
+              {
+                "label": "SSI (SQLSTATE 40001)",
+                "detail": "Detects write-skew rw-cycles without blocking readers; app retries 40001 with jitter."
+              }
+            ],
+            "summary": "Locking the parent row or using SERIALIZABLE with 40001 retries enforces multi-row invariants under MVCC."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where isolation-level guarantees protect business invariants",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Understanding MVCC vs. locking isolation prevents subtle financial and quota bugs:\n\n- **Cloud Quota & Seat-Limit Enforcement**: Prevents over-allocating GPUs, licenses, or shift slots.\n- **Double-Entry Ledgers & Balances**: Uses parent-account `FOR UPDATE` or `SERIALIZABLE` to prevent negative balances.\n- **Booking & Inventory Systems**: Avoids double-booking overlapping time slots via `EXCLUDE USING gist` or SSI.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Match isolation to the invariant: use PostgreSQL SERIALIZABLE (with retry on SQLSTATE 40001) or explicit parent-row SELECT ...",
+      "summary": "Under READ COMMITTED, each SQL statement acquires a fresh snapshot, allowing concurrent INSERTs to appear mid-transaction as phantom rows; meanwhile, PostgreSQL REPEATABLE READ prevents phantoms via transaction-level snapshots but still permits write skew without SERIALIZABLE or explicit parent locking.",
+      "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, match isolation to the invariant: use PostgreSQL SERIALIZABLE (with retry on SQLSTATE 40001) or explicit parent-row SELECT ... FOR UPDATE for multi-row business invariants, and understand how PostgreSQL SSI differs from InnoDB Next-Key Locking."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "simulation": {
+    "title": "SQL Isolation Levels: Preventing Phantom Reads — Interactive Execution Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Workload & Budget"
+      },
+      {
+        "id": "router",
+        "label": "Gateway / Router",
+        "role": "Admission & Dispatch"
+      },
+      {
+        "id": "engine",
+        "label": "Core Engine",
+        "role": "Primary Execution"
+      },
+      {
+        "id": "replica",
+        "label": "Replica / Fallback",
+        "role": "Durability & Recovery"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "router",
+        "label": "request"
+      },
+      {
+        "from": "router",
+        "to": "engine",
+        "label": "route"
+      },
+      {
+        "from": "engine",
+        "to": "replica",
+        "label": "sync / fallback"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why SELECT SUM(...) + INSERT breaks quota invariants under M",
+        "actionLabel": "Dispatch nominal request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "router"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "Ingress",
+          "p99_ms": 8,
+          "error_rate": "0.0%"
+        },
+        "explanation": "Caller sends work into the gateway with explicit timeout and concurrency bounds (Why SELECT SUM(...) + INSERT breaks quota invariants under MVCC)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Phantom rows under READ COMMITTED and write skew under REPEA",
+        "actionLabel": "Execute core invariant",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "Core Path",
+          "p99_ms": 18,
+          "in_flight": 124
+        },
+        "explanation": "The core engine processes the hot path while keeping state transitions deterministic (Phantom rows under READ COMMITTED and write skew under REPEATABLE READ)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Why SELECT ... FOR UPDATE on child rows fails in PostgreSQL",
+        "actionLabel": "Detect skew or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Degraded",
+          "p99_ms": 64,
+          "retries_capped": "true"
+        },
+        "explanation": "Under load or replica lag, bounded backoff and isolation prevent cascading saturation (Why SELECT ... FOR UPDATE on child rows fails in PostgreSQL)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Where isolation-level guarantees protect business invariants",
+        "actionLabel": "Converge & restore SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 11,
+          "drift": 0
+        },
+        "explanation": "State converges cleanly and telemetry confirms the system returned within its SLO envelope (Where isolation-level guarantees protect business invariants)."
+      }
+    ]
+  }
+}

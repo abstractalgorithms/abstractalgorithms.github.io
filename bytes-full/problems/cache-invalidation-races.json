@@ -1,0 +1,814 @@
+{
+  "id": "cache-invalidation-races",
+  "slug": "cache-invalidation-races",
+  "title": "Solving Dual-Write Cache Invalidation Races",
+  "problemType": "architecture",
+  "difficulty": "medium",
+  "prompt": "Your user profile service uses classic Cache-Aside against PostgreSQL 16 and Redis 7 (30,000 reads/sec, 800 writes/sec). Writers execute `UPDATE profiles ...` followed by `redis.del(key)`. Readers on a cache miss execute `SELECT ...` and then `redis.set(key, val, ex=3600)`. Under concurrent load, ~0.05% of profile updates (~35/day) revert to old values in Redis for up to 1 hour because a concurrent cache-miss reader fetched `v1` before the writer committed `v2`, paused on GC/network, and wrote `v1` into Redis after the writer's `DEL`. Redesign the read/write caching protocol to make stale cache repopulation impossible.",
+  "spark": {
+    "summary": "Under Cache-Aside, a slow cache-miss reader that fetches `v1` from the DB can get preempted while a writer commits `v2` and deletes the cache, after which the reader writes stale `v1` back into Redis.",
+    "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, eliminate Cache-Aside read-write races using monotonic row `version` Compare-And-Swap (Lua CAS) in Redis or by moving cache population/invalidation to a single-writer CDC stream.",
+    "byteSummary": "**Core Mechanics:** In a user profile service handling `30,000` reads/sec and `800` writes/sec against PostgreSQL 16 and Redis 7, classic Cache-Aside (`UPDATE` + `redis.del` on write; `SELECT` + `redis.set` on miss) has a 4-step interleaving bug.\n\n**Visual & Structural Flow:** Depicts Preempted Cache-Miss Reader Overwrites Newer Commit v2 (Miss Reader -> Redis 7 -> Postgres 16 -> Writer (v2)); Monotonic Version Lua CAS Rejects Stale v1 Fills (Reader / Writer -> Redis Lua CAS -> Version Tombstone -> PostgreSQL 16 (BIGINT version)).\n\n**Trade-Offs & Production:** Deleting the cache *before* DB commit widens the race window. Eliminate read-write and write-write races with zero read locks (`< 5 ms` p99): **PostgreSQL `BIGINT version` + `RETURNING version`**: Increment `version` atomically on every `UPDATE`.\n\n**Failure Modes & Application:** Version-fenced invalidation is standard across high-read user and catalog services: **User Profiles & Auth Sessions**: Prevents reverted passwords, avatars, or MFA settings."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why Cache-Aside read-write races silently revert user updates",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "Think of **Why Cache-Aside read-write races silently revert user updates** as the intuition layer for Solving Dual-Write Cache Invalidation Races: The mechanism: understand how Why Cache-Aside read-write races silently revert user updates works from first principles.",
+        "core": "In a user profile service handling `30,000` reads/sec and `800` writes/sec against PostgreSQL 16 and Redis 7, classic Cache-Aside (`UPDATE` + `redis.del` on write; `SELECT` + `redis.set` on miss) has a 4-step interleaving bug. Whenever a slow miss reader fetches `v1`, pauses for GC or scheduling, and writes `v1` *after* a concurrent writer commits `v2` and calls `DEL`, ~`0.05%` of updates (`~35/day`) silently revert.",
+        "deepDive": "Under heavy load or partial failure, why cache-aside read-write races silently revert user updates becomes a critical lever for predictable latency and correctness. Under Cache-Aside, a slow cache-miss reader that fetches `v1` from the DB can get preempted while a writer commits `v2` and deletes the cache, after which the reader writes stale `v1` back into Redis."
+      },
+      "purpose": "The mechanism: understand how Why Cache-Aside read-write races silently revert user updates works from first principles."
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "Stale v1 pinned in Redis for 3,600 seconds",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Once the preempted reader executes `redis.set(key, v1, ex=3600)` after the writer's `DEL`, two things break:",
+        "core": "1. **1-Hour Silent Stale State**: All `30,000` reads/sec serve old `v1` until the 3,600s TTL expires.\n2. **Concurrent Writer Reordering (`v2` vs `v3`)**: Two writers can also interleave `UPDATE v2`, `UPDATE v3`, `SET v3`, `SET v2`, leaving `v2` in Redis.",
+        "deepDive": "In production deployments of Solving Dual-Write Cache Invalidation Races, watch how stale v1 pinned in redis for 3,600 seconds interacts with tail latency, retry amplification, and partial failures. Under Cache-Aside, a slow cache-miss reader that fetches `v1` from the DB can get preempted while a writer commits `v2` and deletes the cache, after which the reader writes stale `v1` back into Redis."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "4-Step Cache-Aside Race",
+        "title": "Preempted Cache-Miss Reader Overwrites Newer Commit v2",
+        "actors": [
+          {
+            "id": "rdr",
+            "label": "Miss Reader"
+          },
+          {
+            "id": "red",
+            "label": "Redis 7"
+          },
+          {
+            "id": "pg",
+            "label": "Postgres 16"
+          },
+          {
+            "id": "wtr",
+            "label": "Writer (v2)"
+          }
+        ],
+        "events": [
+          {
+            "from": "rdr",
+            "to": "red",
+            "label": "GET profile -> MISS",
+            "status": "ok"
+          },
+          {
+            "from": "rdr",
+            "to": "pg",
+            "label": "SELECT returns v1 (GC pause)",
+            "status": "warn"
+          },
+          {
+            "from": "wtr",
+            "to": "pg",
+            "label": "UPDATE -> v2 committed",
+            "status": "ok"
+          },
+          {
+            "from": "wtr",
+            "to": "red",
+            "label": "DEL profile key",
+            "status": "ok"
+          },
+          {
+            "from": "rdr",
+            "to": "red",
+            "label": "SET v1 (EX 3600) -> STALE!",
+            "status": "fail"
+          }
+        ],
+        "summary": "Because Redis SET has no version guard, a delayed miss reader overwrites the deleted key with stale v1."
+      },
+      "purpose": "The problem: see what breaks without Stale v1 pinned in Redis for 3,600 seconds under real concurrency or scale.",
+      "decisionFramework": {
+        "problem": "How to implement Solving Dual-Write Cache Invalidation Races without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "To keep the architecture evolvable without sacrificing reliability, eliminate Cache-Aside read-write races using monotonic row `version` Compare-And-Swap (Lua CAS) in Redis or by moving cache population/invalidation to a single-writer CDC stream.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Solving Dual-Write Cache Invalidation Races experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Why Delayed Double Delete and SETNX fail under >500 ms pauses",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Deleting the cache *before* DB commit widens the race window.",
+        "core": "Using **Delayed Double Delete** (`DEL`, sleep `500 ms`, `DEL`) is only heuristic—any GC pause or replica lag `> 500 ms` still pins `v1`.",
+        "deepDive": "Using `SETNX` alone also fails because `DEL` removed the key, allowing the stale `SETNX` to succeed."
+      },
+      "purpose": "The problem: see what breaks without Why Delayed Double Delete and SETNX fail under >500 ms pauses under real concurrency or scale.",
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "Lifecycle & Failure Recovery",
+        "title": "Why Delayed Double Delete and SETNX fail under >500 ms pauses",
+        "states": [
+          {
+            "id": "hit",
+            "label": "Cache Hit",
+            "tone": "good"
+          },
+          {
+            "id": "miss",
+            "label": "Cache Miss",
+            "tone": "info"
+          },
+          {
+            "id": "stampede",
+            "label": "Hot-Key Stampede",
+            "tone": "warn"
+          },
+          {
+            "id": "warm",
+            "label": "Coalesced Fill",
+            "tone": "good"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "hit",
+            "to": "miss",
+            "label": "TTL expired"
+          },
+          {
+            "from": "miss",
+            "to": "stampede",
+            "label": "concurrent misses"
+          },
+          {
+            "from": "stampede",
+            "to": "warm",
+            "label": "singleflight lock"
+          },
+          {
+            "from": "warm",
+            "to": "hit",
+            "label": "value cached"
+          }
+        ]
+      }
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise solution: Monotonic Version Lua CAS (or Single-Writer CDC)",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": {
+        "foundation": "Eliminate read-write and write-write races with zero read locks (`< 5 ms` p99):",
+        "core": "- **PostgreSQL `BIGINT version` + `RETURNING version`**: Increment `version` atomically on every `UPDATE`.\n- **Redis Lua Compare-And-Swap (`EVALSHA`)**: Store `{ver, data}` in a Redis Hash; both writers and miss-readers populate Redis via a Lua script that rejects any write where `new_ver <= cached_ver`.\n- **Short Version Tombstones on `DEL`**: If invalidating instead of write-through, write a tiny `ver=N, tombstone=1` (`EX 60`) so a slow `v1` reader (`ver < N`) is still rejected.\n- **Alternative: Single-Writer CDC**: Stream `pgoutput` WAL changes in LSN order to a single Redis updater.",
+        "deepDive": "In production deployments of Solving Dual-Write Cache Invalidation Races, watch how enterprise solution: monotonic version lua cas (or single-writer cdc) interacts with tail latency, retry amplification, and partial failures. Under Cache-Aside, a slow cache-miss reader that fetches `v1` from the DB can get preempted while a writer commits `v2` and deletes the cache, after which the reader writes stale `v1` back into Redis."
+      },
+      "sectionDiagram": {
+        "kind": "cache-tier",
+        "eyebrow": "Version-Fenced Cache-Aside",
+        "title": "Monotonic Version Lua CAS Rejects Stale v1 Fills",
+        "nodes": [
+          {
+            "label": "Reader / Writer",
+            "role": "Carries row version N"
+          },
+          {
+            "label": "Redis Lua CAS",
+            "role": "Rejects if new_ver <= ver"
+          },
+          {
+            "label": "Version Tombstone",
+            "role": "60s fence on DEL"
+          },
+          {
+            "label": "PostgreSQL 16 (BIGINT version)",
+            "role": "UPDATE ... RETURNING version"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Zero Read Locks",
+            "detail": "Cache hits remain pure HGET/GET (<1ms); Lua CAS runs only on miss fills and writes."
+          },
+          {
+            "label": "Writer Reorder Safe",
+            "detail": "If v3 arrives before v2, Lua CAS keeps v3 and drops v2."
+          },
+          {
+            "label": "CDC Single Writer",
+            "detail": "For zero app-level dual writes, let Debezium LSN order drive Redis updates."
+          }
+        ],
+        "summary": "Monotonic version CAS in Redis makes stale v1 overwrites mathematically impossible regardless of GC pause length."
+      },
+      "markdownContent": "```lua\n-- Atomic Redis Lua CAS: only write if incoming version > cached/tombstone version\nlocal key = KEYS[1]\nlocal new_ver = tonumber(ARGV[1])\nlocal payload = ARGV[2]\nlocal ttl = tonumber(ARGV[3])\n\nlocal cur = redis.call(\"HGET\", key, \"ver\")\nif cur and tonumber(cur) >= new_ver then\n  return 0\nend\nredis.call(\"HSET\", key, \"ver\", new_ver, \"data\", payload)\nredis.call(\"EXPIRE\", key, ttl)\nreturn 1\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where version-fenced caches protect consistency",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Version-fenced invalidation is standard across high-read user and catalog services:",
+        "core": "- **User Profiles & Auth Sessions**: Prevents reverted passwords, avatars, or MFA settings.\n- **Multi-Tier L1/L2 Caches**: Propagates monotonic version numbers across Caffeine L1 and Redis L2.\n- **Search & Derived Views**: Uses DB `version` / LSN watermarks to drop out-of-order async updates.",
+        "deepDive": "In production deployments of Solving Dual-Write Cache Invalidation Races, watch how where version-fenced caches protect consistency interacts with tail latency, retry amplification, and partial failures. Under Cache-Aside, a slow cache-miss reader that fetches `v1` from the DB can get preempted while a writer commits `v2` and deletes the cache, after which the reader writes stale `v1` back into Redis."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "caching",
+          "title": "Concept: Caching",
+          "kind": "concept"
+        },
+        {
+          "slug": "consistency-replication",
+          "title": "Concept: Consistency & Replication",
+          "kind": "concept"
+        },
+        {
+          "slug": "change-data-capture",
+          "title": "Concept: Change Data Capture",
+          "kind": "concept"
+        },
+        {
+          "slug": "synchronizing-multi-tier",
+          "title": "Problem: Synchronizing Multi-Tier L1 & L2 Caches",
+          "kind": "problem"
+        },
+        {
+          "slug": "design-cache",
+          "title": "System Design: High-Concurrency Cache",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why does Delayed Double Delete (DEL -> sleep 500ms -> DEL) not fully guarantee against Cache-Aside stale fills?",
+      "options": [
+        {
+          "id": "a",
+          "text": "If a slow miss reader pauses for >500ms (e.g., GC pause or network stall) before writing v1, it still overwrites Redis after the second DEL",
+          "correct": true,
+          "feedback": "Correct: time-based sleeps are heuristic; monotonic version CAS closes the race deterministically."
+        },
+        {
+          "id": "b",
+          "text": "Redis DEL is not atomic on single keys",
+          "correct": false,
+          "feedback": "Single-key DEL is atomic, but it cannot prevent a subsequent delayed SET from a stale reader."
+        },
+        {
+          "id": "c",
+          "text": "PostgreSQL 16 does not support RETURNING version on UPDATE",
+          "correct": false,
+          "feedback": "PostgreSQL supports `UPDATE ... SET version = version + 1 RETURNING version` natively."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why does Delayed Double Delete (DEL -> sleep 500ms -> DEL) not fully guarantee against Cache-Aside stale fills?",
+        "options": [
+          {
+            "id": "a",
+            "text": "If a slow miss reader pauses for >500ms (e.g., GC pause or network stall) before writing v1, it still overwrites Redis after the second DEL",
+            "correct": true,
+            "feedback": "Correct: time-based sleeps are heuristic; monotonic version CAS closes the race deterministically."
+          },
+          {
+            "id": "b",
+            "text": "Redis DEL is not atomic on single keys",
+            "correct": false,
+            "feedback": "Single-key DEL is atomic, but it cannot prevent a subsequent delayed SET from a stale reader."
+          },
+          {
+            "id": "c",
+            "text": "PostgreSQL 16 does not support RETURNING version on UPDATE",
+            "correct": false,
+            "feedback": "PostgreSQL supports `UPDATE ... SET version = version + 1 RETURNING version` natively."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why Cache-Aside read-write races silently revert user updates', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "b",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "c",
+            "text": "In a user profile service handling 30,000 reads/sec and 800 writes/sec against PostgreSQL 16 and Redis 7, classic Cache-Aside (UPDATE + redis.del on write; SELECT +…",
+            "correct": true,
+            "feedback": "Correct: In a user profile service handling 30,000 reads/sec and 800 writes/sec against PostgreSQL 16 and Redis 7, classic Cache-Aside (UPDATE + redis.del on write; SELECT +…"
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Stale v1 pinned in Redis for 3,600 seconds', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "b",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "c",
+            "text": "Once the preempted reader executes redis.set(key, v1, ex=3600) after the writer's DEL, two things break: 1.",
+            "correct": true,
+            "feedback": "Correct: Once the preempted reader executes redis.set(key, v1, ex=3600) after the writer's DEL, two things break: 1."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** In a user profile service handling `30,000` reads/sec and `800` writes/sec against PostgreSQL 16 and Redis 7, classic Cache-Aside (`UPDATE` + `redis.del` on write; `SELECT` + `redis.set` on miss) has a 4-step interleaving bug.\n\n**How It Flows:** Think of Solving Dual-Write Cache Invalidation Races as a clear step-by-step chain: Miss Reader -> Redis 7 -> Postgres 16 -> Writer (v2) -> Reader / Writer.\n\n**Why Beginners Should Care:** Eliminate Cache-Aside read-write races using monotonic row `version` Compare-And-Swap (Lua CAS) in Redis or by moving cache population/invalidation to a single-writer CDC stream.",
+      "spark": {
+        "summary": "In a user profile service handling `30,000` reads/sec and `800` writes/sec against PostgreSQL 16 and Redis 7, classic Cache-Aside (`UPDATE` + `redis.del` on write; `SELECT` + `redis.set` on miss) has a 4-step interleaving bug.",
+        "keyTakeaway": "Eliminate Cache-Aside read-write races using monotonic row `version` Compare-And-Swap (Lua CAS) in Redis or by moving cache population/invalidation to a single-writer CDC stream."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why Cache-Aside read-write races silently revert user updates",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why Cache-Aside read-write races silently revert user updates works from first principles.",
+          "explanation": "In a user profile service handling `30,000` reads/sec and `800` writes/sec against PostgreSQL 16 and Redis 7, classic Cache-Aside (`UPDATE` + `redis.del` on write; `SELECT` + `redis.set` on miss) has a 4-step interleaving bug. Whenever a slow miss reader fetches `v1`, pauses for GC or scheduling, and writes `v1` *after* a concurrent writer commits `v2` and calls `DEL`, ~`0.05%` of updates (`~35/day`) silently revert.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Stale v1 pinned in Redis for 3,600 seconds",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without Stale v1 pinned in Redis for 3,600 seconds under real concurrency or scale.",
+          "explanation": "Once the preempted reader executes `redis.set(key, v1, ex=3600)` after the writer's `DEL`, two things break: 1. **1-Hour Silent Stale State**: All `30,000` reads/sec serve old `v1` until the 3,600s TTL expires. 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "4-Step Cache-Aside Race",
+            "title": "Preempted Cache-Miss Reader Overwrites Newer Commit v2",
+            "actors": [
+              {
+                "id": "rdr",
+                "label": "Miss Reader"
+              },
+              {
+                "id": "red",
+                "label": "Redis 7"
+              },
+              {
+                "id": "pg",
+                "label": "Postgres 16"
+              },
+              {
+                "id": "wtr",
+                "label": "Writer (v2)"
+              }
+            ],
+            "events": [
+              {
+                "from": "rdr",
+                "to": "red",
+                "label": "GET profile -> MISS",
+                "status": "ok"
+              },
+              {
+                "from": "rdr",
+                "to": "pg",
+                "label": "SELECT returns v1 (GC pause)",
+                "status": "warn"
+              },
+              {
+                "from": "wtr",
+                "to": "pg",
+                "label": "UPDATE -> v2 committed",
+                "status": "ok"
+              },
+              {
+                "from": "wtr",
+                "to": "red",
+                "label": "DEL profile key",
+                "status": "ok"
+              },
+              {
+                "from": "rdr",
+                "to": "red",
+                "label": "SET v1 (EX 3600) -> STALE!",
+                "status": "fail"
+              }
+            ],
+            "summary": "Because Redis SET has no version guard, a delayed miss reader overwrites the deleted key with stale v1."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Why Delayed Double Delete and SETNX fail under >500 ms pauses",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "The problem: see what breaks without Why Delayed Double Delete and SETNX fail under >500 ms pauses under real concurrency or scale.",
+          "explanation": "Deleting the cache *before* DB commit widens the race window. Using **Delayed Double Delete** (`DEL`, sleep `500 ms`, `DEL`) is only heuristic—any GC pause or replica lag `> 500 ms` still pins `v1`. Using `SETNX` alone also fails because `DEL` removed the key, allowing the stale `SETNX` to succeed.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Monotonic Version Lua CAS (or Single-Writer CDC)",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Eliminate read-write and write-write races with zero read locks (`< 5 ms` p99): **PostgreSQL `BIGINT version` + `RETURNING version`**: Increment `version` atomically on every `UPDATE`. **Redis Lua Compare-And-Swap (`EVALSHA`)**: Store `{ver, data}` in a Redis Hash; both writers and miss-readers populate Redis via a Lua script that rejects any write where `new_ver <= cached_ver`.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Version-Fenced Cache-Aside",
+            "title": "Monotonic Version Lua CAS Rejects Stale v1 Fills",
+            "nodes": [
+              {
+                "label": "Reader / Writer",
+                "role": "Carries row version N"
+              },
+              {
+                "label": "Redis Lua CAS",
+                "role": "Rejects if new_ver <= ver"
+              },
+              {
+                "label": "Version Tombstone",
+                "role": "60s fence on DEL"
+              },
+              {
+                "label": "PostgreSQL 16 (BIGINT version)",
+                "role": "UPDATE ... RETURNING version"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Zero Read Locks",
+                "detail": "Cache hits remain pure HGET/GET (<1ms); Lua CAS runs only on miss fills and writes."
+              },
+              {
+                "label": "Writer Reorder Safe",
+                "detail": "If v3 arrives before v2, Lua CAS keeps v3 and drops v2."
+              },
+              {
+                "label": "CDC Single Writer",
+                "detail": "For zero app-level dual writes, let Debezium LSN order drive Redis updates."
+              }
+            ],
+            "summary": "Monotonic version CAS in Redis makes stale v1 overwrites mathematically impossible regardless of GC pause length."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Eliminate Cache-Aside read-write races using monotonic row `version` Compare-And-Swap (Lua CAS) in Redis or by moving cache population/invalidation to a single-writer CDC stream.",
+      "summary": "Under Cache-Aside, a slow cache-miss reader that fetches `v1` from the DB can get preempted while a writer commits `v2` and deletes the cache, after which the reader writes stale `v1` back into Redis.",
+      "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, eliminate Cache-Aside read-write races using monotonic row `version` Compare-And-Swap (Lua CAS) in Redis or by moving cache population/invalidation to a single-writer CDC stream."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** In a user profile service handling `30,000` reads/sec and `800` writes/sec against PostgreSQL 16 and Redis 7, classic Cache-Aside (`UPDATE` + `redis.del` on write; `SELECT` + `redis.set` on miss) has a 4-step interleaving bug.\n\n**Visual & Structural Flow:** Depicts Preempted Cache-Miss Reader Overwrites Newer Commit v2 (Miss Reader -> Redis 7 -> Postgres 16 -> Writer (v2)); Monotonic Version Lua CAS Rejects Stale v1 Fills (Reader / Writer -> Redis Lua CAS -> Version Tombstone -> PostgreSQL 16 (BIGINT version)).\n\n**Trade-Offs & Production:** Deleting the cache *before* DB commit widens the race window. Eliminate read-write and write-write races with zero read locks (`< 5 ms` p99): **PostgreSQL `BIGINT version` + `RETURNING version`**: Increment `version` atomically on every `UPDATE`.\n\n**Failure Modes & Application:** Version-fenced invalidation is standard across high-read user and catalog services: **User Profiles & Auth Sessions**: Prevents reverted passwords, avatars, or MFA settings.",
+      "spark": {
+        "summary": "Under Cache-Aside, a slow cache-miss reader that fetches `v1` from the DB can get preempted while a writer commits `v2` and deletes the cache, after which the reader writes stale `v1` back into Redis.",
+        "keyTakeaway": "Eliminate Cache-Aside read-write races using monotonic row `version` Compare-And-Swap (Lua CAS) in Redis or by moving cache population/invalidation to a single-writer CDC stream."
+      },
+      "summary": "Under Cache-Aside, a slow cache-miss reader that fetches `v1` from the DB can get preempted while a writer commits `v2` and deletes the cache, after which the reader writes stale `v1` back into Redis.",
+      "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, eliminate Cache-Aside read-write races using monotonic row `version` Compare-And-Swap (Lua CAS) in Redis or by moving cache population/invalidation to a single-writer CDC stream."
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** Under Cache-Aside, a slow cache-miss reader that fetches `v1` from the DB can get preempted while a writer commits `v2` and deletes the cache, after which the reader writes stale `v1` back into Redis.\n\n**Production Trade-Offs:** Deleting the cache *before* DB commit widens the race window. Using **Delayed Double Delete** (`DEL`, sleep `500 ms`, `DEL`) is only heuristic—any GC pause or replica lag `> 500 ms` still pins `v1`.\n\n**Failure Modes & Edge Cases:** Version-fenced invalidation is standard across high-read user and catalog services: **User Profiles & Auth Sessions**: Prevents reverted passwords, avatars, or MFA settings.\n\n**Principal Takeaway:** Eliminate Cache-Aside read-write races using monotonic row `version` Compare-And-Swap (Lua CAS) in Redis or by moving cache population/invalidation to a single-writer CDC stream.",
+      "spark": {
+        "summary": "Under Cache-Aside, a slow cache-miss reader that fetches `v1` from the DB can get preempted while a writer commits `v2` and deletes the cache, after which the reader writes stale `v1` back into Redis.",
+        "keyTakeaway": "Eliminate Cache-Aside read-write races using monotonic row `version` Compare-And-Swap (Lua CAS) in Redis or by moving cache population/invalidation to a single-writer CDC stream."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why Cache-Aside read-write races silently revert user updates",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why Cache-Aside read-write races silently revert user updates works from first principles.",
+          "explanation": "In a user profile service handling `30,000` reads/sec and `800` writes/sec against PostgreSQL 16 and Redis 7, classic Cache-Aside (`UPDATE` + `redis.del` on write; `SELECT` + `redis.set` on miss) has a 4-step interleaving bug. Whenever a slow miss reader fetches `v1`, pauses for GC or scheduling, and writes `v1` *after* a concurrent writer commits `v2` and calls `DEL`, ~`0.05%` of updates (`~35/day`) silently revert.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Stale v1 pinned in Redis for 3,600 seconds",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without Stale v1 pinned in Redis for 3,600 seconds under real concurrency or scale.",
+          "explanation": "Once the preempted reader executes `redis.set(key, v1, ex=3600)` after the writer's `DEL`, two things break:\n\n1. **1-Hour Silent Stale State**: All `30,000` reads/sec serve old `v1` until the 3,600s TTL expires.\n2. **Concurrent Writer Reordering (`v2` vs `v3`)**: Two writers can also interleave `UPDATE v2`, `UPDATE v3`, `SET v3`, `SET v2`, leaving `v2` in Redis.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "4-Step Cache-Aside Race",
+            "title": "Preempted Cache-Miss Reader Overwrites Newer Commit v2",
+            "actors": [
+              {
+                "id": "rdr",
+                "label": "Miss Reader"
+              },
+              {
+                "id": "red",
+                "label": "Redis 7"
+              },
+              {
+                "id": "pg",
+                "label": "Postgres 16"
+              },
+              {
+                "id": "wtr",
+                "label": "Writer (v2)"
+              }
+            ],
+            "events": [
+              {
+                "from": "rdr",
+                "to": "red",
+                "label": "GET profile -> MISS",
+                "status": "ok"
+              },
+              {
+                "from": "rdr",
+                "to": "pg",
+                "label": "SELECT returns v1 (GC pause)",
+                "status": "warn"
+              },
+              {
+                "from": "wtr",
+                "to": "pg",
+                "label": "UPDATE -> v2 committed",
+                "status": "ok"
+              },
+              {
+                "from": "wtr",
+                "to": "red",
+                "label": "DEL profile key",
+                "status": "ok"
+              },
+              {
+                "from": "rdr",
+                "to": "red",
+                "label": "SET v1 (EX 3600) -> STALE!",
+                "status": "fail"
+              }
+            ],
+            "summary": "Because Redis SET has no version guard, a delayed miss reader overwrites the deleted key with stale v1."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Why Delayed Double Delete and SETNX fail under >500 ms pauses",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "The problem: see what breaks without Why Delayed Double Delete and SETNX fail under >500 ms pauses under real concurrency or scale.",
+          "explanation": "Deleting the cache *before* DB commit widens the race window. Using **Delayed Double Delete** (`DEL`, sleep `500 ms`, `DEL`) is only heuristic—any GC pause or replica lag `> 500 ms` still pins `v1`. Using `SETNX` alone also fails because `DEL` removed the key, allowing the stale `SETNX` to succeed.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise solution: Monotonic Version Lua CAS (or Single-Writer CDC)",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Eliminate read-write and write-write races with zero read locks (`< 5 ms` p99):\n\n- **PostgreSQL `BIGINT version` + `RETURNING version`**: Increment `version` atomically on every `UPDATE`.\n- **Redis Lua Compare-And-Swap (`EVALSHA`)**: Store `{ver, data}` in a Redis Hash; both writers and miss-readers populate Redis via a Lua script that rejects any write where `new_ver <= cached_ver`.\n- **Short Version Tombstones on `DEL`**: If invalidating instead of write-through, write a tiny `ver=N, tombstone=1` (`EX 60`) so a slow `v1` reader (`ver < N`) is still rejected.\n- **Alternative: Single-Writer CDC**: Stream `pgoutput` WAL changes in LSN order to a single Redis updater.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "cache-tier",
+            "eyebrow": "Version-Fenced Cache-Aside",
+            "title": "Monotonic Version Lua CAS Rejects Stale v1 Fills",
+            "nodes": [
+              {
+                "label": "Reader / Writer",
+                "role": "Carries row version N"
+              },
+              {
+                "label": "Redis Lua CAS",
+                "role": "Rejects if new_ver <= ver"
+              },
+              {
+                "label": "Version Tombstone",
+                "role": "60s fence on DEL"
+              },
+              {
+                "label": "PostgreSQL 16 (BIGINT version)",
+                "role": "UPDATE ... RETURNING version"
+              }
+            ],
+            "cards": [
+              {
+                "label": "Zero Read Locks",
+                "detail": "Cache hits remain pure HGET/GET (<1ms); Lua CAS runs only on miss fills and writes."
+              },
+              {
+                "label": "Writer Reorder Safe",
+                "detail": "If v3 arrives before v2, Lua CAS keeps v3 and drops v2."
+              },
+              {
+                "label": "CDC Single Writer",
+                "detail": "For zero app-level dual writes, let Debezium LSN order drive Redis updates."
+              }
+            ],
+            "summary": "Monotonic version CAS in Redis makes stale v1 overwrites mathematically impossible regardless of GC pause length."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where version-fenced caches protect consistency",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Version-fenced invalidation is standard across high-read user and catalog services:\n\n- **User Profiles & Auth Sessions**: Prevents reverted passwords, avatars, or MFA settings.\n- **Multi-Tier L1/L2 Caches**: Propagates monotonic version numbers across Caffeine L1 and Redis L2.\n- **Search & Derived Views**: Uses DB `version` / LSN watermarks to drop out-of-order async updates.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Eliminate Cache-Aside read-write races using monotonic row `version` Compare-And-Swap (Lua CAS) in Redis or by moving cache population/invalidation to a single-writer CDC stream.",
+      "summary": "Under Cache-Aside, a slow cache-miss reader that fetches `v1` from the DB can get preempted while a writer commits `v2` and deletes the cache, after which the reader writes stale `v1` back into Redis.",
+      "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, eliminate Cache-Aside read-write races using monotonic row `version` Compare-And-Swap (Lua CAS) in Redis or by moving cache population/invalidation to a single-writer CDC stream."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "simulation": {
+    "title": "Solving Dual-Write Cache Invalidation Races — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "app",
+        "label": "App Servers",
+        "role": "Concurrent Reads"
+      },
+      {
+        "id": "sf",
+        "label": "Singleflight",
+        "role": "In-Flight Coalescer"
+      },
+      {
+        "id": "redis",
+        "label": "Redis L2",
+        "role": "Hot Key Store"
+      },
+      {
+        "id": "db",
+        "label": "Primary DB",
+        "role": "Origin Source"
+      }
+    ],
+    "edges": [
+      {
+        "from": "app",
+        "to": "sf",
+        "label": "GET hot_key"
+      },
+      {
+        "from": "sf",
+        "to": "redis",
+        "label": "L2 lookup"
+      },
+      {
+        "from": "redis",
+        "to": "db",
+        "label": "1x origin fetch"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why Cache-Aside read-write races silently revert user updates",
+        "actionLabel": "GET hot_key",
+        "status": "healthy",
+        "activeNodeIds": [
+          "app",
+          "sf"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "GET hot_key",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "App Servers sends work to Singleflight (Why Cache-Aside read-write races silently revert user updates)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Stale v1 pinned in Redis for 3,600 seconds",
+        "actionLabel": "L2 lookup",
+        "status": "healthy",
+        "activeNodeIds": [
+          "sf",
+          "redis"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "L2 lookup",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Singleflight coordinates with Redis L2 while preserving the core invariant (Stale v1 pinned in Redis for 3,600 seconds)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Why Delayed Double Delete and SETNX fail under >500 ms pauses",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "redis",
+          "db"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, Primary DB absorbs pressure without cascading (Why Delayed Double Delete and SETNX fail under >500 ms pauses)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Where version-fenced caches protect consistency",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "app",
+          "sf",
+          "redis",
+          "db"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Where version-fenced caches protect consistency)."
+      }
+    ]
+  }
+}

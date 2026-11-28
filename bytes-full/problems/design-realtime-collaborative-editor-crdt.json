@@ -1,0 +1,672 @@
+{
+  "id": "prob-design-realtime-collaborative-editor-crdt",
+  "slug": "design-realtime-collaborative-editor-crdt",
+  "title": "Design a Real-Time Collaborative Document Editor (CRDTs & WebSockets)",
+  "problemType": "system-design",
+  "difficulty": "hard",
+  "prompt": "Design a Google Docs / Notion-style collaborative editor supporting 10M DAU, 100 concurrent editors per document, <80ms keystroke propagation, and seamless offline editing with automatic conflict-free merge on reconnect.",
+  "spark": {
+    "summary": "Building an offline-capable collaborative editor requires replacing central Operational Transformation (OT) locks with sequence CRDTs (RGA / Yjs) over sticky-routed WebSocket gateways, backed by an append-only operation log and periodic snapshot compaction.",
+    "keyTakeaway": "If latency budgets leave no room for synchronous retries, sequence CRDTs guarantee strong eventual consistency without a central serialization server, but require tombstone compaction and delta-state encoding so document memory does not grow unboundedly.",
+    "byteSummary": "**Core Mechanics:** Concurrent offline edits break naive index-based updates (`insert(pos=5, 'x')`). **Sequence CRDTs** (such as RGA or Yjs) assign each character a globally unique, causally ordered ID `(lamport_ts, client_id)` so concurrent inserts merge **commutatively** in any delivery order.\n\n**Visual & Structural Flow:** Depicts `Client A (Offline Edit)` and `Client B (Concurrent Edit)` each maintaining a local `RGA / Yjs Character Tree` (`a1@A`, `b1@B`), exchanging deltas through a `WebSocket Pub/Sub Gateway` with `Commutative Merge (Zero Locks)` and persisting to a `Compacted Snapshot Store + Op Log`.\n\n**Trade-Offs & Production:** CRDTs eliminate central OT transform-server bottlenecks and support peer-to-peer/offline merges, at the cost of tombstone metadata overhead—mitigated via run-length block encoding and background GC compaction.\n\n**Failure Modes & Application:** Hash-route document rooms to stateful WebSocket/Redis-PubSub shards, enforce per-document max op-size limits, and compact op logs every N=1,000 edits."
+  },
+  "learningJourney": [
+    {
+      "id": "01-requirements-and-scale",
+      "eyebrow": "STAGE 01 · REQUIREMENTS & MATH",
+      "title": "Clarify Concurrency, Offline Sync & Latency Math",
+      "level": "L5 · APPLIED DESIGN",
+      "purpose": "The problem: size WebSocket connections, delta broadcast fanout, and op-log storage.",
+      "explanation": {
+        "foundation": "Think of **Clarify Concurrency, Offline Sync & Latency Math** as the intuition layer for Design a Real-Time Collaborative Document Editor (CRDTs & WebSockets): The problem: size WebSocket connections, delta broadcast fanout, and op-log storage.",
+        "core": "With **10M DAU** and ~500K concurrent active sockets, each typing editor emits ~3–5 keystrokes/sec (~100 bytes per binary CRDT delta). Broadcasting to 100 peers in a room requires `<80 ms` p99 fanout, while offline editors must buffer thousands of local edits and merge cleanly upon reconnect without losing cursor intent.",
+        "deepDive": "Under heavy load or partial failure, clarify concurrency, offline sync & latency math becomes a critical lever for predictable latency and correctness. Building an offline-capable collaborative editor requires replacing central Operational Transformation (OT) locks with sequence CRDTs (RGA / Yjs) over sticky-routed WebSocket gateways, backed by an append-only operation log and periodic snapshot compaction."
+      },
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "Stage 1 Lifecycle",
+        "title": "Clarify Concurrency, Offline Sync & Latency Math",
+        "states": [
+          {
+            "id": "init",
+            "label": "Ready / Idle",
+            "tone": "neutral"
+          },
+          {
+            "id": "active",
+            "label": "In-Flight",
+            "tone": "info"
+          },
+          {
+            "id": "verified",
+            "label": "Committed",
+            "tone": "good"
+          },
+          {
+            "id": "degraded",
+            "label": "Fallback / Retry",
+            "tone": "warn"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "init",
+            "to": "active",
+            "label": "acquire"
+          },
+          {
+            "from": "active",
+            "to": "verified",
+            "label": "quorum ok"
+          },
+          {
+            "from": "active",
+            "to": "degraded",
+            "label": "timeout / skew"
+          },
+          {
+            "from": "degraded",
+            "to": "init",
+            "label": "backoff reset"
+          }
+        ]
+      }
+    },
+    {
+      "id": "02-ot-vs-crdt",
+      "eyebrow": "STAGE 02 · OT VS. CRDT",
+      "title": "Why Operational Transformation (OT) Needs a Central Arbiter",
+      "level": "L5 · APPLIED DESIGN",
+      "purpose": "The failure mode: compare central OT index-shifting against lock-free CRDT convergence.",
+      "explanation": {
+        "foundation": "Classic **OT** transforms integer offsets (`insert(5, 'a')`) on a single authoritative server per document.",
+        "core": "Supporting multi-hour **offline editing** or multi-region active-active rooms in OT becomes notoriously bug-prone (`TP2` puzzle).",
+        "deepDive": "**Sequence CRDTs (RGA / Yjs)** anchor every insert to its *left/right neighbor's immutable ID*, making merges associative, commutative, and idempotent."
+      },
+      "sectionDiagram": {
+        "kind": "behavior-transition",
+        "eyebrow": "Stage 2 Trade-Off",
+        "title": "Why Operational Transformation (OT) Needs a Central Arbite...",
+        "before": {
+          "label": "Naive Unbounded Path",
+          "metrics": [
+            "Unbounded retries",
+            "Tail latency spikes",
+            "Silent state drift"
+          ]
+        },
+        "after": {
+          "label": "Bounded Engineering Path",
+          "metrics": [
+            "Explicit budgets",
+            "Predictable p99",
+            "Verifiable invariants"
+          ]
+        }
+      },
+      "decisionFramework": {
+        "problem": "How to implement Design a Real-Time Collaborative Document Editor (CRDTs & WebSockets) without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "If latency budgets leave no room for synchronous retries, sequence CRDTs guarantee strong eventual consistency without a central serialization server, but require tombstone compaction and delta-state encoding so document memory does not grow unboundedly.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Design a Real-Time Collaborative Document Editor (CRDTs & WebSockets) experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-enterprise-solution",
+      "eyebrow": "STAGE 03 · ENTERPRISE ARCHITECTURE",
+      "title": "RGA/Yjs Delta Sync + Sticky WebSocket Shards + Op-Log Compaction",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "purpose": "The mechanism: route document rooms via consistent hashing and compact tombstones asynchronously.",
+      "explanation": {
+        "foundation": "Think of **RGA/Yjs Delta Sync + Sticky WebSocket Shards + Op-Log Compaction** as the intuition layer for Design a Real-Time Collaborative Document Editor (CRDTs & WebSockets): The mechanism: route document rooms via consistent hashing and compact tombstones asynchronously.",
+        "core": "Consistent-hash `doc_id` to a **WebSocket Room Shard** (with Redis Pub/Sub cross-pod fanout for failover). Clients exchange **state vectors** (`{clientId: maxClock}`) on reconnect to fetch only missing binary deltas, while a background compactor merges the append-only op log into a single **base snapshot** and garbage-collects deleted tombstones once all active replicas acknowledge the epoch.",
+        "deepDive": "Under heavy load or partial failure, rga/yjs delta sync + sticky websocket shards + op-log compaction becomes a critical lever for predictable latency and correctness. Building an offline-capable collaborative editor requires replacing central Operational Transformation (OT) locks with sequence CRDTs (RGA / Yjs) over sticky-routed WebSocket gateways, backed by an append-only operation log and periodic snapshot compaction."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Sync & Persistence Path",
+        "title": "CRDT Delta Sync & Snapshot Compaction Pipeline",
+        "nodes": [
+          {
+            "label": "Local CRDT Tree",
+            "role": "IndexedDB offline"
+          },
+          {
+            "label": "WS Room Shard",
+            "role": "Hash(doc_id) fanout"
+          },
+          {
+            "label": "Append Op Log",
+            "role": "Idempotent deltas"
+          },
+          {
+            "label": "Snapshot Compactor",
+            "role": "Prune tombstones"
+          }
+        ],
+        "cards": [
+          {
+            "label": "State-Vector Sync",
+            "detail": "Reconnects exchange compact version vectors to stream only missing deltas."
+          },
+          {
+            "label": "Run-Length Blocks",
+            "detail": "Yjs merges contiguous typing by one author into 1 block, cutting RAM 10x."
+          },
+          {
+            "label": "Safe Compaction",
+            "detail": "Squashes op logs into a base snapshot periodically for fast cold loads."
+          }
+        ],
+        "summary": "Caption: Sticky document rooms broadcast tiny binary CRDT deltas in <80ms while background compaction bounds op-log and tombstone growth."
+      },
+      "markdownContent": "```python\ndef compute_missing_deltas(local_clock: dict[str, int], remote_ops: list[dict]) -> list[dict]:\n    \"\"\"Filter operations unseen by a reconnecting client using its state vector.\"\"\"\n    missing = []\n    for op in remote_ops:\n        cid = op[\"client_id\"]\n        seq = op[\"seq\"]\n        if seq > local_clock.get(cid, 0):\n            missing.append(op)\n    return sorted(missing, key=lambda o: (o[\"lamport\"], o[\"client_id\"]))\n```"
+    },
+    {
+      "id": "04-tombstone-bloat-and-presence",
+      "eyebrow": "STAGE 04 · SCALE & MEMORY BOUNDS",
+      "title": "Taming Tombstone Bloat & Ephemeral Cursor Presence",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "purpose": "Operational control: keep deleted characters and live cursors from bloating persistent state.",
+      "explanation": {
+        "foundation": "Think of **Taming Tombstone Bloat & Ephemeral Cursor Presence** as the intuition layer for Design a Real-Time Collaborative Document Editor (CRDTs & WebSockets): Operational control: keep deleted characters and live cursors from bloating persistent state.",
+        "core": "Never persist live cursor/selection coordinates in the CRDT op log—broadcast **awareness/presence** as ephemeral volatile messages over WebSockets with a 30s TTL. For deleted text, compress consecutive deletions into run-length **tombstone ranges** and run periodic snapshot compaction.",
+        "deepDive": "Under heavy load or partial failure, taming tombstone bloat & ephemeral cursor presence becomes a critical lever for predictable latency and correctness. Building an offline-capable collaborative editor requires replacing central Operational Transformation (OT) locks with sequence CRDTs (RGA / Yjs) over sticky-routed WebSocket gateways, backed by an append-only operation log and periodic snapshot compaction."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Stage 4 Interaction",
+        "title": "Taming Tombstone Bloat & Ephemeral Cursor Presence",
+        "actors": [
+          {
+            "id": "caller",
+            "label": "Client / Caller"
+          },
+          {
+            "id": "coord",
+            "label": "Coordinator"
+          },
+          {
+            "id": "store",
+            "label": "State / Engine"
+          }
+        ],
+        "steps": [
+          {
+            "from": "caller",
+            "to": "coord",
+            "label": "1. Dispatch request + bounds"
+          },
+          {
+            "from": "coord",
+            "to": "store",
+            "label": "2. Execute deterministic step"
+          },
+          {
+            "from": "store",
+            "to": "coord",
+            "label": "3. Return state & proof"
+          },
+          {
+            "from": "coord",
+            "to": "caller",
+            "label": "4. Ack with bounded latency"
+          }
+        ]
+      }
+    },
+    {
+      "id": "05-follow-ups",
+      "eyebrow": "STAGE 05 · INTERVIEW FOLLOW-UPS",
+      "title": "Permissions Revocation, Undo/Redo & Large Document Splitting",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "purpose": "Applied problems: enforce access control on reconnect and keep per-user undo local.",
+      "explanation": {
+        "foundation": "Think of **Permissions Revocation, Undo/Redo & Large Document Splitting** as the intuition layer for Design a Real-Time Collaborative Document Editor (CRDTs & WebSockets): Applied problems: enforce access control on reconnect and keep per-user undo local.",
+        "core": "On permission downgrade, immediately close the WebSocket and reject delta writes at the room gateway; implement **local per-user undo** using inverse operations scoped strictly to `client_id` so `Ctrl+Z` never undoes a collaborator's edits.",
+        "deepDive": "Under heavy load or partial failure, permissions revocation, undo/redo & large document splitting becomes a critical lever for predictable latency and correctness. Building an offline-capable collaborative editor requires replacing central Operational Transformation (OT) locks with sequence CRDTs (RGA / Yjs) over sticky-routed WebSocket gateways, backed by an append-only operation log and periodic snapshot compaction."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Stage 5 Interaction",
+        "title": "Permissions Revocation, Undo/Redo & Large Document Splitti...",
+        "actors": [
+          {
+            "id": "caller",
+            "label": "Client / Caller"
+          },
+          {
+            "id": "coord",
+            "label": "Coordinator"
+          },
+          {
+            "id": "store",
+            "label": "State / Engine"
+          }
+        ],
+        "steps": [
+          {
+            "from": "caller",
+            "to": "coord",
+            "label": "1. Dispatch request + bounds"
+          },
+          {
+            "from": "coord",
+            "to": "store",
+            "label": "2. Execute deterministic step"
+          },
+          {
+            "from": "store",
+            "to": "coord",
+            "label": "3. Return state & proof"
+          },
+          {
+            "from": "coord",
+            "to": "caller",
+            "label": "4. Ack with bounded latency"
+          }
+        ]
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "question": "Why do sequence CRDTs (RGA / Yjs) anchor character insertions to neighbor IDs like (lamport_ts, client_id) instead of integer array indexes?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Immutable neighbor IDs make concurrent inserts commutative and idempotent regardless of delivery order or offline duration",
+            "correct": true,
+            "feedback": "Correct: integer indexes shift under concurrent edits, whereas unique causal IDs always resolve to the same total order across all replicas."
+          },
+          {
+            "id": "b",
+            "text": "Because JavaScript arrays cannot store more than 1,000 characters",
+            "correct": false,
+            "feedback": "Incorrect: the issue is concurrent index invalidation, not array size."
+          },
+          {
+            "id": "c",
+            "text": "To force every keystroke through a two-phase commit",
+            "correct": false,
+            "feedback": "Incorrect: CRDTs avoid synchronous 2PC locks completely."
+          }
+        ]
+      },
+      {
+        "question": "What happens if a CRDT-backed editor never compacts deleted characters (tombstones)?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Document metadata and cold-load latency grow monotonically with total historical edits, even if the visible text stays short",
+            "correct": true,
+            "feedback": "Correct: tombstones remain in the causal tree until compacted into a fresh base snapshot."
+          },
+          {
+            "id": "b",
+            "text": "Deleted characters reappear randomly for other users",
+            "correct": false,
+            "feedback": "Incorrect: tombstones preserve correctness, they just consume memory and load time."
+          },
+          {
+            "id": "c",
+            "text": "WebSockets automatically switch to HTTP/1.0 polling",
+            "correct": false,
+            "feedback": "Incorrect: tombstone bloat affects memory/storage, not transport negotiation."
+          }
+        ]
+      },
+      {
+        "question": "Where should live collaborator cursor positions be stored?",
+        "options": [
+          {
+            "id": "a",
+            "text": "In an ephemeral in-memory presence/awareness channel (not persisted in the durable CRDT op log)",
+            "correct": true,
+            "feedback": "Correct: cursor moves happen dozens of times per second and have zero durability value after disconnect."
+          },
+          {
+            "id": "b",
+            "text": "In the durable SQLite/Postgres op log so every cursor move can be replayed",
+            "correct": false,
+            "feedback": "Incorrect: persisting ephemeral cursor moves would explode op-log storage and compaction overhead."
+          },
+          {
+            "id": "c",
+            "text": "Inside DNS TXT records",
+            "correct": false,
+            "feedback": "Incorrect: DNS is not a real-time presence channel."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** Building an offline-capable collaborative editor requires replacing central Operational Transformation (OT) locks with sequence CRDTs (RGA / Yjs) over sticky-routed WebSocket gateways, backed by an append-only operation log and periodic snapshot compaction.\n\n**Key Takeaway:** Sequence CRDTs guarantee strong eventual consistency without a central serialization server, but require tombstone compaction and delta-state encoding so document memory does not grow unboundedly.",
+      "spark": {
+        "summary": "Building an offline-capable collaborative editor requires replacing central Operational Transformation (OT) locks with sequence CRDTs (RGA / Yjs) over sticky-routed WebSocket gateways, backed by an append-only operation log and periodic snapshot compaction.",
+        "keyTakeaway": "Sequence CRDTs guarantee strong eventual consistency without a central serialization server, but require tombstone compaction and delta-state encoding so document memory does not grow unboundedly.",
+        "byteSummary": "**Core Mechanics:** Concurrent offline edits break naive index-based updates (`insert(pos=5, 'x')`). **Sequence CRDTs** (such as RGA or Yjs) assign each character a globally unique, causally ordered ID `(lamport_ts, client_id)` so concurrent inserts merge **commutatively** in any delivery order.\n\n**Visual & Structural Flow:** Depicts `Client A (Offline Edit)` and `Client B (Concurrent Edit)` each maintaining a local `RGA / Yjs Character Tree` (`a1@A`, `b1@B`), exchanging deltas through a `WebSocket Pub/Sub Gateway` with `Commutative Merge (Zero Locks)` and persisting to a `Compacted Snapshot Store + Op Log`.\n\n**Trade-Offs & Production:** CRDTs eliminate central OT transform-server bottlenecks and support peer-to-peer/offline merges, at the cost of tombstone metadata overhead—mitigated via run-length block encoding and background GC compaction.\n\n**Failure Modes & Application:** Hash-route document rooms to stateful WebSocket/Redis-PubSub shards, enforce per-document max op-size limits, and compact op logs every N=1,000 edits."
+      },
+      "learningJourney": [
+        {
+          "id": "01-requirements-and-scale",
+          "eyebrow": "STAGE 01 · REQUIREMENTS & MATH",
+          "title": "Clarify Concurrency, Offline Sync & Latency Math",
+          "level": "L5 · APPLIED DESIGN",
+          "purpose": "The problem: size WebSocket connections, delta broadcast fanout, and op-log storage.",
+          "explanation": "With **10M DAU** and ~500K concurrent active sockets, each typing editor emits ~3–5 keystrokes/sec (~100 bytes per binary CRDT delta). Broadcasting to 100 peers in a room requires `<80 ms` p99 fanout, while offline editors must buffer thousands of local edits and merge cleanly upon reconnect without losing cursor intent."
+        },
+        {
+          "id": "02-ot-vs-crdt",
+          "eyebrow": "STAGE 02 · OT VS. CRDT",
+          "title": "Why Operational Transformation (OT) Needs a Central Arbiter",
+          "level": "L5 · APPLIED DESIGN",
+          "purpose": "The failure mode: compare central OT index-shifting against lock-free CRDT convergence.",
+          "explanation": "Classic **OT** transforms integer offsets (`insert(5, 'a')`) on a single authoritative server per document. Supporting multi-hour **offline editing** or multi-region active-active rooms in OT becomes notoriously bug-prone (`TP2` puzzle). **Sequence CRDTs (RGA / Yjs)** anchor every insert to its *left/right neighbor's immutable ID*, making merges associative, commutative, and idempotent."
+        },
+        {
+          "id": "03-enterprise-solution",
+          "eyebrow": "STAGE 03 · ENTERPRISE ARCHITECTURE",
+          "title": "RGA/Yjs Delta Sync + Sticky WebSocket Shards + Op-Log Compaction",
+          "level": "L6 · SCALE & TRADE-OFFS",
+          "purpose": "The mechanism: route document rooms via consistent hashing and compact tombstones asynchronously.",
+          "explanation": "Consistent-hash `doc_id` to a **WebSocket Room Shard** (with Redis Pub/Sub cross-pod fanout for failover). Clients exchange **state vectors** (`{clientId: maxClock}`) on reconnect to fetch only missing binary deltas, while a background compactor merges the append-only op log into a single **base snapshot** and garbage-collects deleted tombstones once all active replicas acknowledge the epoch.",
+          "sectionDiagram": {
+            "kind": "pipeline",
+            "eyebrow": "Sync & Persistence Path",
+            "title": "CRDT Delta Sync & Snapshot Compaction Pipeline",
+            "nodes": [
+              {
+                "label": "Local CRDT Tree",
+                "role": "IndexedDB offline"
+              },
+              {
+                "label": "WS Room Shard",
+                "role": "Hash(doc_id) fanout"
+              },
+              {
+                "label": "Append Op Log",
+                "role": "Idempotent deltas"
+              },
+              {
+                "label": "Snapshot Compactor",
+                "role": "Prune tombstones"
+              }
+            ],
+            "cards": [
+              {
+                "label": "State-Vector Sync",
+                "detail": "Reconnects exchange compact version vectors to stream only missing deltas."
+              },
+              {
+                "label": "Run-Length Blocks",
+                "detail": "Yjs merges contiguous typing by one author into 1 block, cutting RAM 10x."
+              },
+              {
+                "label": "Safe Compaction",
+                "detail": "Squashes op logs into a base snapshot periodically for fast cold loads."
+              }
+            ],
+            "summary": "Caption: Sticky document rooms broadcast tiny binary CRDT deltas in <80ms while background compaction bounds op-log and tombstone growth."
+          },
+          "markdownContent": "```python\ndef compute_missing_deltas(local_clock: dict[str, int], remote_ops: list[dict]) -> list[dict]:\n    \"\"\"Filter operations unseen by a reconnecting client using its state vector.\"\"\"\n    missing = []\n    for op in remote_ops:\n        cid = op[\"client_id\"]\n        seq = op[\"seq\"]\n        if seq > local_clock.get(cid, 0):\n            missing.append(op)\n    return sorted(missing, key=lambda o: (o[\"lamport\"], o[\"client_id\"]))\n```"
+        }
+      ],
+      "finalSummary": "Sequence CRDTs guarantee strong eventual consistency without a central serialization server, but require tombstone compaction and delta-state encoding so document memory does not grow unboundedly.",
+      "summary": "Building an offline-capable collaborative editor requires replacing central Operational Transformation (OT) locks with sequence CRDTs (RGA / Yjs) over sticky-routed WebSocket gateways, backed by an append-only operation log and periodic snapshot compaction.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, sequence CRDTs guarantee strong eventual consistency without a central serialization server, but require tombstone compaction and delta-state encoding so document memory does not grow unboundedly."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** Concurrent offline edits break naive index-based updates (`insert(pos=5, 'x')`). **Sequence CRDTs** (such as RGA or Yjs) assign each character a globally unique, causally ordered ID `(lamport_ts, client_id)` so concurrent inserts merge **commutatively** in any delivery order.\n\n**Visual & Structural Flow:** Depicts `Client A (Offline Edit)` and `Client B (Concurrent Edit)` each maintaining a local `RGA / Yjs Character Tree` (`a1@A`, `b1@B`), exchanging deltas through a `WebSocket Pub/Sub Gateway` with `Commutative Merge (Zero Locks)` and persisting to a `Compacted Snapshot Store + Op Log`.\n\n**Trade-Offs & Production:** CRDTs eliminate central OT transform-server bottlenecks and support peer-to-peer/offline merges, at the cost of tombstone metadata overhead—mitigated via run-length block encoding and background GC compaction.\n\n**Failure Modes & Application:** Hash-route document rooms to stateful WebSocket/Redis-PubSub shards, enforce per-document max op-size limits, and compact op logs every N=1,000 edits.",
+      "spark": {
+        "summary": "Building an offline-capable collaborative editor requires replacing central Operational Transformation (OT) locks with sequence CRDTs (RGA / Yjs) over sticky-routed WebSocket gateways, backed by an append-only operation log and periodic snapshot compaction.",
+        "keyTakeaway": "Sequence CRDTs guarantee strong eventual consistency without a central serialization server, but require tombstone compaction and delta-state encoding so document memory does not grow unboundedly.",
+        "byteSummary": "**Core Mechanics:** Concurrent offline edits break naive index-based updates (`insert(pos=5, 'x')`). **Sequence CRDTs** (such as RGA or Yjs) assign each character a globally unique, causally ordered ID `(lamport_ts, client_id)` so concurrent inserts merge **commutatively** in any delivery order.\n\n**Visual & Structural Flow:** Depicts `Client A (Offline Edit)` and `Client B (Concurrent Edit)` each maintaining a local `RGA / Yjs Character Tree` (`a1@A`, `b1@B`), exchanging deltas through a `WebSocket Pub/Sub Gateway` with `Commutative Merge (Zero Locks)` and persisting to a `Compacted Snapshot Store + Op Log`.\n\n**Trade-Offs & Production:** CRDTs eliminate central OT transform-server bottlenecks and support peer-to-peer/offline merges, at the cost of tombstone metadata overhead—mitigated via run-length block encoding and background GC compaction.\n\n**Failure Modes & Application:** Hash-route document rooms to stateful WebSocket/Redis-PubSub shards, enforce per-document max op-size limits, and compact op logs every N=1,000 edits."
+      },
+      "summary": "Building an offline-capable collaborative editor requires replacing central Operational Transformation (OT) locks with sequence CRDTs (RGA / Yjs) over sticky-routed WebSocket gateways, backed by an append-only operation log and periodic snapshot compaction.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, sequence CRDTs guarantee strong eventual consistency without a central serialization server, but require tombstone compaction and delta-state encoding so document memory does not grow unboundedly."
+    },
+    "advanced": {
+      "byteSummary": "**Core Mechanics:** Concurrent offline edits break naive index-based updates (`insert(pos=5, 'x')`). **Sequence CRDTs** (such as RGA or Yjs) assign each character a globally unique, causally ordered ID `(lamport_ts, client_id)` so concurrent inserts merge **commutatively** in any delivery order.\n\n**Visual & Structural Flow:** Depicts `Client A (Offline Edit)` and `Client B (Concurrent Edit)` each maintaining a local `RGA / Yjs Character Tree` (`a1@A`, `b1@B`), exchanging deltas through a `WebSocket Pub/Sub Gateway` with `Commutative Merge (Zero Locks)` and persisting to a `Compacted Snapshot Store + Op Log`.\n\n**Trade-Offs & Production:** CRDTs eliminate central OT transform-server bottlenecks and support peer-to-peer/offline merges, at the cost of tombstone metadata overhead—mitigated via run-length block encoding and background GC compaction.\n\n**Failure Modes & Application:** Hash-route document rooms to stateful WebSocket/Redis-PubSub shards, enforce per-document max op-size limits, and compact op logs every N=1,000 edits.",
+      "spark": {
+        "summary": "Building an offline-capable collaborative editor requires replacing central Operational Transformation (OT) locks with sequence CRDTs (RGA / Yjs) over sticky-routed WebSocket gateways, backed by an append-only operation log and periodic snapshot compaction.",
+        "keyTakeaway": "Sequence CRDTs guarantee strong eventual consistency without a central serialization server, but require tombstone compaction and delta-state encoding so document memory does not grow unboundedly.",
+        "byteSummary": "**Core Mechanics:** Concurrent offline edits break naive index-based updates (`insert(pos=5, 'x')`). **Sequence CRDTs** (such as RGA or Yjs) assign each character a globally unique, causally ordered ID `(lamport_ts, client_id)` so concurrent inserts merge **commutatively** in any delivery order.\n\n**Visual & Structural Flow:** Depicts `Client A (Offline Edit)` and `Client B (Concurrent Edit)` each maintaining a local `RGA / Yjs Character Tree` (`a1@A`, `b1@B`), exchanging deltas through a `WebSocket Pub/Sub Gateway` with `Commutative Merge (Zero Locks)` and persisting to a `Compacted Snapshot Store + Op Log`.\n\n**Trade-Offs & Production:** CRDTs eliminate central OT transform-server bottlenecks and support peer-to-peer/offline merges, at the cost of tombstone metadata overhead—mitigated via run-length block encoding and background GC compaction.\n\n**Failure Modes & Application:** Hash-route document rooms to stateful WebSocket/Redis-PubSub shards, enforce per-document max op-size limits, and compact op logs every N=1,000 edits."
+      },
+      "learningJourney": [
+        {
+          "id": "01-requirements-and-scale",
+          "eyebrow": "STAGE 01 · REQUIREMENTS & MATH",
+          "title": "Clarify Concurrency, Offline Sync & Latency Math",
+          "level": "L5 · APPLIED DESIGN",
+          "purpose": "The problem: size WebSocket connections, delta broadcast fanout, and op-log storage.",
+          "explanation": "With **10M DAU** and ~500K concurrent active sockets, each typing editor emits ~3–5 keystrokes/sec (~100 bytes per binary CRDT delta). Broadcasting to 100 peers in a room requires `<80 ms` p99 fanout, while offline editors must buffer thousands of local edits and merge cleanly upon reconnect without losing cursor intent."
+        },
+        {
+          "id": "02-ot-vs-crdt",
+          "eyebrow": "STAGE 02 · OT VS. CRDT",
+          "title": "Why Operational Transformation (OT) Needs a Central Arbiter",
+          "level": "L5 · APPLIED DESIGN",
+          "purpose": "The failure mode: compare central OT index-shifting against lock-free CRDT convergence.",
+          "explanation": "Classic **OT** transforms integer offsets (`insert(5, 'a')`) on a single authoritative server per document. Supporting multi-hour **offline editing** or multi-region active-active rooms in OT becomes notoriously bug-prone (`TP2` puzzle). **Sequence CRDTs (RGA / Yjs)** anchor every insert to its *left/right neighbor's immutable ID*, making merges associative, commutative, and idempotent."
+        },
+        {
+          "id": "03-enterprise-solution",
+          "eyebrow": "STAGE 03 · ENTERPRISE ARCHITECTURE",
+          "title": "RGA/Yjs Delta Sync + Sticky WebSocket Shards + Op-Log Compaction",
+          "level": "L6 · SCALE & TRADE-OFFS",
+          "purpose": "The mechanism: route document rooms via consistent hashing and compact tombstones asynchronously.",
+          "explanation": "Consistent-hash `doc_id` to a **WebSocket Room Shard** (with Redis Pub/Sub cross-pod fanout for failover). Clients exchange **state vectors** (`{clientId: maxClock}`) on reconnect to fetch only missing binary deltas, while a background compactor merges the append-only op log into a single **base snapshot** and garbage-collects deleted tombstones once all active replicas acknowledge the epoch.",
+          "sectionDiagram": {
+            "kind": "pipeline",
+            "eyebrow": "Sync & Persistence Path",
+            "title": "CRDT Delta Sync & Snapshot Compaction Pipeline",
+            "nodes": [
+              {
+                "label": "Local CRDT Tree",
+                "role": "IndexedDB offline"
+              },
+              {
+                "label": "WS Room Shard",
+                "role": "Hash(doc_id) fanout"
+              },
+              {
+                "label": "Append Op Log",
+                "role": "Idempotent deltas"
+              },
+              {
+                "label": "Snapshot Compactor",
+                "role": "Prune tombstones"
+              }
+            ],
+            "cards": [
+              {
+                "label": "State-Vector Sync",
+                "detail": "Reconnects exchange compact version vectors to stream only missing deltas."
+              },
+              {
+                "label": "Run-Length Blocks",
+                "detail": "Yjs merges contiguous typing by one author into 1 block, cutting RAM 10x."
+              },
+              {
+                "label": "Safe Compaction",
+                "detail": "Squashes op logs into a base snapshot periodically for fast cold loads."
+              }
+            ],
+            "summary": "Caption: Sticky document rooms broadcast tiny binary CRDT deltas in <80ms while background compaction bounds op-log and tombstone growth."
+          },
+          "markdownContent": "```python\ndef compute_missing_deltas(local_clock: dict[str, int], remote_ops: list[dict]) -> list[dict]:\n    \"\"\"Filter operations unseen by a reconnecting client using its state vector.\"\"\"\n    missing = []\n    for op in remote_ops:\n        cid = op[\"client_id\"]\n        seq = op[\"seq\"]\n        if seq > local_clock.get(cid, 0):\n            missing.append(op)\n    return sorted(missing, key=lambda o: (o[\"lamport\"], o[\"client_id\"]))\n```"
+        },
+        {
+          "id": "04-tombstone-bloat-and-presence",
+          "eyebrow": "STAGE 04 · SCALE & MEMORY BOUNDS",
+          "title": "Taming Tombstone Bloat & Ephemeral Cursor Presence",
+          "level": "L6 · SCALE & TRADE-OFFS",
+          "purpose": "Operational control: keep deleted characters and live cursors from bloating persistent state.",
+          "explanation": "Never persist live cursor/selection coordinates in the CRDT op log—broadcast **awareness/presence** as ephemeral volatile messages over WebSockets with a 30s TTL. For deleted text, compress consecutive deletions into run-length **tombstone ranges** and run periodic snapshot compaction."
+        },
+        {
+          "id": "05-follow-ups",
+          "eyebrow": "STAGE 05 · INTERVIEW FOLLOW-UPS",
+          "title": "Permissions Revocation, Undo/Redo & Large Document Splitting",
+          "level": "L7 · STAFF / PRINCIPAL",
+          "purpose": "Applied problems: enforce access control on reconnect and keep per-user undo local.",
+          "explanation": "On permission downgrade, immediately close the WebSocket and reject delta writes at the room gateway; implement **local per-user undo** using inverse operations scoped strictly to `client_id` so `Ctrl+Z` never undoes a collaborator's edits."
+        }
+      ],
+      "finalSummary": "Sequence CRDTs guarantee strong eventual consistency without a central serialization server, but require tombstone compaction and delta-state encoding so document memory does not grow unboundedly.",
+      "summary": "Building an offline-capable collaborative editor requires replacing central Operational Transformation (OT) locks with sequence CRDTs (RGA / Yjs) over sticky-routed WebSocket gateways, backed by an append-only operation log and periodic snapshot compaction.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, sequence CRDTs guarantee strong eventual consistency without a central serialization server, but require tombstone compaction and delta-state encoding so document memory does not grow unboundedly."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "prerequisites": [
+    {
+      "title": "CRDTs & Conflict-Free Replicated Data",
+      "summary": "CRDTs (Conflict-free Replicated Data Types) are replicated data structures whose concurrent updates commute or form a mathematical join-semilattice, guaranteeing every replica converges to the exact same state without coordination or consensus."
+    },
+    {
+      "title": "WebSocket Real-Time Scaling",
+      "summary": "WebSockets (RFC 6455) upgrade an HTTP connection into a persistent, full-duplex TCP frame stream; scaling to millions of concurrent connections shifts the bottleneck from request/sec to stateful memory, ephemeral ports, pub/sub fan-out, and reconnect storms."
+    },
+    {
+      "title": "Consistent Hashing & Virtual Nodes",
+      "summary": "Consistent hashing assigns data keys to servers in a way that limits how many keys move when servers are added or removed. This helps avoid widespread cache misses and sudden load on databases."
+    }
+  ],
+  "simulation": {
+    "title": "Design a Real-Time Collaborative Document Editor (CRDTs & WebSockets) — Interactive Execution Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Workload & Budget"
+      },
+      {
+        "id": "router",
+        "label": "Gateway / Router",
+        "role": "Admission & Dispatch"
+      },
+      {
+        "id": "engine",
+        "label": "Core Engine",
+        "role": "Primary Execution"
+      },
+      {
+        "id": "replica",
+        "label": "Replica / Fallback",
+        "role": "Durability & Recovery"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "router",
+        "label": "request"
+      },
+      {
+        "from": "router",
+        "to": "engine",
+        "label": "route"
+      },
+      {
+        "from": "engine",
+        "to": "replica",
+        "label": "sync / fallback"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Clarify Concurrency, Offline Sync & Latency Math",
+        "actionLabel": "Dispatch nominal request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "router"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "Ingress",
+          "p99_ms": 8,
+          "error_rate": "0.0%"
+        },
+        "explanation": "Caller sends work into the gateway with explicit timeout and concurrency bounds (Clarify Concurrency, Offline Sync & Latency Math)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Why Operational Transformation (OT) Needs a Central Arbiter",
+        "actionLabel": "Execute core invariant",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "Core Path",
+          "p99_ms": 18,
+          "in_flight": 124
+        },
+        "explanation": "The core engine processes the hot path while keeping state transitions deterministic (Why Operational Transformation (OT) Needs a Central Arbiter)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "RGA/Yjs Delta Sync + Sticky WebSocket Shards + Op-Log Compac",
+        "actionLabel": "Detect skew or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Degraded",
+          "p99_ms": 64,
+          "retries_capped": "true"
+        },
+        "explanation": "Under load or replica lag, bounded backoff and isolation prevent cascading saturation (RGA/Yjs Delta Sync + Sticky WebSocket Shards + Op-Log Compaction)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Permissions Revocation, Undo/Redo & Large Document Splitting",
+        "actionLabel": "Converge & restore SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 11,
+          "drift": 0
+        },
+        "explanation": "State converges cleanly and telemetry confirms the system returned within its SLO envelope (Permissions Revocation, Undo/Redo & Large Document Splitting)."
+      }
+    ]
+  }
+}

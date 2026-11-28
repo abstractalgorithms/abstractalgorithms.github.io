@@ -1,0 +1,772 @@
+{
+  "id": "100m-player-leaderboard",
+  "slug": "100m-player-leaderboard",
+  "title": "Design a 100M-Player Distributed Leaderboard at 200K Writes/Sec",
+  "problemType": "system-design",
+  "difficulty": "hard",
+  "prompt": "Design a real-time distributed leaderboard for 100,000,000 active players sustaining 200,000 score updates/sec and serving getTopK(100) and getPlayerRank(userId) in < 20 ms p99 with deterministic tie-breaking and zero-downtime season resets.",
+  "spark": {
+    "summary": "A single Redis ZSET holding 100M players consumes ~14 GB RAM and saturates one CPU core at ~80K ops/s, causing multi-second RDB fork pauses and dropped score updates. Sharding by `userId % 16`, buffering writes through a `userId`-partitioned Kafka WAL, caching a 16-shard Min-Heap Top-100 for 500 ms, and serving tail ranks from a Score-Range Prefix Histogram holds `getTopK(100)` and `getPlayerRank(userId)` under 20 ms p99.",
+    "keyTakeaway": "When a single sorted set hits its single-core CPU ceiling and stalls on 14 GB memory snapshots, shard players by user ID across 16 instances, serve Top-100 from a 500 ms merged cache, and estimate tail ranks in O(1) from a score-range histogram instead of scanning all shards.",
+    "byteSummary": "Putting 100,000,000 players into one Redis Sorted Set (`ZSET`) breaks in three ways: 100M skip-list + hash entries consume ~14 GB RAM, 200,000 `ZADD`s/sec exceed a single Redis thread's ~80-100K ops/sec ceiling, and `BGSAVE` `fork()` page-table copies trigger multi-second latency spikes.\n\nSharding across `K = 16` Redis instances by `userId % 16` drops per-shard load to **12,500 writes/sec** and **~875 MB RAM**—leaving 6x CPU headroom and sub-10 ms RDB forks. A `userId`-partitioned Kafka log absorbs bursts and pipelines 100 `ZADD`s per network syscall.\n\nFor reads: `getTopK(100)` runs a background 16-shard `ZREVRANGE 0 99` scatter-gather every **500 ms**, merges 1,600 entries in a Min-Heap in <0.5 ms, and serves 100K reads/sec from cache. For `getPlayerRank(userId)`, players in the **Top 10,000** get exact ranks from a merged snapshot, while the remaining 99.99M players read an **O(1) Score-Range Prefix Histogram** (<0.1% variance) instead of scanning 16 shards."
+  },
+  "learningJourney": [
+    {
+      "id": "01-lb-physics",
+      "eyebrow": "STAGE 01 · HARDWARE & MEMORY LIMITS",
+      "title": "Why a Single 14 GB Redis ZSET Collapses at 200K Writes/Sec",
+      "level": "foundation",
+      "purpose": "Derive the shard count K = 16 directly from Redis single-thread CPU ceilings, skip-list memory overhead, and OS fork() copy-on-write stalls.",
+      "explanation": {
+        "foundation": "Every `ZADD` into a Redis Sorted Set updates two structures in memory: a dict mapping `userId -> score` (~64 bytes) and a probabilistic **skip list** node with 1-32 forward pointers (~76 bytes). At ~140 bytes per player:\n\n$$\\text{Total RAM} = 100\\times 10^6 \\times 140\\text{ B} \\approx 14\\text{ GB}$$\n\nA single Redis process executes commands on **one main thread**. Even with fast NVMe and 10 Gbps NICs, a single Redis instance saturates around ~80,000–100,000 `ZADD`s/sec when skip-list depth is $\\log_2(10^8) \\approx 27$ levels. At 200,000 writes/sec, commands queue up, p99 latency explodes past seconds, and `OOM` or dropped connections follow.",
+        "core": "Even if Redis were multi-threaded, a 14 GB single-instance heap breaks on persistence and failover. When `BGSAVE` or `AOF rewrite` calls `fork()`, the Linux kernel copies the parent process's page table (~28 MB for 14 GB at 4 KB pages, or worse under Transparent Huge Pages). During 200K writes/sec, copy-on-write page faults duplicate dirty 4 KB/2 MB pages rapidly, doubling RAM usage and stalling the event loop.\n\nSizing for **50% safety margin** (target $\\le 15\\text{K writes/sec}$ and $\\le 1.5\\text{ GB}$ per shard) yields:\n\n$$K = \\max\\left(\\lceil 200\\text{K} / 15\\text{K} \\rceil, \\lceil 14\\text{ GB} / 1.5\\text{ GB} \\rceil\\right) = 16\\text{ shards}$$\n\nAt $K=16$ (`userId % 16`), each shard holds **6.25M players (~875 MB RAM)** and **12,500 writes/sec**.",
+        "deepDive": "Why `userId % 16` instead of score-range sharding (e.g., Shard 0 = scores `0..1000`, Shard 1 = `1001..2000`)? Score-range sharding creates severe **write hotspots** (90% of new players sit in the `0..1000` bucket) and forces expensive **cross-shard moves** (`ZREM` on Shard 0 + `ZADD` on Shard 1) whenever a player levels up. Hash sharding by `userId % 16` keeps every player's updates pinned to one shard and balances write load evenly—at the cost of an `O(K)` scatter-gather for global Top-K, which we amortize in Stage 3."
+      },
+      "comparison": [
+        {
+          "choice": "Single 14 GB Redis ZSET",
+          "benefits": "O(log N) exact ZREVRANK in 1 call; zero scatter-gather.",
+          "costs": "Saturates 1 CPU core at ~90K ZADD/s; multi-second fork() stalls; 14 GB blast radius."
+        },
+        {
+          "choice": "Score-Range Sharding",
+          "benefits": "Top-K reads hit only the highest score shard.",
+          "costs": "Massive write skew on beginner score ranges; non-atomic cross-shard moves on score jumps."
+        },
+        {
+          "choice": "K=16 Hash Sharding (userId % 16)",
+          "benefits": "Uniform 12.5K ZADD/s & ~875 MB/shard; single-shard atomic ZADD.",
+          "costs": "Global Top-K requires merging K=16 shards (solved via 500 ms cache)."
+        }
+      ],
+      "sectionDiagram": {
+        "kind": "behavior-transition",
+        "eyebrow": "STAGE 01 · CAPACITY SCALING",
+        "title": "Breaking the 1-Core Redis Ceiling with K=16 Hash Sharding",
+        "steps": [
+          {
+            "label": "Single ZSET",
+            "title": "100M Entries / 1 Core",
+            "metric": "14 GB RAM · 200K/s Overloaded",
+            "status": "fail"
+          },
+          {
+            "label": "Partition Key",
+            "title": "shard = hash(userId) % 16",
+            "metric": "Uniform Distribution · Zero Moves",
+            "status": "warn"
+          },
+          {
+            "label": "16 Redis Shards",
+            "title": "6.25M Players / Shard",
+            "metric": "875 MB RAM · 12.5K ZADD/s",
+            "status": "ok"
+          },
+          {
+            "label": "Headroom & Fork",
+            "title": "6x CPU & Sub-10ms BGSAVE",
+            "metric": "< 2 ms p99 Write",
+            "status": "ok"
+          }
+        ],
+        "summary": "Sharding 100M players across 16 Redis nodes drops per-shard load to 875 MB and 12.5K writes/sec."
+      }
+    },
+    {
+      "id": "02-lb-write-path",
+      "eyebrow": "STAGE 02 · INGESTION & PIPELINING",
+      "title": "Surviving Bursts: Kafka Partitioned WAL & Pipelined ZADD",
+      "level": "foundation",
+      "purpose": "Explain why direct synchronous API-to-Redis writes drop updates during failovers and how userId-partitioned Kafka + pipelining protects ordering.",
+      "explanation": {
+        "foundation": "If the Score API calls Redis `ZADD` synchronously inside the HTTP handler, two things break under load: (1) 200,000 individual TCP round-trips/sec burn huge kernel `epoll`/syscall overhead; (2) a 3-second Redis primary failover drops or times out 600,000 score updates.",
+        "core": "Instead, `POST /v1/scores` validates the payload, publishes an event `(userId, absoluteScore, ts, matchId)` to a **Kafka topic partitioned by `userId`** (32+ partitions), and returns `202 Accepted` in <3 ms. Partitioning by `userId` guarantees all updates for a given player arrive in strict causal order.\n\nConsumer workers pull batches of 100–250 events and flush them to each Redis shard using **Redis pipelining**—cutting network round-trips by 100x while keeping per-batch latency under 5 ms.",
+        "deepDive": "Always send **absolute scores** (`ZADD key score userId`) rather than relative increments (`ZINCRBY key delta userId`) whenever possible. If a Kafka consumer crashes after flushing a pipeline to Redis but before committing its Kafka offset, replaying `ZINCRBY +50` double-credits the player, whereas `ZADD 1450` (guarded by `ZADD GT`—Greater Than—if scores are monotonic) is 100% idempotent."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "STAGE 02 · ORDERED WRITE PIPELINE",
+        "title": "Why Kafka WAL + Pipelined Idempotent ZADD Survives Failovers",
+        "actors": [
+          {
+            "id": "api",
+            "label": "Score API"
+          },
+          {
+            "id": "kfk",
+            "label": "Kafka (userId Part)"
+          },
+          {
+            "id": "wrk",
+            "label": "Batch Consumer"
+          },
+          {
+            "id": "red",
+            "label": "Redis Shard i"
+          }
+        ],
+        "events": [
+          {
+            "from": "api",
+            "to": "kfk",
+            "label": "Publish (userId, absScore, ts)",
+            "status": "ok"
+          },
+          {
+            "from": "kfk",
+            "to": "wrk",
+            "label": "Ordered batch (100 events)",
+            "status": "ok"
+          },
+          {
+            "from": "wrk",
+            "to": "red",
+            "label": "Pipeline 100x ZADD GT",
+            "status": "ok"
+          },
+          {
+            "from": "red",
+            "to": "wrk",
+            "label": "ACK -> Commit Kafka Offset",
+            "status": "ok"
+          }
+        ],
+        "summary": "Partitioning Kafka by userId preserves per-player order while pipelined ZADD GT makes consumer replays idempotent."
+      },
+      "simulation": {
+        "title": "Score Update Pipeline & Failover Replay",
+        "nodes": [
+          {
+            "id": "client",
+            "label": "Game Server",
+            "role": "Score Emitter"
+          },
+          {
+            "id": "kafka",
+            "label": "Kafka Partition 7",
+            "role": "Ordered WAL"
+          },
+          {
+            "id": "worker",
+            "label": "Pipeline Worker",
+            "role": "Batch 100 ZADD"
+          },
+          {
+            "id": "redis",
+            "label": "Redis Shard 7",
+            "role": "875 MB ZSET"
+          }
+        ],
+        "edges": [
+          {
+            "from": "client",
+            "to": "kafka",
+            "label": "1. Produce (key=u42)"
+          },
+          {
+            "from": "kafka",
+            "to": "worker",
+            "label": "2. Poll batch"
+          },
+          {
+            "from": "worker",
+            "to": "redis",
+            "label": "3. Pipeline ZADD GT"
+          }
+        ],
+        "steps": [
+          {
+            "stepNumber": 1,
+            "title": "Ingest Score Event",
+            "actionLabel": "Publish to Kafka",
+            "status": "healthy",
+            "activeNodeIds": [
+              "client",
+              "kafka"
+            ],
+            "activeEdgeIndex": 0,
+            "stateSnapshot": {
+              "user": "u42",
+              "score": 9850,
+              "kafka_offset": 41020
+            },
+            "explanation": "Score API appends u42=9850 to Kafka Partition 7 and ACKs the game server in 2 ms without waiting on Redis."
+          },
+          {
+            "stepNumber": 2,
+            "title": "Batch & Pipeline",
+            "actionLabel": "Flush 100 ZADDs",
+            "status": "healthy",
+            "activeNodeIds": [
+              "kafka",
+              "worker",
+              "redis"
+            ],
+            "activeEdgeIndex": 2,
+            "stateSnapshot": {
+              "batch_size": 100,
+              "syscalls": 1,
+              "shard_qps": "12.5K/s"
+            },
+            "explanation": "Worker batches 100 updates for Shard 7 into a single pipelined TCP write, cutting syscall overhead 100x."
+          },
+          {
+            "stepNumber": 3,
+            "title": "Worker Crash Before Offset Commit",
+            "actionLabel": "Replay Idempotent ZADD GT",
+            "status": "warning",
+            "activeNodeIds": [
+              "worker",
+              "redis"
+            ],
+            "activeEdgeIndex": 2,
+            "stateSnapshot": {
+              "replayed": "true",
+              "zadd_mode": "GT",
+              "double_credit": 0
+            },
+            "explanation": "If the worker crashes before committing offset 41020, replay runs ZADD GT 9850—no score inflation or regression."
+          }
+        ]
+      },
+      "decisionFramework": {
+        "problem": "How to implement Design a 100M-Player Distributed Leaderboard at 200K Writes/Sec without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "When a single sorted set hits its single-core CPU ceiling and stalls on 14 GB memory snapshots, shard players by user ID across 16 instances, serve Top-100 from a 500 ms merged cache, and estimate tail ranks in O(1) from a score-range histogram instead of scanning all shards.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Design a 100M-Player Distributed Leaderboard at 200K Writes/Sec experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-lb-topk",
+      "eyebrow": "STAGE 03 · GLOBAL TOP-K MERGE",
+      "title": "Scatter-Gather Top-100 via Min-Heap + 500 ms Singleflight Cache",
+      "level": "intermediate",
+      "purpose": "Prevent 100K read RPS from hitting all 16 Redis shards by merging Top-100 in a K-way Min-Heap behind a 500 ms cache.",
+      "explanation": {
+        "foundation": "If 100,000 players open the leaderboard tab simultaneously and each request fans out `ZREVRANGE 0 99` to all 16 shards, Redis receives 1.6M range queries/sec and melts down.",
+        "core": "Instead, a **single background refresher** (or `Singleflight`-guarded cache-aside) queries `ZREVRANGE lb:shard_i 0 99 WITHSCORES` across the 16 shards once every **500 ms** (~50 KB total payload). A **size-100 Min-Heap** merges the 1,600 candidates in $O(16 \\times 100 \\log 100) \\approx 10,000$ operations (<0.3 ms) and writes the serialized Top-100 JSON to a read cache/CDN.",
+        "deepDive": "```python\nimport heapq\n\ndef merge_topk_shards(shard_lists: list[list[tuple[float, str]]], k: int = 100) -> list[tuple[float, str]]:\n    if k <= 0:\n        raise ValueError('k must be positive')\n    min_heap: list[tuple[float, str]] = []\n    for entries in shard_lists:\n        for score, user_id in entries:\n            if len(min_heap) < k:\n                heapq.heappush(min_heap, (score, user_id))\n            elif score > min_heap[0][0]:\n                heapq.heapreplace(min_heap, (score, user_id))\n    return sorted(min_heap, key=lambda x: x[0], reverse=True)\n```"
+      },
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "STAGE 03 · READ FAN-OUT SHIELD",
+        "title": "100K RPS Served from 500 ms Cache via Background Min-Heap Merge",
+        "graphNodes": [
+          {
+            "id": "clients",
+            "label": "100K Read RPS",
+            "role": "Leaderboard Tab",
+            "col": 0,
+            "row": 0,
+            "tone": "neutral"
+          },
+          {
+            "id": "cache",
+            "label": "500 ms Edge/Redis Cache",
+            "role": "Serves <2ms Hits",
+            "col": 1,
+            "row": 0,
+            "tone": "primary"
+          },
+          {
+            "id": "refresher",
+            "label": "Singleflight Refresher",
+            "role": "1x / 500ms Cron",
+            "col": 1,
+            "row": 1,
+            "tone": "tint"
+          },
+          {
+            "id": "shards",
+            "label": "16x Redis ZREVRANGE 0 99",
+            "role": "1,600 Candidates",
+            "col": 2,
+            "row": 1,
+            "tone": "amber"
+          }
+        ],
+        "graphEdges": [
+          {
+            "from": "clients",
+            "to": "cache",
+            "label": "GET /top100 (<2ms)",
+            "style": "solid",
+            "tone": "green"
+          },
+          {
+            "from": "refresher",
+            "to": "shards",
+            "label": "Every 500ms",
+            "style": "dashed",
+            "tone": "amber"
+          },
+          {
+            "from": "refresher",
+            "to": "cache",
+            "label": "Write Min-Heap Top-100",
+            "style": "solid",
+            "tone": "green"
+          }
+        ],
+        "summary": "Decoupling 100K RPS client reads from a 500 ms background Min-Heap merge caps shard read overhead at 2 QPS/shard."
+      }
+    },
+    {
+      "id": "04-lb-rank",
+      "eyebrow": "STAGE 04 · O(1) GLOBAL RANKING",
+      "title": "Exact Top-10K Snapshot vs. O(1) Score-Range Histogram for 99.99M Players",
+      "level": "intermediate",
+      "purpose": "Explain why global ZREVRANK cannot work across 16 shards and how a tiered Top-10K + Score Histogram serves all 100M players in O(1).",
+      "explanation": {
+        "foundation": "On a single Redis ZSET, `ZREVRANK` computes exact rank in $O(\\log N)$. Across 16 shards, your local rank on Shard 3 tells you nothing about how many players on Shards 0–2 and 4–15 have a higher score—computing exact global rank for player #45,120,000 would require running `ZCOUNT shard_i (score, +inf)` on **all 16 shards** on every profile view!",
+        "core": "Notice the product asymmetry: players in the **Top 10,000** care deeply about exact `#42 vs #43`, while player `#45,120,000` only needs an accurate percentile/bracket (`~#45.1M`).\n\n- **Tier 1 (Top 10,000)**: Background refresher merges `ZREVRANGE 0 9999` across 16 shards every 2s into a fast lookup hash map (`O(1)` exact rank).\n- **Tier 2 (Remaining 99.99M)**: Maintain a **Score-Range Prefix Histogram** (e.g., 10,000 fixed/log-width score buckets) updated asynchronously by Kafka consumers (`HINCRBY bucket_new +1`, `HINCRBY bucket_old -1`). Global rank = `sum(buckets > my_bucket) + linear_interp` in **O(1)**!",
+        "deepDive": "Even better: because the Kafka consumer already reads the player's old score (or caches it in a compact RocksDB/Redis lookup) before issuing `ZADD`, updating the two histogram bucket counters adds negligible overhead and keeps rank variance under **0.1%**."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 04 · TIERED RANK LOOKUP",
+        "title": "Exact Top-10K Map + O(1) Score-Range Prefix Histogram",
+        "summary": "Tiering an exact Top-10K map with an O(1) Score-Range Prefix Histogram eliminates 16-shard ZCOUNT storms.",
+        "nodes": [
+          {
+            "id": "t0",
+            "label": "Tier 1: Top-10K Map",
+            "role": "Exact #1..#10,000"
+          },
+          {
+            "id": "t1",
+            "label": "Tier 2: Prefix Histogram",
+            "role": "10K Score Buckets"
+          },
+          {
+            "id": "t2",
+            "label": "Fallback: Shard ZCOUNT",
+            "role": "16-Shard Exact"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Tier 1: Top-10K Map",
+            "detail": "2s merged snapshot · O(1) hash lookup"
+          },
+          {
+            "label": "Tier 2: Prefix Histogram",
+            "detail": "O(1) lookup for 99.99M tail · <0.1% variance"
+          },
+          {
+            "label": "Fallback: Shard ZCOUNT",
+            "detail": "Used only for audit / prize tie checks"
+          }
+        ]
+      }
+    },
+    {
+      "id": "05-lb-tiebreak",
+      "eyebrow": "STAGE 05 · PRECISION & ANTI-CHEAT",
+      "title": "53-Bit IEEE-754 Composite Tie-Breaking & Server-Signed Score Guards",
+      "level": "advanced",
+      "purpose": "Pack score + inverted timestamp cleanly inside Redis float64's 53-bit exact integer mantissa without silent rounding corruption.",
+      "explanation": {
+        "foundation": "Redis stores ZSET scores as **IEEE-754 64-bit floating-point (`double`)**, which only represents integers **exactly** up to $2^{53} - 1 = 9,007,199,254,740,991$. Packing a 40-bit score + 32-bit timestamp (72 bits) silently drops low-order bits and breaks tie-breaking!",
+        "core": "Fit the composite score strictly within **53 bits**:\n\n$$\\text{composite} = (\\text{score} \\ll 20) \\mid ((\\text{MAX\\_TS} - \\text{ts}) \\;\\&\\; \\text{0xFFFFF})$$\n\nThis gives **33 bits for score** (up to $8.58 \\times 10^9$) and **20 bits for inverted relative timestamp** (~12 days at 1-second resolution, or ~17 minutes at 1-ms resolution within a match). Earlier achievers get a larger inverted timestamp and rank higher on ties!",
+        "deepDive": "On the security boundary, never accept raw client scores (`POST /score = 999999999`). Require server-signed match receipts (HMAC/JWT from authoritative game servers), enforce per-minute score-delta anomaly caps, and quarantine cheaters via `ZREM` on their single `userId % 16` shard."
+      },
+      "caveats": [
+        "Never exceed 2^53 - 1 (9.007e15) in Redis ZSET composite scores, or IEEE-754 rounding will corrupt tie-breaker bits.",
+        "Never trust client-submitted absolute scores without server-signed match telemetry or delta-velocity checks."
+      ],
+      "sectionDiagram": {
+        "kind": "wal-mvcc",
+        "eyebrow": "STAGE 05 · 53-BIT COMPOSITE LAYOUT",
+        "title": "Packing Score + Inverted Timestamp Inside IEEE-754 Exact Mantissa",
+        "records": [
+          {
+            "label": "Bits 52..20 (33b)",
+            "value": "Player Score (0 .. 8.58B)",
+            "tone": "green"
+          },
+          {
+            "label": "Bits 19..0 (20b)",
+            "value": "(MAX_TS - ts) & 0xFFFFF",
+            "tone": "blue"
+          },
+          {
+            "label": "Overflow >= 54b",
+            "value": "IEEE-754 Rounds Low Bits!",
+            "tone": "amber"
+          }
+        ],
+        "summary": "Keeping composite scores within 53 bits preserves exact tie-breaking without floating-point rounding."
+      }
+    },
+    {
+      "id": "06-lb-lifecycle",
+      "eyebrow": "STAGE 06 · ZERO-DOWNTIME RESETS",
+      "title": "Versioned Season Cutovers & Non-Blocking Redis UNLINK",
+      "level": "advanced",
+      "purpose": "Prevent multi-second midnight Redis freezes during season resets by switching versioned keys and freeing old ZSETs asynchronously.",
+      "explanation": {
+        "foundation": "Calling Redis `DEL lb:shard_0` on a 6.25M-entry ZSET frees 6.25 million heap nodes **synchronously on the single main thread**—freezing the entire Redis shard for 2–4 seconds right at midnight UTC!",
+        "core": "Namespace every ZSET by season ID (`lb:s42:shard_0..15`, `lb:s43:shard_0..15`). Pre-warm empty `s43` keys and histogram buckets 5 minutes before midnight. At `00:00:00 UTC`, flip the active season pointer atomically in config/API.",
+        "deepDive": "Archive `s42` Top-K and final ranks to S3/Iceberg from a read replica (never the write primary), then reclaim `s42` RAM using `UNLINK lb:s42:shard_i`—which detaches the key in $O(1)$ and frees memory on a background lazy-free thread."
+      },
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "STAGE 06 · SEASON CUTOVER LIFECYCLE",
+        "title": "Zero-Downtime Season Switch with Async UNLINK Reclamation",
+        "states": [
+          {
+            "id": "active",
+            "label": "Season s42 Active",
+            "sublabel": "lb:s42:shard_0..15",
+            "tone": "green"
+          },
+          {
+            "id": "prewarm",
+            "label": "Pre-Warm s43",
+            "sublabel": "T-5m Empty Buckets",
+            "tone": "blue"
+          },
+          {
+            "id": "cutover",
+            "label": "Atomic Flip -> s43",
+            "sublabel": "00:00:00 UTC Cutover",
+            "tone": "amber"
+          },
+          {
+            "id": "unlink",
+            "label": "Replica Archive + UNLINK",
+            "sublabel": "O(1) Async Free",
+            "tone": "green"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "active",
+            "to": "prewarm",
+            "label": "23:55 UTC"
+          },
+          {
+            "from": "prewarm",
+            "to": "cutover",
+            "label": "00:00 UTC"
+          },
+          {
+            "from": "cutover",
+            "to": "unlink",
+            "label": "After S3 archive"
+          }
+        ],
+        "summary": "Versioned season namespaces and background UNLINK eliminate midnight reset stalls."
+      }
+    },
+    {
+      "id": "07-lb-resilience",
+      "eyebrow": "STAGE 07 · FAILOVER & DEGRADATION",
+      "title": "10 ms Shard Timeouts, Replica Isolation & Stale-While-Revalidate",
+      "level": "advanced",
+      "purpose": "Keep Top-100 p99 under 20 ms even when a Redis shard fails over or a consumer lags.",
+      "explanation": {
+        "foundation": "In a 16-shard scatter-gather, tail latency is governed by the **slowest** of the 16 shards. If Shard 7 stalls for 3 seconds during a Sentinel/Cluster primary promotion, synchronous retries would stall 100% of Top-100 refreshes.",
+        "core": "Route read-heavy `ZREVRANGE` refreshes to per-shard **read replicas**, enforce a strict **10 ms per-shard timeout**, and on any shard timeout serve the last good cached Top-100 (`Stale-While-Revalidate`) while incrementing `leaderboard_stale_serve_total`.",
+        "deepDive": "On the write side, Kafka retains 24+ hours of score events; once Shard 7's standby promotes to primary (~2-5s), the Kafka consumer automatically replays the missed `ZADD GT` batch with zero data loss."
+      },
+      "reflectionQuestions": [
+        "Why does a 10 ms per-shard timeout + Stale-While-Revalidate outperform synchronous retries on a 16-shard scatter-gather?",
+        "How would your histogram update logic handle a player whose score decreases (if penalties exist) vs. monotonically increasing scores?"
+      ],
+      "sectionDiagram": {
+        "kind": "quorum-cluster",
+        "eyebrow": "STAGE 07 · FAILOVER ISOLATION",
+        "title": "Replica Reads + 10 ms Timeout + SWR Fallback During Shard 7 Failover",
+        "nodes": [
+          {
+            "id": "s0",
+            "label": "Shards 0..6, 8..15",
+            "role": "Replica ZREVRANGE <3ms",
+            "status": "ok"
+          },
+          {
+            "id": "s7",
+            "label": "Shard 7 Primary",
+            "role": "Failover (Timeout 10ms)",
+            "status": "warn"
+          },
+          {
+            "id": "swr",
+            "label": "SWR Top-100 Cache",
+            "role": "Serve Last Good (<2ms)",
+            "status": "ok"
+          },
+          {
+            "id": "kfk",
+            "label": "Kafka Offset Replay",
+            "role": "Heal Shard 7 Post-Promo",
+            "status": "ok"
+          }
+        ],
+        "summary": "Per-shard 10 ms timeouts and SWR caching shield readers while Kafka replays missed writes onto promoted replicas."
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-1",
+        "question": "At 100M players (~14 GB total ZSET RAM) and 200k ZADD/sec, why is K = 16 sharding (`userId % 16`) effective?",
+        "options": [
+          {
+            "id": "a",
+            "text": "It reduces total RAM to 1 MB.",
+            "correct": false,
+            "feedback": "Incorrect: Total RAM across all shards remains ~14 GB (~875 MB/shard)."
+          },
+          {
+            "id": "b",
+            "text": "It drops per-shard write rate to 12.5k ZADD/sec and per-shard RAM to ~875 MB, eliminating single-thread saturation and large RDB fork stalls.",
+            "correct": true,
+            "feedback": "Correct: Splitting load 16 ways keeps every Redis node comfortably inside CPU and memory headroom."
+          },
+          {
+            "id": "c",
+            "text": "It removes the need for a Kafka write-ahead log.",
+            "correct": false,
+            "feedback": "Incorrect: Kafka is still used for durable persistence and replay."
+          },
+          {
+            "id": "d",
+            "text": "It makes Redis multi-threaded for a single ZSET.",
+            "correct": false,
+            "feedback": "Incorrect: Each Redis shard's command execution remains single-threaded."
+          }
+        ],
+        "explanation": "Sharding 16 ways cuts per-shard writes to 12.5k/sec and RAM to ~875 MB, well within single-node Redis limits."
+      },
+      {
+        "id": "kc-2",
+        "question": "Why should a midnight seasonal leaderboard reset use `UNLINK` on versioned keys (`lb:s42:shard_i`) instead of `DEL`?",
+        "options": [
+          {
+            "id": "a",
+            "text": "DEL does not delete ZSETs.",
+            "correct": false,
+            "feedback": "Incorrect: DEL deletes ZSETs, but synchronously on the main thread."
+          },
+          {
+            "id": "b",
+            "text": "UNLINK is only for SQL databases.",
+            "correct": false,
+            "feedback": "Incorrect: UNLINK is a native Redis command."
+          },
+          {
+            "id": "c",
+            "text": "Synchronous DEL on a 6.25M-member ZSET blocks Redis's single event loop for seconds, whereas UNLINK frees memory asynchronously in a background thread.",
+            "correct": true,
+            "feedback": "Correct: UNLINK removes the key reference in O(1) and reclaims the 6.25M nodes off the main thread."
+          },
+          {
+            "id": "d",
+            "text": "UNLINK automatically merges scores into the new season.",
+            "correct": false,
+            "feedback": "Incorrect: UNLINK only deletes the old key asynchronously."
+          }
+        ],
+        "explanation": "UNLINK unlinks the key in O(1) and frees millions of skip-list nodes in a background thread, avoiding event-loop freezes."
+      },
+      {
+        "id": "kc-3",
+        "question": "What happens if you pack a composite tie-breaker `(score << 24) | ts` into a Redis ZSET score that totals 56 bits?",
+        "options": [
+          {
+            "id": "a",
+            "text": "IEEE-754 64-bit floats only have 53 bits of exact integer precision, so the lowest bits are silently rounded and tie-breaking breaks.",
+            "correct": true,
+            "feedback": "Correct: Redis ZSET scores are IEEE-754 doubles, which lose exact integer precision above 2^53 - 1."
+          },
+          {
+            "id": "b",
+            "text": "Redis automatically switches to 128-bit decimals.",
+            "correct": false,
+            "feedback": "Incorrect: Redis ZSET scores are always 64-bit IEEE-754 floats."
+          },
+          {
+            "id": "c",
+            "text": "Redis throws an out-of-memory error.",
+            "correct": false,
+            "feedback": "Incorrect: It silently rounds the significand rather than throwing OOM."
+          },
+          {
+            "id": "d",
+            "text": "It doubles ZADD throughput.",
+            "correct": false,
+            "feedback": "Incorrect: Bit width above 53 causes precision loss, not speedup."
+          }
+        ],
+        "explanation": "Because Redis ZSET scores are 64-bit floats with 53-bit significands, composite integer encodings must stay <= 53 bits."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "At 100M players and 200K score updates/sec, a single sorted set cannot fit on one CPU core or survive multi-second snapshot forks. The core design tension is balancing uniform write sharding against fast global Top-K and player-rank reads.",
+      "keyTakeaway": "When a single sorted set hits its single-core CPU ceiling and stalls on 14 GB memory snapshots, shard players by user ID across 16 instances, serve Top-100 from a 500 ms merged cache, and estimate tail ranks in O(1) from a score-range histogram instead of scanning all shards.",
+      "byteSummary": "Splitting 100M players across 16 Redis shards drops each server to 12.5k writes/sec. A background job merges the Top-100 every 500 ms, and score-range buckets give every other player their rank in O(1)."
+    },
+    "intermediate": {
+      "summary": "At 100M players and 200K score updates/sec, a single sorted set cannot fit on one CPU core or survive multi-second snapshot forks. The core design tension is balancing uniform write sharding against fast global Top-K and player-rank reads.",
+      "keyTakeaway": "When a single sorted set hits its single-core CPU ceiling and stalls on 14 GB memory snapshots, shard players by user ID across 16 instances, serve Top-100 from a 500 ms merged cache, and estimate tail ranks in O(1) from a score-range histogram instead of scanning all shards.",
+      "byteSummary": "UserId % 16 sharding scales writes linearly, pipelined Kafka consumers ensure durability, and a 500ms singleflight cache shields shards from Top-100 read storms."
+    },
+    "advanced": {
+      "summary": "At 100M players and 200K score updates/sec, a single sorted set cannot fit on one CPU core or survive multi-second snapshot forks. The core design tension is balancing uniform write sharding against fast global Top-K and player-rank reads.",
+      "keyTakeaway": "When a single sorted set hits its single-core CPU ceiling and stalls on 14 GB memory snapshots, shard players by user ID across 16 instances, serve Top-100 from a 500 ms merged cache, and estimate tail ranks in O(1) from a score-range histogram instead of scanning all shards.",
+      "byteSummary": "Production reliability hinges on avoiding main-thread stalls (no DEL on 6M-entry ZSETs, no large RDB forks on primaries), staying <= 53 bits in composite scores, and degrading gracefully to stale Top-100 during shard failovers."
+    }
+  },
+  "tagline": "Why a single Redis ZSET stalls at 200K ZADD/sec and 14 GB RAM—and how K=16 sharding, 500 ms Min-Heap merging, O(1) score histograms, and 53-bit composite floats hold p99 under 20 ms.",
+  "purpose": "At 100M players and 200K score updates/sec, a single sorted set cannot fit on one CPU core or survive multi-second snapshot forks. The core design tension is balancing uniform write sharding against fast global Top-K and player-rank reads.",
+  "pedagogicalFramework": "RESHADED",
+  "prerequisites": [
+    {
+      "title": "Sharded ZSETs & Score-Range Histogram Ranking",
+      "summary": "Partitioning players across K Redis ZSET shards by userId % K scales write throughput linearly, while a Min-Heap merges global Top-K slices in O(K * T log K) and Score-Range Histograms answer getRank(userId) in O(1)."
+    },
+    {
+      "title": "Skip Lists & Probabilistic Multi-Level Indexing",
+      "summary": "A skip list layers probabilistic express lanes on top of a sorted linked list so searches, insertions, and range scans run in O(log N) expected time without global tree rebalancing."
+    }
+  ],
+  "simulation": {
+    "title": "Design a 100M-Player Distributed Leaderboard at 200K Writes/Sec — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Client",
+        "role": "Fenced Request"
+      },
+      {
+        "id": "leader",
+        "label": "Quorum Leader",
+        "role": "Term & Log Index"
+      },
+      {
+        "id": "f1",
+        "label": "Replica 1",
+        "role": "Majority Vote"
+      },
+      {
+        "id": "f2",
+        "label": "Replica 2",
+        "role": "Async Catch-Up"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "leader",
+        "label": "write(token)"
+      },
+      {
+        "from": "leader",
+        "to": "f1",
+        "label": "AppendEntries"
+      },
+      {
+        "from": "leader",
+        "to": "f2",
+        "label": "quorum sync"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why a Single 14 GB Redis ZSET Collapses at 200K Writes/Sec",
+        "actionLabel": "write(token)",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "leader"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "write(token)",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Client sends work to Quorum Leader (Why a Single 14 GB Redis ZSET Collapses at 200K Writes/Sec)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Surviving Bursts: Kafka Partitioned WAL & Pipelined ZADD",
+        "actionLabel": "AppendEntries",
+        "status": "healthy",
+        "activeNodeIds": [
+          "leader",
+          "f1"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "AppendEntries",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Quorum Leader coordinates with Replica 1 while preserving the core invariant (Surviving Bursts: Kafka Partitioned WAL & Pipelined ZADD)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Scatter-Gather Top-100 via Min-Heap + 500 ms Singleflight Cache",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "f1",
+          "f2"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, Replica 2 absorbs pressure without cascading (Scatter-Gather Top-100 via Min-Heap + 500 ms Singleflight Cache)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "10 ms Shard Timeouts, Replica Isolation & Stale-While-Revalidate",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "leader",
+          "f1",
+          "f2"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (10 ms Shard Timeouts, Replica Isolation & Stale-While-Revalidate)."
+      }
+    ]
+  }
+}

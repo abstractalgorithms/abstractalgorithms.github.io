@@ -1,0 +1,841 @@
+{
+  "id": "online-ddl-large",
+  "slug": "online-ddl-large",
+  "title": "Zero-Downtime Online DDL for Large Tables",
+  "problemType": "system-design",
+  "difficulty": "hard",
+  "prompt": "Running `ALTER TABLE orders ADD COLUMN tax_jurisdiction VARCHAR(32) NOT NULL DEFAULT 'US'` or changing a column type on a 1.4 TB (1.8B-row) PostgreSQL 15 / MySQL 8 table at 4,200 writes/s caused a 47-minute total write outage. Even though PostgreSQL 11+ adds constant-default columns instantly, the `ACCESS EXCLUSIVE` lock queued behind a long-running BI query, piling up 18,000 blocked `INSERT`/`UPDATE` connections.",
+  "spark": {
+    "summary": "An ALTER TABLE on a 1.8B-row orders table acquires an ACCESS EXCLUSIVE / metadata lock, queuing behind a 12-minute analytics query and blocking all production writes behind it.",
+    "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, enforce lock_timeout + statement_timeout on all DDL, use CONCURRENTLY / gh-ost online schema change, and apply Expand-Contract for non-trivial column changes.",
+    "byteSummary": "**Core Mechanics:** Running `ALTER TABLE orders` on a **1.4 TB (1.8B-row)** PostgreSQL 15 / MySQL 8 table at **4,200 TPS writes** and **15,000 TPS reads** caused a **47-minute total write outage**.\n\n**Visual & Structural Flow:** Depicts 47-Minute Lock Queue Freeze vs. Safe Online Migration (Long SELECT -> ALTER TABLE -> 4.2k/s OLTP -> PG / gh-ost); Zero-Downtime 1.4 TB Migration with Replica-Lag Throttling (1. Expand (2s lock) -> 2. Dual-Write + Backfill -> Lag Monitor (<2s) -> 3. Swap & Contract).\n\n**Trade-Offs & Production:** Running `ALTER TABLE` directly during a 'low-traffic' window still fails if any reporting query or `idle in transaction` session is open, and table-rewriting changes (e.g., `INT. Execute schema changes with zero write downtime and `< 2s` replica lag: **Always Set `lock_timeout = '2s'` + `statement_timeout`**: If `ALTER` cannot acquire the metadata lock.\n\n**Failure Modes & Application:** Zero-downtime schema evolution is foundational for continuous deployment on high-scale OLTP databases: **Multi-Terabyte Fintech & E-Commerce Ledgers**: Safely evolving `orders` and `payments` tables without maintenance windows."
+  },
+  "learningJourney": [
+    {
+      "id": "01-why-this-problem-matters",
+      "eyebrow": "STAGE 01 · WHY IT MATTERS",
+      "title": "Why Zero-Downtime Online DDL Matters",
+      "level": "L4 · FUNDAMENTALS",
+      "explanation": {
+        "foundation": "Think of **Why Zero-Downtime Online DDL Matters** as the intuition layer for Zero-Downtime Online DDL for Large Tables: The mechanism: understand how Why Zero-Downtime Online DDL Matters works from first principles.",
+        "core": "Running `ALTER TABLE orders` on a **1.4 TB (1.8B-row)** PostgreSQL 15 / MySQL 8 table at **4,200 TPS writes** and **15,000 TPS reads** caused a **47-minute total write outage**. Even instant metadata-only `ALTER`s queue behind a single long-running query for `ACCESS EXCLUSIVE` lock—blocking *all* subsequent `SELECT`s and `INSERT`s behind the lock queue (`PgBouncer` `max_client_conn = 5,000`) while keeping streaming replica lag `< 2s`.",
+        "deepDive": "Under heavy load or partial failure, why zero-downtime online ddl matters becomes a critical lever for predictable latency and correctness. An ALTER TABLE on a 1.8B-row orders table acquires an ACCESS EXCLUSIVE / metadata lock, queuing behind a 12-minute analytics query and blocking all production writes behind it."
+      },
+      "purpose": "The mechanism: understand how Why Zero-Downtime Online DDL Matters works from first principles."
+    },
+    {
+      "id": "02-what-is-the-impact",
+      "eyebrow": "STAGE 02 · IMPACT",
+      "title": "Real-World Impact of Unbounded DDL Lock Queues",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "A naive `ALTER TABLE` triggers a two-sided outage:",
+        "core": "1. **Lock Queue Pile-Up**: `ALTER` waits for an active 20-minute analytics `SELECT` to release `ACCESS SHARE`; meanwhile, all 4,200 TPS writes queue *behind* the waiting `ACCESS EXCLUSIVE` lock.\n2. **PgBouncer Connection Exhaustion**: Blocked writes saturate all 5,000 `PgBouncer` client connections in seconds.\n3. **Replication Lag Spike**: Rewriting 1.4 TB in one transaction generates massive WAL/binlog bursts, blowing past the `< 2s` replica lag SLA.",
+        "deepDive": "In production deployments of Zero-Downtime Online DDL for Large Tables, watch how real-world impact of unbounded ddl lock queues interacts with tail latency, retry amplification, and partial failures. An ALTER TABLE on a 1.8B-row orders table acquires an ACCESS EXCLUSIVE / metadata lock, queuing behind a 12-minute analytics query and blocking all production writes behind it."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "DDL Lock Queue Pile-Up vs. Lock-Timeout + Expand-Contract",
+        "title": "47-Minute Lock Queue Freeze vs. Safe Online Migration",
+        "actors": [
+          {
+            "id": "rep",
+            "label": "Long SELECT"
+          },
+          {
+            "id": "ddl",
+            "label": "ALTER TABLE"
+          },
+          {
+            "id": "oltp",
+            "label": "4.2k/s OLTP"
+          },
+          {
+            "id": "pg",
+            "label": "PG / gh-ost"
+          }
+        ],
+        "events": [
+          {
+            "from": "rep",
+            "to": "pg",
+            "label": "Holds ACCESS SHARE (20 min)",
+            "status": "warn"
+          },
+          {
+            "from": "ddl",
+            "to": "pg",
+            "label": "Naive: waits for ACCESS EXCLUSIVE",
+            "status": "fail"
+          },
+          {
+            "from": "oltp",
+            "to": "pg",
+            "label": "4.2k/s queries pile up behind DDL -> 47m outage",
+            "status": "fail"
+          },
+          {
+            "from": "ddl",
+            "to": "pg",
+            "label": "Fixed: SET lock_timeout='2s' + Expand-Contract",
+            "status": "ok"
+          },
+          {
+            "from": "oltp",
+            "to": "pg",
+            "label": "Throttled backfill keeps replica lag <2s",
+            "status": "ok"
+          }
+        ],
+        "summary": "Short lock_timeout retries + Expand-Contract (or gh-ost) prevent DDL from ever blocking OLTP traffic."
+      },
+      "purpose": "The problem: see what breaks without Real-World Impact of Unbounded DDL Lock Queues under real concurrency or scale.",
+      "decisionFramework": {
+        "problem": "How to implement Zero-Downtime Online DDL for Large Tables without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "To keep the architecture evolvable without sacrificing reliability, enforce lock_timeout + statement_timeout on all DDL, use CONCURRENTLY / gh-ost online schema change, and apply Expand-Contract for non-trivial column changes.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Zero-Downtime Online DDL for Large Tables experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-naive-solution",
+      "eyebrow": "STAGE 03 · NAIVE SOLUTION",
+      "title": "Naive Solution (and Why It Breaks)",
+      "level": "L5 · APPLIED DESIGN",
+      "explanation": {
+        "foundation": "Think of **Naive Solution (and Why It Breaks)** as the intuition layer for Zero-Downtime Online DDL for Large Tables: The problem: see what breaks without Naive Solution under real concurrency or scale.",
+        "core": "Running `ALTER TABLE` directly during a 'low-traffic' window still fails if any reporting query or `idle in transaction` session is open, and table-rewriting changes (e.g., `INT -> BIGINT` or `VARCHAR` resize) rewrite 1.4 TB under an exclusive lock.",
+        "deepDive": "Under heavy load or partial failure, naive solution (and why it breaks) becomes a critical lever for predictable latency and correctness. An ALTER TABLE on a 1.8B-row orders table acquires an ACCESS EXCLUSIVE / metadata lock, queuing behind a 12-minute analytics query and blocking all production writes behind it."
+      },
+      "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "Request & State Flow",
+        "title": "Naive Solution (and Why It Breaks)",
+        "actors": [
+          {
+            "id": "client",
+            "label": "Caller"
+          },
+          {
+            "id": "entry",
+            "label": "Service Entry"
+          },
+          {
+            "id": "worker",
+            "label": "Core Processor"
+          },
+          {
+            "id": "store",
+            "label": "State Store"
+          }
+        ],
+        "events": [
+          {
+            "from": "client",
+            "to": "entry",
+            "label": "Submit bounded request"
+          },
+          {
+            "from": "entry",
+            "to": "worker",
+            "label": "Apply domain invariant"
+          },
+          {
+            "from": "worker",
+            "to": "store",
+            "label": "Persist or read state"
+          },
+          {
+            "from": "entry",
+            "to": "client",
+            "label": "Return verified response"
+          }
+        ]
+      }
+    },
+    {
+      "id": "04-enterprise-solution",
+      "eyebrow": "STAGE 04 · ENTERPRISE SOLUTION",
+      "title": "Enterprise Solution: `lock_timeout` Retries, `CONCURRENTLY` & Expand-Contract / `gh-ost`",
+      "level": "L6 · SCALE & TRADE-OFFS",
+      "explanation": {
+        "foundation": "Execute schema changes with zero write downtime and `< 2s` replica lag:",
+        "core": "- **Always Set `lock_timeout = '2s'` + `statement_timeout`**: If `ALTER` cannot acquire the metadata lock within 2s, abort and retry with backoff rather than queueing 4,200 TPS behind it.\n- **Concurrent Indexes & `NOT VALID` Constraints**: Use `CREATE INDEX CONCURRENTLY` and `ADD CONSTRAINT ... NOT VALID` followed by `VALIDATE CONSTRAINT` (which only takes `SHARE UPDATE EXCLUSIVE`, allowing reads and writes).\n- **Expand-Contract / `gh-ost`**: For type changes or 1.4 TB rewrites, add a nullable new column, dual-write in app/triggers, backfill in throttled batches (pausing whenever `replica_lag > 1.5s`), swap reads, and drop the old column (or use `gh-ost` on MySQL).",
+        "deepDive": "In production deployments of Zero-Downtime Online DDL for Large Tables, watch how enterprise solution: `lock_timeout` retries, `concurrently` & expand-contract / `gh-ost` interacts with tail latency, retry amplification, and partial failures. An ALTER TABLE on a 1.8B-row orders table acquires an ACCESS EXCLUSIVE / metadata lock, queuing behind a 12-minute analytics query and blocking all production writes behind it."
+      },
+      "sectionDiagram": {
+        "kind": "wal-mvcc",
+        "eyebrow": "Expand-Contract & Throttled Backfill",
+        "title": "Zero-Downtime 1.4 TB Migration with Replica-Lag Throttling",
+        "nodes": [
+          {
+            "label": "1. Expand (2s lock)",
+            "role": "Add nullable col / NOT VALID"
+          },
+          {
+            "label": "2. Dual-Write + Backfill",
+            "role": "Batches of 5k rows"
+          },
+          {
+            "label": "Lag Monitor (<2s)",
+            "role": "Throttle if replica_lag > 1.5s"
+          },
+          {
+            "label": "3. Swap & Contract",
+            "role": "Cutover reads -> drop old"
+          }
+        ],
+        "edges": [
+          {
+            "label": "Zero table lock"
+          },
+          {
+            "label": "WAL/binlog paced"
+          }
+        ],
+        "cards": [
+          {
+            "label": "lock_timeout = 2s",
+            "detail": "Prevents DDL from queuing behind long analytics SELECTs."
+          },
+          {
+            "label": "NOT VALID + VALIDATE",
+            "detail": "Validates 1.8B rows without blocking concurrent INSERT/UPDATEs."
+          },
+          {
+            "label": "Lag-Aware Throttle",
+            "detail": "Pauses backfill if streaming replica lag exceeds 1.5 seconds."
+          },
+          {
+            "label": "gh-ost (MySQL)",
+            "detail": "Shadow table + binlog stream cutover with atomic RENAME."
+          }
+        ],
+        "summary": "Expand-Contract and lag-throttled backfills migrate 1.8B rows online without saturating PgBouncer or lagging replicas."
+      },
+      "markdownContent": "```sql\nSELECT pid, wait_event_type, wait_event, state, left(query, 80) FROM pg_stat_activity WHERE wait_event = 'Lock';\n\nSET lock_timeout = '1500ms';\nALTER TABLE orders ADD COLUMN amount_v2 BIGINT NULL;\nALTER TABLE orders ADD CONSTRAINT chk_v2_nn CHECK (amount_v2 IS NOT NULL) NOT VALID;\nALTER TABLE orders VALIDATE CONSTRAINT chk_v2_nn;\n\nALTER TABLE orders VALIDATE CONSTRAINT chk_v2_nn; -- SHARE UPDATE EXCLUSIVE (writes allowed)\n```",
+      "purpose": "Operational control: configure bounds, failure handling, and safe production defaults."
+    },
+    {
+      "id": "05-system-design-applications",
+      "eyebrow": "STAGE 05 · SYSTEM DESIGN APPLICATIONS",
+      "title": "Where Online DDL Applies in System Design",
+      "level": "L7 · STAFF / PRINCIPAL",
+      "explanation": {
+        "foundation": "Zero-downtime schema evolution is foundational for continuous deployment on high-scale OLTP databases:",
+        "core": "- **Multi-Terabyte Fintech & E-Commerce Ledgers**: Safely evolving `orders` and `payments` tables without maintenance windows.\n- **32-bit to 64-bit Primary Key Migrations**: Migrating `INT` PKs before overflow via Expand-Contract shadow columns.\n- **CI/CD Migration Gates**: Automated linters (Squawk / Atlas) blocking unguarded `ALTER TABLE`s in PRs.",
+        "deepDive": "In production deployments of Zero-Downtime Online DDL for Large Tables, watch how where online ddl applies in system design interacts with tail latency, retry amplification, and partial failures. An ALTER TABLE on a 1.8B-row orders table acquires an ACCESS EXCLUSIVE / metadata lock, queuing behind a 12-minute analytics query and blocking all production writes behind it."
+      },
+      "supportingConcepts": [
+        {
+          "slug": "online-schema-migrations",
+          "title": "Concept: Online Schema Migrations",
+          "kind": "concept"
+        },
+        {
+          "slug": "database-indexing",
+          "title": "Concept: Database Indexing",
+          "kind": "concept"
+        },
+        {
+          "slug": "mysql-replication-topologies",
+          "title": "Concept: MySQL Replication Topologies",
+          "kind": "concept"
+        },
+        {
+          "slug": "postgresql-vacuum-table",
+          "title": "Problem: PostgreSQL VACUUM & Table Bloat",
+          "kind": "problem"
+        }
+      ],
+      "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win."
+    }
+  ],
+  "practice": {
+    "knowledgeCheck": {
+      "question": "Why can even a fast metadata-only `ALTER TABLE` cause a total outage on a busy PostgreSQL table?",
+      "options": [
+        {
+          "id": "a",
+          "text": "While `ALTER TABLE` waits behind an active long `SELECT` for `ACCESS EXCLUSIVE`, all new `SELECT`/`INSERT`/`UPDATE` queries queue behind the `ALTER`",
+          "correct": true,
+          "feedback": "Correct: setting a short `lock_timeout` (e.g., 2s) prevents the DDL from holding up the lock queue."
+        },
+        {
+          "id": "b",
+          "text": "PostgreSQL always rewrites the entire 1.4 TB table on disk for every `ALTER TABLE`",
+          "correct": false,
+          "feedback": "Many metadata changes (like adding a nullable or constant-default column in PG 11+) don't rewrite the table, yet still require `ACCESS EXCLUSIVE`."
+        },
+        {
+          "id": "c",
+          "text": "`PgBouncer` automatically drops all tables larger than 1 TB during DDL",
+          "correct": false,
+          "feedback": "`PgBouncer` is a connection pooler; its client pool saturates because queries queue behind the DDL lock."
+        }
+      ]
+    },
+    "knowledgeChecks": [
+      {
+        "question": "Why can even a fast metadata-only `ALTER TABLE` cause a total outage on a busy PostgreSQL table?",
+        "options": [
+          {
+            "id": "a",
+            "text": "While `ALTER TABLE` waits behind an active long `SELECT` for `ACCESS EXCLUSIVE`, all new `SELECT`/`INSERT`/`UPDATE` queries queue behind the `ALTER`",
+            "correct": true,
+            "feedback": "Correct: setting a short `lock_timeout` (e.g., 2s) prevents the DDL from holding up the lock queue."
+          },
+          {
+            "id": "b",
+            "text": "PostgreSQL always rewrites the entire 1.4 TB table on disk for every `ALTER TABLE`",
+            "correct": false,
+            "feedback": "Many metadata changes (like adding a nullable or constant-default column in PG 11+) don't rewrite the table, yet still require `ACCESS EXCLUSIVE`."
+          },
+          {
+            "id": "c",
+            "text": "`PgBouncer` automatically drops all tables larger than 1 TB during DDL",
+            "correct": false,
+            "feedback": "`PgBouncer` is a connection pooler; its client pool saturates because queries queue behind the DDL lock."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Why Zero-Downtime Online DDL Matters', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Running ALTER TABLE orders on a **1.4 TB (1.8B-row)** PostgreSQL 15 / MySQL 8 table at **4,200 TPS writes** and **15,000 TPS reads** caused a **47-minute total write outage**.",
+            "correct": true,
+            "feedback": "Correct: Running ALTER TABLE orders on a **1.4 TB (1.8B-row)** PostgreSQL 15 / MySQL 8 table at **4,200 TPS writes** and **15,000 TPS reads** caused a **47-minute total write outage**."
+          },
+          {
+            "id": "b",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "c",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          }
+        ]
+      },
+      {
+        "question": "Regarding 'Real-World Impact of Unbounded DDL Lock Queues', which statement accurately reflects the engineering principle?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Defer architectural invariants until after a major production incident occurs.",
+            "correct": false,
+            "feedback": "Incorrect: designing for failure modes and clear invariants upfront prevents silent data corruption and outages."
+          },
+          {
+            "id": "b",
+            "text": "Rely on default unbounded retries and wall-clock assumptions before measuring production bottlenecks.",
+            "correct": false,
+            "feedback": "Incorrect: unbounded retries and unverified assumptions amplify tail latency and cascading failures."
+          },
+          {
+            "id": "c",
+            "text": "A naive ALTER TABLE triggers a two-sided outage: 1.",
+            "correct": true,
+            "feedback": "Correct: A naive ALTER TABLE triggers a two-sided outage: 1."
+          }
+        ]
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "byteSummary": "**The Core Idea (Beginner):** Running `ALTER TABLE orders` on a **1.4 TB (1.8B-row)** PostgreSQL 15 / MySQL 8 table at **4,200 TPS writes** and **15,000 TPS reads** caused a **47-minute total write outage**.\n\n**How It Flows:** Think of Zero-Downtime Online DDL for Large Tables as a clear step-by-step chain: Long SELECT -> ALTER TABLE -> 4.2k/s OLTP -> PG / gh-ost -> 1. Expand (2s lock).\n\n**Why Beginners Should Care:** Enforce lock_timeout + statement_timeout on all DDL, use CONCURRENTLY / gh-ost online schema change, and apply Expand-Contract for non-trivial column changes.",
+      "spark": {
+        "summary": "Running `ALTER TABLE orders` on a **1.4 TB (1.8B-row)** PostgreSQL 15 / MySQL 8 table at **4,200 TPS writes** and **15,000 TPS reads** caused a **47-minute total write outage**.",
+        "keyTakeaway": "Enforce lock_timeout + statement_timeout on all DDL, use CONCURRENTLY / gh-ost online schema change, and apply Expand-Contract for non-trivial column changes."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why Zero-Downtime Online DDL Matters",
+          "eyebrow": "Beginner Path · Step 01",
+          "purpose": "The mechanism: understand how Why Zero-Downtime Online DDL Matters works from first principles.",
+          "explanation": "Running `ALTER TABLE orders` on a **1.4 TB (1.8B-row)** PostgreSQL 15 / MySQL 8 table at **4,200 TPS writes** and **15,000 TPS reads** caused a **47-minute total write outage**.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Real-World Impact of Unbounded DDL Lock Queues",
+          "eyebrow": "Beginner Path · Step 02",
+          "purpose": "The problem: see what breaks without Real-World Impact of Unbounded DDL Lock Queues under real concurrency or scale.",
+          "explanation": "A naive `ALTER TABLE` triggers a two-sided outage: 1. **Lock Queue Pile-Up**: `ALTER` waits for an active 20-minute analytics `SELECT` to release `ACCESS SHARE`; meanwhile, all 4,200 TPS writes queue *behind* the waiting `ACCESS EXCLUSIVE` lock. 2.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "DDL Lock Queue Pile-Up vs. Lock-Timeout + Expand-Contract",
+            "title": "47-Minute Lock Queue Freeze vs. Safe Online Migration",
+            "actors": [
+              {
+                "id": "rep",
+                "label": "Long SELECT"
+              },
+              {
+                "id": "ddl",
+                "label": "ALTER TABLE"
+              },
+              {
+                "id": "oltp",
+                "label": "4.2k/s OLTP"
+              },
+              {
+                "id": "pg",
+                "label": "PG / gh-ost"
+              }
+            ],
+            "events": [
+              {
+                "from": "rep",
+                "to": "pg",
+                "label": "Holds ACCESS SHARE (20 min)",
+                "status": "warn"
+              },
+              {
+                "from": "ddl",
+                "to": "pg",
+                "label": "Naive: waits for ACCESS EXCLUSIVE",
+                "status": "fail"
+              },
+              {
+                "from": "oltp",
+                "to": "pg",
+                "label": "4.2k/s queries pile up behind DDL -> 47m outage",
+                "status": "fail"
+              },
+              {
+                "from": "ddl",
+                "to": "pg",
+                "label": "Fixed: SET lock_timeout='2s' + Expand-Contract",
+                "status": "ok"
+              },
+              {
+                "from": "oltp",
+                "to": "pg",
+                "label": "Throttled backfill keeps replica lag <2s",
+                "status": "ok"
+              }
+            ],
+            "summary": "Short lock_timeout retries + Expand-Contract (or gh-ost) prevent DDL from ever blocking OLTP traffic."
+          },
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive Solution (and Why It Breaks)",
+          "eyebrow": "Beginner Path · Step 03",
+          "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+          "explanation": "Running `ALTER TABLE` directly during a 'low-traffic' window still fails if any reporting query or `idle in transaction` session is open, and table-rewriting changes (e.g., `INT -> BIGINT` or `VARCHAR` resize) rewrite 1.4 TB under an exclusive lock.",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": null,
+          "level": "L3 · FOUNDATIONS"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise Solution: `lock_timeout` Retries, `CONCURRENTLY` & Expand-Contract / `gh-ost`",
+          "eyebrow": "Beginner Path · Step 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Execute schema changes with zero write downtime and `< 2s` replica lag: **Always Set `lock_timeout = '2s'` + `statement_timeout`**: If `ALTER` cannot acquire the metadata lock within 2s, abort and retry with backoff rather than queueing 4,200 TPS behind it. **Concurrent Indexes & `NOT VALID` Constraints**: Use `CREATE INDEX CONCURRENTLY` and `ADD CONSTRAINT ...",
+          "ideas": [],
+          "example": null,
+          "reflectionQuestions": [],
+          "sectionDiagram": {
+            "kind": "wal-mvcc",
+            "eyebrow": "Expand-Contract & Throttled Backfill",
+            "title": "Zero-Downtime 1.4 TB Migration with Replica-Lag Throttling",
+            "nodes": [
+              {
+                "label": "1. Expand (2s lock)",
+                "role": "Add nullable col / NOT VALID"
+              },
+              {
+                "label": "2. Dual-Write + Backfill",
+                "role": "Batches of 5k rows"
+              },
+              {
+                "label": "Lag Monitor (<2s)",
+                "role": "Throttle if replica_lag > 1.5s"
+              },
+              {
+                "label": "3. Swap & Contract",
+                "role": "Cutover reads -> drop old"
+              }
+            ],
+            "edges": [
+              {
+                "label": "Zero table lock"
+              },
+              {
+                "label": "WAL/binlog paced"
+              }
+            ],
+            "cards": [
+              {
+                "label": "lock_timeout = 2s",
+                "detail": "Prevents DDL from queuing behind long analytics SELECTs."
+              },
+              {
+                "label": "NOT VALID + VALIDATE",
+                "detail": "Validates 1.8B rows without blocking concurrent INSERT/UPDATEs."
+              },
+              {
+                "label": "Lag-Aware Throttle",
+                "detail": "Pauses backfill if streaming replica lag exceeds 1.5 seconds."
+              },
+              {
+                "label": "gh-ost (MySQL)",
+                "detail": "Shadow table + binlog stream cutover with atomic RENAME."
+              }
+            ],
+            "summary": "Expand-Contract and lag-throttled backfills migrate 1.8B rows online without saturating PgBouncer or lagging replicas."
+          },
+          "level": "L3 · FOUNDATIONS"
+        }
+      ],
+      "finalSummary": "Enforce lock_timeout + statement_timeout on all DDL, use CONCURRENTLY / gh-ost online schema change, and apply Expand-Contract for non-trivial column changes.",
+      "summary": "An ALTER TABLE on a 1.8B-row orders table acquires an ACCESS EXCLUSIVE / metadata lock, queuing behind a 12-minute analytics query and blocking all production writes behind it.",
+      "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, enforce lock_timeout + statement_timeout on all DDL, use CONCURRENTLY / gh-ost online schema change, and apply Expand-Contract for non-trivial column changes."
+    },
+    "intermediate": {
+      "byteSummary": "**Core Mechanics:** Running `ALTER TABLE orders` on a **1.4 TB (1.8B-row)** PostgreSQL 15 / MySQL 8 table at **4,200 TPS writes** and **15,000 TPS reads** caused a **47-minute total write outage**.\n\n**Visual & Structural Flow:** Depicts 47-Minute Lock Queue Freeze vs. Safe Online Migration (Long SELECT -> ALTER TABLE -> 4.2k/s OLTP -> PG / gh-ost); Zero-Downtime 1.4 TB Migration with Replica-Lag Throttling (1. Expand (2s lock) -> 2. Dual-Write + Backfill -> Lag Monitor (<2s) -> 3. Swap & Contract).\n\n**Trade-Offs & Production:** Running `ALTER TABLE` directly during a 'low-traffic' window still fails if any reporting query or `idle in transaction` session is open, and table-rewriting changes (e.g., `INT. Execute schema changes with zero write downtime and `< 2s` replica lag: **Always Set `lock_timeout = '2s'` + `statement_timeout`**: If `ALTER` cannot acquire the metadata lock.\n\n**Failure Modes & Application:** Zero-downtime schema evolution is foundational for continuous deployment on high-scale OLTP databases: **Multi-Terabyte Fintech & E-Commerce Ledgers**: Safely evolving `orders` and `payments` tables without maintenance windows.",
+      "spark": {
+        "summary": "An ALTER TABLE on a 1.8B-row orders table acquires an ACCESS EXCLUSIVE / metadata lock, queuing behind a 12-minute analytics query and blocking all production writes behind it.",
+        "keyTakeaway": "Enforce lock_timeout + statement_timeout on all DDL, use CONCURRENTLY / gh-ost online schema change, and apply Expand-Contract for non-trivial column changes."
+      },
+      "summary": "An ALTER TABLE on a 1.8B-row orders table acquires an ACCESS EXCLUSIVE / metadata lock, queuing behind a 12-minute analytics query and blocking all production writes behind it.",
+      "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, enforce lock_timeout + statement_timeout on all DDL, use CONCURRENTLY / gh-ost online schema change, and apply Expand-Contract for non-trivial column changes."
+    },
+    "advanced": {
+      "byteSummary": "**Internals & Invariants (Advanced):** An ALTER TABLE on a 1.8B-row orders table acquires an ACCESS EXCLUSIVE / metadata lock, queuing behind a 12-minute analytics query and blocking all production writes behind it.\n\n**Production Trade-Offs:** Running `ALTER TABLE` directly during a 'low-traffic' window still fails if any reporting query or `idle in transaction` session is open, and table-rewriting changes (e.g., `INT -> BIGINT` or `VARCHAR` resize) rewrite 1.4 TB under an exclusive lock.\n\n**Failure Modes & Edge Cases:** Zero-downtime schema evolution is foundational for continuous deployment on high-scale OLTP databases: **Multi-Terabyte Fintech & E-Commerce Ledgers**: Safely evolving `orders` and `payments` tables without maintenance windows.\n\n**Principal Takeaway:** Enforce lock_timeout + statement_timeout on all DDL, use CONCURRENTLY / gh-ost online schema change, and apply Expand-Contract for non-trivial column changes.",
+      "spark": {
+        "summary": "An ALTER TABLE on a 1.8B-row orders table acquires an ACCESS EXCLUSIVE / metadata lock, queuing behind a 12-minute analytics query and blocking all production writes behind it.",
+        "keyTakeaway": "Enforce lock_timeout + statement_timeout on all DDL, use CONCURRENTLY / gh-ost online schema change, and apply Expand-Contract for non-trivial column changes."
+      },
+      "learningJourney": [
+        {
+          "id": "01-why-this-problem-matters",
+          "title": "Why Zero-Downtime Online DDL Matters",
+          "eyebrow": "Advanced Path · Stage 01",
+          "purpose": "The mechanism: understand how Why Zero-Downtime Online DDL Matters works from first principles.",
+          "explanation": "Running `ALTER TABLE orders` on a **1.4 TB (1.8B-row)** PostgreSQL 15 / MySQL 8 table at **4,200 TPS writes** and **15,000 TPS reads** caused a **47-minute total write outage**. Even instant metadata-only `ALTER`s queue behind a single long-running query for `ACCESS EXCLUSIVE` lock—blocking *all* subsequent `SELECT`s and `INSERT`s behind the lock queue (`PgBouncer` `max_client_conn = 5,000`) while keeping streaming replica lag `< 2s`.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L4 · FUNDAMENTALS"
+        },
+        {
+          "id": "02-what-is-the-impact",
+          "title": "Real-World Impact of Unbounded DDL Lock Queues",
+          "eyebrow": "Advanced Path · Stage 02",
+          "purpose": "The problem: see what breaks without Real-World Impact of Unbounded DDL Lock Queues under real concurrency or scale.",
+          "explanation": "A naive `ALTER TABLE` triggers a two-sided outage:\n\n1. **Lock Queue Pile-Up**: `ALTER` waits for an active 20-minute analytics `SELECT` to release `ACCESS SHARE`; meanwhile, all 4,200 TPS writes queue *behind* the waiting `ACCESS EXCLUSIVE` lock.\n2. **PgBouncer Connection Exhaustion**: Blocked writes saturate all 5,000 `PgBouncer` client connections in seconds.\n3. **Replication Lag Spike**: Rewriting 1.4 TB in one transaction generates massive WAL/binlog bursts, blowing past the `< 2s` replica lag SLA.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "sequence-timeline",
+            "eyebrow": "DDL Lock Queue Pile-Up vs. Lock-Timeout + Expand-Contract",
+            "title": "47-Minute Lock Queue Freeze vs. Safe Online Migration",
+            "actors": [
+              {
+                "id": "rep",
+                "label": "Long SELECT"
+              },
+              {
+                "id": "ddl",
+                "label": "ALTER TABLE"
+              },
+              {
+                "id": "oltp",
+                "label": "4.2k/s OLTP"
+              },
+              {
+                "id": "pg",
+                "label": "PG / gh-ost"
+              }
+            ],
+            "events": [
+              {
+                "from": "rep",
+                "to": "pg",
+                "label": "Holds ACCESS SHARE (20 min)",
+                "status": "warn"
+              },
+              {
+                "from": "ddl",
+                "to": "pg",
+                "label": "Naive: waits for ACCESS EXCLUSIVE",
+                "status": "fail"
+              },
+              {
+                "from": "oltp",
+                "to": "pg",
+                "label": "4.2k/s queries pile up behind DDL -> 47m outage",
+                "status": "fail"
+              },
+              {
+                "from": "ddl",
+                "to": "pg",
+                "label": "Fixed: SET lock_timeout='2s' + Expand-Contract",
+                "status": "ok"
+              },
+              {
+                "from": "oltp",
+                "to": "pg",
+                "label": "Throttled backfill keeps replica lag <2s",
+                "status": "ok"
+              }
+            ],
+            "summary": "Short lock_timeout retries + Expand-Contract (or gh-ost) prevent DDL from ever blocking OLTP traffic."
+          },
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "03-naive-solution",
+          "title": "Naive Solution (and Why It Breaks)",
+          "eyebrow": "Advanced Path · Stage 03",
+          "purpose": "The problem: see what breaks without Naive Solution under real concurrency or scale.",
+          "explanation": "Running `ALTER TABLE` directly during a 'low-traffic' window still fails if any reporting query or `idle in transaction` session is open, and table-rewriting changes (e.g., `INT -> BIGINT` or `VARCHAR` resize) rewrite 1.4 TB under an exclusive lock.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L5 · APPLIED DESIGN"
+        },
+        {
+          "id": "04-enterprise-solution",
+          "title": "Enterprise Solution: `lock_timeout` Retries, `CONCURRENTLY` & Expand-Contract / `gh-ost`",
+          "eyebrow": "Advanced Path · Stage 04",
+          "purpose": "Operational control: configure bounds, failure handling, and safe production defaults.",
+          "explanation": "Execute schema changes with zero write downtime and `< 2s` replica lag:\n\n- **Always Set `lock_timeout = '2s'` + `statement_timeout`**: If `ALTER` cannot acquire the metadata lock within 2s, abort and retry with backoff rather than queueing 4,200 TPS behind it.\n- **Concurrent Indexes & `NOT VALID` Constraints**: Use `CREATE INDEX CONCURRENTLY` and `ADD CONSTRAINT ... NOT VALID` followed by `VALIDATE CONSTRAINT` (which only takes `SHARE UPDATE EXCLUSIVE`, allowing reads and writes).\n- **Expand-Contract / `gh-ost`**: For type changes or 1.4 TB rewrites, add a nullable new column, dual-write in app/triggers, backfill in throttled batches (pausing whenever `replica_lag > 1.5s`), swap reads, and drop the old column (or use `gh-ost` on MySQL).",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": {
+            "kind": "wal-mvcc",
+            "eyebrow": "Expand-Contract & Throttled Backfill",
+            "title": "Zero-Downtime 1.4 TB Migration with Replica-Lag Throttling",
+            "nodes": [
+              {
+                "label": "1. Expand (2s lock)",
+                "role": "Add nullable col / NOT VALID"
+              },
+              {
+                "label": "2. Dual-Write + Backfill",
+                "role": "Batches of 5k rows"
+              },
+              {
+                "label": "Lag Monitor (<2s)",
+                "role": "Throttle if replica_lag > 1.5s"
+              },
+              {
+                "label": "3. Swap & Contract",
+                "role": "Cutover reads -> drop old"
+              }
+            ],
+            "edges": [
+              {
+                "label": "Zero table lock"
+              },
+              {
+                "label": "WAL/binlog paced"
+              }
+            ],
+            "cards": [
+              {
+                "label": "lock_timeout = 2s",
+                "detail": "Prevents DDL from queuing behind long analytics SELECTs."
+              },
+              {
+                "label": "NOT VALID + VALIDATE",
+                "detail": "Validates 1.8B rows without blocking concurrent INSERT/UPDATEs."
+              },
+              {
+                "label": "Lag-Aware Throttle",
+                "detail": "Pauses backfill if streaming replica lag exceeds 1.5 seconds."
+              },
+              {
+                "label": "gh-ost (MySQL)",
+                "detail": "Shadow table + binlog stream cutover with atomic RENAME."
+              }
+            ],
+            "summary": "Expand-Contract and lag-throttled backfills migrate 1.8B rows online without saturating PgBouncer or lagging replicas."
+          },
+          "level": "L6 · SCALE & TRADE-OFFS"
+        },
+        {
+          "id": "05-system-design-applications",
+          "title": "Where Online DDL Applies in System Design",
+          "eyebrow": "Advanced Path · Stage 05",
+          "purpose": "Scope boundary: identify where this pattern fits best and where simpler or async alternatives win.",
+          "explanation": "Zero-downtime schema evolution is foundational for continuous deployment on high-scale OLTP databases:\n\n- **Multi-Terabyte Fintech & E-Commerce Ledgers**: Safely evolving `orders` and `payments` tables without maintenance windows.\n- **32-bit to 64-bit Primary Key Migrations**: Migrating `INT` PKs before overflow via Expand-Contract shadow columns.\n- **CI/CD Migration Gates**: Automated linters (Squawk / Atlas) blocking unguarded `ALTER TABLE`s in PRs.",
+          "caveats": null,
+          "ideas": null,
+          "example": null,
+          "reflectionQuestions": null,
+          "sectionDiagram": null,
+          "level": "L7 · STAFF / PRINCIPAL"
+        }
+      ],
+      "finalSummary": "Enforce lock_timeout + statement_timeout on all DDL, use CONCURRENTLY / gh-ost online schema change, and apply Expand-Contract for non-trivial column changes.",
+      "summary": "An ALTER TABLE on a 1.8B-row orders table acquires an ACCESS EXCLUSIVE / metadata lock, queuing behind a 12-minute analytics query and blocking all production writes behind it.",
+      "keyTakeaway": "To keep the architecture evolvable without sacrificing reliability, enforce lock_timeout + statement_timeout on all DDL, use CONCURRENTLY / gh-ost online schema change, and apply Expand-Contract for non-trivial column changes."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "simulation": {
+    "title": "Zero-Downtime Online DDL for Large Tables — Interactive Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Input Workload"
+      },
+      {
+        "id": "entry",
+        "label": "Router / API",
+        "role": "Admission Control"
+      },
+      {
+        "id": "worker",
+        "label": "Processor",
+        "role": "Domain Logic"
+      },
+      {
+        "id": "store",
+        "label": "State Layer",
+        "role": "Durable Store"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "entry",
+        "label": "request"
+      },
+      {
+        "from": "entry",
+        "to": "worker",
+        "label": "dispatch"
+      },
+      {
+        "from": "worker",
+        "to": "store",
+        "label": "read/write"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Why Zero-Downtime Online DDL Matters",
+        "actionLabel": "request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "entry"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "request",
+          "p99_ms": 6,
+          "status": "nominal"
+        },
+        "explanation": "Caller sends work to Router / API (Why Zero-Downtime Online DDL Matters)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Real-World Impact of Unbounded DDL Lock Queues",
+        "actionLabel": "dispatch",
+        "status": "healthy",
+        "activeNodeIds": [
+          "entry",
+          "worker"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "dispatch",
+          "p99_ms": 14,
+          "throughput": "peak"
+        },
+        "explanation": "Router / API coordinates with Processor while preserving the core invariant (Real-World Impact of Unbounded DDL Lock Queues)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Naive Solution (and Why It Breaks)",
+        "actionLabel": "Handle spike or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "worker",
+          "store"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Contention / Fallback",
+          "p99_ms": 48,
+          "guarded": "true"
+        },
+        "explanation": "Under load skew or dependency lag, State Layer absorbs pressure without cascading (Naive Solution (and Why It Breaks))."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Where Online DDL Applies in System Design",
+        "actionLabel": "Converge within SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "entry",
+          "worker",
+          "store"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 9,
+          "errors": 0
+        },
+        "explanation": "The system stabilizes cleanly within its latency and correctness budget (Where Online DDL Applies in System Design)."
+      }
+    ]
+  }
+}

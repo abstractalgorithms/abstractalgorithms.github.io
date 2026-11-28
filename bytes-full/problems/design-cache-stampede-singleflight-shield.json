@@ -1,0 +1,814 @@
+{
+  "id": "prob-design-cache-stampede-singleflight-shield",
+  "slug": "design-cache-stampede-singleflight-shield",
+  "title": "Design a Thundering-Herd Cache Stampede Shield with Singleflight Coalescing",
+  "problemType": "system-design",
+  "difficulty": "hard",
+  "prompt": "Design a distributed caching and stampede-shield layer protecting a PostgreSQL origin (max 2,000 QPS) behind 200 stateless API pods serving 500K QPS total, where celebrity-product flash sales can trigger 100K concurrent misses on a single key with < 15 ms p99 latency.",
+  "spark": {
+    "summary": "Combine L1 in-process caching, Redis L2 with Stale-While-Revalidate, a Consistent-Hash Singleflight Coalescer tier, and Probabilistic Early Refresh.",
+    "keyTakeaway": "When traffic spikes expose hidden coupling, local singleflight alone still sends 200 queries across 200 pods; consistent-hash routing to a coalescer tier + SWR keeps origin QPS <= 1 per hot key and p99 latency < 15 ms.",
+    "byteSummary": "With 200 stateless API pods and a PostgreSQL origin capped at 2,000 QPS, a single hot-key expiration during a 100K-QPS flash sale would immediately overwhelm the database—even if each pod ran local Singleflight (200 pods × 1 leader = 200 simultaneous queries per key, multiplied across dozens of hot keys).\n\nThe solution layers three defenses: (1) an L1 in-process LRU cache (short 2–5s TTL) + L2 Redis cluster storing `(value, soft_ttl, hard_ttl)` for Stale-While-Revalidate; (2) Probabilistic Early Refresh (XFetch) so background workers renew hot keys before `soft_ttl` expires; and (3) a Consistent-Hash Singleflight Coalescer ring that routes any true cache miss for key `K` to a single designated coalescer node.\n\nIf the origin slows down or fails, the coalescer returns the `soft_ttl`-expired stale value (up to `hard_ttl`) rather than cascading 503s to 100K shoppers, and enforces a bounded wait timeout + circuit breaker per origin shard."
+  },
+  "learningJourney": [
+    {
+      "id": "01-capacity-and-amplification",
+      "eyebrow": "STAGE 01 · CAPACITY MATH",
+      "title": "Quantifying Pod-Level vs. Cluster-Wide Amplification",
+      "level": "foundation",
+      "purpose": "Quantify why 200 API pods with local-only singleflight still overload a 2,000 QPS PostgreSQL ceiling.",
+      "explanation": {
+        "foundation": "Assume 500K total QPS across 200 API pods (2,500 QPS/pod) and a PostgreSQL origin ceiling of 2,000 QPS.",
+        "core": "If 20 hot keys expire simultaneously, local-only singleflight emits `20 * 200 = 4,000` origin queries—double the database limit. Consistent-hash coalescing reduces that to `20 * 1 = 20` origin queries (1% of DB capacity).",
+        "deepDive": "In production deployments of Design a Thundering-Herd Cache Stampede Shield with Singleflight Coalescing, watch how quantifying pod-level vs. cluster-wide amplification interacts with tail latency, retry amplification, and partial failures. Production stampede shields combine L1 hot-key absorption, consistent-hash Singleflight rings, SWR fallbacks, origin semaphores, and graceful ring draining."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 01 · CAPACITY MATH",
+        "title": "Quantifying Pod-Level vs. Cluster-Wide Amplification",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "500K Total Read QPS",
+            "sub": "200 Stateless API Pods",
+            "role": "Cluster Load"
+          },
+          {
+            "id": "n2",
+            "label": "20 Hot Keys Expire",
+            "sub": "Local Singleflight = 200x",
+            "role": "4,000 Origin QPS"
+          },
+          {
+            "id": "n3",
+            "label": "PostgreSQL Ceiling",
+            "sub": "2,000 QPS Max Capacity",
+            "role": "Origin Collapse"
+          },
+          {
+            "id": "n4",
+            "label": "Global Coalescer Ring",
+            "sub": "Collapse 200 -> 1 Query",
+            "role": "20 Origin QPS"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "triggers"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "exceeds 2x"
+          },
+          {
+            "from": "n2",
+            "to": "n4",
+            "label": "solved by"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Pod Amplification Math",
+            "detail": "20 simultaneously expiring keys x 200 pods = 4,000 concurrent DB queries—2x PostgreSQL capacity."
+          },
+          {
+            "label": "Global Coalescing Goal",
+            "detail": "Reduce origin queries per expired key from N_pods (200) down to exactly 1."
+          },
+          {
+            "label": "Latency Target",
+            "detail": "Hold p99 read latency <10 ms even during mass TTL expirations."
+          }
+        ],
+        "summary": "Local-only singleflight across 200 pods still emits 200x origin queries; global coalescing collapses 4,000 QPS to 20.",
+        "caption": "Local-only singleflight across 200 pods still emits 200x origin queries; global coalescing collapses 4,000 QPS to 20."
+      }
+    },
+    {
+      "id": "02-multi-tier-cache-layout",
+      "eyebrow": "STAGE 02 · MULTI-TIER CACHE",
+      "title": "L1 Process Cache + L2 Redis with Dual-TTL SWR",
+      "level": "foundation",
+      "purpose": "Pair a 2s L1 process cache with L2 Redis Dual-TTL Stale-While-Revalidate for <2 ms hot reads.",
+      "explanation": {
+        "foundation": "Store `{payload, soft_ttl_ts, hard_ttl_ts}` in Redis. When `now < soft_ttl_ts`, return immediately (< 2 ms). When `soft_ttl_ts <= now < hard_ttl_ts`, serve the stale payload immediately to the caller while triggering an async singleflight background refresh.",
+        "core": "Only when `now >= hard_ttl_ts` (cold miss) does the caller block on the Singleflight Coalescer.",
+        "deepDive": "In production deployments of Design a Thundering-Herd Cache Stampede Shield with Singleflight Coalescing, watch how l1 process cache + l2 redis with dual-ttl swr interacts with tail latency, retry amplification, and partial failures. Production stampede shields combine L1 hot-key absorption, consistent-hash Singleflight rings, SWR fallbacks, origin semaphores, and graceful ring draining."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 02 · MULTI-TIER CACHE",
+        "title": "L1 Process Cache + L2 Redis with Dual-TTL SWR",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "L1 Process Cache (2s)",
+            "sub": "Absorbs 99% Hot Reads",
+            "role": "Sub-ms Hit"
+          },
+          {
+            "id": "n2",
+            "label": "L2 Redis Dual-TTL",
+            "sub": "{val, soft_ttl, hard_ttl}",
+            "role": "Shared Cache"
+          },
+          {
+            "id": "n3",
+            "label": "soft <= now < hard",
+            "sub": "Serve Stale Immediately",
+            "role": "Zero Caller Wait"
+          },
+          {
+            "id": "n4",
+            "label": "Async Ring Refresh",
+            "sub": "1 Background Leader",
+            "role": "Origin Update"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "on L1 miss"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "if soft expired"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "triggers"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Three-State TTL",
+            "detail": "Fresh (<soft_ttl) returns immediately; Stale (<hard_ttl) serves stale + refreshes async; Expired (>=hard_ttl) blocks on Singleflight."
+          },
+          {
+            "label": "Why L1 Matters",
+            "detail": "A 2-second in-process LRU shields Redis and the coalescer ring from 100K QPS single-key spikes."
+          },
+          {
+            "label": "Payload Overhead",
+            "detail": "Storing soft_ttl_ts alongside the JSON/protobuf value adds just 16 bytes per Redis key."
+          }
+        ],
+        "summary": "L1 2s process caching plus L2 Redis Dual-TTL SWR serves stale payloads in <2 ms while refreshing in the background.",
+        "caption": "L1 2s process caching plus L2 Redis Dual-TTL SWR serves stale payloads in <2 ms while refreshing in the background."
+      },
+      "decisionFramework": {
+        "problem": "How to implement Design a Thundering-Herd Cache Stampede Shield with Singleflight Coalescing without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "When traffic spikes expose hidden coupling, local singleflight alone still sends 200 queries across 200 pods; consistent-hash routing to a coalescer tier + SWR keeps origin QPS <= 1 per hot key and p99 latency < 15 ms.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Design a Thundering-Herd Cache Stampede Shield with Singleflight Coalescing experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "03-consistent-hash-coalescer",
+      "eyebrow": "STAGE 03 · COALESCER RING",
+      "title": "Consistent-Hash Routing & Bounded-Wait Singleflight",
+      "level": "intermediate",
+      "purpose": "Route cache misses through a Maglev/Ketama consistent-hash coalescer ring with backup failover.",
+      "explanation": {
+        "foundation": "Use Maglev or Ketama consistent hashing with 150 virtual nodes per coalescer pod so key `K` always hashes to primary node `P(K)` (with backup `B(K)` if `P(K)` fails health checks).",
+        "core": "```python\nclass StampedeShield:\n    def __init__(self, ring, singleflight, redis_client, origin_fn) -> None:\n        self.ring = ring\n        self.sf = singleflight\n        self.redis = redis_client\n        self.origin_fn = origin_fn",
+        "deepDive": "def get_with_shield(self, key: str, now: float) -> bytes:\n        entry = self.redis.get_entry(key)\n        if entry and now < entry.soft_ttl:\n            return entry.payload\n        if entry and now < entry.hard_ttl:\n            self._trigger_async_refresh(key)\n            return entry.payload\n        try:\n            val, _ = self.sf.do(key, lambda: self._fetch_and_populate(key), wait_timeout=0.05)\n            return val\n        except TimeoutError:\n            if entry:\n                return entry.payload\n            raise\n```"
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 03 · COALESCER RING",
+        "title": "Consistent-Hash Routing & Bounded-Wait Singleflight",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "L2 Cache Miss",
+            "sub": "hash(key) on Ring",
+            "role": "Consistent Route"
+          },
+          {
+            "id": "n2",
+            "label": "Primary Coalescer P(K)",
+            "sub": "150 Vnodes / Pod",
+            "role": "Singleflight Group"
+          },
+          {
+            "id": "n3",
+            "label": "Backup Node B(K)",
+            "sub": "Health-Check Failover",
+            "role": "Zero SPOF"
+          },
+          {
+            "id": "n4",
+            "label": "1 Origin DB Query",
+            "sub": "Writes L2 + Wakes All",
+            "role": "Coalesced Fan-Out"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "routes to"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "if P(K) down"
+          },
+          {
+            "from": "n2",
+            "to": "n4",
+            "label": "runs 1 query"
+          }
+        ],
+        "cards": [
+          {
+            "label": "150 Virtual Nodes",
+            "detail": "150 vnodes per coalescer pod keep key distribution within ~5% variance across the ring."
+          },
+          {
+            "label": "Bounded Follower Wait",
+            "detail": "Followers wait at most 150 ms on P(K) before falling back or returning stale data."
+          },
+          {
+            "label": "Detached Leader Context",
+            "detail": "Leader refresh uses an independent backend timeout so one caller abort never fails others."
+          }
+        ],
+        "summary": "Consistent-hash routing to Primary/Backup coalescer pods collapses 200 pods into 1 origin query with fast failover.",
+        "caption": "Consistent-hash routing to Primary/Backup coalescer pods collapses 200 pods into 1 origin query with fast failover."
+      }
+    },
+    {
+      "id": "04-probabilistic-early-refresh",
+      "eyebrow": "STAGE 04 · XFETCH",
+      "title": "Eliminating Cold Misses via Probabilistic Early Refresh",
+      "level": "intermediate",
+      "purpose": "Eliminate cold-miss waiting altogether by triggering XFetch probabilistic early refreshes before soft_ttl.",
+      "explanation": {
+        "foundation": "Each read computes `-delta * beta * ln(rand())`, where `delta` is the last recomputation duration and `beta = 1.0`. If `now - delta * beta * ln(rand()) >= soft_ttl`, one caller triggers an async Singleflight refresh early.",
+        "core": "Hot keys are refreshed proactively, while cold keys never waste background CPU.",
+        "deepDive": "In production deployments of Design a Thundering-Herd Cache Stampede Shield with Singleflight Coalescing, watch how eliminating cold misses via probabilistic early refresh interacts with tail latency, retry amplification, and partial failures. Production stampede shields combine L1 hot-key absorption, consistent-hash Singleflight rings, SWR fallbacks, origin semaphores, and graceful ring draining."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 04 · XFETCH",
+        "title": "Eliminating Cold Misses via Probabilistic Early Refresh",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "Redis Read Hit",
+            "sub": "Read delta & soft_ttl",
+            "role": "Normal Request"
+          },
+          {
+            "id": "n2",
+            "label": "now - d*b*ln(rand)",
+            "sub": ">= soft_ttl Check",
+            "role": "XFetch Formula"
+          },
+          {
+            "id": "n3",
+            "label": "1 Early Refresh",
+            "sub": "Async Singleflight",
+            "role": "Pre-Expiry"
+          },
+          {
+            "id": "n4",
+            "label": "Fresh Before Expiry",
+            "sub": "0% Synchronous Misses",
+            "role": "Smooth p99"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "evaluates"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "if triggered"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "keeps cache"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Why XFetch Works",
+            "detail": "As now approaches soft_ttl, high-QPS keys have exponentially rising probability of refreshing early."
+          },
+          {
+            "label": "Recompute-Time Aware",
+            "detail": "Keys with larger delta (longer DB query) start refreshing earlier automatically."
+          },
+          {
+            "label": "Zero Extra Infrastructure",
+            "detail": "XFetch runs inline using random() and the stored last-recompute duration delta."
+          }
+        ],
+        "summary": "XFetch uses recomputation duration delta to probabilistically refresh hot keys before soft_ttl expires.",
+        "caption": "XFetch uses recomputation duration delta to probabilistically refresh hot keys before soft_ttl expires."
+      }
+    },
+    {
+      "id": "05-celebrity-key-overload",
+      "eyebrow": "STAGE 05 · HOT-KEY PROTECTION",
+      "title": "Protecting the Coalescer Node from 100K QPS on One Key",
+      "level": "advanced",
+      "purpose": "Protect the coalescer pod NIC from 100K QPS single-key spikes using L1 caches and salted key striping.",
+      "explanation": {
+        "foundation": "Think of **Protecting the Coalescer Node from 100K QPS on One Key** as the intuition layer for Design a Thundering-Herd Cache Stampede Shield with Singleflight Coalescing: Protect the coalescer pod NIC from 100K QPS single-key spikes using L1 caches and salted key striping.",
+        "core": "If 100K QPS hits one coalescer pod for `product:999`, even a fast hash lookup can saturate that pod's NIC. Solve this with a **2-second L1 in-process cache** on every API pod (absorbing 99%+ of hot reads locally) plus **2-choice power-of-two sharding** (`K#0`, `K#1`) only when `qps(K) > threshold`.",
+        "deepDive": "Under heavy load or partial failure, protecting the coalescer node from 100k qps on one key becomes a critical lever for predictable latency and correctness. Production stampede shields combine L1 hot-key absorption, consistent-hash Singleflight rings, SWR fallbacks, origin semaphores, and graceful ring draining."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 05 · HOT-KEY PROTECTION",
+        "title": "Protecting the Coalescer Node from 100K QPS on One Key",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "100K QPS Hot Key",
+            "sub": "product:999 Spike",
+            "role": "NIC Saturation"
+          },
+          {
+            "id": "n2",
+            "label": "2s L1 In-Process LRU",
+            "sub": "99% Absorbed Locally",
+            "role": "1K QPS to Ring"
+          },
+          {
+            "id": "n3",
+            "label": "Optional Key Salting",
+            "sub": "product:999#0..7",
+            "role": "8x Ring Spread"
+          },
+          {
+            "id": "n4",
+            "label": "Balanced Pod CPU/NIC",
+            "sub": "No Single-Pod HotSpot",
+            "role": "Protected Ring"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "filtered by"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "if still hot"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "achieves"
+          }
+        ],
+        "cards": [
+          {
+            "label": "L1 Shield Math",
+            "detail": "A 2-second L1 cache reduces 100K QPS on a single key to at most 100 misses/sec across 200 pods."
+          },
+          {
+            "label": "Hot-Key Salting",
+            "detail": "For ultra-hot keys, striping across 8 salts trades 8x origin calls for 8x coalescer NIC distribution."
+          },
+          {
+            "label": "Singleflight + L1",
+            "detail": "Populate L1 directly from the Singleflight response to heal all 200 pods within 1 round-trip."
+          }
+        ],
+        "summary": "2s L1 process caches and optional 8-way key salting prevent single hot keys from saturating one coalescer pod.",
+        "caption": "2s L1 process caches and optional 8-way key salting prevent single hot keys from saturating one coalescer pod."
+      }
+    },
+    {
+      "id": "06-origin-circuit-breaker",
+      "eyebrow": "STAGE 06 · FAILURE ISOLATION",
+      "title": "Origin Circuit Breakers, Negative Caching & Shedding",
+      "level": "advanced",
+      "purpose": "Prevent cascading DB outages with per-shard origin semaphores, circuit breakers, and stale-if-error.",
+      "explanation": {
+        "foundation": "Cap concurrent origin queries per shard via a semaphore (e.g., max 500 in-flight). If PostgreSQL p99 exceeds 200 ms, trip the circuit breaker: immediately return `hard_ttl` stale data if available or short-circuit with `503 Retry-After`.",
+        "core": "Cache `NOT_FOUND` tombstones for 30s (negative caching) to block cache-penetration attacks.",
+        "deepDive": "In production deployments of Design a Thundering-Herd Cache Stampede Shield with Singleflight Coalescing, watch how origin circuit breakers, negative caching & shedding interacts with tail latency, retry amplification, and partial failures. Production stampede shields combine L1 hot-key absorption, consistent-hash Singleflight rings, SWR fallbacks, origin semaphores, and graceful ring draining."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 06 · FAILURE ISOLATION",
+        "title": "Origin Circuit Breakers, Negative Caching & Shedding",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "Origin Semaphore",
+            "sub": "Max 500 In-Flight DB",
+            "role": "Concurrency Cap"
+          },
+          {
+            "id": "n2",
+            "label": "Latency Breaker",
+            "sub": "Trip if DB p99 >200ms",
+            "role": "Origin Shield"
+          },
+          {
+            "id": "n3",
+            "label": "Stale-If-Error",
+            "sub": "Serve hard_ttl Payload",
+            "role": "Graceful Degrade"
+          },
+          {
+            "id": "n4",
+            "label": "Fast 503 + Retry-After",
+            "sub": "No Queue Pileup",
+            "role": "Fail Fast"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "trips on lag"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "if hard_ttl ok"
+          },
+          {
+            "from": "n2",
+            "to": "n4",
+            "label": "if no cache"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Semaphore Cap",
+            "detail": "Hard-capping in-flight origin queries at 500 prevents PostgreSQL connection-pool exhaustion."
+          },
+          {
+            "label": "Stale-If-Error",
+            "detail": "When the origin breaker is open, extending hard_ttl stale serves keeps 99% of reads healthy."
+          },
+          {
+            "label": "No Negative 503 Caching",
+            "detail": "Call Forget(key) on transient 5xx errors so the next healthy probe can recover immediately."
+          }
+        ],
+        "summary": "Per-shard origin semaphores, >200 ms breakers, and stale-if-error keep reads serving during DB degradation.",
+        "caption": "Per-shard origin semaphores, >200 ms breakers, and stale-if-error keep reads serving during DB degradation."
+      }
+    },
+    {
+      "id": "07-observability-and-tuning",
+      "eyebrow": "STAGE 07 · OBSERVABILITY",
+      "title": "Tracking Coalesce Ratio, Stale-Serve Rate & Ring Churn",
+      "level": "advanced",
+      "purpose": "Track coalesce ratio, stale-serve rate, XFetch early refreshes, and graceful ring draining during deploys.",
+      "explanation": {
+        "foundation": "Think of **Tracking Coalesce Ratio, Stale-Serve Rate & Ring Churn** as the intuition layer for Design a Thundering-Herd Cache Stampede Shield with Singleflight Coalescing: Track coalesce ratio, stale-serve rate, XFetch early refreshes, and graceful ring draining during deploys.",
+        "core": "Emit `singleflight_coalesce_ratio` (followers / leaders), `stale_serve_rate`, `xfetch_early_refresh_count`, and `origin_qps`. During rolling deployments, use graceful draining on the coalescer ring so in-flight leaders finish and populate Redis before pod termination.",
+        "deepDive": "Under heavy load or partial failure, tracking coalesce ratio, stale-serve rate & ring churn becomes a critical lever for predictable latency and correctness. Production stampede shields combine L1 hot-key absorption, consistent-hash Singleflight rings, SWR fallbacks, origin semaphores, and graceful ring draining."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "STAGE 07 · OBSERVABILITY",
+        "title": "Tracking Coalesce Ratio, Stale-Serve Rate & Ring Churn",
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "coalesce_ratio",
+            "sub": "Followers / Leaders",
+            "role": "Efficiency KPI"
+          },
+          {
+            "id": "n2",
+            "label": "stale_serve_rate",
+            "sub": "SWR & Breaker Hits",
+            "role": "Freshness KPI"
+          },
+          {
+            "id": "n3",
+            "label": "Graceful Ring Drain",
+            "sub": "Finish In-Flight Calls",
+            "role": "Deploy Safety"
+          },
+          {
+            "id": "n4",
+            "label": "origin_qps > 1,600",
+            "sub": "Alert Before 2K Cap",
+            "role": "Headroom Guard"
+          }
+        ],
+        "edges": [
+          {
+            "from": "n1",
+            "to": "n2",
+            "label": "balances"
+          },
+          {
+            "from": "n2",
+            "to": "n3",
+            "label": "protected by"
+          },
+          {
+            "from": "n3",
+            "to": "n4",
+            "label": "watched by"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Coalesce Ratio",
+            "detail": "A high followers/leaders ratio confirms the ring is actively collapsing stampedes."
+          },
+          {
+            "label": "Graceful Ring Draining",
+            "detail": "Drain coalescer pods sequentially during deploys so only 1/N keys remap per step."
+          },
+          {
+            "label": "Origin Headroom Alert",
+            "detail": "Page on-call if origin QPS crosses 80% of the 2,000 QPS PostgreSQL ceiling."
+          }
+        ],
+        "summary": "Monitoring coalesce ratios, stale-serve rates, and origin QPS headroom ensures stampede protection holds during deploys.",
+        "caption": "Monitoring coalesce ratios, stale-serve rates, and origin QPS headroom ensures stampede protection holds during deploys."
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-1",
+        "question": "Why does local-only Singleflight on 200 API pods still risk overwhelming a 2,000-QPS PostgreSQL origin?",
+        "options": [
+          {
+            "id": "a",
+            "text": "PostgreSQL rejects connections from stateless pods.",
+            "correct": false,
+            "feedback": "Incorrect: Without consistent-hash affinity, every pod independently sends 1 leader query per missing key."
+          },
+          {
+            "id": "b",
+            "text": "Each of the 200 pods elects its own leader per expired key, multiplying origin load by 200x across hot keys.",
+            "correct": true,
+            "feedback": "Correct: Without consistent-hash affinity, every pod independently sends 1 leader query per missing key."
+          },
+          {
+            "id": "c",
+            "text": "Local Singleflight cannot cache results in Redis.",
+            "correct": false,
+            "feedback": "Incorrect: Without consistent-hash affinity, every pod independently sends 1 leader query per missing key."
+          },
+          {
+            "id": "d",
+            "text": "Local Singleflight blocks L1 cache reads.",
+            "correct": false,
+            "feedback": "Incorrect: Without consistent-hash affinity, every pod independently sends 1 leader query per missing key."
+          }
+        ],
+        "explanation": "Without consistent-hash affinity, every pod independently sends 1 leader query per missing key."
+      },
+      {
+        "id": "kc-2",
+        "question": "What is the role of `soft_ttl` vs. `hard_ttl` in Stale-While-Revalidate?",
+        "options": [
+          {
+            "id": "a",
+            "text": "soft_ttl disables Singleflight coalescing.",
+            "correct": false,
+            "feedback": "Incorrect: Dual-TTL decouples freshness triggers from hard eviction, keeping read latency flat during refreshes."
+          },
+          {
+            "id": "b",
+            "text": "Both TTLs must be identical.",
+            "correct": false,
+            "feedback": "Incorrect: Dual-TTL decouples freshness triggers from hard eviction, keeping read latency flat during refreshes."
+          },
+          {
+            "id": "c",
+            "text": "Between soft_ttl and hard_ttl, stale data is served immediately while an async Singleflight leader refreshes Redis.",
+            "correct": true,
+            "feedback": "Correct: Dual-TTL decouples freshness triggers from hard eviction, keeping read latency flat during refreshes."
+          },
+          {
+            "id": "d",
+            "text": "hard_ttl deletes the origin database row.",
+            "correct": false,
+            "feedback": "Incorrect: Dual-TTL decouples freshness triggers from hard eviction, keeping read latency flat during refreshes."
+          }
+        ],
+        "explanation": "Dual-TTL decouples freshness triggers from hard eviction, keeping read latency flat during refreshes."
+      },
+      {
+        "id": "kc-3",
+        "question": "How do you prevent a 100K-QPS celebrity key from saturating the single coalescer pod it hashes to?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Remove consistent hashing and hit PostgreSQL directly.",
+            "correct": false,
+            "feedback": "Incorrect: Short-lived L1 caches on API pods absorb the vast majority of reads before any network hop to Redis or the coalescer."
+          },
+          {
+            "id": "b",
+            "text": "Increase the database connection pool to 100,000.",
+            "correct": false,
+            "feedback": "Incorrect: Short-lived L1 caches on API pods absorb the vast majority of reads before any network hop to Redis or the coalescer."
+          },
+          {
+            "id": "c",
+            "text": "Disable timeouts on the coalescer.",
+            "correct": false,
+            "feedback": "Incorrect: Short-lived L1 caches on API pods absorb the vast majority of reads before any network hop to Redis or the coalescer."
+          },
+          {
+            "id": "d",
+            "text": "Serve 99%+ of hot reads from a short 2-second L1 in-process cache on each API pod.",
+            "correct": true,
+            "feedback": "Correct: Short-lived L1 caches on API pods absorb the vast majority of reads before any network hop to Redis or the coalescer."
+          }
+        ],
+        "explanation": "Short-lived L1 caches on API pods absorb the vast majority of reads before any network hop to Redis or the coalescer."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Combine a tiny local cache, Redis, and a Singleflight coordinator so 100K flash-sale requests only trigger 1 database query.",
+      "keyTakeaway": "When traffic spikes expose hidden coupling, local singleflight alone still sends 200 queries across 200 pods; consistent-hash routing to a coalescer tier + SWR keeps origin QPS <= 1 per hot key and p99 latency < 15 ms.",
+      "byteSummary": "When 100,000 shoppers view the same flash-sale item, a single cache miss can crash the database. Putting a tiny 2-second cache on every web server handles most traffic.\n\nFor actual misses, routing the same key to one Singleflight coordinator ensures only one query hits PostgreSQL."
+    },
+    "intermediate": {
+      "summary": "Layer L1 LRU, Redis SWR (soft/hard TTL), XFetch early refresh, and a Consistent-Hash Singleflight tier to cap origin QPS.",
+      "keyTakeaway": "When traffic spikes expose hidden coupling, local singleflight alone still sends 200 queries across 200 pods; consistent-hash routing to a coalescer tier + SWR keeps origin QPS <= 1 per hot key and p99 latency < 15 ms.",
+      "byteSummary": "200 stateless pods require cluster-wide coalescing via consistent hashing. Pairing that with Redis dual-TTL Stale-While-Revalidate and XFetch probabilistic early refresh eliminates both thundering herds and miss-latency spikes.\n\nNegative caching blocks non-existent key scans."
+    },
+    "advanced": {
+      "summary": "Production stampede shields combine L1 hot-key absorption, consistent-hash Singleflight rings, SWR fallbacks, origin semaphores, and graceful ring draining.",
+      "keyTakeaway": "When traffic spikes expose hidden coupling, local singleflight alone still sends 200 queries across 200 pods; consistent-hash routing to a coalescer tier + SWR keeps origin QPS <= 1 per hot key and p99 latency < 15 ms.",
+      "byteSummary": "At 500K QPS, resilience depends on bounding every queue: 50 ms follower wait timeouts, per-shard origin semaphores, and circuit breakers that fall back to stale Redis payloads.\n\nGraceful pod draining on the consistent-hash ring prevents leader drops during deploys."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "prerequisites": [
+    {
+      "title": "Singleflight Request Coalescing: Eliminating Thundering Herds",
+      "summary": "Singleflight maintains an in-flight map of active keys so that concurrent callers for the same key await a single leader execution instead of stampeding the origin."
+    },
+    {
+      "title": "Distributed & Application Caching",
+      "summary": "Caching keeps a reusable copy of data so an application can avoid repeating a database query, calculation, or network call. It can make responses faster and reduce database load. The trade-off: the copy may be out of date."
+    },
+    {
+      "title": "Consistent Hashing & Virtual Nodes",
+      "summary": "Consistent hashing assigns data keys to servers in a way that limits how many keys move when servers are added or removed. This helps avoid widespread cache misses and sudden load on databases."
+    }
+  ],
+  "simulation": {
+    "title": "Design a Thundering-Herd Cache Stampede Shield with Singleflight Coalescing — Interactive Execution Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Workload & Budget"
+      },
+      {
+        "id": "router",
+        "label": "Gateway / Router",
+        "role": "Admission & Dispatch"
+      },
+      {
+        "id": "engine",
+        "label": "Core Engine",
+        "role": "Primary Execution"
+      },
+      {
+        "id": "replica",
+        "label": "Replica / Fallback",
+        "role": "Durability & Recovery"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "router",
+        "label": "request"
+      },
+      {
+        "from": "router",
+        "to": "engine",
+        "label": "route"
+      },
+      {
+        "from": "engine",
+        "to": "replica",
+        "label": "sync / fallback"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Quantifying Pod-Level vs. Cluster-Wide Amplification",
+        "actionLabel": "Dispatch nominal request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "router"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "Ingress",
+          "p99_ms": 8,
+          "error_rate": "0.0%"
+        },
+        "explanation": "Caller sends work into the gateway with explicit timeout and concurrency bounds (Quantifying Pod-Level vs. Cluster-Wide Amplification)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "L1 Process Cache + L2 Redis with Dual-TTL SWR",
+        "actionLabel": "Execute core invariant",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "Core Path",
+          "p99_ms": 18,
+          "in_flight": 124
+        },
+        "explanation": "The core engine processes the hot path while keeping state transitions deterministic (L1 Process Cache + L2 Redis with Dual-TTL SWR)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Consistent-Hash Routing & Bounded-Wait Singleflight",
+        "actionLabel": "Detect skew or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Degraded",
+          "p99_ms": 64,
+          "retries_capped": "true"
+        },
+        "explanation": "Under load or replica lag, bounded backoff and isolation prevent cascading saturation (Consistent-Hash Routing & Bounded-Wait Singleflight)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Tracking Coalesce Ratio, Stale-Serve Rate & Ring Churn",
+        "actionLabel": "Converge & restore SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 11,
+          "drift": 0
+        },
+        "explanation": "State converges cleanly and telemetry confirms the system returned within its SLO envelope (Tracking Coalesce Ratio, Stale-Serve Rate & Ring Churn)."
+      }
+    ]
+  }
+}

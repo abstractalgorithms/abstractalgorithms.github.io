@@ -1,0 +1,516 @@
+{
+  "id": "design-linearizable-metadata-store",
+  "slug": "design-linearizable-metadata-store",
+  "title": "Design a Linearizable Metadata & Config Store with Raft Lease Reads & Watchers",
+  "problemType": "architecture",
+  "difficulty": "hard",
+  "domain": "Distributed Systems",
+  "tagline": "Serving 100K RPS linearizable reads, CAS locks with fencing tokens, and 50K concurrent gRPC Watchers on a 5-node Raft cluster.",
+  "purpose": "Design an etcd/Chubby-grade metadata control plane that handles high-fanout service discovery reads, strictly ordered config watches, and split-brain-proof distributed leases.",
+  "prompt": "Design a linearizable metadata and configuration store (etcd/ZooKeeper scale) for a 10,000-node microservice fleet: 100K RPS linearizable reads, 5K RPS CAS writes, 50K concurrent Watch streams with zero missed revisions, and lease-backed leader locks.",
+  "pedagogicalFramework": "RESHADED",
+  "prerequisites": [
+    {
+      "title": "Raft ReadIndex & Lease Reads",
+      "summary": "Know how Batched ReadIndex and Monotonic Lease Reads serve linearizable reads without WAL writes."
+    },
+    {
+      "title": "MVCC Revisions & Fencing Tokens",
+      "summary": "Understand monotonic global revision numbers for Watchers and why distributed locks need monotonic fencing tokens."
+    }
+  ],
+  "spark": {
+    "summary": "Pair a 5-node Raft cluster with MVCC B+Tree storage (global monotonic `revision`), Batched ReadIndex / Follower offload for 100K RPS reads, and multiplexed gRPC Watch streams.",
+    "keyTakeaway": "When building a linearizable control-plane metadata store, back every key with a global MVCC revision in Raft, serve reads via Batched ReadIndex + Follower offload, and multiplex Watchers over a single gRPC stream per node.",
+    "byteSummary": "Control planes like Kubernetes (`etcd`) face an asymmetric workload: 5K writes/sec, 100K linearizable reads/sec, and 50,000 Watchers listening for config or endpoint changes. Putting all 50,000 Watchers on separate Raft proposals or polling loops crushes the cluster.\n\nThe architecture uses a 5-node Raft consensus group backed by an MVCC B+Tree (BoltDB-style) keyed by a monotonically increasing 64-bit `revision`. Every CAS write increments `revision` atomically upon Raft commit, enabling: (1) Lock-free Watchers that subscribe from `start_revision` and replay missed history from the MVCC log before switching to live pushes over multiplexed gRPC HTTP/2 streams; (2) Lease-backed distributed locks that return `revision` as a monotonic fencing token.\n\nFor 100K RPS linearizable reads, the Leader uses Batched ReadIndex (plus Follower ReadIndex offload) to serve reads from the in-memory B+Tree cache in <2 ms without touching the Raft WAL—while Watch Event Multiplexers coalesce thousands of Watchers onto ~10K gRPC connections."
+  },
+  "learningJourney": [
+    {
+      "id": "stage-1-requirements-estimations",
+      "stageNumber": 1,
+      "title": "R & E · Requirements, Revision Math & Watch Fanout Sizing",
+      "whyThisMatters": "Quantifies Raft WAL bandwidth, MVCC compaction windows, and Watch fanout traffic.",
+      "explanation": {
+        "foundation": "5K CAS writes/sec x 2 KB = 10 MB/s of Raft log replication across 5 nodes—easily handled by NVMe WALs (<5 ms quorum `fsync`).",
+        "core": "Illustrative Sizing: 100K reads/sec x 4 KB = 400 MB/s (3.2 Gbps) egress. A single Leader's 10 Gbps NIC can serve it, or offloading 80% to the 4 Followers via Follower ReadIndex drops per-node egress to 80 MB/s! For 50,000 Watchers receiving 100 config updates/sec, multiplexing 100 Watchers per gRPC HTTP/2 connection cuts TCP sockets from 50,000 to 500.",
+        "deepDive": "Keep the total dataset bounded (e.g., <=8–16 GB of active metadata, compacted every 5 minutes by `revision`) so the entire MVCC B+Tree stays hot in OS/mmap RAM."
+      },
+      "sectionDiagram": {
+        "kind": "behavior-transition",
+        "eyebrow": "Control Plane Scaling",
+        "title": "Polling + Unbounded History vs. MVCC Revisions + Multiplexed Watch",
+        "before": {
+          "label": "Naive Polling + 50K Sockets",
+          "metrics": [
+            "50K clients polling every 1s",
+            "Missed updates during reconnects",
+            "Leader NIC saturated on reads"
+          ]
+        },
+        "after": {
+          "label": "MVCC + ReadIndex + gRPC Mux",
+          "metrics": [
+            "Zero missed events via revision",
+            "Batched ReadIndex + Follower offload",
+            "500 muxed HTTP/2 Watch streams"
+          ]
+        }
+      }
+    },
+    {
+      "id": "stage-2-storage-schema-mvcc",
+      "stageNumber": 2,
+      "title": "S · Storage: MVCC B+Tree Keyed by Monotonic Revision",
+      "whyThisMatters": "Shows how `(revision, sub_revision)` keys power both time-travel Watchers and fencing tokens.",
+      "explanation": {
+        "foundation": "Instead of overwriting keys in place, every Raft-committed `PUT` or `DELETE` writes a new MVCC tuple keyed by `(main_rev, sub_rev)`.",
+        "core": "An in-memory `TreeIndex` maps `user_key -> [rev_1, rev_2, ...]` while BoltDB/B+Tree stores `rev -> {key, value, create_rev, mod_rev, version, lease_id}`. Watchers that disconnect at `rev = 10,400` reconnect with `watch(start_rev=10,401)` and catch up seamlessly from the B+Tree.",
+        "deepDive": "Background MVCC Compaction periodically prunes revisions older than `latest_rev - retention_window` (e.g., 5 minutes), returning `CompactedError` if a Watcher was offline longer than retention so it knows to do a full `List` + `Watch` resync."
+      },
+      "sectionDiagram": {
+        "kind": "tree-index",
+        "eyebrow": "MVCC Storage Layout",
+        "title": "In-Memory TreeIndex (Key -> Revs) + BoltDB B+Tree (Rev -> Value)",
+        "levels": [
+          {
+            "label": "TreeIndex (RAM B-Tree)",
+            "detail": "user_key -> latest & historical revs"
+          },
+          {
+            "label": "BoltDB B+Tree (mmap)",
+            "detail": "(main_rev, sub_rev) -> KV + LeaseID"
+          },
+          {
+            "label": "Raft WAL (NVMe)",
+            "detail": "Sequential quorum log + snapshots"
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-3-high-level-architecture",
+      "stageNumber": 3,
+      "title": "H & A · 5-Node Raft + Follower ReadIndex + Watch Multiplexer",
+      "whyThisMatters": "Traces CAS writes, linearizable reads, and Watch event delivery end-to-end.",
+      "explanation": {
+        "foundation": "All writes (`PUT`, `CAS`, `LeaseGrant`) route to the Raft Leader, replicate to a 3/5 majority, and commit.",
+        "core": "On commit, the state machine updates `TreeIndex` + BoltDB and immediately pushes `{key, rev, value}` into the local **Watch Event Multiplexer**, which fans out to all matching Watchers. Reads hit either Leader Lease/Batched ReadIndex or Follower ReadIndex (`Follower -> Leader.ReadIndex() -> local apply >= readIndex`).",
+        "deepDive": "Multi-Region Note: Place 3 voting nodes in the primary region (or 2+2+1 across 3 AZs/regions with <10 ms RTT) and non-voting **Learner** nodes in distant regions for local `serializable` or `ReadIndex` reads without slowing down write quorum."
+      },
+      "sectionDiagram": {
+        "kind": "sequence-timeline",
+        "eyebrow": "CAS + Watch Flow",
+        "title": "Writer CAS -> Raft Quorum Commit -> MVCC Apply -> Watch Push",
+        "actors": [
+          {
+            "id": "w",
+            "label": "Writer Client"
+          },
+          {
+            "id": "ldr",
+            "label": "Raft Leader"
+          },
+          {
+            "id": "flw",
+            "label": "Followers (3/5)"
+          },
+          {
+            "id": "wat",
+            "label": "Watchers"
+          }
+        ],
+        "steps": [
+          {
+            "from": "w",
+            "to": "ldr",
+            "label": "CAS(key, expected_mod_rev=42)"
+          },
+          {
+            "from": "ldr",
+            "to": "flw",
+            "label": "Replicate Raft entry (rev=43)"
+          },
+          {
+            "from": "ldr",
+            "to": "w",
+            "label": "Commit & return fencing rev=43"
+          },
+          {
+            "from": "ldr",
+            "to": "wat",
+            "label": "Mux push event(rev=43)"
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-4-detailed-design-leases-fencing",
+      "stageNumber": 4,
+      "title": "D · Detailed Design: Leases, Fencing Tokens & Watch Catch-Up",
+      "whyThisMatters": "Prevents split-brain lock holders and slow-Watcher memory exhaustion.",
+      "explanation": {
+        "foundation": "Clients acquire distributed locks by attaching a TTL **Lease** (`LeaseGrant(ttl=10s)`) to a lock key via `CAS(create_rev == 0)`.",
+        "core": "The store returns the lock key's `mod_revision` (e.g., `104`) as a **Fencing Token**. Downstream storage servers reject any write carrying `token < max_seen_token`, blocking a paused zombie lock holder even if its lease expired! If the client fails to send `LeaseKeepAlive` within 10s, the Leader proposes `LeaseRevoke` through Raft, deleting all attached keys and notifying Watchers.",
+        "deepDive": "Slow Watcher Protection: If a Watch client stalls and stops reading its gRPC stream, never buffer unbounded events in RAM! Cap per-Watcher send buffers (e.g., 1,000 events) and demote stalled Watchers to `unsynced`—when they drain, they catch up directly from the BoltDB MVCC B+Tree."
+      },
+      "codeExample": {
+        "language": "python",
+        "title": "CAS Lock with Fencing Token & Bounded Watch Catch-Up",
+        "code": "def acquire_fenced_lock(kv_store, lock_key, owner_id, lease_id):\n    # Atomic Raft CAS: succeed only if key does not exist (create_rev == 0)\n    ok, commit_rev = kv_store.txn_cas(\n        if_create_rev=0,\n        key=lock_key,\n        value=owner_id,\n        lease_id=lease_id,\n    )\n    if not ok:\n        raise LockContentionError('Lock already held')\n    return commit_rev  # Monotonic fencing token for downstream storage\n"
+      },
+      "decisionFramework": {
+        "problem": "How to scale Watchers and linearizable reads on a Raft metadata store without OOMing or stalling writes.",
+        "naiveSolution": "Buffer all Watch events per client in unbounded RAM and run all reads through the Raft WAL.",
+        "whyItFails": "Slow Watch clients OOM the server; WAL reads cap cluster read QPS at disk `fsync` throughput.",
+        "alternatives": "Unbounded per-Watcher RAM queues vs. MVCC B+Tree Catch-Up + Bounded Buffers + ReadIndex.",
+        "decision": "Back Watchers with an MVCC B+Tree (`unsynced` fallback on slow consumers), multiplex over HTTP/2, and serve reads via Batched ReadIndex + Follower offload.",
+        "tradeOffs": "Requires periodic MVCC compaction (forcing very stale Watchers to `List` + `Watch`) in exchange for bounded RAM and 100K RPS reads."
+      },
+      "decisionExercise": {
+        "prompt": "A Watch client pauses for 20 minutes while MVCC compaction runs every 5 minutes. When it reconnects with `start_revision = 5,000` (already compacted), what must the metadata store return?",
+        "options": [
+          {
+            "id": "a",
+            "label": "Return `CompactedError` (with `compact_revision`) so the client performs a fresh linearizable `List` snapshot and restarts `Watch` from that snapshot's revision.",
+            "isCorrect": true,
+            "explanation": "Correct! Silently skipping compacted revisions would cause missed deletes/updates; `CompactedError` triggers a safe List+Watch resync."
+          },
+          {
+            "id": "b",
+            "label": "Start streaming from the latest revision and ignore the gap.",
+            "isCorrect": false,
+            "explanation": "Skipping events breaks state synchronization for controllers like Kubernetes."
+          },
+          {
+            "id": "c",
+            "label": "Disable MVCC compaction permanently.",
+            "isCorrect": false,
+            "explanation": "Disabling compaction causes unbounded disk and RAM growth."
+          }
+        ]
+      },
+      "sectionDiagram": {
+        "kind": "state-machine",
+        "eyebrow": "Watcher Stream State",
+        "title": "Synced (Live Mux) -> Slow Buffer Full (Unsynced) -> MVCC Catch-Up -> Compacted",
+        "states": [
+          {
+            "id": "sync",
+            "label": "Synced (Live Push)",
+            "tone": "good"
+          },
+          {
+            "id": "unsync",
+            "label": "Unsynced (B+Tree Scan)",
+            "tone": "info"
+          },
+          {
+            "id": "comp",
+            "label": "Compacted -> List+Watch",
+            "tone": "warn"
+          }
+        ],
+        "transitions": [
+          {
+            "from": "sync",
+            "to": "unsync",
+            "label": "gRPC buffer full"
+          },
+          {
+            "from": "unsync",
+            "to": "sync",
+            "label": "caught up to head"
+          },
+          {
+            "from": "unsync",
+            "to": "comp",
+            "label": "rev < compact_rev"
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-5-evaluation-assumptions-glossary",
+      "stageNumber": 5,
+      "title": "E & D · Evaluation, Assumptions, Limitations & Glossary",
+      "whyThisMatters": "Documents dataset size caps, Raft quorum limits, and control-plane terminology.",
+      "explanation": {
+        "foundation": "Raft metadata stores are designed for small, critical control-plane state (<=8–16 GB), not bulk blob or event storage.",
+        "core": "Assumptions & Limitations: Sizing assumes <=16 GB live MVCC state, <=10 ms intra-region RTT across 5 voting nodes, and periodic 5-minute MVCC compaction. Storing multi-GB payloads or millions of keys per second in Raft saturates BoltDB write transactions and heartbeat timers, risking spurious leader elections.",
+        "deepDive": "Glossary: MVCC Revision (global monotonic 64-bit counter incremented per Raft transaction); CAS (Compare-And-Swap on `mod_revision` or `create_revision`); Fencing Token (monotonic token blocking stale lock holders); Learner Node (non-voting Raft replica scaling read-only locality)."
+      },
+      "sectionDiagram": {
+        "kind": "architecture-graph",
+        "eyebrow": "Control Plane Architecture",
+        "title": "5-Node Raft -> MVCC BoltDB -> Batched ReadIndex + gRPC Watch Mux",
+        "nodes": [
+          {
+            "id": "raft",
+            "label": "5-Node Raft Quorum",
+            "tier": "ingress"
+          },
+          {
+            "id": "mvcc",
+            "label": "MVCC BoltDB + TreeIndex",
+            "tier": "storage"
+          },
+          {
+            "id": "read",
+            "label": "ReadIndex + Follower Offload",
+            "tier": "compute"
+          },
+          {
+            "id": "mux",
+            "label": "gRPC Watch Multiplexer",
+            "tier": "control"
+          }
+        ],
+        "edges": [
+          {
+            "from": "raft",
+            "to": "mvcc",
+            "label": "commit rev"
+          },
+          {
+            "from": "mvcc",
+            "to": "read",
+            "label": "100K RPS reads"
+          },
+          {
+            "from": "mvcc",
+            "to": "mux",
+            "label": "50K Watchers"
+          }
+        ]
+      }
+    }
+  ],
+  "simulation": {
+    "title": "Linearizable Metadata Store — CAS, ReadIndex & Watch Resync",
+    "nodes": [
+      {
+        "id": "cli",
+        "label": "Service Clients",
+        "role": "100K Reads / 5K CAS"
+      },
+      {
+        "id": "ldr",
+        "label": "Raft Leader",
+        "role": "Quorum + ReadIndex"
+      },
+      {
+        "id": "mvcc",
+        "label": "MVCC BoltDB",
+        "role": "Revisions + Leases"
+      },
+      {
+        "id": "wat",
+        "label": "Watch Mux",
+        "role": "50K HTTP/2 Streams"
+      }
+    ],
+    "edges": [
+      {
+        "from": "cli",
+        "to": "ldr",
+        "label": "CAS / ReadIndex"
+      },
+      {
+        "from": "ldr",
+        "to": "mvcc",
+        "label": "commit rev"
+      },
+      {
+        "from": "mvcc",
+        "to": "wat",
+        "label": "push delta"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "CAS Write Commits at Revision 43",
+        "actionLabel": "Acquire fenced lock via Raft",
+        "status": "healthy",
+        "activeNodeIds": [
+          "cli",
+          "ldr",
+          "mvcc"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "revision": 43,
+          "quorum": "3/5",
+          "fencing_token": 43
+        },
+        "explanation": "CAS write replicates across 3/5 nodes, increments MVCC revision to 43, and returns fencing token 43."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Multiplexed Watch Push to 50K Clients",
+        "actionLabel": "Broadcast rev 43 over 500 streams",
+        "status": "healthy",
+        "activeNodeIds": [
+          "mvcc",
+          "wat"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "watchers": "50K",
+          "http2_streams": 500,
+          "missed_events": 0
+        },
+        "explanation": "Watch Multiplexer pushes revision 43 to all subscribed controllers without polling."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Slow Watcher Demoted to Unsynced",
+        "actionLabel": "Cap RAM buffer; catch up via B+Tree",
+        "status": "warning",
+        "activeNodeIds": [
+          "mvcc",
+          "wat"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "slow_watcher": "unsynced",
+          "ram_bounded": "true",
+          "catchup_rev": 43
+        },
+        "explanation": "A stalled Watcher hits its 1,000-event buffer limit and catches up cleanly from MVCC BoltDB once drained."
+      },
+      {
+        "stepNumber": 4,
+        "title": "100K RPS Linearizable ReadIndex",
+        "actionLabel": "Batch heartbeats + Follower offload",
+        "status": "healthy",
+        "activeNodeIds": [
+          "cli",
+          "ldr",
+          "mvcc"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "read_rps": "100K",
+          "p99_ms": 1.8,
+          "wal_writes": 0
+        },
+        "explanation": "Batched ReadIndex + Follower offload sustains 100K RPS linearizable reads at 1.8 ms p99."
+      }
+    ]
+  },
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-1",
+        "question": "How does an etcd-style metadata store let a disconnected Watch client resume without missing any config updates?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Every write is stored under a global monotonic `revision` in an MVCC B+Tree, so Watchers reconnect with `start_revision = last_seen + 1`.",
+            "correct": true,
+            "feedback": "Correct! MVCC revision history lets Watchers replay missed events until caught up to live head."
+          },
+          {
+            "id": "b",
+            "text": "The server keeps an infinite per-client RAM queue forever.",
+            "correct": false,
+            "feedback": "Unbounded per-client RAM queues would OOM the server on slow clients."
+          },
+          {
+            "id": "c",
+            "text": "Clients broadcast UDP packets to all 5 Raft nodes.",
+            "correct": false,
+            "feedback": "Watchers use multiplexed gRPC HTTP/2 streams."
+          },
+          {
+            "id": "d",
+            "text": "Raft disables compaction permanently.",
+            "correct": false,
+            "feedback": "Compaction runs periodically; very old Watchers receive `CompactedError` and resync via List+Watch."
+          }
+        ],
+        "explanation": "Global MVCC revisions decouple Watch durability from bounded per-connection RAM buffers."
+      },
+      {
+        "id": "kc-2",
+        "question": "Why should a distributed lock backed by a Raft Lease also return `mod_revision` as a Fencing Token?",
+        "options": [
+          {
+            "id": "a",
+            "text": "So downstream storage can reject late writes from a paused zombie lock holder whose lease expired while it was stalled.",
+            "correct": true,
+            "feedback": "Correct! Downstream servers enforce `token >= max_seen_token`, preventing split-brain overwrites."
+          },
+          {
+            "id": "b",
+            "text": "To encrypt the gRPC Watch stream.",
+            "correct": false,
+            "feedback": "TLS encrypts gRPC; fencing tokens order resource writes."
+          },
+          {
+            "id": "c",
+            "text": "To skip Raft majority quorum on writes.",
+            "correct": false,
+            "feedback": "Lock acquisition still requires Raft quorum."
+          },
+          {
+            "id": "d",
+            "text": "To double the LeaseKeepAlive TTL automatically.",
+            "correct": false,
+            "feedback": "Fencing tokens do not modify lease TTLs."
+          }
+        ],
+        "explanation": "Leases alone cannot stop a paused client from sending an already-in-flight write; monotonic fencing tokens close that race."
+      },
+      {
+        "id": "kc-3",
+        "question": "Why should a Raft metadata store enforce a strict dataset size limit (e.g., 8–16 GB) and regular MVCC compaction?",
+        "options": [
+          {
+            "id": "a",
+            "text": "To keep the MVCC B+Tree hot in memory and prevent large snapshots/compactions from stalling Raft heartbeat timers.",
+            "correct": true,
+            "feedback": "Correct! Bloated MVCC tables cause slow BoltDB commits and Raft snapshot stalls that trigger spurious elections."
+          },
+          {
+            "id": "b",
+            "text": "Because gRPC cannot send payloads larger than 8 GB total per year.",
+            "correct": false,
+            "feedback": "The limit is about state-machine memory and snapshot stability, not gRPC."
+          },
+          {
+            "id": "c",
+            "text": "Because 64-bit revisions overflow at 16 GB.",
+            "correct": false,
+            "feedback": "64-bit revisions never overflow in practice."
+          },
+          {
+            "id": "d",
+            "text": "To prevent Follower ReadIndex offload.",
+            "correct": false,
+            "feedback": "Keeping state compact makes Follower ReadIndex faster."
+          }
+        ],
+        "explanation": "Metadata stores are optimized for compact, high-consistency control-plane state, not bulk storage."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "Build a strongly consistent config and lock store using a 5-node Raft cluster, versioned MVCC keys, and multiplexed Watch streams.",
+      "keyTakeaway": "When building a reliable config and lock service, store every change with a version number in Raft so Watchers never miss updates and locks stay safe.",
+      "byteSummary": "A 5-node Raft cluster stores every config update with a monotonic revision number, serves fast reads via ReadIndex, and pushes live updates to 50K Watchers over shared HTTP/2 streams."
+    },
+    "intermediate": {
+      "summary": "Combine 5-node Raft + MVCC BoltDB (`revision`), Batched ReadIndex + Follower offload for 100K RPS reads, and bounded-buffer gRPC Watch multiplexing.",
+      "keyTakeaway": "When designing an etcd-scale metadata store, back Watchers with MVCC revision catch-up, protect locks with fencing tokens, and offload reads via ReadIndex.",
+      "byteSummary": "MVCC revisions enable seamless Watch catch-up and monotonic fencing tokens, while Batched ReadIndex + Follower offload serves 100K RPS reads without touching the WAL."
+    },
+    "advanced": {
+      "summary": "5-node Raft + MVCC BoltDB/TreeIndex, 5-minute revision compaction with `CompactedError` resync, `unsynced` slow-Watcher demotion, and Learner-node read scaling.",
+      "keyTakeaway": "When operating a 100K-RPS control plane, bound per-Watcher RAM via `unsynced` MVCC fallback, enforce 8–16 GB state caps, and offload reads with ReadIndex.",
+      "byteSummary": "Pairing `unsynced` MVCC B+Tree catch-up, 5-minute revision compaction, `mod_revision` fencing tokens, and Batched/Follower ReadIndex keeps p99 <2 ms with zero missed Watch events."
+    }
+  }
+}

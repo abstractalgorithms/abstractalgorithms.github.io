@@ -1,0 +1,701 @@
+{
+  "id": "prob-design-multi-pattern-waf-dlp-scanner",
+  "slug": "design-multi-pattern-waf-dlp-scanner",
+  "title": "Design a 50K RPS Multi-Pattern WAF & DLP Payload Scanner",
+  "problemType": "system-design",
+  "difficulty": "hard",
+  "prompt": "Architect a real-time Web Application Firewall (WAF) and Data Loss Prevention (DLP) inspection engine capable of scanning 10 KB–100 KB HTTP payloads at 50,000+ req/s against K = 10,000+ active threat signatures with sub-2ms p99 inspection latency and zero-downtime signature updates.",
+  "spark": {
+    "summary": "Replace O(K * N) sequential regex/KMP loops with an immutable, byte-flattened Aho-Corasick DFA engine that scans payloads in a single O(N + Z) pass and hot-swaps rulesets atomically.",
+    "keyTakeaway": "If latency budgets leave no room for synchronous retries, decoupling offline DFA compilation from the lock-free O(N + Z) request scan path keeps p99 latency under 2 ms even as signature count K scales past 10,000.",
+    "byteSummary": "Scale Bottleneck: At 50,000 req/s with 10 KB payloads and K = 10,000 signatures, naive sequential KMP or regex evaluation executes 10^8 character operations per request—saturating 64-core inspection nodes below 500 req/s.\n\nCore Architecture: A centralized Signature Compiler normalizes and compiles all K patterns (total length M) into a byte-level Aho-Corasick DFA (or Double-Array Trie) with pre-merged output links. Worker nodes hold an immutable active automaton reference and inspect incoming payloads in a single contiguous O(N + Z) pass.\n\nOperational Resilience: Rule updates are compiled off the hot path into a shadow DFA, memory-bounded before activation, and published via an atomic pointer swap so in-flight requests finish cleanly on the prior snapshot with zero lock contention."
+  },
+  "learningJourney": [
+    {
+      "id": "stage-1",
+      "eyebrow": "Stage 1 · Foundation",
+      "title": "Capacity Sizing & Why Sequential Regex/KMP Fails",
+      "level": "foundation",
+      "purpose": "Establish the CPU and memory budget at 50,000 req/s and prove why O(K * N) scanning cannot meet sub-2ms p99 SLOs.",
+      "explanation": {
+        "foundation": "With N = 10 KB average payload and 50,000 req/s fleet-wide (e.g., 1,000 req/s per 64-core edge node), each node has ~1 ms per core-budget per request. Scanning K = 10,000 signatures sequentially requires 10,000 * 10,240 = 1.024 * 10^8 operations per request, exceeding a single core's 3 * 10^9 cycles/sec capacity by >30x.",
+        "core": "```python\ndef estimate_ops_per_sec(rps: int, payload_bytes: int, patterns: int) -> dict[str, int]:\n    return {\n        \"naive_ops_per_sec\": rps * payload_bytes * patterns,\n        \"aho_corasick_ops_per_sec\": rps * 2 * payload_bytes,\n    }\n```",
+        "deepDive": "In production deployments of Design a 50K RPS Multi-Pattern WAF & DLP Payload Scanner, watch how capacity sizing & why sequential regex/kmp fails interacts with tail latency, retry amplification, and partial failures. Hyperscale WAF/DLP nodes combine flat int32 DFA tables (or Double-Array Tries), bounded canonicalization, 1% shadow-canary rule linting, and lock-free atomic snapshots."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Capacity Math",
+        "title": "50K RPS Inspection Budget: O(K * N) vs O(N + Z)",
+        "nodes": [
+          {
+            "id": "in",
+            "label": "50,000 req/s (10 KB)",
+            "sub": "500 MB/s total ingress",
+            "role": "source"
+          },
+          {
+            "id": "naive",
+            "label": "Naive: 10^8 ops/req",
+            "sub": "< 500 req/s on 64 cores",
+            "role": "warning"
+          },
+          {
+            "id": "ac",
+            "label": "AC DFA: <= 20K ops/req",
+            "sub": "50,000+ req/s at <2ms p99",
+            "role": "store"
+          }
+        ],
+        "edges": [
+          {
+            "from": "in",
+            "to": "naive",
+            "label": "K = 10,000 passes"
+          },
+          {
+            "from": "in",
+            "to": "ac",
+            "label": "1 linear pass"
+          }
+        ],
+        "cards": [
+          {
+            "label": "5,000x Work Reduction",
+            "detail": "Eliminating the K factor cuts per-request character work from 10^8 to ~2 * 10^4."
+          },
+          {
+            "label": "Ingress Bandwidth",
+            "detail": "50k * 10 KB = 500 MB/s fits comfortably in modern NIC + L3 cache budgets."
+          }
+        ],
+        "summary": "Caption: Switching from O(K * N) to O(N + Z) eliminates the 10,000x pattern multiplier from the hot path.",
+        "caption": "Caption: Switching from O(K * N) to O(N + Z) eliminates the 10,000x pattern multiplier from the hot path."
+      }
+    },
+    {
+      "id": "stage-2",
+      "eyebrow": "Stage 2 · Foundation",
+      "title": "Byte-Level Normalization & UTF-8 Evasion Defense",
+      "level": "foundation",
+      "purpose": "Prevent WAF bypasses via URL-encoding, case mixing, or null-byte obfuscation before feeding bytes into the automaton.",
+      "explanation": {
+        "foundation": "Attackers evade literal signature matching using `%27`, mixed case (`SeLeCt`), or double-encoding. Running canonicalization (bounded URL-decode + ASCII lowercase) in a single streaming pass before or fused with the Aho-Corasick byte transition ensures both evasion resistance and O(N) speed.",
+        "core": "```python\ndef normalize_ascii_lower(raw: bytes, max_len: int = 102_400) -> bytes:\n    if len(raw) > max_len:\n        raise ValueError(\"Payload exceeds max inspection size\")\n    return raw.lower()\n```",
+        "deepDive": "In production deployments of Design a 50K RPS Multi-Pattern WAF & DLP Payload Scanner, watch how byte-level normalization & utf-8 evasion defense interacts with tail latency, retry amplification, and partial failures. Hyperscale WAF/DLP nodes combine flat int32 DFA tables (or Double-Array Tries), bounded canonicalization, 1% shadow-canary rule linting, and lock-free atomic snapshots."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Ingress Normalization",
+        "title": "Canonicalizing Payloads Before Automaton Scan",
+        "nodes": [
+          {
+            "id": "raw",
+            "label": "Raw HTTP Payload",
+            "sub": "Bounded <= 100 KB",
+            "role": "source"
+          },
+          {
+            "id": "norm",
+            "label": "Canonicalizer",
+            "sub": "URL-decode + lowercase",
+            "role": "process"
+          },
+          {
+            "id": "scan",
+            "label": "Byte-Level AC Scan",
+            "sub": "Single-pass inspection",
+            "role": "store"
+          }
+        ],
+        "edges": [
+          {
+            "from": "raw",
+            "to": "norm",
+            "label": "Enforce size cap"
+          },
+          {
+            "from": "norm",
+            "to": "scan",
+            "label": "Normalized byte stream"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Bounded Decoding",
+            "detail": "Cap decode depth (e.g., max 2 passes) to prevent CPU-exhaustion zip/encoding bombs."
+          },
+          {
+            "label": "Fail-Closed Policy",
+            "detail": "Oversized payloads trigger explicit 413/block or sampled deep-inspection."
+          }
+        ],
+        "summary": "Caption: Canonicalizing input bytes within strict size bounds prevents obfuscation bypasses without hurting throughput.",
+        "caption": "Caption: Canonicalizing input bytes within strict size bounds prevents obfuscation bypasses without hurting throughput."
+      },
+      "decisionFramework": {
+        "problem": "How to implement Design a 50K RPS Multi-Pattern WAF & DLP Payload Scanner without hitting unbounded tail latency, state divergence, or operational fragility.",
+        "naiveSolution": "Use a single unpartitioned path with unbounded retries and synchronous global coordination.",
+        "whyItFails": "Global coordination serializes throughput under load, while unbounded retries amplify transient stalls into full outages.",
+        "alternatives": "Compare synchronous strict-consistency paths against bounded asynchronous replication, local caching, or partitioned ownership.",
+        "decision": "If latency budgets leave no room for synchronous retries, decoupling offline DFA compilation from the lock-free O(N + Z) request scan path keeps p99 latency under 2 ms even as signature count K scales past 10,000.",
+        "tradeOffs": "Gains predictable p99 latency and fault isolation in exchange for explicit bounding, observability, and slightly higher implementation complexity."
+      },
+      "decisionExercise": {
+        "prompt": "When Design a 50K RPS Multi-Pattern WAF & DLP Payload Scanner experiences a sudden 5x traffic spike alongside a slow downstream dependency, which engineering choice best protects system stability?",
+        "options": [
+          {
+            "id": "unbounded-retry",
+            "label": "Increase retry counts and remove client timeouts so every request eventually succeeds.",
+            "isCorrect": false,
+            "explanation": "Unbounded retries multiply load on an already struggling dependency and exhaust worker pools."
+          },
+          {
+            "id": "bounded-isolation",
+            "label": "Enforce strict latency budgets, bounded jittered retries, and graceful fallback or load shedding.",
+            "isCorrect": true,
+            "explanation": "Bounding retries and isolating slow paths preserves healthy capacity and keeps tail latency predictable."
+          }
+        ]
+      }
+    },
+    {
+      "id": "stage-3",
+      "eyebrow": "Stage 3 · Intermediate",
+      "title": "Compiled Byte-DFA & Output Bitmask Layout",
+      "level": "intermediate",
+      "purpose": "Design the in-memory automaton layout so each byte transition is a single array index with zero heap allocations on the scan path.",
+      "explanation": {
+        "foundation": "Using a flat 256-entry transition table per state (`int32[num_states][256]`) lets the scanner advance with `state = table[state * 256 + byte]`. For K = 10,000 signatures averaging 15 bytes (M <= 150,000 states), 150,000 * 256 * 4 bytes = 153 MB—easily fitting in node RAM while eliminating hash lookups and failure-link loops.",
+        "core": "```python\ndef scan_dfa(go: list[list[int]], outputs: list[list[int]], data: bytes) -> list[tuple[int, int]]:\n    state = 0\n    hits: list[tuple[int, int]] = []\n    for idx, b in enumerate(data):\n        state = go[state][b]\n        if outputs[state]:\n            for rule_id in outputs[state]:\n                hits.append((idx, rule_id))\n    return hits\n```",
+        "deepDive": "In production deployments of Design a 50K RPS Multi-Pattern WAF & DLP Payload Scanner, watch how compiled byte-dfa & output bitmask layout interacts with tail latency, retry amplification, and partial failures. Hyperscale WAF/DLP nodes combine flat int32 DFA tables (or Double-Array Tries), bounded canonicalization, 1% shadow-canary rule linting, and lock-free atomic snapshots."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Data Structure Layout",
+        "title": "Flat Int32 Transition Table (Zero Allocations)",
+        "nodes": [
+          {
+            "id": "state",
+            "label": "int32 state = 0",
+            "sub": "CPU register resident",
+            "role": "source"
+          },
+          {
+            "id": "table",
+            "label": "go[state * 256 + b]",
+            "sub": "153 MB flat int32 array",
+            "role": "process"
+          },
+          {
+            "id": "out",
+            "label": "outputs[state]",
+            "sub": "Emit rule_id hits",
+            "role": "store"
+          }
+        ],
+        "edges": [
+          {
+            "from": "state",
+            "to": "table",
+            "label": "O(1) array index"
+          },
+          {
+            "from": "table",
+            "to": "out",
+            "label": "Check non-empty rule list"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Zero GC Pressure",
+            "detail": "Scan loop allocates zero objects unless a threat signature actually matches."
+          },
+          {
+            "label": "Early Termination",
+            "detail": "In WAF block mode, return immediately on the first high-severity rule hit."
+          }
+        ],
+        "summary": "Caption: A flat byte-indexed DFA table executes each state transition in a single memory lookup with zero GC.",
+        "caption": "Caption: A flat byte-indexed DFA table executes each state transition in a single memory lookup with zero GC."
+      }
+    },
+    {
+      "id": "stage-4",
+      "eyebrow": "Stage 4 · Intermediate",
+      "title": "Hybrid Two-Stage Filtering: AC Prefilter + Anchored Regex",
+      "level": "intermediate",
+      "purpose": "Handle complex regex signatures (like credit-card Luhn patterns or SQLi grammars) without slowing down the 99% clean traffic.",
+      "explanation": {
+        "foundation": "Think of **Hybrid Two-Stage Filtering: AC Prefilter + Anchored Regex** as the intuition layer for Design a 50K RPS Multi-Pattern WAF & DLP Payload Scanner: Handle complex regex signatures (like credit-card Luhn patterns or SQLi grammars) without slowing down the 99% clean traffic.",
+        "core": "Pure Aho-Corasick matches literal substrings, whereas WAF/DLP rules often require regexes (e.g., `UNION\\s+SELECT`). The industry-standard pattern (used by Hyperscan and Envoy WAFs) extracts a mandatory literal anchor from each regex (e.g., `'union'`), runs Aho-Corasick as a 1-pass prefilter, and invokes the full regex engine ONLY for the tiny fraction (< 0.5%) of payloads whose literal anchor matched.",
+        "deepDive": "Under heavy load or partial failure, hybrid two-stage filtering: ac prefilter + anchored regex becomes a critical lever for predictable latency and correctness. Hyperscale WAF/DLP nodes combine flat int32 DFA tables (or Double-Array Tries), bounded canonicalization, 1% shadow-canary rule linting, and lock-free atomic snapshots."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Hybrid Engine",
+        "title": "Aho-Corasick Literal Prefilter + Targeted Regex Verifier",
+        "nodes": [
+          {
+            "id": "ac",
+            "label": "Stage 1: AC Prefilter",
+            "sub": "Scans 100% of traffic in O(N)",
+            "role": "source"
+          },
+          {
+            "id": "clean",
+            "label": "99.5% Clean Pass",
+            "sub": "0 regexes executed",
+            "role": "store"
+          },
+          {
+            "id": "regex",
+            "label": "Stage 2: Regex Verify",
+            "sub": "Only on matched rule IDs",
+            "role": "process"
+          }
+        ],
+        "edges": [
+          {
+            "from": "ac",
+            "to": "clean",
+            "label": "No anchor hit"
+          },
+          {
+            "from": "ac",
+            "to": "regex",
+            "label": "Anchor hit (< 0.5%)"
+          }
+        ],
+        "cards": [
+          {
+            "label": "ReDoS Protection",
+            "detail": "Use linear-time RE2/DFA regexes in Stage 2 to prevent catastrophic backtracking."
+          },
+          {
+            "label": "99.5% Bypass",
+            "detail": "Most requests never touch the heavier regex engine."
+          }
+        ],
+        "summary": "Caption: Using Aho-Corasick as a literal prefilter shields expensive regex verification from 99.5% of clean traffic.",
+        "caption": "Caption: Using Aho-Corasick as a literal prefilter shields expensive regex verification from 99.5% of clean traffic."
+      }
+    },
+    {
+      "id": "stage-5",
+      "eyebrow": "Stage 5 · Intermediate",
+      "title": "Zero-Downtime Rule Updates via Atomic Blue-Green Swap",
+      "level": "intermediate",
+      "purpose": "Push new CVE/DLP signatures across the fleet without blocking worker threads or causing torn Trie reads.",
+      "explanation": {
+        "foundation": "Think of **Zero-Downtime Rule Updates via Atomic Blue-Green Swap** as the intuition layer for Design a 50K RPS Multi-Pattern WAF & DLP Payload Scanner: Push new CVE/DLP signatures across the fleet without blocking worker threads or causing torn Trie reads.",
+        "core": "A background control-plane watcher downloads signed rule bundles, verifies checksums, compiles a new immutable DFA snapshot in off-path memory, and atomically swaps the pointer read by worker threads. Requests already mid-scan continue reading the previous immutable snapshot until they return, after which reference counting or GC reclaims the old table.",
+        "deepDive": "Under heavy load or partial failure, zero-downtime rule updates via atomic blue-green swap becomes a critical lever for predictable latency and correctness. Hyperscale WAF/DLP nodes combine flat int32 DFA tables (or Double-Array Tries), bounded canonicalization, 1% shadow-canary rule linting, and lock-free atomic snapshots."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Control Plane",
+        "title": "Background Compilation & Atomic Pointer Swap",
+        "nodes": [
+          {
+            "id": "bundle",
+            "label": "Signed Rule Bundle",
+            "sub": "SHA-256 verified",
+            "role": "source"
+          },
+          {
+            "id": "shadow",
+            "label": "Shadow DFA Build",
+            "sub": "Off-path thread + cap check",
+            "role": "process"
+          },
+          {
+            "id": "ptr",
+            "label": "Atomic Active Ptr",
+            "sub": "Zero-lock worker reads",
+            "role": "store"
+          }
+        ],
+        "edges": [
+          {
+            "from": "bundle",
+            "to": "shadow",
+            "label": "Compile off hot path"
+          },
+          {
+            "from": "shadow",
+            "to": "ptr",
+            "label": "Atomic CAS / set"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Peak RAM Budget",
+            "detail": "Provision 2x DFA RAM (e.g., 310 MB) so old and new snapshots can coexist briefly during swap."
+          },
+          {
+            "label": "Rollback Safety",
+            "detail": "Keep the previous verified bundle cached on disk for instant rollback."
+          }
+        ],
+        "summary": "Caption: Building shadow automata off the request path and swapping pointers atomically ensures zero-downtime rule updates.",
+        "caption": "Caption: Building shadow automata off the request path and swapping pointers atomically ensures zero-downtime rule updates."
+      }
+    },
+    {
+      "id": "stage-6",
+      "eyebrow": "Stage 6 · Advanced",
+      "title": "DLP Streaming Chunk Boundaries & Cross-Buffer Matches",
+      "level": "advanced",
+      "purpose": "Detect signatures split across TCP/HTTP chunk boundaries without buffering multi-megabyte bodies in RAM.",
+      "explanation": {
+        "foundation": "Think of **DLP Streaming Chunk Boundaries & Cross-Buffer Matches** as the intuition layer for Design a 50K RPS Multi-Pattern WAF & DLP Payload Scanner: Detect signatures split across TCP/HTTP chunk boundaries without buffering multi-megabyte bodies in RAM.",
+        "core": "Because Aho-Corasick is a finite state machine, scanning a chunked stream requires carrying only a single 32-bit `state` integer from chunk `k` to chunk `k+1`! Even if a banned signature spans the exact boundary between two 4 KB network buffers, `state` preserves the exact partial prefix match across chunks with O(1) per-stream memory.",
+        "deepDive": "Under heavy load or partial failure, dlp streaming chunk boundaries & cross-buffer matches becomes a critical lever for predictable latency and correctness. Hyperscale WAF/DLP nodes combine flat int32 DFA tables (or Double-Array Tries), bounded canonicalization, 1% shadow-canary rule linting, and lock-free atomic snapshots."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "Streaming Scan",
+        "title": "Cross-Chunk Matching with O(1) State Carryover",
+        "nodes": [
+          {
+            "id": "c1",
+            "label": "Chunk 1 ('...pas')",
+            "sub": "Ends at state('pas')",
+            "role": "source"
+          },
+          {
+            "id": "reg",
+            "label": "Carry int32 state",
+            "sub": "4 bytes per stream",
+            "role": "process"
+          },
+          {
+            "id": "c2",
+            "label": "Chunk 2 ('sword...')",
+            "sub": "Resumes & hits 'password'",
+            "role": "store"
+          }
+        ],
+        "edges": [
+          {
+            "from": "c1",
+            "to": "reg",
+            "label": "Save state"
+          },
+          {
+            "from": "reg",
+            "to": "c2",
+            "label": "Resume scan"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Zero Re-Buffering",
+            "detail": "No need to copy chunks into a contiguous buffer to catch split signatures."
+          },
+          {
+            "label": "O(1) Stream State",
+            "detail": "100,000 concurrent streams need only 400 KB of state memory."
+          }
+        ],
+        "summary": "Caption: Carrying a single int32 automaton state across network chunks detects boundary-spanning signatures with O(1) memory.",
+        "caption": "Caption: Carrying a single int32 automaton state across network chunks detects boundary-spanning signatures with O(1) memory."
+      }
+    },
+    {
+      "id": "stage-7",
+      "eyebrow": "Stage 7 · Advanced",
+      "title": "Observability, False-Positive Canarying & Fail-Safe Limits",
+      "level": "advanced",
+      "purpose": "Prevent bad signature pushes from blocking legitimate production traffic or crashing edge proxies.",
+      "explanation": {
+        "foundation": "Think of **Observability, False-Positive Canarying & Fail-Safe Limits** as the intuition layer for Design a 50K RPS Multi-Pattern WAF & DLP Payload Scanner: Prevent bad signature pushes from blocking legitimate production traffic or crashing edge proxies.",
+        "core": "A single overly broad rule (e.g., an empty string or 2-character common token) can trigger a 100% block rate. Production deployments enforce: (1) minimum pattern length >= 4 bytes at compile time, (2) shadow/log-only canary rollout on 1% of nodes before enforcement, and (3) per-request scan timeouts/payload caps with explicit telemetry (`waf_scan_duration_us`, `waf_rule_hit_total`).",
+        "deepDive": "Under heavy load or partial failure, observability, false-positive canarying & fail-safe limits becomes a critical lever for predictable latency and correctness. Hyperscale WAF/DLP nodes combine flat int32 DFA tables (or Double-Array Tries), bounded canonicalization, 1% shadow-canary rule linting, and lock-free atomic snapshots."
+      },
+      "sectionDiagram": {
+        "kind": "pipeline",
+        "eyebrow": "SRE Guardrails",
+        "title": "Canary Shadow Mode & Compile-Time Rule Linting",
+        "nodes": [
+          {
+            "id": "lint",
+            "label": "Rule Linter",
+            "sub": "Reject len < 4 or > 500k rules",
+            "role": "source"
+          },
+          {
+            "id": "canary",
+            "label": "1% Shadow Canary",
+            "sub": "Log-only hit rate check",
+            "role": "process"
+          },
+          {
+            "id": "prod",
+            "label": "100% Enforcement",
+            "sub": "Promoted if hit rate < threshold",
+            "role": "store"
+          }
+        ],
+        "edges": [
+          {
+            "from": "lint",
+            "to": "canary",
+            "label": "Compile validated set"
+          },
+          {
+            "from": "canary",
+            "to": "prod",
+            "label": "Auto-promote or rollback"
+          }
+        ],
+        "cards": [
+          {
+            "label": "Blast-Radius Cap",
+            "detail": "Shadow canary catches false-positive storms before any customer request is blocked."
+          },
+          {
+            "label": "Compile Invariant",
+            "detail": "Rejecting empty or <4-byte patterns prevents Z = O(N) output explosions."
+          }
+        ],
+        "summary": "Caption: Rule linting and 1% shadow-mode canarying prevent noisy signatures from causing self-inflicted outages.",
+        "caption": "Caption: Rule linting and 1% shadow-mode canarying prevent noisy signatures from causing self-inflicted outages."
+      }
+    }
+  ],
+  "practice": {
+    "knowledgeChecks": [
+      {
+        "id": "kc-1",
+        "question": "Why is an Aho-Corasick DFA able to detect a banned keyword split across two consecutive 4 KB HTTP stream chunks without buffering the entire payload?",
+        "options": [
+          {
+            "id": "a",
+            "text": "It automatically buffers all chunks into a temporary file on disk.",
+            "correct": false,
+            "feedback": "Incorrect: Disk buffering would destroy sub-2ms p99 latency."
+          },
+          {
+            "id": "b",
+            "text": "The automaton's entire prefix history is encoded in a single int32 current-state ID carried from one chunk to the next.",
+            "correct": true,
+            "feedback": "Correct: Carrying the current state ID across chunks preserves partial prefix matches in O(1) memory."
+          },
+          {
+            "id": "c",
+            "text": "It re-runs regexes over the overlap of the last 100 bytes.",
+            "correct": false,
+            "feedback": "Incorrect: Overlap windows fail if a pattern is longer than the window and require extra copying."
+          },
+          {
+            "id": "d",
+            "text": "TCP guarantees keywords never split across packet boundaries.",
+            "correct": false,
+            "feedback": "Incorrect: TCP is a byte stream and splits payloads arbitrarily."
+          }
+        ],
+        "explanation": "Because the DFA state encodes the longest matched suffix so far, carrying a single int32 state across chunks catches split patterns in O(1) space."
+      },
+      {
+        "id": "kc-2",
+        "question": "How should a 50,000 req/s WAF handle complex regex rules alongside 10,000 literal signatures without blowing its 2 ms p99 latency budget?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Run all 10,000 regexes sequentially on every request.",
+            "correct": false,
+            "feedback": "Incorrect: Sequential regex evaluation causes O(K * N) CPU saturation."
+          },
+          {
+            "id": "b",
+            "text": "Disable regex rules entirely.",
+            "correct": false,
+            "feedback": "Incorrect: Many WAF/DLP policies require regexes for structured patterns."
+          },
+          {
+            "id": "c",
+            "text": "Extract mandatory literal anchors into the Aho-Corasick prefilter and invoke linear-time RE2 verification only on payloads that hit an anchor.",
+            "correct": true,
+            "feedback": "Correct: Prefiltering eliminates regex work for ~99.5% of clean traffic while preserving full regex accuracy."
+          },
+          {
+            "id": "d",
+            "text": "Use nested backtracking regexes with a 5-second timeout.",
+            "correct": false,
+            "feedback": "Incorrect: Backtracking regexes risk ReDoS and violate the 2 ms p99 SLO."
+          }
+        ],
+        "explanation": "Using Aho-Corasick as a literal anchor prefilter restricts regex execution to the tiny fraction of payloads that match an anchor."
+      },
+      {
+        "id": "kc-3",
+        "question": "What happens if a WAF updates its Aho-Corasick Trie in place while worker threads are actively scanning HTTP payloads?",
+        "options": [
+          {
+            "id": "a",
+            "text": "Worker threads can observe torn node pointers, corrupted failure links, or crashes; instead, compile a shadow DFA off-path and swap pointers atomically.",
+            "correct": true,
+            "feedback": "Correct: Immutable shadow compilation plus atomic pointer swap guarantees lock-free, race-free hot reloads."
+          },
+          {
+            "id": "b",
+            "text": "Python's GIL automatically makes multi-step Trie mutations atomic.",
+            "correct": false,
+            "feedback": "Incorrect: Even with a GIL, multi-statement mutations across nodes and failure links leave the graph inconsistent between bytecode instructions."
+          },
+          {
+            "id": "c",
+            "text": "The scanner automatically pauses and retries.",
+            "correct": false,
+            "feedback": "Incorrect: Standard memory reads do not auto-retry on concurrent graph mutation."
+          },
+          {
+            "id": "d",
+            "text": "In-place mutation doubles throughput.",
+            "correct": false,
+            "feedback": "Incorrect: In-place mutation introduces data races or requires heavy reader-writer locks that hurt throughput."
+          }
+        ],
+        "explanation": "Compiling an immutable shadow automaton off the hot path and swapping an atomic reference prevents torn reads without lock contention."
+      }
+    ]
+  },
+  "complexityVariants": {
+    "beginner": {
+      "summary": "A fast WAF/DLP scanner compiles thousands of banned patterns into one Aho-Corasick state machine so every request is checked in a single pass.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, decoupling offline DFA compilation from the lock-free O(N + Z) request scan path keeps p99 latency under 2 ms even as signature count K scales past 10,000.",
+      "byteSummary": "Instead of checking 10,000 rules one by one on every web request, the scanner uses one pre-built Aho-Corasick lookup table. When security teams add new rules, a background thread builds the new table and swaps a pointer in an instant."
+    },
+    "intermediate": {
+      "summary": "At 50k req/s, flattening Aho-Corasick into a byte-indexed DFA with literal-anchor regex prefiltering and atomic blue-green reloads meets sub-2ms p99 SLOs.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, decoupling offline DFA compilation from the lock-free O(N + Z) request scan path keeps p99 latency under 2 ms even as signature count K scales past 10,000.",
+      "byteSummary": "The architecture pairs a byte-level Aho-Corasick DFA (O(1) per byte, zero scan-path allocations) with RE2 secondary verification for anchored regexes, O(1) cross-chunk streaming state, and immutable shadow compilation for zero-downtime updates."
+    },
+    "advanced": {
+      "summary": "Hyperscale WAF/DLP nodes combine flat int32 DFA tables (or Double-Array Tries), bounded canonicalization, 1% shadow-canary rule linting, and lock-free atomic snapshots.",
+      "keyTakeaway": "If latency budgets leave no room for synchronous retries, decoupling offline DFA compilation from the lock-free O(N + Z) request scan path keeps p99 latency under 2 ms even as signature count K scales past 10,000.",
+      "byteSummary": "Production deployment requires bounding input canonicalization passes, rejecting <4-byte wildcard-like signatures that inflate Z to O(N), provisioning 2x automaton RAM for brief blue-green overlap during atomic swaps, and gating rule promotions behind 1% shadow-mode false-positive telemetry."
+    }
+  },
+  "pedagogicalFramework": "RESHADED",
+  "prerequisites": [
+    {
+      "title": "Aho-Corasick Automaton & Multi-Pattern Matching",
+      "summary": "The Aho-Corasick Automaton fuses a prefix Trie with KMP-style BFS failure links and dictionary output links, scanning N-byte payloads against K patterns in O(N + M + Z) amortized time."
+    }
+  ],
+  "simulation": {
+    "title": "Design a 50K RPS Multi-Pattern WAF & DLP Payload Scanner — Interactive Execution Walkthrough",
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Caller",
+        "role": "Workload & Budget"
+      },
+      {
+        "id": "router",
+        "label": "Gateway / Router",
+        "role": "Admission & Dispatch"
+      },
+      {
+        "id": "engine",
+        "label": "Core Engine",
+        "role": "Primary Execution"
+      },
+      {
+        "id": "replica",
+        "label": "Replica / Fallback",
+        "role": "Durability & Recovery"
+      }
+    ],
+    "edges": [
+      {
+        "from": "client",
+        "to": "router",
+        "label": "request"
+      },
+      {
+        "from": "router",
+        "to": "engine",
+        "label": "route"
+      },
+      {
+        "from": "engine",
+        "to": "replica",
+        "label": "sync / fallback"
+      }
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "title": "Capacity Sizing & Why Sequential Regex/KMP Fails",
+        "actionLabel": "Dispatch nominal request",
+        "status": "healthy",
+        "activeNodeIds": [
+          "client",
+          "router"
+        ],
+        "activeEdgeIndex": 0,
+        "stateSnapshot": {
+          "phase": "Ingress",
+          "p99_ms": 8,
+          "error_rate": "0.0%"
+        },
+        "explanation": "Caller sends work into the gateway with explicit timeout and concurrency bounds (Capacity Sizing & Why Sequential Regex/KMP Fails)."
+      },
+      {
+        "stepNumber": 2,
+        "title": "Byte-Level Normalization & UTF-8 Evasion Defense",
+        "actionLabel": "Execute core invariant",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine"
+        ],
+        "activeEdgeIndex": 1,
+        "stateSnapshot": {
+          "phase": "Core Path",
+          "p99_ms": 18,
+          "in_flight": 124
+        },
+        "explanation": "The core engine processes the hot path while keeping state transitions deterministic (Byte-Level Normalization & UTF-8 Evasion Defense)."
+      },
+      {
+        "stepNumber": 3,
+        "title": "Compiled Byte-DFA & Output Bitmask Layout",
+        "actionLabel": "Detect skew or partial fault",
+        "status": "warning",
+        "activeNodeIds": [
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Degraded",
+          "p99_ms": 64,
+          "retries_capped": "true"
+        },
+        "explanation": "Under load or replica lag, bounded backoff and isolation prevent cascading saturation (Compiled Byte-DFA & Output Bitmask Layout)."
+      },
+      {
+        "stepNumber": 4,
+        "title": "Observability, False-Positive Canarying & Fail-Safe Limits",
+        "actionLabel": "Converge & restore SLO",
+        "status": "healthy",
+        "activeNodeIds": [
+          "router",
+          "engine",
+          "replica"
+        ],
+        "activeEdgeIndex": 2,
+        "stateSnapshot": {
+          "phase": "Converged",
+          "p99_ms": 11,
+          "drift": 0
+        },
+        "explanation": "State converges cleanly and telemetry confirms the system returned within its SLO envelope (Observability, False-Positive Canarying & Fail-Safe Limits)."
+      }
+    ]
+  }
+}
